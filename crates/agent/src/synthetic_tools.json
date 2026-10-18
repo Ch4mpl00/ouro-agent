@@ -385,5 +385,46 @@
         ]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "workflow_functions",
+      "description": "The functions a saved workflow can call, one line each: name, arguments (`?` optional), read or write, a one-line summary. With `name`, that one function in full: its description and argument schema.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "One function to show in full."
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "probe_function",
+      "description": "Run one read function of a workflow once, with these arguments, and see its reply (cut to its first few thousand characters). Build a definition's expressions from the fields of this reply. Functions that change something and model steps are refused.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "arguments": {
+            "type": "object",
+            "description": "The arguments as the workflow's `with` would pass them."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
   }
 ]

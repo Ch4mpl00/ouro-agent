@@ -53,7 +53,8 @@ async fn saves_small_mcp_and_synthetic_outputs_without_changing_mcp_schemas_or_a
                 let reply = last_json(&p.messages);
                 assert_eq!((&reply["content"], &reply["truncated"]), (&json!("found"), &json!(false)));
                 assert_eq!(s1.memory.get(reply["memory_key"].as_str().unwrap()).unwrap(), "found");
-                call("read_skill", json!({"name":"test"}))
+                // Not the loop's own skill, which would come back as a note.
+                call("read_skill", json!({"name":"other"}))
             }),
             turn(move |p| {
                 let reply = last_json(&p.messages);
@@ -1219,6 +1220,59 @@ async fn workers_receive_refs_and_isolated_history_and_cannot_delegate() {
     let (_, obs) = f.db.get_trace("parent").unwrap().unwrap();
     let worker = obs.iter().find(|o| o.name == "invoke_sub_agent").unwrap();
     assert!(obs.iter().any(|o| o.name == "iter-0" && o.parent_observation_id.as_deref() == Some(&worker.id)));
+    f.engine.shutdown().await;
+}
+// The workflow-author worker alone is offered the function catalog and the
+// probe: every other loop would pay for their schemas on every turn.
+#[tokio::test]
+async fn only_the_workflow_author_is_offered_the_catalog_and_the_probe() {
+    let model = Arc::new(Scripted::new(vec![
+        calls(&[("invoke_sub_agent", json!({"skills":["workflow-author"],"prompt":"draft"}))]),
+        calls(&[("probe_function", json!({"name":"nope"}))]),
+        assistant("child"),
+        assistant("parent"),
+    ]));
+    let skills = [("parent", "---\ntools: *\n---\nparent\n"), ("workflow-author", "---\ntools: []\n---\nauthor\n")];
+    let f = fixture(model.clone(), &["search_news"], &skills);
+    let mut opts = LoopOptions::new("parent", context());
+    opts.skills = vec!["parent".into()];
+    let loop_ = f.engine.start_loop(opts).await.unwrap();
+    loop_.send("go".into()).await.unwrap();
+    let seen = model.seen.lock().unwrap().clone();
+    let offered = |i: usize, name: &str| seen[i].tools.iter().any(|t| t.name == name);
+    assert!(!offered(0, "workflow_functions") && !offered(0, "probe_function"), "the parent");
+    assert!(offered(0, "search_news"), "the parent keeps its MCP tools");
+    assert!(offered(1, "workflow_functions") && offered(1, "probe_function"), "the author");
+    assert!(!offered(1, "search_news"), "no MCP tool of its own");
+    drop(seen);
+    f.engine.shutdown().await;
+}
+// A loop asking for a skill it already runs gets a note, not a second copy.
+#[tokio::test]
+async fn reading_a_skill_the_loop_already_runs_returns_a_note() {
+    let model = Arc::new(Scripted::new(vec![
+        calls(&[("read_skill", json!({"name":"author"})), ("read_skill", json!({"name":"other"}))]),
+        assistant("done"),
+    ]));
+    let skills = [("author", "---\ntools: []\n---\nauthor body\n"), ("other", "---\ntools: []\n---\nother body\n")];
+    let f = fixture(model.clone(), &[], &skills);
+    let mut opts = LoopOptions::new("loop", context());
+    opts.skills = vec!["author".into()];
+    f.engine.start_loop(opts).await.unwrap().send("go".into()).await.unwrap();
+    let seen = model.seen.lock().unwrap().clone();
+    let replies: Vec<String> = seen[1]
+        .messages
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| m["content"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(
+        replies[0].contains("Already part of your instructions") && !replies[0].contains("author body"),
+        "{}",
+        replies[0]
+    );
+    assert!(replies[1].contains("other body"), "{}", replies[1]);
+    drop(seen);
     f.engine.shutdown().await;
 }
 #[tokio::test]

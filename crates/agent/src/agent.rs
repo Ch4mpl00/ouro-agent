@@ -378,6 +378,9 @@ impl AgentLoop {
         match name {
             "invoke_sub_agent" => self.opts.parent_id.is_none(),
             "write_skill" => self.opts.allow_skill_writes && self.skill_names.iter().any(|n| n == "dreaming"),
+            name if crate::flows::AUTHOR_TOOLS.contains(&name) => {
+                self.skill_names.iter().any(|n| n == "workflow-author")
+            }
             _ => true,
         }
     }
@@ -484,6 +487,14 @@ impl AgentLoop {
             }
             "read_skill" => {
                 let name = string_arg(args, "name", true)?;
+                // A skill this loop already runs is in its instructions: a
+                // second copy would cost its size again on every turn. A loop
+                // that may rewrite skills still gets the text it edits.
+                if self.skill_names.iter().any(|n| n == name) && !self.opts.allow_skill_writes {
+                    return Ok(json!({"name": name, "found": true, "loaded": true, "content": null,
+                        "note": "Already part of your instructions."})
+                    .to_string());
+                }
                 Ok(match engine.deps.skill_store.read_skill(name).await? {
                     None => json!({"name": name, "found": false, "content": null}),
                     Some(skill) => json!({"name": name, "found": true, "content": skill.body, "tools": skill.tools.to_json(), "source": skill.source, "sizeBytes": skill.body.len()}),
@@ -511,6 +522,8 @@ impl AgentLoop {
             }
             "invoke_sub_agent" => self.worker(engine, args, span).await,
             name if crate::flows::TOOLS.contains(&name) => crate::flows::tool(engine, name, args),
+            "workflow_functions" => crate::flows::functions(engine, args),
+            "probe_function" => crate::flows::probe(engine, args, &self.cancel).await,
             name if crate::schedule::TOOLS.contains(&name) => {
                 let tz = &self.opts.session.env.timezone;
                 let (store, workflows) = (&*engine.deps.schedule, &*engine.deps.workflows);

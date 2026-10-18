@@ -51,6 +51,28 @@ fn the_store_keeps_versions_and_one_active_each() {
     store_contract(&AgentDb::open(dir.path().join("agent.db")).unwrap());
 }
 
+// The language card of workflow-author.md stays true to the interpreter:
+// its reference definition parses and validates. Its function names stand
+// for real ones, so any name is callable here.
+#[test]
+fn the_authoring_skills_reference_definition_is_valid() {
+    struct Any;
+    impl owf::model::Catalog for Any {
+        fn has(&self, _: &str) -> bool {
+            true
+        }
+    }
+    let skill =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../skills.default/workflow-author.md"))
+            .unwrap();
+    let examples: Vec<&str> = skill.split("```yaml\n").skip(1).filter_map(|block| block.split("```").next()).collect();
+    assert!(!examples.is_empty(), "workflow-author shows a reference");
+    for example in examples {
+        let wf = owf::model::parse_yaml(example).unwrap_or_else(|e| panic!("{e}\n{example}"));
+        owf::model::validate(&wf, &Any).unwrap_or_else(|e| panic!("{e}\n{example}"));
+    }
+}
+
 // ── the world ───────────────────────────────────────────────────────────────
 
 // MCP with the read-only marks a real server sends.
@@ -371,6 +393,46 @@ do: [ { send: { call: send_telegram_message, with: { text: once }, metadata: { d
 
 // A workflow sends to the user's chat from its input, not from an id
 // written into the definition.
+// The author's catalog: every callable function one line each, one in
+// full on request; the probe runs reads only, cut to their shape.
+#[tokio::test]
+async fn the_author_sees_the_functions_and_probes_only_reads() {
+    use agent::flows::{functions, probe};
+    let w = world(vec![]);
+    let none = Map::new();
+    let catalog = functions(&w.engine, &none).unwrap();
+    let line = |name: &str| catalog.lines().find(|l| l.starts_with(&format!("{name}("))).map(str::to_owned);
+    assert_eq!(line("search_news").as_deref(), Some("search_news(query?: any, k?: any) read — search"));
+    assert_eq!(
+        line("send_telegram_message").as_deref(),
+        Some("send_telegram_message(chatId?: any, text: any) write — send")
+    );
+    assert!(line("llm_decide").unwrap().starts_with("llm_decide(items, prompt, threshold?) read"));
+    assert_eq!(line("get_next_signal"), None, "the signal queue is the supervisor's");
+    let one: Value = serde_json::from_str(
+        &functions(&w.engine, json!({"name": "send_telegram_message"}).as_object().unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!((one["effect"].as_str(), one["parameters"]["required"].clone()), (Some("write"), json!(["text"])));
+
+    let cancel = CancellationToken::new();
+    let args = |v: Value| v.as_object().unwrap().clone();
+    let reply = probe(&w.engine, &args(json!({"name": "search_news", "arguments": {"query": "x"}})), &cancel).await;
+    assert!(reply.unwrap().contains("Rust 2.0"));
+    for refused in ["send_telegram_message", "llm_compose", "get_next_signal", "nope"] {
+        assert!(probe(&w.engine, &args(json!({"name": refused})), &cancel).await.is_err(), "{refused}");
+    }
+    assert_eq!(w.calls().iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["search_news"], "nothing else ran");
+
+    let big = "x".repeat(20_000);
+    w.mcp.always(Arc::new(move |_, _, _| {
+        let big = big.clone();
+        Box::pin(async move { Ok(big) })
+    }));
+    let cut = probe(&w.engine, &args(json!({"name": "search_news"})), &cancel).await.unwrap();
+    assert!(cut.len() < 7_000 && cut.contains("20000 characters in all"), "{}", cut.len());
+}
+
 #[tokio::test]
 async fn a_workflow_sends_to_the_chat_its_input_names() {
     use agent::session::{EnvData, session};

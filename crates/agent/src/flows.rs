@@ -821,6 +821,17 @@ impl FlowRun for Flows {
 // the chat) lets a schedule run it.
 pub const TOOLS: &[&str] = &["save_workflow", "activate_workflow", "list_workflows", "read_workflow"];
 
+// The workflow-author worker's own tools (`workflow-author` skill, which
+// takes no MCP tools of its own): the functions a workflow can call, one
+// line each or one in full, and a run of one read function, so that a
+// definition is built from a real reply without the worker being able to
+// change anything while it explores.
+pub const AUTHOR_TOOLS: &[&str] = &["workflow_functions", "probe_function"];
+
+// What a probe returns at most: enough to see a reply's shape, never a
+// whole store.
+const PROBE_MAX_CHARS: usize = 6000;
+
 fn effect_name(mcp: &dyn Mcp, wf: &owf::model::Workflow, function: &str) -> &'static str {
     match effect(mcp, function) {
         Some(Effect::Read) => "read",
@@ -901,4 +912,124 @@ pub fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::R
         }
         _ => anyhow::bail!("unknown workflow tool {name}"),
     }
+}
+
+// The type of one JSON-schema property, short: `string`, `integer`, an
+// enum as its values joined by `|`, an array as `[item]`.
+fn short_type(schema: &Value, property: &Value) -> String {
+    let resolve = |p: &Value| -> Value {
+        match p.get("$ref").and_then(Value::as_str).and_then(|r| r.strip_prefix("#/$defs/")) {
+            Some(name) => schema["$defs"][name].clone(),
+            None => p.clone(),
+        }
+    };
+    let p = resolve(property);
+    let variants: Vec<Value> = match p.get("anyOf").or_else(|| p.get("oneOf")).and_then(Value::as_array) {
+        Some(v) => v.iter().map(resolve).collect(),
+        None => vec![p],
+    };
+    let mut names = Vec::new();
+    for v in &variants {
+        if let Some(values) = v.get("enum").and_then(Value::as_array) {
+            names.push(values.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("|"));
+            continue;
+        }
+        let types: Vec<&str> = match &v["type"] {
+            Value::String(t) => vec![t.as_str()],
+            Value::Array(t) => t.iter().filter_map(Value::as_str).collect(),
+            _ => vec![],
+        };
+        for t in types.into_iter().filter(|t| *t != "null") {
+            names.push(if t == "array" { format!("[{}]", short_type(schema, &v["items"])) } else { t.to_owned() });
+        }
+    }
+    if names.is_empty() { "any".into() } else { names.join("|") }
+}
+
+fn first_sentence(text: &str) -> String {
+    let line = text.split(['\n']).next().unwrap_or_default();
+    let end = line.find(". ").map_or(line.len(), |i| i + 1);
+    line[..end].trim().to_owned()
+}
+
+/// `workflow_functions`: every function a workflow can call, one line each,
+/// or with `name` that one in full (description and argument schema).
+pub fn functions(engine: &Engine, args: &Map<String, Value>) -> anyhow::Result<String> {
+    let mcp = &*engine.deps.mcp;
+    let tools: Vec<ToolDef> = model_tools(mcp).into_iter().filter(|t| !WITHHELD.contains(&t.name.as_str())).collect();
+    let effect_of = |name: &str| match effect(mcp, name) {
+        Some(Effect::Read) => "read",
+        _ => "write",
+    };
+    if let Some(name) = args.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()) {
+        if let Some((_, _, takes, needs)) = MODEL_FUNCTIONS.iter().find(|f| f.0 == name) {
+            return Ok(json!({"name": name, "effect": effect_of(name), "takes": takes, "needs": needs,
+                "description": "A model step of the workflow runtime; the skill describes it."})
+            .to_string());
+        }
+        let tool = tools.iter().find(|t| t.name == name).ok_or_else(|| anyhow::anyhow!("no function `{name}`"))?;
+        return Ok(json!({"name": name, "effect": effect_of(name), "description": tool.description,
+            "parameters": tool.parameters})
+        .to_string());
+    }
+    let mut lines = vec![
+        "One line per function: name(arguments; `?` optional) effect — summary. \
+        workflow_functions(name) gives one in full."
+            .to_owned(),
+    ];
+    for (name, effect, takes, needs) in MODEL_FUNCTIONS {
+        let args: Vec<String> =
+            takes.iter().map(|a| if needs.contains(a) { a.to_string() } else { format!("{a}?") }).collect();
+        let effect = if *effect == Effect::Read { "read" } else { "write" };
+        lines.push(format!("{name}({}) {effect} — a model step; see the skill", args.join(", ")));
+    }
+    for tool in &tools {
+        let schema = &tool.parameters;
+        let required: Vec<&str> =
+            schema["required"].as_array().map(|r| r.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+        let args: Vec<String> = schema["properties"]
+            .as_object()
+            .map(|p| {
+                p.iter()
+                    .map(|(n, prop)| {
+                        let optional = if required.contains(&n.as_str()) { "" } else { "?" };
+                        format!("{n}{optional}: {}", short_type(schema, prop))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let summary = first_sentence(tool.description.as_deref().unwrap_or_default());
+        lines.push(format!("{}({}) {} — {summary}", tool.name, args.join(", "), effect_of(&tool.name)));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// `probe_function`: runs one read function once and returns its reply,
+/// cut to its first PROBE_MAX_CHARS. Writes and model steps are refused.
+pub async fn probe(engine: &Engine, args: &Map<String, Value>, cancel: &CancellationToken) -> anyhow::Result<String> {
+    let mcp = &*engine.deps.mcp;
+    let name = args.get("name").and_then(Value::as_str).filter(|n| !n.is_empty());
+    let name = name.ok_or_else(|| anyhow::anyhow!("name: Expected nonempty string"))?;
+    anyhow::ensure!(
+        !MODEL_FUNCTIONS.iter().any(|f| f.0 == name),
+        "`{name}` is a model step; probe the reads that feed it instead"
+    );
+    mcp_tool(mcp, name).ok_or_else(|| anyhow::anyhow!("no function `{name}`"))?;
+    anyhow::ensure!(
+        effect(mcp, name) == Some(Effect::Read),
+        "`{name}` changes something; probe_function runs only read functions"
+    );
+    let arguments = match args.get("arguments") {
+        None | Some(Value::Null) => Map::new(),
+        Some(Value::Object(a)) => a.clone(),
+        Some(_) => anyhow::bail!("arguments: Expected an object"),
+    };
+    let raw = mcp.call_tool(name, arguments, cancel).await?;
+    let total = raw.chars().count();
+    Ok(if total <= PROBE_MAX_CHARS {
+        raw
+    } else {
+        let head: String = raw.chars().take(PROBE_MAX_CHARS).collect();
+        format!("{head}\n… [cut: {total} characters in all; the shape above is the whole reply's]")
+    })
 }

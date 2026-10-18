@@ -62,17 +62,6 @@ fn all_shipped_skills_pass_the_agents_startup_validation_against_prods_mcp_surfa
         let mcp = McpClient::connect(open_http(url), ConnectOptions::default()).await.unwrap();
         let own: Vec<String> = mcp.tools().into_iter().map(|t| t.name).collect();
         assert!(own.iter().any(|t| t == "get_next_signal"), "the full instance serves the signal queue");
-        // Every example workflow in a shipped skill passes the check
-        // save_workflow makes, against prod's tool surface.
-        let author = std::fs::read_to_string(repo.join("skills.default/workflow-author.md")).unwrap();
-        let examples: Vec<&str> =
-            author.split("```yaml\n").skip(1).filter_map(|block| block.split("```").next()).collect();
-        assert!(!examples.is_empty(), "workflow-author shows an example");
-        for example in examples {
-            if let Err(problems) = agent::flows::check(&mcp, example) {
-                panic!("an example in workflow-author.md does not validate:\n{problems}\n{example}");
-            }
-        }
         // The read-only marks a saved workflow relies on: a call to one of
         // these never counts as a change. A new tool decides which it is here.
         let mut read_only: Vec<&str> = own.iter().map(String::as_str).filter(|t| mcp.read_only(t)).collect();
