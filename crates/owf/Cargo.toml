@@ -1,0 +1,23 @@
+[package]
+name = "owf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+futures = "0.3.34"
+jaq-core = "3.1.1"
+jaq-json = { version = "2.0.3", features = ["serde"] }
+jaq-std = "3.0.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+serde_yaml_ng = "0.10.0"
+jsonschema = { version = "0.59.0", default-features = false }
+chrono = "0.4.45"
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["time", "sync", "macros", "rt"] }
+tokio-util = "0.7.19"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["full", "test-util"] }

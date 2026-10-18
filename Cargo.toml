@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mcp", "crates/agent", "crates/codex", "crates/evals"]
+members = ["crates/mcp", "crates/agent", "crates/codex", "crates/evals", "crates/owf"]
 
 # Symbols stripped: the binaries ship to the droplet on every Rust change.
 [profile.release]
