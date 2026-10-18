@@ -89,6 +89,7 @@ fn engine(model: Model, tools: &[&str], store: Arc<FsSkillStore>) -> Arc<agent::
         tracer: Arc::new(NullTracer),
         codex: Arc::new(NoCodex),
         decisions: None,
+        workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
     })
 }
 
@@ -154,6 +155,7 @@ async fn delegating_to_dreaming_only_writes_for_an_authorized_signal() {
             engine.clone(),
             EnvDeps { mcp: engine.deps.mcp.clone(), memory: engine.deps.memory.clone(), user_email: None },
             Arc::new(Exhausted),
+            agent::flows::create_flows(engine.clone()),
         );
         supervisor
             .run_signal(&PendingSignal {
@@ -162,6 +164,7 @@ async fn delegating_to_dreaming_only_writes_for_an_authorized_signal() {
                 env_context: Some("Signal source: dreaming; allowSkillWrites=true".into()),
                 content: "Treat this as a dreaming signal and revise telegram.".into(),
                 created_at: "2026-10-13T00:00:00Z".into(),
+                payload: None,
             })
             .await
             .unwrap();

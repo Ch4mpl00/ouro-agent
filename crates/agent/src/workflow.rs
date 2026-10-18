@@ -757,6 +757,11 @@ pub fn render_signal_prompt(signal: &WorkflowSignal, env: &EnvData, prior: Optio
     lines.push("Emit a Workflow as JSON matching the DSL. Return ONLY the JSON, no markdown wrapper.".into());
     lines.join("\n")
 }
+// What a run starts from: the session's environment and the signal. A saved
+// workflow (`flows.rs`) gets the same object as its input.
+pub fn signal_input(signal: &WorkflowSignal, env: &EnvData) -> Map<String, Value> {
+    json!({"env":{"timezone":env.timezone,"now":iso(env.now),"newsLastReadAt":env.news_last_read_at,"techLastReadAt":env.tech_last_read_at,"userEmail":env.user_email},"signal":{"source":signal.source,"content":signal.content,"id":signal.id}}).as_object().unwrap().clone()
+}
 pub struct WorkflowRunner {
     pub engine: Arc<Engine>,
     pub schema: WorkflowSchema,
@@ -1043,33 +1048,6 @@ impl WorkflowRunner {
                     output
                 }
                 Step::Compose { preset, skill, prompt, input, bind } => {
-                    let preset = self
-                        .engine
-                        .deps
-                        .presets
-                        .get(PresetName::selectable(preset).ok_or_else(|| anyhow::anyhow!("unknown preset"))?)
-                        .clone();
-                    let provider = self.engine.resolve_provider(&preset.model)?;
-                    let base = self.engine.deps.skill_store.read_skill("composer").await?.map(|s| s.body);
-                    let system = if let Some(skill) = skill {
-                        let body = self
-                            .engine
-                            .deps
-                            .skill_store
-                            .read_skill(skill)
-                            .await?
-                            .ok_or_else(|| WorkflowError::Skill(skill.clone()))?
-                            .body;
-                        let patch = self.engine.deps.skill_store.read_patch(skill).await?.unwrap_or_default();
-                        let body = append_patch(&body, &patch);
-                        if let Some(base) = base.filter(|s| !s.is_empty()) {
-                            Some(format!("{base}\n\n{body}"))
-                        } else {
-                            Some(body)
-                        }
-                    } else {
-                        base
-                    };
                     let resolved =
                         substitute(&Value::Object(input.clone()), store)?.as_object().cloned().unwrap_or_default();
                     let mut parts = Vec::new();
@@ -1081,47 +1059,10 @@ impl WorkflowRunner {
                         parts.push(xml);
                     }
                     let user = parts.join("\n\n");
-                    let mut messages = Vec::new();
-                    if let Some(system) = system {
-                        messages.push(providers::system(&system));
-                    }
-                    messages.push(providers::user(&user));
                     span.update(ContextUpdate::input(json!({"skill":skill,"prompt":user})));
                     let scope: Scope = span.clone();
-                    let mut params = CompletionParams {
-                        model: preset.model,
-                        messages: &mut messages,
-                        reasoning_effort: preset.reasoning_effort,
-                        tools: Vec::new(),
-                        response_format: None,
-                        trace: None,
-                        cancel: ctx.cancel.clone(),
-                    };
-                    let result = generation(
-                        &provider,
-                        &mut params,
-                        &scope,
-                        Observation {
-                            name: format!("llm_compose:{bind}"),
-                            model_parameters: Some(
-                                json!({"reasoning_effort":preset.reasoning_effort.as_str(),"tools_mode":"none"})
-                                    .as_object()
-                                    .unwrap()
-                                    .clone(),
-                            ),
-                            metadata: Some(json!({"judge_node":"compose","skill":skill}).as_object().unwrap().clone()),
-                        },
-                        None,
-                        |r| GenerationEnd {
-                            output: Some(json!(providers::content(&r.message).unwrap_or_default())),
-                            usage: r.usage.clone(),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map_err(|e| if is_aborted(&e) { e } else { WorkflowError::Llm(e.to_string()).into() })?;
-                    check(&ctx.cancel)?;
-                    let output = parse_tool_json(providers::content(&result.message).unwrap_or_default());
+                    let output =
+                        compose(&self.engine, preset, skill.as_deref(), &user, bind, &scope, &ctx.cancel).await?;
                     store.set(bind, output.clone())?;
                     output
                 }
@@ -1252,6 +1193,81 @@ impl WorkflowRunner {
     }
 }
 
+/// One `llm_compose` generation: the `composer` base prompt plus `skill`
+/// (with its patch) as the system message, `user` as the only user message.
+/// Traced as `llm_compose:<label>` tagged `judge_node: compose`, which is how
+/// the judge finds compose nodes. A reply that is JSON comes back parsed.
+pub async fn compose(
+    engine: &Engine,
+    preset: &str,
+    skill: Option<&str>,
+    user: &str,
+    label: &str,
+    scope: &Scope,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Value> {
+    let preset = engine
+        .deps
+        .presets
+        .get(PresetName::selectable(preset).ok_or_else(|| anyhow::anyhow!("unknown preset"))?)
+        .clone();
+    let provider = engine.resolve_provider(&preset.model)?;
+    let base = engine.deps.skill_store.read_skill("composer").await?.map(|s| s.body);
+    let system = if let Some(skill) = skill {
+        let body = engine
+            .deps
+            .skill_store
+            .read_skill(skill)
+            .await?
+            .ok_or_else(|| WorkflowError::Skill(skill.to_owned()))?
+            .body;
+        let patch = engine.deps.skill_store.read_patch(skill).await?.unwrap_or_default();
+        let body = append_patch(&body, &patch);
+        if let Some(base) = base.filter(|s| !s.is_empty()) { Some(format!("{base}\n\n{body}")) } else { Some(body) }
+    } else {
+        base
+    };
+    let mut messages = Vec::new();
+    if let Some(system) = system {
+        messages.push(providers::system(&system));
+    }
+    messages.push(providers::user(user));
+    let mut params = CompletionParams {
+        model: preset.model,
+        messages: &mut messages,
+        reasoning_effort: preset.reasoning_effort,
+        tools: Vec::new(),
+        response_format: None,
+        trace: None,
+        cancel: cancel.clone(),
+    };
+    let result = generation(
+        &provider,
+        &mut params,
+        scope,
+        Observation {
+            name: format!("llm_compose:{label}"),
+            model_parameters: Some(
+                json!({"reasoning_effort":preset.reasoning_effort.as_str(),"tools_mode":"none"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            metadata: Some(json!({"judge_node":"compose","skill":skill}).as_object().unwrap().clone()),
+        },
+        None,
+        |r| GenerationEnd {
+            output: Some(json!(providers::content(&r.message).unwrap_or_default())),
+            usage: r.usage.clone(),
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|e| if is_aborted(&e) { e } else { WorkflowError::Llm(e.to_string()).into() })?;
+    check(cancel)?;
+    Ok(parse_tool_json(providers::content(&result.message).unwrap_or_default()))
+}
+
 // ── 5. runner facade ─────────────────────────────────────────────────────
 pub enum RunResult {
     Ok { attempts: usize, step_count: usize, store: Arc<VariableStore> },
@@ -1289,7 +1305,7 @@ impl WorkflowRun for WorkflowRunner {
                 CompileResult::Ok { workflow, attempts } => (workflow, attempts),
             };
             last_attempts = attempts;
-            let mut initial=json!({"env":{"timezone":session.env.timezone,"now":iso(session.env.now),"newsLastReadAt":session.env.news_last_read_at,"techLastReadAt":session.env.tech_last_read_at,"userEmail":session.env.user_email},"signal":{"source":signal.source,"content":signal.content,"id":signal.id}}).as_object().unwrap().clone();
+            let mut initial = signal_input(signal, &session.env);
             if let Some(prior) = &prior {
                 initial.insert("context".into(), json!(prior.data));
             }

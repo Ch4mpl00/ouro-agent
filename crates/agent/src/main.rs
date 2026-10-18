@@ -7,6 +7,7 @@ use agent::{
     db::{AgentDb, DEFAULT_DB_PATH},
     decisions::decision_client,
     errors::{is_aborted, or_cancel},
+    flows::create_durable_flows,
     langfuse::LangfuseTracer,
     local_recorder::local_recorder_tracer,
     mcp::{ConnectOptions, Mcp, McpClient, RETRY_UNTIL_UP, open_from_env},
@@ -182,6 +183,7 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
             skills: vec!["orchestrator".into(), "routing".into()],
             skill_store: skills.clone(),
             memory: db.clone(),
+            workflows: db.clone(),
             tracer,
             codex: codex_client(&std::env::var("CODEX_URL").unwrap_or_else(|_| "http://localhost:3010".into())),
             decisions: Some(decision_client(
@@ -195,13 +197,17 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
                 .await?
                 .into_iter()
                 .map(|s| s.name)
-                .filter(|s| !["planner", "orchestrator", "routing", "recovery"].contains(&s.as_str()))
+                .filter(|s| {
+                    !["planner", "orchestrator", "routing", "recovery", "workflow-author"].contains(&s.as_str())
+                })
                 .collect();
             let workflow = create_workflow_runner(engine.clone(), known_skills)?;
+            let flows = create_durable_flows(engine.clone(), (*db).clone());
             let supervisor = create_supervisor_with_cancel(
                 engine.clone(),
                 EnvDeps { mcp: mcp.clone(), memory: db.clone(), user_email: std::env::var("USER_EMAIL").ok() },
                 workflow,
+                flows.clone(),
                 stopping.child_token(),
             );
             let journal_cancel = CancellationToken::new();
@@ -217,7 +223,16 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
                 let cancel = journal_cancel.clone();
                 journal = Some(tokio::spawn(async move { worker.run(cancel).await }));
             }
-            eprintln!("[supervisor] entering main loop (scheduler → workflow, other sources → agent-loop)");
+            eprintln!(
+                "[supervisor] entering main loop (scheduler → saved workflow or planner, other sources → agent-loop)"
+            );
+            let durable_cancel = stopping.child_token();
+            let recovery = if !once {
+                let cancel = durable_cancel.clone();
+                Some(tokio::spawn(async move { flows.worker(cancel).await }))
+            } else {
+                None
+            };
             let outcome = if once {
                 let raw = mcp.call_tool("get_next_signal", serde_json::Map::new(), &stopping).await;
                 match raw {
@@ -249,6 +264,10 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
                     }
                 }
             };
+            durable_cancel.cancel();
+            if let Some(recovery) = recovery {
+                let _ = recovery.await;
+            }
             journal_cancel.cancel();
             if let Some(task) = journal {
                 log_journal_result(task.await);

@@ -22,6 +22,20 @@
       "when": 1791902683744,
       "tag": "0002_unusual_thor",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1792411200000,
+      "tag": "0003_saved_workflows",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1792411200001,
+      "tag": "0004_durable_runs",
+      "breakpoints": true
     }
   ]
 }

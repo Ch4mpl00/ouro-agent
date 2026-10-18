@@ -20,6 +20,7 @@ fn signal() -> PendingSignal {
         content: "Telegram message in chat -10042 (forum topic thread_id=7).\nText: \"давай\"".into(),
         env_context: Some("Default Telegram chat id: 999.".into()),
         created_at: "2026-09-06 12:00:00".into(),
+        payload: None,
     }
 }
 

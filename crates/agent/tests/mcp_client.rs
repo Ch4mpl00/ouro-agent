@@ -391,3 +391,41 @@ async fn a_lost_reply_after_a_side_effect_is_never_replayed() {
     assert_eq!(client.call_tool("effect", args("next"), &CancellationToken::new()).await.unwrap(), "ok");
     client.close().await;
 }
+
+#[tokio::test]
+async fn durable_transport_reports_ambiguous_effect_without_reissuing_it() {
+    use agent::mcp::ToolCallFailure;
+    let server = Server::new().await;
+    let (client, connections) = server.connect().await;
+    server.state.lose_reply.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        client.call_tool_once("effect", args("durable"), &CancellationToken::new()).await,
+        Err(ToolCallFailure::Unknown(_))
+    ));
+    assert_eq!(*server.state.ledger.lock().unwrap(), ["start durable", "done durable"]);
+    assert_eq!(connections.load(Ordering::SeqCst), 1);
+    client.close().await;
+    assert!(matches!(
+        client.call_tool_once("effect", args("closed"), &CancellationToken::new()).await,
+        Err(ToolCallFailure::NotExecuted(_))
+    ));
+}
+
+#[tokio::test]
+async fn durable_transport_can_prove_session_rejection_before_execution() {
+    use agent::mcp::ToolCallFailure;
+    let server = Server::new().await;
+    let (client, _) = server.connect().await;
+    server.evict().await;
+    let cancel = CancellationToken::new();
+    match client.call_tool_once("effect", args("fresh"), &cancel).await {
+        Ok(text) => assert_eq!(text, "ok"), // Transport closed before dispatch; safely reconnected.
+        Err(ToolCallFailure::NotExecuted(_)) => {
+            assert!(server.state.ledger.lock().unwrap().is_empty());
+            assert_eq!(client.call_tool_once("effect", args("fresh"), &cancel).await.unwrap(), "ok");
+        }
+        Err(ToolCallFailure::Unknown(error)) => panic!("session rejection was ambiguous: {error}"),
+    }
+    assert_eq!(*server.state.ledger.lock().unwrap(), ["start fresh", "done fresh"]);
+    client.close().await;
+}

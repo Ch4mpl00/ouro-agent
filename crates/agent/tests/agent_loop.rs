@@ -617,6 +617,7 @@ fn signal(source: &str, content: &str) -> PendingSignal {
         content: content.into(),
         env_context: Some("chatId=42".into()),
         created_at: "2026-09-06T12:00:00Z".into(),
+        payload: None,
     }
 }
 
@@ -668,6 +669,7 @@ fn supervisor(h: &Harness, workflow: Arc<dyn WorkflowRun>) -> Arc<agent::supervi
         h.engine.clone(),
         EnvDeps { mcp: timezone, memory: h.persist.clone(), user_email: None },
         workflow,
+        agent::flows::create_flows(h.engine.clone()),
     )
 }
 
@@ -1062,6 +1064,7 @@ fn engine_with(openrouter: Option<Arc<dyn ChatProvider>>) -> Arc<agent::agent::E
         tracer: null(),
         codex: Arc::new(NoCodex),
         decisions: None,
+        workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
     })
 }
 

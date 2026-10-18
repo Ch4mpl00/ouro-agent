@@ -52,6 +52,7 @@ dependencies = [
  "dotenvy",
  "futures",
  "hex",
+ "owf",
  "proptest",
  "rand 0.10.3",
  "regex",

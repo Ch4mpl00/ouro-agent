@@ -19,6 +19,10 @@ Typical routes:
 - `nashdom-bill`: utility mail and PDF extraction.
 - `dreaming`: the scheduled skill-maintenance task. It may update skills
   as assigned; it should report what changed.
+- `workflow-author`: the user wants something done on a schedule
+  ("присылай каждое утро …"), or a scheduled task should run without
+  re-planning. The worker saves a draft workflow and returns what it
+  does; deliver that to the user and ask them to confirm.
 - No matching domain: omit `skills` for a general worker, or act directly
   if the task is small. `orchestrator`, `routing` and transport skills are
   parent instructions, not worker tasks.
@@ -53,6 +57,12 @@ After a successful full news-digest delivery, stamp
 `news_digest.last_read_at` with the session's current ISO time. A topical
 `news-query` does not advance it. Delivery and its watermark are dependent
 actions: wait for delivery success first.
+
+A drafted workflow runs only after the user confirms it in the chat. On
+their yes, call `activate_workflow(name, version)`, then `schedule_task`
+with `payload: {"workflow": "<name>"}` and a one-line `prompt` saying what
+it does (none if a schedule for it already exists: `list_scheduled_tasks`).
+Never activate on your own judgement.
 
 User knowledge ("запомни", "что помнишь про") uses MCP `remember`,
 `recall`, `get_fact` and `read_doc` directly. It is distinct from temporary

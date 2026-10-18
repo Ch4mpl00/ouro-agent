@@ -229,5 +229,94 @@
         ]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "save_workflow",
+      "description": "Validate a saved-workflow definition (Open Workflow Specification DSL 1.0, YAML) and store it as a new draft version of `name`. Problems come back with the path of the task and property to fix; fix them all and save again. The reply lists every call the workflow makes with its effect (read/write) — show the user the write calls before asking them to confirm. A draft never runs; see activate_workflow.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The workflow's name; must equal document.name in the definition."
+          },
+          "definition": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The whole definition as YAML."
+          },
+          "note": {
+            "type": "string",
+            "description": "What this version changes, for the history."
+          }
+        },
+        "required": [
+          "name",
+          "definition"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "activate_workflow",
+      "description": "Make a saved version of a workflow the one that runs; the version active before retires. Call it ONLY after the user explicitly confirmed this version in the chat. A scheduled task with payload {\"workflow\": name} then runs it without the agent.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "name",
+          "version"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_workflows",
+      "description": "List saved workflows: the newest version of each, its status, and which version is active.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_workflow",
+      "description": "Read a saved workflow's definition: the newest version, or `version`.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
   }
 ]

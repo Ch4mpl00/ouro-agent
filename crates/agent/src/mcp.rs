@@ -13,6 +13,7 @@
 //     fails, the next call reconnects; a call that may have reached a tool is
 //     never replayed (a Telegram message must not go out twice).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,13 +38,34 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[async_trait]
 pub trait Mcp: Send + Sync {
     fn tools(&self) -> Vec<ToolDef>;
+    // Whether the server marks `name` read-only (`readOnlyHint`). Anything
+    // not marked may change the world.
+    fn read_only(&self, _name: &str) -> bool {
+        false
+    }
     async fn call_tool(
         &self,
         name: &str,
         args: Map<String, Value>,
         cancel: &CancellationToken,
     ) -> anyhow::Result<String>;
+    /// Durable calls must not hide ambiguous request retries. Adapters that
+    /// cannot prove non-dispatch conservatively return Unknown.
+    async fn call_tool_once(
+        &self,
+        name: &str,
+        args: Map<String, Value>,
+        cancel: &CancellationToken,
+    ) -> Result<String, ToolCallFailure> {
+        self.call_tool(name, args, cancel).await.map_err(ToolCallFailure::Unknown)
+    }
     async fn close(&self) {}
+}
+
+#[derive(Debug)]
+pub enum ToolCallFailure {
+    NotExecuted(anyhow::Error),
+    Unknown(anyhow::Error),
 }
 
 pub type SharedMcp = Arc<dyn Mcp>;
@@ -244,6 +266,7 @@ impl Connection {
 
 pub struct McpClient {
     tools: Vec<ToolDef>,
+    read_only: HashSet<String>,
     open: Open,
     sleep: Sleep,
     // The current session. A replaced one is dropped when the last call
@@ -290,7 +313,13 @@ impl McpClient {
             log_retry("connect"),
         )
         .await?;
+        let read_only = tools
+            .iter()
+            .filter(|t| t.annotations.as_ref().and_then(|a| a.read_only_hint) == Some(true))
+            .map(|t| t.name.to_string())
+            .collect();
         Ok(McpClient {
+            read_only,
             tools: tool_defs(tools),
             open,
             sleep: options.sleep,
@@ -362,8 +391,37 @@ pub fn result_text(result: &rmcp::model::CallToolResult) -> String {
 
 #[async_trait]
 impl Mcp for McpClient {
+    async fn call_tool_once(
+        &self,
+        name: &str,
+        args: Map<String, Value>,
+        cancel: &CancellationToken,
+    ) -> Result<String, ToolCallFailure> {
+        check(cancel).map_err(ToolCallFailure::NotExecuted)?;
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(ToolCallFailure::NotExecuted(aborted()));
+        }
+        let mut client = self.current().await;
+        if client.peer.is_transport_closed() {
+            client = or_cancel(cancel, self.reconnect(&client)).await.map_err(ToolCallFailure::NotExecuted)?;
+        }
+        match Self::call_on(&client, name, &args, cancel).await {
+            Ok(result) => Ok(result_text(&result)),
+            Err(error) if is_session_lost(&error) => {
+                // The session rejected the request before dispatch. Refresh it
+                // for the next attempt, but never reissue tools/call here.
+                let _ = or_cancel(cancel, self.reconnect(&client)).await;
+                Err(ToolCallFailure::NotExecuted(error))
+            }
+            Err(error) => Err(ToolCallFailure::Unknown(error)),
+        }
+    }
     fn tools(&self) -> Vec<ToolDef> {
         self.tools.clone()
+    }
+
+    fn read_only(&self, name: &str) -> bool {
+        self.read_only.contains(name)
     }
 
     async fn call_tool(

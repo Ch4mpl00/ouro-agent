@@ -90,6 +90,7 @@ fn signal(source: &str, id: i64) -> PendingSignal {
         },
         env_context: Some("Default Telegram chat id: 999.".into()),
         created_at: "2026-09-06 12:00:00".into(),
+        payload: None,
     }
 }
 fn history(id: i64, text: &str, role: &str, chat: i64, thread: Option<i64>, at: &str) -> Value {
@@ -153,6 +154,7 @@ fn setup(
         f.engine.clone(),
         EnvDeps { mcp: mcp.clone(), memory: f.db.clone(), user_email: Some("user@test".into()) },
         workflow.clone(),
+        agent::flows::create_flows(f.engine.clone()),
     );
     (f, mcp, workflow, supervisor)
 }
@@ -186,6 +188,100 @@ async fn routing_uses_workflow_only_for_scheduler_and_domain_signals_are_delegat
         assert_eq!(calls.iter().any(|(n, _)| n == "get_telegram_chat_history"), source == "telegram");
         supervisor.shutdown().await;
     }
+}
+// A scheduled task naming a saved workflow runs it instead of the planner. A
+// run that faulted before any write hands the task to the agent loop; one
+// that faulted after a write only recovers, as a failed execution does.
+#[tokio::test]
+async fn a_saved_workflow_runs_without_the_planner_and_faults_hand_over_by_effect() {
+    const HEAD: &str = "document: { dsl: '1.0.4', namespace: agent, name: w, version: '1.0.0' }\n";
+    let cases = [
+        ("completes", "do: [ { a: { set: { done: true } } } ]"),
+        ("faults first", "do: [ { a: { raise: { error: { type: 'https://x/e', status: 500 } } } } ]"),
+        (
+            "faults after a write",
+            "do: [ { a: { call: t1 } }, { b: { raise: { error: { type: 'https://x/e', status: 500 } } } } ]",
+        ),
+        ("is missing", ""),
+    ];
+    for (case, body) in cases {
+        let model = Arc::new(Scripted::new(vec![assistant("done")]));
+        let (f, mcp, workflow, supervisor) = setup(model.clone(), Stage::Success);
+        if !body.is_empty() {
+            let saved = f.engine.deps.workflows.save("w", &format!("{HEAD}{body}"), None).unwrap();
+            f.engine.deps.workflows.activate("w", saved.version).unwrap();
+        }
+        let scheduled = PendingSignal { payload: Some(json!({"workflow":"w"})), ..signal("scheduler", 42) };
+        let result = supervisor.run_signal(&scheduled).await;
+        assert_eq!(workflow.called.load(Ordering::SeqCst), 0, "{case}: the planner never runs");
+        let seen = model.seen.lock().unwrap().clone();
+        let system = seen.first().map(|s| s.messages[0]["content"].as_str().unwrap().to_owned());
+        match case {
+            "completes" => {
+                let output: Value = serde_json::from_str(&result.unwrap()).unwrap();
+                assert_eq!(output, json!({"ok":true,"workflow":"w","output":{"done":true}}));
+                assert!(seen.is_empty(), "no model call");
+            }
+            "faults first" | "is missing" => {
+                assert_eq!(result.unwrap(), "done");
+                let system = system.unwrap();
+                assert!(system.contains("SCHEDULER"), "{case}: the agent loop takes the task");
+                let note =
+                    if case == "is missing" { "has no active version" } else { "failed before changing anything" };
+                assert!(system.contains(note), "{case}: {system}");
+            }
+            _ => {
+                assert!(result.unwrap_err().to_string().contains("may have changed something"));
+                assert!(system.unwrap().contains("RECOVERY"), "{case}: only a report");
+                assert!(mcp.calls.lock().unwrap().iter().any(|(n, _)| n == "t1"));
+            }
+        }
+        let (_, obs) = f.db.get_trace("scheduler:42").unwrap().unwrap();
+        assert_eq!(obs.iter().any(|o| o.name == "runner"), !body.is_empty(), "{case}");
+        supervisor.shutdown().await;
+    }
+    // A payload on another source is not a workflow.
+    let model = Arc::new(Scripted::new(vec![assistant("done")]));
+    let (_f, _, workflow, supervisor) = setup(model, Stage::Success);
+    let telegram = PendingSignal { payload: Some(json!({"workflow":"w"})), ..signal("telegram", 43) };
+    assert_eq!(telegram.saved_workflow(), None);
+    supervisor.run_signal(&telegram).await.unwrap();
+    assert_eq!(workflow.called.load(Ordering::SeqCst), 0);
+    supervisor.shutdown().await;
+}
+// An interrupted saved workflow is still the durable worker's to finish:
+// the signal ends without a recovery report and without the agent loop.
+#[tokio::test]
+async fn an_interrupted_saved_workflow_is_left_to_durable_recovery() {
+    struct Interrupting;
+    #[async_trait]
+    impl agent::flows::FlowRun for Interrupting {
+        async fn run(
+            &self,
+            _: &str,
+            _: &WorkflowSignal,
+            _: &Session,
+            _: &agent::tracing::Scope,
+            _: &CancellationToken,
+        ) -> agent::flows::FlowResult {
+            agent::flows::FlowResult::Interrupted { error: owf::run::WorkflowError::runtime("disk full") }
+        }
+    }
+    let model = Arc::new(Scripted::new(vec![assistant("done")]));
+    let (f, mcp, workflow, _) = setup(model.clone(), Stage::Success);
+    let supervisor = create_supervisor(
+        f.engine.clone(),
+        EnvDeps { mcp: mcp.clone(), memory: f.db.clone(), user_email: Some("user@test".into()) },
+        workflow.clone(),
+        Arc::new(Interrupting),
+    );
+    let scheduled = PendingSignal { payload: Some(json!({"workflow":"w"})), ..signal("scheduler", 42) };
+    let output: Value = serde_json::from_str(&supervisor.run_signal(&scheduled).await.unwrap()).unwrap();
+    assert_eq!(output["resumes"], true);
+    assert!(model.seen.lock().unwrap().is_empty(), "neither the agent loop nor recovery ran");
+    let (_, obs) = f.db.get_trace("scheduler:42").unwrap().unwrap();
+    assert!(!obs.iter().any(|o| o.name == "recovery"));
+    supervisor.shutdown().await;
 }
 #[tokio::test]
 async fn compile_and_replan_failures_fall_back_but_execute_failure_only_recovers() {

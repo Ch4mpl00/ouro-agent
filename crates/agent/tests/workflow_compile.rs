@@ -136,6 +136,7 @@ fn compiler(
         tracer: Arc::new(agent::tracing::NullTracer),
         codex: Arc::new(NoCodex),
         decisions: None,
+        workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
     });
     let mut runner = create_workflow_runner(engine, vec!["telegram".into(), "news-digest".into()]).unwrap();
     if let Some(n) = max_attempts {

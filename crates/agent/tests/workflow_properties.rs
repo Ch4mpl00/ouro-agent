@@ -276,6 +276,7 @@ async fn run_ok_engine(workflow: &Workflow, with_context: bool) -> ExecResult {
         tracer: Arc::new(NullTracer),
         codex: Arc::new(BracketsCodex),
         decisions: Some(decision_client("fake".into(), Arc::new(Refusing))),
+        workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
     });
     let runner = create_workflow_runner(engine, vec!["writer".into()]).unwrap();
     let mut initial = json!({
@@ -453,6 +454,7 @@ async fn plan_act_replan(max_passes: usize, script: Vec<Pass>) -> Result<(), Tes
         tracer: Arc::new(NullTracer),
         codex: Arc::new(NoCodex),
         decisions: None,
+        workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
     });
     let mut runner = create_workflow_runner(engine, vec!["s".into()]).unwrap();
     {
@@ -652,6 +654,7 @@ async fn patched(
         tracer: Arc::new(NullTracer),
         codex: Arc::new(NoCodex),
         decisions: None,
+        workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
     });
     let runner = create_workflow_runner(engine, vec!["writer".into()]).unwrap();
     let result = runner
@@ -1015,6 +1018,7 @@ async fn faults(items: Vec<Item>, witnessed: &Mutex<BTreeSet<&'static str>>) -> 
         tracer: Arc::new(NullTracer),
         codex: Arc::new(WorldCodex(world.clone())),
         decisions: Some(decision_client("fake".into(), Arc::new(WorldDecisions(world.clone())))),
+        workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
     });
     let runner = create_workflow_runner(engine.clone(), vec!["s".into()]).unwrap();
     let store = VariableStore::new(json!({"list":[1,2]}).as_object().unwrap().clone());

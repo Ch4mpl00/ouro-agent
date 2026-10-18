@@ -420,6 +420,7 @@ async fn run(plans: &[(i64, Plan)]) -> Run {
         tracer: Arc::new(local_recorder_tracer(db.clone())),
         codex: Arc::new(NoCodex),
         decisions: None,
+        workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
     });
     let known: Vec<String> = skill_store
         .list_skills()
@@ -430,8 +431,12 @@ async fn run(plans: &[(i64, Plan)]) -> Run {
         .filter(|n| !["planner", "orchestrator", "routing", "recovery"].contains(&n.as_str()))
         .collect();
     let workflow = create_workflow_runner(engine.clone(), known).unwrap();
-    let supervisor =
-        create_supervisor(engine.clone(), EnvDeps { mcp: mcp.clone(), memory: db.clone(), user_email: None }, workflow);
+    let supervisor = create_supervisor(
+        engine.clone(),
+        EnvDeps { mcp: mcp.clone(), memory: db.clone(), user_email: None },
+        workflow,
+        agent::flows::create_flows(engine.clone()),
+    );
     run_poll_loop(mcp, supervisor.clone(), world.drained.clone(), std::time::Duration::ZERO).await.unwrap();
 
     let traced = plans

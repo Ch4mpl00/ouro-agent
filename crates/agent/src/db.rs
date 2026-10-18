@@ -47,7 +47,7 @@ impl AgentDb {
         conn.busy_timeout(Duration::from_millis(5000))?;
         // Turning a fresh file into WAL is not covered by the busy handler.
         retry_boot_race(|| conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(())).map_err(anyhow::Error::from))?;
-        conn.execute_batch("PRAGMA foreign_keys = ON")?;
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL")?;
         retry_boot_race(|| migrate(&conn))?;
         Ok(AgentDb { conn: Arc::new(Mutex::new(conn)) })
     }
@@ -92,6 +92,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0000_bouncy_bloodaxe", include_str!("../migrations/0000_bouncy_bloodaxe.sql")),
     ("0001_bored_medusa", include_str!("../migrations/0001_bored_medusa.sql")),
     ("0002_unusual_thor", include_str!("../migrations/0002_unusual_thor.sql")),
+    ("0003_saved_workflows", include_str!("../migrations/0003_saved_workflows.sql")),
+    ("0004_durable_runs", include_str!("../migrations/0004_durable_runs.sql")),
 ];
 
 pub struct Migration {

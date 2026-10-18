@@ -145,6 +145,7 @@ pub fn fixture(provider: Arc<dyn ChatProvider>, definitions: &[&str], skills: &[
         tracer: Arc::new(local_recorder_tracer(db.clone())),
         codex: Arc::new(NoCodex),
         decisions: None,
+        workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
     });
     Fixture { root, db, skills: store, mcp, engine }
 }
@@ -443,6 +444,7 @@ impl Harness {
             tracer,
             codex: Arc::new(NoCodex),
             decisions: None,
+            workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
         });
         Harness { engine, session, mcp, persist, model }
     }

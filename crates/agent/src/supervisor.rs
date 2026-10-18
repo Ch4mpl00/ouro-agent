@@ -4,6 +4,7 @@ use crate::{
     activity::{ACTIVITY_STREAM, tail_utf16},
     agent::{AgentLoop, Engine, LoopOptions},
     errors::{aborted, check, is_aborted},
+    flows::{FlowResult, FlowRun},
     mcp::{Mcp, SharedMcp},
     session::{EnvDeps, Format, Session, gather_env_data, render_context, session},
     tool_results::is_tool_error,
@@ -36,8 +37,18 @@ pub struct PendingSignal {
     #[serde(rename = "envContext", deserialize_with = "required_nullable")]
     pub env_context: Option<String>,
     pub created_at: String,
+    // Structured data from the scheduled task that fired it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
 }
 impl PendingSignal {
+    // The saved workflow a scheduled task runs, `payload.workflow`.
+    pub fn saved_workflow(&self) -> Option<String> {
+        if self.source != "scheduler" {
+            return None;
+        }
+        self.payload.as_ref()?.get("workflow")?.as_str().filter(|s| !s.is_empty()).map(str::to_owned)
+    }
     fn workflow_signal(&self) -> WorkflowSignal {
         WorkflowSignal {
             id: self.id,
@@ -187,23 +198,31 @@ pub struct Supervisor {
     pub engine: Arc<Engine>,
     pub env: EnvDeps,
     pub workflow: Arc<dyn WorkflowRun>,
+    pub flows: Arc<dyn FlowRun>,
     cancel: CancellationToken,
     active: Arc<tokio::sync::Semaphore>,
     shutdown: tokio::sync::Mutex<bool>,
 }
-pub fn create_supervisor(engine: Arc<Engine>, env: EnvDeps, workflow: Arc<dyn WorkflowRun>) -> Arc<Supervisor> {
-    create_supervisor_with_cancel(engine, env, workflow, CancellationToken::new())
+pub fn create_supervisor(
+    engine: Arc<Engine>,
+    env: EnvDeps,
+    workflow: Arc<dyn WorkflowRun>,
+    flows: Arc<dyn FlowRun>,
+) -> Arc<Supervisor> {
+    create_supervisor_with_cancel(engine, env, workflow, flows, CancellationToken::new())
 }
 pub fn create_supervisor_with_cancel(
     engine: Arc<Engine>,
     env: EnvDeps,
     workflow: Arc<dyn WorkflowRun>,
+    flows: Arc<dyn FlowRun>,
     cancel: CancellationToken,
 ) -> Arc<Supervisor> {
     Arc::new(Supervisor {
         engine,
         env,
         workflow,
+        flows,
         cancel,
         active: Arc::new(tokio::sync::Semaphore::new(1)),
         shutdown: Default::default(),
@@ -225,8 +244,9 @@ impl Supervisor {
         let _active = self.active.acquire().await.map_err(|_| aborted())?;
         check(&self.cancel)?;
         let id = format!("{}:{}", signal.source, signal.id);
-        let use_workflow = signal.source == "scheduler";
-        let trace=self.engine.deps.tracer.trace(TraceStart{id:id.clone(),name:format!("signal:{}",signal.source),kind:SpanKind::Agent,session_id:Some(id.clone()),tags:Some(vec![signal.source.clone(),if use_workflow{"planner-mode"}else{"agent-loop"}.into()]),metadata:Some(json!({"signal_id":signal.id,"signal_source":signal.source,"signal_created_at":signal.created_at,"activity":"run"}).as_object().unwrap().clone())});
+        let saved = signal.saved_workflow();
+        let use_workflow = signal.source == "scheduler" && saved.is_none();
+        let trace=self.engine.deps.tracer.trace(TraceStart{id:id.clone(),name:format!("signal:{}",signal.source),kind:SpanKind::Agent,session_id:Some(id.clone()),tags:Some(vec![signal.source.clone(),if saved.is_some(){"saved-workflow"}else if use_workflow{"planner-mode"}else{"agent-loop"}.into()]),metadata:Some(json!({"signal_id":signal.id,"signal_source":signal.source,"signal_created_at":signal.created_at,"activity":"run"}).as_object().unwrap().clone())});
         trace.update(ContextUpdate::input(signal.content.clone()));
         let scope: Scope = trace.clone();
         let mut context = None;
@@ -234,6 +254,22 @@ impl Supervisor {
         let mut span: Option<Arc<dyn Span>> = None;
         let outcome=async{
             let session=session(&id,gather_env_data(&self.env,&self.cancel).await?);context=Some(session.clone());
+            // A saved workflow that failed before changing anything hands its task to the agent loop.
+            let mut handover=None;
+            if let Some(name)=&saved{
+                let result=self.flows.run(name,&signal.workflow_signal(),&session,&scope,&self.cancel).await;check(&self.cancel)?;
+                let failure=match result{
+                    FlowResult::Completed(output)=>{let output=json!({"ok":true,"workflow":name,"output":output});trace.update(ContextUpdate::output(output.clone()));return Ok(output.to_string());},
+                    FlowResult::Cancelled=>return Err(aborted()),
+                    FlowResult::Waiting{wake_at_ms}=>{let output=json!({"ok":true,"workflow":name,"waiting_until_ms":wake_at_ms});trace.update(ContextUpdate::output(output.clone()));return Ok(output.to_string());},
+                    // Not a failure to report: the run stays recoverable and the durable worker resumes it.
+                    FlowResult::Interrupted{error}=>{let output=json!({"ok":false,"workflow":name,"interrupted":error,"resumes":true});trace.event(EventStart{name:"interrupted".into(),level:Some(Level::Warning),metadata:output.as_object().cloned(),..Default::default()});trace.update(ContextUpdate::output(output.clone()));return Ok(output.to_string());},
+                    FlowResult::Faulted{error,effects_started:true}=>{trace.event(EventStart{name:"fallback".into(),level:Some(Level::Error),metadata:Some(json!({"stage":"saved_workflow","workflow":name,"error":error,"effects_started":true}).as_object().unwrap().clone()),..Default::default()});anyhow::bail!("Saved workflow {name} failed after it may have changed something: {error}");},
+                    FlowResult::Faulted{error,..}=>{handover=Some(format!("The saved workflow `{name}` for this task failed before changing anything: {error}. Do the task yourself."));json!({"stage":"saved_workflow","workflow":name,"error":error,"effects_started":false})},
+                    FlowResult::Missing=>{handover=Some(format!("This task names the saved workflow `{name}`, which has no active version. Do the task yourself."));json!({"stage":"saved_workflow","workflow":name,"reason":"missing"})},
+                };
+                trace.event(EventStart{name:"fallback".into(),level:Some(Level::Warning),metadata:failure.as_object().cloned(),..Default::default()});trace.update(ContextUpdate::metadata(json!({"fallback":"agent-loop","workflow_failure_stage":"saved_workflow"}).as_object().unwrap().clone()));
+            }
             if use_workflow{
                 let result=self.workflow.run_signal(&signal.workflow_signal(),session.clone(),scope.clone(),&self.cancel).await?;check(&self.cancel)?;
                 let fallback=match result{
@@ -249,7 +285,8 @@ impl Supervisor {
             let activity=if signal.source=="telegram"{load_recent_activity(self.engine.deps.mcp.as_ref(),&scope,&self.cancel).await?}else{None};let transport=signal.source=="telegram"||signal.source=="scheduler";
             let mut prompts=vec![render_context(&session.env)?];if let Some(activity)=activity{prompts.push(activity);}prompts.push(format!("Signal source: {}",signal.source));if !transport{prompts.push(format!("Delegate the domain work to skill {}. You own the final delivery.",json!(signal.source)));}
             if let Some(env)=signal.env_context.as_ref().filter(|s|!s.is_empty()){prompts.push(env.clone());}
-            let mut opts=LoopOptions::new(&id,session);opts.cancel=self.cancel.clone();opts.skills=if transport{vec![signal.source.clone()]}else{Vec::new()};opts.allow_skill_writes=signal.source=="dreaming";opts.system_prompt=Some(prompts.join("\n\n"));opts.preset=if use_workflow{crate::models::PresetName::Base}else{crate::models::PresetName::Smart};opts.trace_scope=Some(primary.clone());
+            if let Some(note)=handover{prompts.push(note);}
+            let mut opts=LoopOptions::new(&id,session);opts.cancel=self.cancel.clone();opts.skills=if transport{vec![signal.source.clone()]}else{Vec::new()};opts.allow_skill_writes=signal.source=="dreaming";opts.system_prompt=Some(prompts.join("\n\n"));opts.preset=if signal.source=="scheduler"{crate::models::PresetName::Base}else{crate::models::PresetName::Smart};opts.trace_scope=Some(primary.clone());
             let agent=self.engine.start_loop(opts).await?;loop_=Some(agent.clone());let output=agent.send(input).await?;primary.end(SpanEnd::output(output.clone()));trace.update(ContextUpdate{output:Some(json!(output)),metadata:Some(json!({"skills":if transport{vec![signal.source.as_str(),"orchestrator","routing"]}else{vec!["orchestrator","routing"]}}).as_object().unwrap().clone()),..Default::default()});Ok::<_,anyhow::Error>(output)
         }.await;
         if let Err(error) = &outcome {

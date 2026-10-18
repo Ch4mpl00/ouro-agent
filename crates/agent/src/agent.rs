@@ -39,6 +39,7 @@ pub struct EngineDeps {
     pub tracer: Arc<dyn Tracer>,
     pub codex: SharedCodex,
     pub decisions: Option<Arc<crate::decisions::DecisionClient>>,
+    pub workflows: Arc<dyn crate::flows::WorkflowStore>,
 }
 pub struct Engine {
     pub deps: EngineDeps,
@@ -508,6 +509,7 @@ impl AgentLoop {
                 Ok(json!({"count": skills.len(), "skills": skills}).to_string())
             }
             "invoke_sub_agent" => self.worker(engine, args, span).await,
+            name if crate::flows::TOOLS.contains(&name) => crate::flows::tool(engine, name, args),
             _ => anyhow::bail!("unknown synthetic tool {name}"),
         }
     }

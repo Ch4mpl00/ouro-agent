@@ -224,6 +224,7 @@ impl Exec {
             tracer: tracer.clone(),
             codex: codex.clone(),
             decisions: setup.decisions,
+            workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
         });
         let runner = create_workflow_runner(engine.clone(), vec!["news-query".into()]).unwrap();
         Exec { runner, engine, mcp, llm, persist, codex, tracer, written }

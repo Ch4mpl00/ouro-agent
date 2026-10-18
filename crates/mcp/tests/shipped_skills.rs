@@ -62,6 +62,48 @@ fn all_shipped_skills_pass_the_agents_startup_validation_against_prods_mcp_surfa
         let mcp = McpClient::connect(open_http(url), ConnectOptions::default()).await.unwrap();
         let own: Vec<String> = mcp.tools().into_iter().map(|t| t.name).collect();
         assert!(own.iter().any(|t| t == "get_next_signal"), "the full instance serves the signal queue");
+        // Every example workflow in a shipped skill passes the check
+        // save_workflow makes, against prod's tool surface.
+        let author = std::fs::read_to_string(repo.join("skills.default/workflow-author.md")).unwrap();
+        let examples: Vec<&str> =
+            author.split("```yaml\n").skip(1).filter_map(|block| block.split("```").next()).collect();
+        assert!(!examples.is_empty(), "workflow-author shows an example");
+        for example in examples {
+            if let Err(problems) = agent::flows::check(&mcp, example) {
+                panic!("an example in workflow-author.md does not validate:\n{problems}\n{example}");
+            }
+        }
+        // The read-only marks a saved workflow relies on: a call to one of
+        // these never counts as a change. A new tool decides which it is here.
+        let mut read_only: Vec<&str> = own.iter().map(String::as_str).filter(|t| mcp.read_only(t)).collect();
+        read_only.sort();
+        assert_eq!(
+            read_only,
+            [
+                "doc_history",
+                "download_gmail_attachment",
+                "fetch_article",
+                "fetch_url",
+                "find_notes",
+                "get_fact",
+                "get_telegram_chat_history",
+                "get_timezone",
+                "journal_tail",
+                "list_memory",
+                "list_monobank_transactions",
+                "list_nashdom_mails",
+                "list_news",
+                "list_scheduled_tasks",
+                "list_signals",
+                "list_userbot_dialogs",
+                "read_doc",
+                "read_file",
+                "read_pdf",
+                "recall",
+                "search_news",
+                "wait_for_signal",
+            ]
+        );
         let gateway: Value =
             serde_json::from_str(&std::fs::read_to_string(repo.join("crates/mcp/gateway.config.json")).unwrap())
                 .unwrap();
