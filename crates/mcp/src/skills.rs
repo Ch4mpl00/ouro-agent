@@ -271,6 +271,7 @@ struct ReadSkillParams {
 impl McpTools {
     #[tool(
         name = "list_skills",
+        annotations(read_only_hint = true),
         title = "List available skills",
         description = "Return the catalog of all available skills. Each entry includes the \
             exact fileName, human-readable title, short description, declared \
@@ -291,6 +292,7 @@ impl McpTools {
 
     #[tool(
         name = "read_skill",
+        annotations(read_only_hint = true),
         title = "Read complete skill instructions",
         description = "Return the complete UTF-8 Markdown contents of one active skill file \
             selected from list_skills, including its frontmatter. Pass the exact \

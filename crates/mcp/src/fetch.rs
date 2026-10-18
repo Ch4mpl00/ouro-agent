@@ -281,6 +281,7 @@ struct FetchParams {
 impl McpTools {
     #[tool(
         name = "fetch_url",
+        annotations(read_only_hint = true),
         title = "Fetch a URL's raw content",
         description = "GET a URL and return its RAW body (HTML / JSON / text). Use when you \
             already have a link and need the raw content — e.g. the raw HTML to \

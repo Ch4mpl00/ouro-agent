@@ -50,6 +50,7 @@ struct ReadPdfParams {
 impl McpTools {
     #[tool(
         name = "read_pdf",
+        annotations(read_only_hint = true),
         title = "Read PDF",
         description = "Extract plain text from a PDF file at the given absolute path. Returns \
             the full text (pages separated by a blank line) and total page count. \

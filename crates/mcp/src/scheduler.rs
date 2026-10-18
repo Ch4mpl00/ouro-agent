@@ -458,6 +458,7 @@ impl McpTools {
 
     #[tool(
         name = "list_scheduled_tasks",
+        annotations(read_only_hint = true),
         title = "List scheduled tasks",
         description = "Show every task that may still fire — recurring tasks (always) and \
             one-shots that haven't been triggered yet. Each row includes the \
@@ -511,6 +512,7 @@ impl McpTools {
 
     #[tool(
         name = "get_timezone",
+        annotations(read_only_hint = true),
         title = "Get configured timezone",
         description = "Return the IANA timezone driving cron evaluation and digest \
             schedule decisions. Defaults to UTC when unset."

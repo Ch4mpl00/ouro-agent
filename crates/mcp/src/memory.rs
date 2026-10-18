@@ -2266,6 +2266,7 @@ impl McpTools {
     // defeated archive as a discovery boundary.
     #[tool(
         name = "recall",
+        annotations(read_only_hint = true),
         title = "Search everything the agents remember",
         description = "Semantic search across ALL shared memory — project documents and \
             standalone facts alike. Use it whenever the user refers to something \
@@ -2310,6 +2311,7 @@ impl McpTools {
 
     #[tool(
         name = "get_fact",
+        annotations(read_only_hint = true),
         title = "Read one fact in full",
         description = "Load a fact by id — the read half of a `fact:<id>` ref returned by recall."
     )]
@@ -2341,6 +2343,7 @@ impl McpTools {
 
     #[tool(
         name = "list_memory",
+        annotations(read_only_hint = true),
         title = "List projects, or the documents in one",
         description = "Without `project`: every project, plus every journal stream with its \
             capacity and size. With it: that project's documents, \
@@ -2379,6 +2382,7 @@ impl McpTools {
 
     #[tool(
         name = "read_doc",
+        annotations(read_only_hint = true),
         title = "Read a project document",
         description = "Return a document's full markdown plus its `version`. You need that \
             version to patch it, and the text has to be fresh or your quoted \
@@ -2459,6 +2463,7 @@ impl McpTools {
 
     #[tool(
         name = "doc_history",
+        annotations(read_only_hint = true),
         title = "Who changed a document, when and why",
         description = "List a document's patches, newest first: patch id, kind, actor, the \
             rationale recorded at the time, and the versions it moved between. \
@@ -2530,6 +2535,7 @@ impl McpTools {
 
     #[tool(
         name = "journal_tail",
+        annotations(read_only_hint = true),
         title = "Read the newest records of a journal stream",
         description = "Return the last `n` entries of a stream, newest first. A stream nobody \
             has written to reads as an empty list, not an error."

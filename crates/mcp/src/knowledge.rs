@@ -217,6 +217,7 @@ impl McpTools {
 
     #[tool(
         name = "find_notes",
+        annotations(read_only_hint = true),
         title = "Semantic search over the personal knowledge base",
         description = "Recall notes saved with add_note by meaning, not exact wording \
             (\"что ты помнишь про роутер?\", \"когда Лёша платит за интернет?\", \

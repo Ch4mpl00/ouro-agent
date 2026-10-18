@@ -686,6 +686,7 @@ pub fn attachment_path(
 impl McpTools {
     #[tool(
         name = "list_nashdom_mails",
+        annotations(read_only_hint = true),
         title = "List NashDom mails",
         description = "List ALL NashDom-related emails (sender or subject match), newest \
             first. Returns message metadata (subject, from, date, snippet) and \
@@ -741,6 +742,8 @@ impl McpTools {
 
     #[tool(
         name = "download_gmail_attachment",
+        // Writes only a cache of what it reads: repeating it changes nothing.
+        annotations(read_only_hint = true),
         title = "Download a Gmail attachment",
         description = "Save a Gmail attachment to local storage and return the absolute filePath. Use \
             after list_nashdom_mails to fetch a specific PDF, then read it with the Read tool \

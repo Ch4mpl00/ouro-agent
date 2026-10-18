@@ -1256,6 +1256,7 @@ impl McpTools {
 
     #[tool(
         name = "get_telegram_chat_history",
+        annotations(read_only_hint = true),
         title = "Get Telegram chat history",
         description = "Read the last N messages of a Telegram chat from the local log, in \
             chronological order. Pass threadId to scope to a single forum topic \

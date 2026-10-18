@@ -204,6 +204,7 @@ struct ListParams {
 impl McpTools {
     #[tool(
         name = "list_monobank_transactions",
+        annotations(read_only_hint = true),
         title = "List Monobank transactions",
         description = "Fetch recent transactions for a Monobank account. accountId can be a specific \
             account.id or '0' for the default UAH account. days is the lookback window \
