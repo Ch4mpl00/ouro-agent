@@ -68,8 +68,8 @@ expression: `"Привет ${ .name }"` is an error, write
 
 Data flow: each task's output is the next task's input (`.`). The
 workflow's input is `{ env: { timezone, now, newsLastReadAt,
-techLastReadAt, userEmail }, signal: { source, content, id } }`, available
-everywhere as `$workflow.input`. To keep a result for later tasks, export
+techLastReadAt, userEmail, telegramChatId }, signal: { source, content,
+id } }`, available everywhere as `$workflow.input`. To keep a result for later tasks, export
 it into the context: `export: { as: '${ $context + { digest: . } }' }`, then
 read `$context.digest`. A `fork` returns its branches' outputs as an array
 in order.
@@ -93,8 +93,9 @@ falls back to the agent; one that fails after a write is only reported.
 ## Example: the daily news digest
 
 Copy the filter and compose prompts verbatim from the `planner` skill's
-news-digest anchor (`read_skill planner`), and the chat id from the
-environment.
+news-digest anchor (`read_skill planner`). Send to
+`$workflow.input.env.telegramChatId`, the user's chat, unless they named
+another; never write a chat id into the definition.
 
 ```yaml
 document: { dsl: '1.0.4', namespace: agent, name: news-digest, version: '1.0.0' }
@@ -123,7 +124,7 @@ do:
       export: { as: '${ $context + { digest: . } }' }
   - send:
       call: send_telegram_message
-      with: { chatId: 123456789, text: '${ $context.digest }' }
+      with: { chatId: '${ $workflow.input.env.telegramChatId }', text: '${ $context.digest }' }
   - stamp:
       fork:
         branches:

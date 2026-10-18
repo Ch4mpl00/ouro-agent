@@ -369,6 +369,33 @@ do: [ { send: { call: send_telegram_message, with: { text: once }, metadata: { d
     trace.end();
 }
 
+// A workflow sends to the user's chat from its input, not from an id
+// written into the definition.
+#[tokio::test]
+async fn a_workflow_sends_to_the_chat_its_input_names() {
+    use agent::session::{EnvData, session};
+    let w = world(vec![]);
+    w.activate(
+        "ping",
+        r#"document: { dsl: '1.0.4', namespace: t, name: ping, version: '0.1.0' }
+do: [ { send: { call: send_telegram_message, with: { chatId: '${ $workflow.input.env.telegramChatId }', text: hi } } } ]
+"#,
+    );
+    let env = EnvData { telegram_chat_id: Some("4242".into()), ..task_context("scheduler:8").env.clone() };
+    let signal = WorkflowSignal { id: 8, source: "scheduler".into(), content: "go".into(), env_context: None };
+    let trace = w.tracer.trace(TraceStart { id: "scheduler:8".into(), name: "t".into(), ..Default::default() });
+    let scope: Scope = trace.clone();
+    let result = create_flows(w.engine.clone())
+        .run("ping", &signal, &session("scheduler:8", env), &scope, &CancellationToken::new())
+        .await;
+    trace.end();
+    assert!(matches!(result, FlowResult::Completed(_)), "{result:?}");
+    assert_eq!(
+        w.calls(),
+        [("send_telegram_message".to_string(), json!({"chatId":"4242","text":"hi"}).as_object().unwrap().clone())]
+    );
+}
+
 #[tokio::test]
 async fn a_fault_before_any_write_reports_that_nothing_changed() {
     let w = world(Vec::new());

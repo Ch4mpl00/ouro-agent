@@ -24,6 +24,7 @@ fn owns_its_identity_environment_and_a_stable_memory_instance() {
             user_email: None,
             news_last_read_at: None,
             tech_last_read_at: None,
+            telegram_chat_id: None,
         }
     );
     let memory = &context.memory;
@@ -242,6 +243,7 @@ async fn environment_does_not_replace_storage_failures_with_bootstrap_watermarks
         mcp: std::sync::Arc::new(support::FakeMcp::default()),
         memory: std::sync::Arc::new(BrokenMemory),
         user_email: None,
+        telegram_chat_id: None,
     };
     let error = agent::session::gather_env_data(&deps, &tokio_util::sync::CancellationToken::new()).await.unwrap_err();
     assert!(error.to_string().contains("storage failed"));

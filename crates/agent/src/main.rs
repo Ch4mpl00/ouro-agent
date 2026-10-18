@@ -71,6 +71,8 @@ struct Config {
     journal_options: ActivityOptions,
     // The environment note a scheduled fire carries.
     env_context: Option<String>,
+    // A workflow's default destination (`env.telegramChatId`).
+    telegram_chat_id: Option<String>,
 }
 fn configuration() -> anyhow::Result<Config> {
     let deepseek_key = required("DEEPSEEK_API_KEY", "")?;
@@ -110,6 +112,7 @@ fn configuration() -> anyhow::Result<Config> {
     }
     let topics = parse_telegram_topics(var("TELEGRAM_TOPICS_JSON").as_deref());
     let env_context = telegram_env_note(default_chat_id.as_deref(), &topics);
+    let telegram_chat_id = default_chat_id;
     Ok(Config {
         root,
         db,
@@ -122,6 +125,7 @@ fn configuration() -> anyhow::Result<Config> {
         journal_model,
         journal_options,
         env_context,
+        telegram_chat_id,
     })
 }
 fn retry_provider(kind: ProviderKind, api: Arc<dyn agent::providers::JsonApi>) -> SharedProvider {
@@ -218,7 +222,12 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
             let flows = create_durable_flows(engine.clone(), (*db).clone());
             let supervisor = create_supervisor_with_cancel(
                 engine.clone(),
-                EnvDeps { mcp: mcp.clone(), memory: db.clone(), user_email: std::env::var("USER_EMAIL").ok() },
+                EnvDeps {
+                    mcp: mcp.clone(),
+                    memory: db.clone(),
+                    user_email: std::env::var("USER_EMAIL").ok(),
+                    telegram_chat_id: config.telegram_chat_id.clone(),
+                },
                 workflow,
                 flows.clone(),
                 stopping.child_token(),

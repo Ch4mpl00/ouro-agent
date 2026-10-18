@@ -667,7 +667,7 @@ fn supervisor(h: &Harness, workflow: Arc<dyn WorkflowRun>) -> Arc<agent::supervi
     let timezone: Arc<dyn Mcp> = ToolMcp::returning(Vec::new(), "{\"timezone\":\"UTC\"}");
     create_supervisor(
         h.engine.clone(),
-        EnvDeps { mcp: timezone, memory: h.persist.clone(), user_email: None },
+        EnvDeps { mcp: timezone, memory: h.persist.clone(), user_email: None, telegram_chat_id: None },
         workflow,
         agent::flows::create_flows(h.engine.clone()),
     )

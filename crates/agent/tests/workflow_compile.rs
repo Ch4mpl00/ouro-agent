@@ -162,6 +162,7 @@ fn env() -> EnvData {
         user_email: Some("user@example.com".into()),
         news_last_read_at: Some("2026-06-02T18:00:00Z".into()),
         tech_last_read_at: Some("2026-06-02T05:00:00Z".into()),
+        telegram_chat_id: None,
     }
 }
 

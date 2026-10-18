@@ -154,7 +154,12 @@ async fn delegating_to_dreaming_only_writes_for_an_authorized_signal() {
         let engine = engine(model, &[], store.clone());
         let supervisor = create_supervisor(
             engine.clone(),
-            EnvDeps { mcp: engine.deps.mcp.clone(), memory: engine.deps.memory.clone(), user_email: None },
+            EnvDeps {
+                mcp: engine.deps.mcp.clone(),
+                memory: engine.deps.memory.clone(),
+                user_email: None,
+                telegram_chat_id: None,
+            },
             Arc::new(Exhausted),
             agent::flows::create_flows(engine.clone()),
         );

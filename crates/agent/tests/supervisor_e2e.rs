@@ -434,7 +434,7 @@ async fn run(plans: &[(i64, Plan)]) -> Run {
     let workflow = create_workflow_runner(engine.clone(), known).unwrap();
     let supervisor = create_supervisor(
         engine.clone(),
-        EnvDeps { mcp: mcp.clone(), memory: db.clone(), user_email: None },
+        EnvDeps { mcp: mcp.clone(), memory: db.clone(), user_email: None, telegram_chat_id: None },
         workflow,
         agent::flows::create_flows(engine.clone()),
     );

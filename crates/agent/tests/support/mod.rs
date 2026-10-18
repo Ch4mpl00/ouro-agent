@@ -26,6 +26,7 @@ pub fn context() -> Session {
             user_email: None,
             news_last_read_at: None,
             tech_last_read_at: None,
+            telegram_chat_id: None,
         },
     )
 }
@@ -412,6 +413,7 @@ pub fn task_context(id: &str) -> Session {
             user_email: None,
             news_last_read_at: None,
             tech_last_read_at: None,
+            telegram_chat_id: None,
         },
     )
 }

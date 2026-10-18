@@ -22,6 +22,8 @@ pub struct EnvData {
     pub user_email: Option<String>,
     pub news_last_read_at: Option<String>,
     pub tech_last_read_at: Option<String>,
+    // TELEGRAM_DEFAULT_CHAT_ID: where a workflow sends by default.
+    pub telegram_chat_id: Option<String>,
 }
 
 // A caller-supplied label; the store neither parses nor validates JSON.
@@ -132,6 +134,7 @@ pub struct EnvDeps {
     pub mcp: Arc<dyn Mcp>,
     pub memory: Arc<dyn MemoryStore>,
     pub user_email: Option<String>,
+    pub telegram_chat_id: Option<String>,
 }
 
 // The integration-owned timezone, from MCP. "UTC" when the call fails: a
@@ -156,6 +159,7 @@ pub async fn gather_env_data(deps: &EnvDeps, cancel: &CancellationToken) -> anyh
         user_email: deps.user_email.clone(),
         news_last_read_at: deps.memory.get(NEWS_LAST_READ_AT)?,
         tech_last_read_at: deps.memory.get(TECH_LAST_READ_AT)?,
+        telegram_chat_id: deps.telegram_chat_id.clone(),
     })
 }
 

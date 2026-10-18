@@ -152,7 +152,12 @@ fn setup(
     let workflow = Arc::new(FakeWorkflow { stage, called: AtomicUsize::new(0) });
     let supervisor = create_supervisor(
         f.engine.clone(),
-        EnvDeps { mcp: mcp.clone(), memory: f.db.clone(), user_email: Some("user@test".into()) },
+        EnvDeps {
+            mcp: mcp.clone(),
+            memory: f.db.clone(),
+            user_email: Some("user@test".into()),
+            telegram_chat_id: None,
+        },
         workflow.clone(),
         agent::flows::create_flows(f.engine.clone()),
     );
@@ -271,7 +276,12 @@ async fn an_interrupted_saved_workflow_is_left_to_durable_recovery() {
     let (f, mcp, workflow, _) = setup(model.clone(), Stage::Success);
     let supervisor = create_supervisor(
         f.engine.clone(),
-        EnvDeps { mcp: mcp.clone(), memory: f.db.clone(), user_email: Some("user@test".into()) },
+        EnvDeps {
+            mcp: mcp.clone(),
+            memory: f.db.clone(),
+            user_email: Some("user@test".into()),
+            telegram_chat_id: None,
+        },
         workflow.clone(),
         Arc::new(Interrupting),
     );

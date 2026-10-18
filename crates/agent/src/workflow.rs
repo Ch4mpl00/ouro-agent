@@ -760,7 +760,7 @@ pub fn render_signal_prompt(signal: &WorkflowSignal, env: &EnvData, prior: Optio
 // What a run starts from: the session's environment and the signal. A saved
 // workflow (`flows.rs`) gets the same object as its input.
 pub fn signal_input(signal: &WorkflowSignal, env: &EnvData) -> Map<String, Value> {
-    json!({"env":{"timezone":env.timezone,"now":iso(env.now),"newsLastReadAt":env.news_last_read_at,"techLastReadAt":env.tech_last_read_at,"userEmail":env.user_email},"signal":{"source":signal.source,"content":signal.content,"id":signal.id}}).as_object().unwrap().clone()
+    json!({"env":{"timezone":env.timezone,"now":iso(env.now),"newsLastReadAt":env.news_last_read_at,"techLastReadAt":env.tech_last_read_at,"userEmail":env.user_email,"telegramChatId":env.telegram_chat_id},"signal":{"source":signal.source,"content":signal.content,"id":signal.id}}).as_object().unwrap().clone()
 }
 pub struct WorkflowRunner {
     pub engine: Arc<Engine>,
