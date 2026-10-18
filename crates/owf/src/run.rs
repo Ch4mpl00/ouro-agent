@@ -469,6 +469,11 @@ async fn execute(
                 },
             )?;
         }
+        // Cancelled before anything ran: that wins over a fault the
+        // workflow's own input expression would raise.
+        if cancel.is_cancelled() {
+            return Err(Fault::Cancelled);
+        }
         match &wf.timeout {
             None => run.workflow(input).await,
             Some(spec) => match run.duration(
