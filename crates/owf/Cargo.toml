@@ -20,4 +20,5 @@ tokio = { version = "1.53.1", features = ["time", "sync", "macros", "rt"] }
 tokio-util = "0.7.19"
 
 [dev-dependencies]
+proptest = "1"
 tokio = { version = "1.53.1", features = ["full", "test-util"] }

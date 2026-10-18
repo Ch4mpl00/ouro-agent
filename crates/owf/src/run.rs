@@ -50,14 +50,18 @@ pub trait Functions: Send + Sync {
 /// One step of a run, keyed by task reference.
 #[derive(Debug)]
 pub enum Event<'a> {
+    /// `parent` is the task this one runs inside (a reusable function's
+    /// caller), `None` at the top level.
     TaskStarted {
         reference: &'a str,
+        parent: Option<&'a str>,
         kind: &'static str,
         input: &'a Value,
     },
     /// `if` was false; the task's input passes through.
     TaskSkipped {
         reference: &'a str,
+        parent: Option<&'a str>,
     },
     TaskCompleted {
         reference: &'a str,
@@ -85,6 +89,31 @@ pub struct Silent;
 
 impl Observer for Silent {
     fn event(&self, _: &Event<'_>) {}
+}
+
+// A timeout or a fork winner can drop a pending child without returning a
+// fault through `task`; its observer span must still close before its parent.
+struct TaskSpan<'a> {
+    observer: &'a dyn Observer,
+    reference: &'a str,
+    active: bool,
+}
+
+impl Drop for TaskSpan<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let error = WorkflowError {
+                instance: Some(self.reference.into()),
+                ..WorkflowError::standard(
+                    "runtime",
+                    499,
+                    "Task Interrupted",
+                    "the task was cancelled or its enclosing task stopped",
+                )
+            };
+            self.observer.event(&Event::TaskFaulted { reference: self.reference, error: &error });
+        }
+    }
 }
 
 pub trait Clock: Send + Sync {
@@ -369,7 +398,7 @@ impl Run<'_> {
             None => raw,
         };
         let mut ctx = input.clone();
-        let (out, _) = ended(self.list(&self.wf.tasks, "/do".into(), input, &mut ctx, &none).await?);
+        let (out, _) = ended(self.list(&self.wf.tasks, "/do".into(), None, input, &mut ctx, &none).await?);
         let out = match self.wf.output.as_ref().and_then(|o| o.as_.as_ref()) {
             Some(t) => self.transform(t, &out, &self.args(&ctx, &null, &null, &null, &none))?,
             None => out,
@@ -385,6 +414,7 @@ impl Run<'_> {
         &'s self,
         tasks: &'s TaskList,
         at: String,
+        parent: Option<&'s str>,
         input: Value,
         ctx: &'s mut Value,
         scope: &'s Scope,
@@ -392,9 +422,12 @@ impl Run<'_> {
         Box::pin(async move {
             let mut data = input;
             let mut i = 0;
+            let mut visits = vec![0usize; tasks.len()];
             while let Some((name, task)) = tasks.get(i) {
-                let reference = format!("{at}/{i}/{name}");
-                let (out, flow) = self.task(task, name, &reference, data, ctx, scope).await?;
+                let suffix = if visits[i] == 0 { String::new() } else { format!("[{}]", visits[i]) };
+                let reference = format!("{at}/{i}/{name}{suffix}");
+                visits[i] += 1;
+                let (out, flow) = self.task(task, name, &reference, parent, data, ctx, scope).await?;
                 data = out;
                 i = match flow {
                     Flow::Continue => i + 1,
@@ -411,11 +444,13 @@ impl Run<'_> {
 
     /// One task: the limit and cancellation checks, then the data flow,
     /// with a fault located at this task unless an inner one already is.
+    #[allow(clippy::too_many_arguments)]
     fn task<'s>(
         &'s self,
         task: &'s Task,
         name: &'s str,
         reference: &'s str,
+        parent: Option<&'s str>,
         raw: Value,
         ctx: &'s mut Value,
         scope: &'s Scope,
@@ -428,9 +463,16 @@ impl Run<'_> {
             if self.tasks_run.fetch_add(1, Ordering::SeqCst) >= max {
                 let e =
                     WorkflowError::runtime(format!("more than {max} tasks ran; a loop or a `then` cycle does not end"));
-                return Err(Fault::Fatal(WorkflowError { instance: Some(reference.into()), ..e }));
+                let e = WorkflowError { instance: Some(reference.into()), ..e };
+                self.observe(Event::TaskFaulted { reference, error: &e });
+                return Err(Fault::Fatal(e));
             }
-            match self.steps(task, name, reference, raw, ctx, scope).await {
+            let mut span = TaskSpan { observer: self.host.observer.as_ref(), reference, active: false };
+            let result = self.steps(task, name, reference, parent, raw, ctx, scope, &mut span).await;
+            if !matches!(result, Err(Fault::Cancelled)) {
+                span.active = false;
+            }
+            match result {
                 Err(Fault::Error(mut e)) => {
                     e.instance.get_or_insert_with(|| reference.into());
                     self.observe(Event::TaskFaulted { reference, error: &e });
@@ -448,14 +490,17 @@ impl Run<'_> {
 
     /// if → input.schema → input.from → the task (under its timeout) →
     /// output.as → output.schema → export.as → export.schema.
+    #[allow(clippy::too_many_arguments)]
     async fn steps(
         &self,
         task: &Task,
         name: &str,
         reference: &str,
+        parent: Option<&str>,
         raw: Value,
         ctx: &mut Value,
         scope: &Scope,
+        span: &mut TaskSpan<'_>,
     ) -> Result<(Value, Flow), Fault> {
         let null = Value::Null;
         let mut desc = json!({
@@ -469,7 +514,7 @@ impl Run<'_> {
             let v =
                 expr::eval(expr::bare(cond), &raw, &self.args(ctx, &null, &null, &desc, scope)).map_err(expression)?;
             if !expr::truthy(&v) {
-                self.observe(Event::TaskSkipped { reference });
+                self.observe(Event::TaskSkipped { reference, parent });
                 return Ok((raw, Flow::Continue));
             }
         }
@@ -484,7 +529,8 @@ impl Run<'_> {
             Some(spec) => Some(self.duration(spec, &input, &self.args(ctx, &input, &null, &desc, scope))?),
             None => None,
         };
-        self.observe(Event::TaskStarted { reference, kind: task.kind.name(), input: &input });
+        self.observe(Event::TaskStarted { reference, parent, kind: task.kind.name(), input: &input });
+        span.active = true;
         let body = self.kind(task, reference, &input, ctx, scope, &desc);
         let (out, flow) = match limit {
             None => body.await?,
@@ -537,7 +583,9 @@ impl Run<'_> {
                 };
                 Ok((self.call(model::function_name(function), call_args, reference, ctx).await?, None))
             }
-            Kind::Do(tasks) => Ok(ended(self.list(tasks, format!("{reference}/do"), input.clone(), ctx, scope).await?)),
+            Kind::Do(tasks) => Ok(ended(
+                self.list(tasks, format!("{reference}/do"), Some(reference), input.clone(), ctx, scope).await?,
+            )),
             Kind::For { each, at, items, condition, tasks } => {
                 let items = match items {
                     Items::Inline(items) => items.clone(),
@@ -565,7 +613,7 @@ impl Run<'_> {
                             break;
                         }
                     }
-                    match self.list(tasks, format!("{reference}/do"), data, ctx, &inner).await? {
+                    match self.list(tasks, format!("{reference}[{i}]/do"), Some(reference), data, ctx, &inner).await? {
                         Next::Done(v) => data = v,
                         Next::End(v) => return Ok((v, Some(Flow::End))),
                     }
@@ -587,15 +635,16 @@ impl Run<'_> {
                 let a = args(ctx);
                 for (_, case) in cases {
                     let hit = match &case.when {
-                        None => true,
+                        None => false,
                         Some(w) => expr::truthy(&expr::eval(w, input, &a).map_err(expression)?),
                     };
                     if hit {
                         return Ok((input.clone(), Some(case.then.clone())));
                     }
                 }
-                // No case matched: the task's own `then` applies.
-                Ok((input.clone(), None))
+                let default = cases.iter().find(|(_, case)| case.when.is_none()).map(|(_, case)| case.then.clone());
+                // Without a default, the task's own `then` applies.
+                Ok((input.clone(), default))
             }
             Kind::Try { tasks, catch } => self.attempt(tasks, catch, reference, input, ctx, scope, desc).await,
             Kind::Raise(r) => Err(self.raise(r, reference, input, &args(ctx))?.into()),
@@ -612,7 +661,9 @@ impl Run<'_> {
             // A reusable function is a task whose input is the call's
             // arguments; it sees none of the caller's loop or catch variables.
             let none = Scope::new();
-            let (out, _) = self.task(function, name, &format!("/use/functions/{name}"), args, ctx, &none).await?;
+            let (out, _) = self
+                .task(function, name, &format!("{reference}/use/functions/{name}"), Some(reference), args, ctx, &none)
+                .await?;
             return Ok(out);
         }
         let effect = self
@@ -636,16 +687,16 @@ impl Run<'_> {
         &self,
         branches: &TaskList,
         compete: bool,
-        reference: &str,
+        fork: &str,
         input: &Value,
         ctx: &Value,
         scope: &Scope,
     ) -> Result<Value, Fault> {
         let runs = branches.iter().enumerate().map(|(i, (name, branch))| {
-            let reference = format!("{reference}/fork/branches/{i}/{name}");
+            let reference = format!("{fork}/fork/branches/{i}/{name}");
             let mut ctx = ctx.clone();
             let input = input.clone();
-            async move { self.task(branch, name, &reference, input, &mut ctx, scope).await.map(|(v, _)| v) }
+            async move { self.task(branch, name, &reference, Some(fork), input, &mut ctx, scope).await.map(|(v, _)| v) }
         });
         if !compete {
             // In declaration order; the first fault cancels the rest.
@@ -714,11 +765,12 @@ impl Run<'_> {
         let mut attempt: u32 = 1;
         loop {
             let writes = self.writes.load(Ordering::SeqCst);
-            let error = match self.list(tasks, format!("{reference}/try"), input.clone(), ctx, scope).await {
-                Ok(next) => return Ok(ended(next)),
-                Err(Fault::Error(e)) => e,
-                Err(stop) => return Err(stop),
-            };
+            let error =
+                match self.list(tasks, format!("{reference}/try"), Some(reference), input.clone(), ctx, scope).await {
+                    Ok(next) => return Ok(ended(next)),
+                    Err(Fault::Error(e)) => e,
+                    Err(stop) => return Err(stop),
+                };
             let mut caught = scope.clone();
             caught.push((catch.as_.clone(), error.to_value()));
             let args = self.args(ctx, input, &Value::Null, desc, &caught);
@@ -737,8 +789,17 @@ impl Run<'_> {
             }
             return match &catch.tasks {
                 Some(handler) => {
-                    let (out, flow) =
-                        ended(self.list(handler, format!("{reference}/catch/do"), input.clone(), ctx, &caught).await?);
+                    let (out, flow) = ended(
+                        self.list(
+                            handler,
+                            format!("{reference}/catch/do"),
+                            Some(reference),
+                            input.clone(),
+                            ctx,
+                            &caught,
+                        )
+                        .await?,
+                    );
                     Ok((out, flow.or_else(|| catch.then.clone())))
                 }
                 None => Ok((input.clone(), catch.then.clone())),
@@ -882,7 +943,7 @@ mod tests {
         fn event(&self, event: &Event<'_>) {
             let line = match event {
                 Event::TaskStarted { reference, .. } => format!("start {reference}"),
-                Event::TaskSkipped { reference } => format!("skip {reference}"),
+                Event::TaskSkipped { reference, .. } => format!("skip {reference}"),
                 Event::TaskCompleted { reference, .. } => format!("done {reference}"),
                 Event::TaskFaulted { reference, .. } => format!("fault {reference}"),
                 Event::TaskRetrying { reference, attempt, delay, .. } => {
@@ -1175,7 +1236,7 @@ do:
         let o = exec(&s, "use:\n  functions:\n    notify: { call: send, with: { text: '${ \"hi \" + .name }' } }\ndo:\n  - greet: { call: notify, with: { name: '${ .user }' } }\n", json!({"user": "ann"})).await;
         assert_eq!(completed(&o), &json!({"sent": "hi ann"}));
         assert!(o.effects_started);
-        assert_eq!(s.fake.calls.lock().unwrap()[0].2, "/use/functions/notify");
+        assert_eq!(s.fake.calls.lock().unwrap()[0].2, "/do/0/greet/use/functions/notify");
     }
 
     const RETRYING: &str = r#"

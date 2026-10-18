@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8dc723bdd1bafe63de56cb800ca10bcc2bdc9f907d3ac2918184376262aefe6d # shrinks to (Program { input_from: None, output_as: None, functions: [Task { name: "helper", when: None, input_from: None, output_as: None, export_as: None, timeout_ms: None, then: None, body: Set(Expr(Same)) }, Task { name: "notify", when: None, input_from: None, output_as: None, export_as: None, timeout_ms: None, then: None, body: Set(Expr(Same)) }], tasks: [Task { name: "t0", when: None, input_from: None, output_as: None, export_as: None, timeout_ms: None, then: None, body: Switch([Case { name: "c0", when: None, then: Continue }, Case { name: "c1", when: Some(True), then: Exit }]) }, Task { name: "t1", when: None, input_from: None, output_as: None, export_as: None, timeout_ms: None, then: None, body: Set(Expr(Same)) }, Task { name: "t2", when: None, input_from: None, output_as: None, export_as: None, timeout_ms: None, then: None, body: Set(Expr(Same)) }], bare: false }, Object {"n": Number(0)})
