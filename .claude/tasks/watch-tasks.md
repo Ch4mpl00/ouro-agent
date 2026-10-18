@@ -5,6 +5,12 @@
 **Area:** agent / mcp / scheduler
 **Created:** 2026-09-10
 
+> **Уточнение 2026-10-16:** общий runtime процессов, carried state,
+> ожидания и user input развиваются на стороне агента поверх текущего
+> workflow: [durable workflows](durable-workflows.md). MCP предоставляет
+> инструменты и события. Предложения ниже о владении watches/state в MCP
+> и TypeScript-пути — исторические; реализацию согласовать с новым решением.
+
 ## Context
 
 Today the agent can be told *"do X at time T"* (`schedule_task` → cron →
