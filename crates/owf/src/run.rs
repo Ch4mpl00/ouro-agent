@@ -7,6 +7,7 @@
 // (`/do/1/fetch/try/0/get`), so a trace names exactly which part of the
 // definition ran. Only `call` reaches the host; everything else is evaluated
 // here.
+use crate::durable::{self, CallFailure, CallState, Delivery, Journal, Record, StepOutcome, TaskResult};
 use crate::expr::{self, Args};
 use crate::model::{
     self, Backoff, Catalog, Catch, DurationSpec, Flow, Invalid, Items, Kind, Raise, Retry, Task, TaskList, Workflow,
@@ -17,16 +18,16 @@ use futures::future::{BoxFuture, try_join_all};
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::sync::Arc;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 // ── 1. host seams and outcome ──────────────────────────────────────────────
 
 /// What a host function does to the world (MCP's `readOnlyHint`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Effect {
     Read,
     Write,
@@ -37,6 +38,7 @@ pub struct CallInfo<'a> {
     pub run_id: &'a str,
     pub reference: &'a str,
     pub cancel: &'a CancellationToken,
+    pub delivery: Delivery,
 }
 
 /// The functions `call` reaches (MCP tools, model steps, …).
@@ -44,6 +46,11 @@ pub struct CallInfo<'a> {
 pub trait Functions: Send + Sync {
     /// The function's effect class; `None` when the host has no such function.
     fn effect(&self, name: &str) -> Option<Effect>;
+    /// Durable entry point. Adapters must honor delivery at every internal
+    /// retry boundary; only proven non-execution permits an at-most-once retry.
+    async fn invoke(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
+        self.call(name, args, info).await.map_err(CallFailure::Unknown)
+    }
     async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError>;
 }
 
@@ -66,6 +73,10 @@ pub enum Event<'a> {
     TaskCompleted {
         reference: &'a str,
         output: &'a Value,
+    },
+    TaskSuspended {
+        reference: &'a str,
+        wake_at_ms: i64,
     },
     TaskFaulted {
         reference: &'a str,
@@ -152,11 +163,17 @@ pub struct Host {
     pub runtime: Value,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Status {
     Completed(Value),
     Faulted(WorkflowError),
     Cancelled,
+    /// The worker can be released until this UTC timestamp.
+    Waiting {
+        wake_at_ms: i64,
+    },
+    /// Persistence failed or ownership was lost. Leave the run recoverable.
+    Interrupted(WorkflowError),
 }
 
 #[derive(Debug)]
@@ -254,6 +271,8 @@ enum Fault {
     /// A host limit was hit: the run stops whatever the definition says.
     Fatal(WorkflowError),
     Cancelled,
+    Waiting(i64),
+    Storage(WorkflowError),
 }
 
 impl From<WorkflowError> for Fault {
@@ -307,36 +326,185 @@ fn datetime(t: DateTime<Utc>) -> Value {
 
 /// Runs `wf` on `input` to completion, a fault, or `cancel`.
 pub async fn run(host: &Host, wf: &Workflow, run_id: &str, input: Value, cancel: &CancellationToken) -> Outcome {
+    execute(host, wf, run_id, input, cancel, None).await
+}
+
+/// Replays saved checkpoints, then executes until completion or a durable
+/// wait. The same run must always use the same definition and original input.
+pub async fn resume(
+    host: &Host,
+    wf: &Workflow,
+    run_id: &str,
+    input: Value,
+    cancel: &CancellationToken,
+    journal: &dyn Journal,
+) -> Outcome {
+    execute(host, wf, run_id, input, cancel, Some(journal)).await
+}
+
+async fn execute(
+    host: &Host,
+    wf: &Workflow,
+    run_id: &str,
+    input: Value,
+    cancel: &CancellationToken,
+    journal: Option<&dyn Journal>,
+) -> Outcome {
+    let records = match journal.map(Journal::load).transpose() {
+        Ok(records) => records.unwrap_or_default(),
+        Err(e) => {
+            return Outcome {
+                status: Status::Interrupted(WorkflowError::runtime(e.to_string())),
+                effects_started: true,
+                tasks_run: 0,
+            };
+        }
+    };
+    let tasks = records.values().filter(|r| matches!(r, Record::Task { .. })).count();
+    let writes = records.values().filter(|r| matches!(r, Record::Call { effect: Effect::Write, .. })).count();
+    let (started_ms, runtime) = match records.get("execution") {
+        Some(Record::Execution { version, max_tasks, max_attempts, .. })
+            if *version != durable::VERSION
+                || *max_tasks != host.limits.max_tasks
+                || *max_attempts != host.limits.max_attempts =>
+        {
+            return Outcome {
+                status: Status::Interrupted(WorkflowError::runtime("incompatible durable version or execution limits")),
+                effects_started: true,
+                tasks_run: tasks,
+            };
+        }
+        Some(Record::Execution {
+            version,
+            run_id: original_id,
+            definition,
+            input: original,
+            runtime,
+            started_ms,
+            max_tasks,
+            max_attempts,
+        }) if *version == durable::VERSION
+            && original_id == run_id
+            && definition == &wf.definition
+            && original == &input
+            && *max_tasks == host.limits.max_tasks
+            && *max_attempts == host.limits.max_attempts =>
+        {
+            (*started_ms, runtime.clone())
+        }
+        Some(_) => {
+            return Outcome {
+                status: Status::Faulted(WorkflowError::runtime("a run's definition or input changed")),
+                effects_started: writes > 0,
+                tasks_run: tasks,
+            };
+        }
+        None if records.is_empty() => (host.clock.now().timestamp_millis(), host.runtime.clone()),
+        None => {
+            return Outcome {
+                status: Status::Interrupted(WorkflowError::runtime("missing execution record")),
+                effects_started: true,
+                tasks_run: tasks,
+            };
+        }
+    };
+    if records.iter().any(|(key, record)| !match record {
+        Record::Execution { .. } => key == "execution",
+        Record::Finished { status } => {
+            key == "finished" && matches!(status, Status::Completed(_) | Status::Faulted(_) | Status::Cancelled)
+        }
+        Record::Task { .. } => key.ends_with("#task"),
+        Record::Call { .. } => key.ends_with("#call"),
+        Record::Winner { .. } => key.ends_with("#winner"),
+        Record::Timer { .. } => key.ends_with("#wait") || key.contains("#retry["),
+        Record::Retry { .. } => key.contains("#retry-decision["),
+    }) {
+        return Outcome {
+            status: Status::Interrupted(WorkflowError::runtime("invalid durable record key or terminal state")),
+            effects_started: true,
+            tasks_run: tasks,
+        };
+    }
+    if records.values().any(|record| match record {
+        Record::Execution { started_ms, .. } | Record::Task { started_ms, .. } => {
+            DateTime::from_timestamp_millis(*started_ms).is_none()
+        }
+        _ => false,
+    }) {
+        return Outcome {
+            status: Status::Interrupted(WorkflowError::runtime("invalid saved timestamp")),
+            effects_started: true,
+            tasks_run: tasks,
+        };
+    }
     let run = Run {
         host,
         wf,
         run_id,
         cancel,
-        tasks_run: AtomicUsize::new(0),
-        writes: AtomicUsize::new(0),
-        workflow: json!({ "id": run_id, "definition": wf.definition, "input": input, "startedAt": datetime(host.clock.now()) }),
+        tasks_run: AtomicUsize::new(tasks),
+        writes: AtomicUsize::new(writes),
+        workflow: json!({ "id": run_id, "definition": wf.definition, "input": input, "startedAt": datetime(DateTime::from_timestamp_millis(started_ms).expect("stored timestamp")) }),
+        runtime: runtime.clone(),
+        journal,
+        records: Mutex::new(records),
+        attempts: Mutex::default(),
     };
-    let result = match &wf.timeout {
-        None => run.workflow(input).await,
-        Some(spec) => match run.duration(
-            spec,
-            &input,
-            &run.args(&Value::Null, &Value::Null, &Value::Null, &Value::Null, &Scope::new()),
-        ) {
-            Err(f) => Err(f),
-            Ok(limit) => match tokio::time::timeout(limit, run.workflow(input)).await {
-                Ok(r) => r,
-                Err(_) => {
-                    Err(Fault::Fatal(WorkflowError::timeout(format!("the workflow did not finish within {limit:?}"))))
-                }
+    if let Some(Record::Finished { status }) = run.record("finished") {
+        return Outcome { status, effects_started: writes > 0, tasks_run: tasks };
+    }
+    let result = async {
+        if run.record("execution").is_none() {
+            run.save(
+                "execution",
+                Record::Execution {
+                    version: durable::VERSION,
+                    run_id: run_id.into(),
+                    definition: wf.definition.clone(),
+                    input: input.clone(),
+                    runtime,
+                    started_ms,
+                    max_tasks: host.limits.max_tasks,
+                    max_attempts: host.limits.max_attempts,
+                },
+            )?;
+        }
+        match &wf.timeout {
+            None => run.workflow(input).await,
+            Some(spec) => match run.duration(
+                spec,
+                &input,
+                &run.args(&Value::Null, &Value::Null, &Value::Null, &Value::Null, &Scope::new()),
+            ) {
+                Err(f) => Err(f),
+                Ok(limit) => match run.remaining(limit, started_ms) {
+                    Err(_) if run.has_unknown("") => Err(run.unknown("workflow")),
+                    Err(e) => Err(e),
+                    Ok((remaining, deadline)) => match tokio::time::timeout(remaining, run.workflow(input)).await {
+                        Ok(Err(Fault::Waiting(wake))) => Err(Fault::Waiting(wake.min(deadline))),
+                        Ok(r) => r,
+                        Err(_) if run.has_unknown("") => Err(run.unknown("workflow")),
+                        Err(_) => Err(Fault::Fatal(WorkflowError::timeout(format!(
+                            "the workflow did not finish within {limit:?}"
+                        )))),
+                    },
+                },
             },
-        },
-    };
-    let status = match result {
+        }
+    }
+    .await;
+    let mut status = match result {
         Ok(v) => Status::Completed(v),
         Err(Fault::Error(e) | Fault::Fatal(e)) => Status::Faulted(e),
         Err(Fault::Cancelled) => Status::Cancelled,
+        Err(Fault::Waiting(wake_at_ms)) => Status::Waiting { wake_at_ms },
+        Err(Fault::Storage(e)) => Status::Interrupted(e),
     };
+    if matches!(status, Status::Completed(_) | Status::Faulted(_) | Status::Cancelled)
+        && let Err(Fault::Storage(error)) = run.save("finished", Record::Finished { status: status.clone() })
+    {
+        status = Status::Interrupted(error);
+    }
     Outcome {
         status,
         effects_started: run.writes.load(Ordering::SeqCst) > 0,
@@ -354,9 +522,145 @@ struct Run<'a> {
     writes: AtomicUsize,
     /// `$workflow`.
     workflow: Value,
+    runtime: Value,
+    journal: Option<&'a dyn Journal>,
+    records: Mutex<BTreeMap<String, Record>>,
+    /// Attempt prefixes of the `try`s running now: `<task>/try[k]` → `<task>/try`.
+    attempts: Mutex<Vec<(String, String)>>,
 }
 
 impl Run<'_> {
+    fn record(&self, key: &str) -> Option<Record> {
+        self.records.lock().unwrap_or_else(|e| e.into_inner()).get(key).cloned()
+    }
+
+    fn save(&self, key: &str, record: Record) -> Result<(), Fault> {
+        if let Some(journal) = self.journal {
+            if let Some(old) = self.record(key) {
+                durable::check_transition(&old, &record)
+                    .map_err(|e| Fault::Storage(WorkflowError::runtime(e.to_string())))?;
+            }
+            journal
+                .save(key, &record)
+                .map_err(|e| Fault::Storage(WorkflowError::runtime(format!("checkpoint {key}: {e}"))))?;
+            self.records.lock().unwrap_or_else(|e| e.into_inner()).insert(key.to_owned(), record);
+        }
+        Ok(())
+    }
+
+    fn remaining(&self, duration: Duration, started_ms: i64) -> Result<(Duration, i64), Fault> {
+        let millis = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
+        let deadline = started_ms.saturating_add(millis);
+        let left = if self.journal.is_some() {
+            deadline.saturating_sub(self.host.clock.now().timestamp_millis())
+        } else {
+            millis
+        };
+        if left <= 0 {
+            return Err(WorkflowError::timeout("the saved deadline has passed").into());
+        }
+        Ok((Duration::from_millis(left as u64), deadline))
+    }
+
+    /// An at-most-once call in the attempt whose outcome forbids sending it
+    /// again: unknown, or a tool error (which is no proof it did nothing).
+    /// One that succeeded does not block: the next attempt reuses its result.
+    fn blocks_retry(&self, reference: &str) -> bool {
+        self.records.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(key, r)| {
+            key.starts_with(&format!("{reference}/"))
+                && matches!(
+                    r,
+                    Record::Call {
+                        delivery: Delivery::AtMostOnce,
+                        state: CallState::Pending | CallState::Done(Err(_)),
+                        ..
+                    }
+                )
+        })
+    }
+
+    /// `reference` as the first attempt of every enclosing `try` names it.
+    /// Only the prefixes `attempt` registered are replaced, longest (the
+    /// innermost `try`) first, so a task merely named `try` never folds.
+    fn logical(&self, reference: &str) -> String {
+        let attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
+        let mut logical = reference.to_owned();
+        while let Some((attempt, first)) = attempts
+            .iter()
+            .filter(|(attempt, _)| {
+                logical.strip_prefix(attempt.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            })
+            .max_by_key(|(attempt, _)| attempt.len())
+        {
+            logical = format!("{first}{}", &logical[attempt.len()..]);
+        }
+        logical
+    }
+
+    /// What an earlier attempt of this protected call left: the result to
+    /// reuse, a fault, or None when it has to be sent (again).
+    fn earlier_attempt(
+        &self,
+        logical: &str,
+        key: &str,
+        name: &str,
+        args: &Value,
+        reference: &str,
+    ) -> Option<Result<Value, Fault>> {
+        let records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        let earlier: Vec<_> = records
+            .iter()
+            .filter(|(k, _)| k.as_str() != key)
+            .filter_map(|(_, r)| match r {
+                Record::Call { logical: l, function, arguments, delivery, state, .. } if l == logical => {
+                    Some((function, arguments, delivery, state))
+                }
+                _ => None,
+            })
+            .collect();
+        if let Some((function, arguments, _, CallState::Done(Ok(value)))) =
+            earlier.iter().copied().find(|(.., state)| matches!(state, CallState::Done(Ok(_))))
+        {
+            if function != name || arguments != args {
+                return Some(Err(Fault::Fatal(WorkflowError::standard(
+                    "conflict",
+                    409,
+                    "Idempotency conflict",
+                    format!(
+                        "{reference}: an earlier attempt already made this call with other arguments; nothing was sent"
+                    ),
+                ))));
+            }
+            return Some(Ok(value.clone()));
+        }
+        // Retrying an attempt like this is refused (`blocks_retry`); kept here
+        // so that no other path can send an at-most-once call twice.
+        for (_, _, delivery, state) in &earlier {
+            match (delivery, state) {
+                (Delivery::AtMostOnce, CallState::Pending) => return Some(Err(self.unknown(reference))),
+                (Delivery::AtMostOnce, CallState::Done(Err(error))) => return Some(Err(Fault::Error(error.clone()))),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn has_unknown(&self, reference: &str) -> bool {
+        self.records.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(key, r)| {
+            (key == &format!("{reference}#call") || key.starts_with(&format!("{reference}/")))
+                && matches!(r, Record::Call { delivery: Delivery::AtMostOnce, state: CallState::Pending, .. })
+        })
+    }
+
+    fn unknown(&self, reference: &str) -> Fault {
+        Fault::Fatal(WorkflowError::standard(
+            "outcome_unknown",
+            409,
+            "Outcome unknown",
+            format!("{reference}: at-most-once call may have executed; automatic retry is forbidden"),
+        ))
+    }
+
     fn observe(&self, event: Event<'_>) {
         self.host.observer.event(&event);
     }
@@ -371,7 +675,7 @@ impl Run<'_> {
             .with("output", output.clone())
             .with("task", task.clone())
             .with("workflow", self.workflow.clone())
-            .with("runtime", self.host.runtime.clone());
+            .with("runtime", self.runtime.clone());
         for (name, value) in scope {
             args.set(name, value.clone());
         }
@@ -459,20 +763,38 @@ impl Run<'_> {
             if self.cancel.is_cancelled() {
                 return Err(Fault::Cancelled);
             }
+            let key = format!("{reference}#task");
+            let prior = self.record(&key);
+            if let Some(Record::Task { result: Some(result), .. }) = &prior {
+                *ctx = result.context.clone();
+                return match &result.outcome {
+                    StepOutcome::Completed { output, flow } => Ok((output.clone(), flow.clone())),
+                    StepOutcome::Faulted { error, fatal: true } => Err(Fault::Fatal(error.clone())),
+                    StepOutcome::Faulted { error, fatal: false } => Err(Fault::Error(error.clone())),
+                };
+            }
             let max = self.host.limits.max_tasks;
-            if self.tasks_run.fetch_add(1, Ordering::SeqCst) >= max {
+            if prior.is_none() && self.tasks_run.fetch_add(1, Ordering::SeqCst) >= max {
                 let e =
                     WorkflowError::runtime(format!("more than {max} tasks ran; a loop or a `then` cycle does not end"));
                 let e = WorkflowError { instance: Some(reference.into()), ..e };
                 self.observe(Event::TaskFaulted { reference, error: &e });
                 return Err(Fault::Fatal(e));
             }
+            let started_ms = match prior {
+                Some(Record::Task { started_ms, .. }) => started_ms,
+                _ => self.host.clock.now().timestamp_millis(),
+            };
+            self.save(&key, Record::Task { started_ms, result: None })?;
             let mut span = TaskSpan { observer: self.host.observer.as_ref(), reference, active: false };
-            let result = self.steps(task, name, reference, parent, raw, ctx, scope, &mut span).await;
-            if !matches!(result, Err(Fault::Cancelled)) {
+            let result = self.steps(task, name, reference, parent, raw, ctx, scope, started_ms, &mut span).await;
+            if let Err(Fault::Waiting(wake_at_ms)) = &result {
+                self.observe(Event::TaskSuspended { reference, wake_at_ms: *wake_at_ms });
+            }
+            if !matches!(result, Err(Fault::Cancelled | Fault::Storage(_))) {
                 span.active = false;
             }
-            match result {
+            let result = match result {
                 Err(Fault::Error(mut e)) => {
                     e.instance.get_or_insert_with(|| reference.into());
                     self.observe(Event::TaskFaulted { reference, error: &e });
@@ -484,7 +806,20 @@ impl Run<'_> {
                     Err(Fault::Fatal(e))
                 }
                 other => other,
+            };
+            let outcome = match &result {
+                Ok((output, flow)) => Some(StepOutcome::Completed { output: output.clone(), flow: flow.clone() }),
+                Err(Fault::Error(error)) => Some(StepOutcome::Faulted { error: error.clone(), fatal: false }),
+                Err(Fault::Fatal(error)) => Some(StepOutcome::Faulted { error: error.clone(), fatal: true }),
+                _ => None,
+            };
+            if let Some(outcome) = outcome {
+                self.save(
+                    &key,
+                    Record::Task { started_ms, result: Some(TaskResult { context: ctx.clone(), outcome }) },
+                )?;
             }
+            result
         })
     }
 
@@ -500,6 +835,7 @@ impl Run<'_> {
         raw: Value,
         ctx: &mut Value,
         scope: &Scope,
+        started_ms: i64,
         span: &mut TaskSpan<'_>,
     ) -> Result<(Value, Flow), Fault> {
         let null = Value::Null;
@@ -508,7 +844,7 @@ impl Run<'_> {
             "reference": reference,
             "definition": task.definition,
             "input": raw,
-            "startedAt": datetime(self.host.clock.now()),
+            "startedAt": datetime(DateTime::from_timestamp_millis(started_ms).expect("stored timestamp")),
         });
         if let Some(cond) = &task.when {
             let v =
@@ -534,12 +870,23 @@ impl Run<'_> {
         let body = self.kind(task, reference, &input, ctx, scope, &desc);
         let (out, flow) = match limit {
             None => body.await?,
-            Some(limit) => match tokio::time::timeout(limit, body).await {
-                Ok(r) => r?,
-                Err(_) => {
-                    return Err(WorkflowError::timeout(format!("{reference} did not finish within {limit:?}")).into());
+            Some(limit) => {
+                let (remaining, deadline) = self
+                    .remaining(limit, started_ms)
+                    .map_err(|error| if self.has_unknown(reference) { self.unknown(reference) } else { error })?;
+                match tokio::time::timeout(remaining, body).await {
+                    Ok(Err(Fault::Waiting(wake))) => return Err(Fault::Waiting(wake.min(deadline))),
+                    Ok(r) => r?,
+                    Err(_) => {
+                        if self.has_unknown(reference) {
+                            return Err(self.unknown(reference));
+                        }
+                        return Err(
+                            WorkflowError::timeout(format!("{reference} did not finish within {limit:?}")).into()
+                        );
+                    }
                 }
-            },
+            }
         };
         desc["output"] = out.clone();
         let out = match task.output.as_ref().and_then(|o| o.as_.as_ref()) {
@@ -581,7 +928,7 @@ impl Run<'_> {
                     Some(w) => expr::render(w, input, &args(ctx)).map_err(expression)?,
                     None => Value::Object(Map::new()),
                 };
-                Ok((self.call(model::function_name(function), call_args, reference, ctx).await?, None))
+                Ok((self.call(model::function_name(function), call_args, reference, ctx, task.delivery).await?, None))
             }
             Kind::Do(tasks) => Ok(ended(
                 self.list(tasks, format!("{reference}/do"), Some(reference), input.clone(), ctx, scope).await?,
@@ -650,35 +997,114 @@ impl Run<'_> {
             Kind::Raise(r) => Err(self.raise(r, reference, input, &args(ctx))?.into()),
             Kind::Wait(spec) => {
                 let d = self.duration(spec, input, &args(ctx))?;
-                self.sleep(d).await?;
+                self.sleep(d, &format!("{reference}#wait")).await?;
                 Ok((input.clone(), None))
             }
         }
     }
 
-    async fn call(&self, name: &str, args: Value, reference: &str, ctx: &mut Value) -> Result<Value, Fault> {
+    async fn call(
+        &self,
+        name: &str,
+        args: Value,
+        reference: &str,
+        ctx: &mut Value,
+        delivery: Delivery,
+    ) -> Result<Value, Fault> {
         if let Some((_, function)) = self.wf.uses.functions.iter().find(|(n, _)| n == name) {
-            // A reusable function is a task whose input is the call's
-            // arguments; it sees none of the caller's loop or catch variables.
+            if delivery != Delivery::AtLeastOnce {
+                return Err(Fault::Fatal(WorkflowError::validation(
+                    "delivery belongs on the external call inside a reusable function",
+                )));
+            }
             let none = Scope::new();
             let (out, _) = self
                 .task(function, name, &format!("{reference}/use/functions/{name}"), Some(reference), args, ctx, &none)
                 .await?;
             return Ok(out);
         }
+        let key = format!("{reference}#call");
+        let logical = self.logical(reference);
+        let prior = self.record(&key);
+        if let Some(Record::Call {
+            logical: old_logical,
+            function,
+            arguments,
+            effect: _,
+            delivery: old_delivery,
+            state,
+        }) = &prior
+        {
+            if old_logical != &logical || function != name || arguments != &args || *old_delivery != delivery {
+                return Err(Fault::Fatal(WorkflowError::runtime(format!("{reference}: call bindings changed"))));
+            }
+            match state {
+                CallState::Done(result) => return result.clone().map_err(Fault::Error),
+                CallState::Pending if delivery == Delivery::AtMostOnce => return Err(self.unknown(reference)),
+                _ => {}
+            }
+        } else if prior.is_some() {
+            return Err(Fault::Storage(WorkflowError::runtime("invalid call record")));
+        }
         let effect = self
             .host
             .functions
             .effect(name)
             .ok_or_else(|| Fault::Fatal(WorkflowError::runtime(format!("unknown function `{name}`"))))?;
-        if effect == Effect::Write {
+        if let Some(Record::Call { effect: original, .. }) = &prior
+            && *original != effect
+        {
+            return Err(Fault::Fatal(WorkflowError::runtime("function effect classification changed")));
+        }
+        // A retry attempt of a protected call: an earlier attempt's success
+        // stands, so the call is not sent again.
+        if prior.is_none()
+            && logical != reference
+            && (effect == Effect::Write || delivery == Delivery::AtMostOnce)
+            && let Some(result) = self.earlier_attempt(&logical, &key, name, &args, reference)
+        {
+            return result;
+        }
+        self.save(
+            &key,
+            Record::Call {
+                logical: logical.clone(),
+                function: name.into(),
+                arguments: args.clone(),
+                effect,
+                delivery,
+                state: CallState::Pending,
+            },
+        )?;
+        if effect == Effect::Write && prior.is_none() {
             self.writes.fetch_add(1, Ordering::SeqCst);
         }
-        let info = CallInfo { run_id: self.run_id, reference, cancel: self.cancel };
-        tokio::select! {
-            _ = self.cancel.cancelled() => Err(Fault::Cancelled),
-            r = self.host.functions.call(name, args, &info) => r.map_err(Fault::Error),
+        let info = CallInfo { run_id: self.run_id, reference, cancel: self.cancel, delivery };
+        if self.journal.is_none() {
+            return tokio::select! {
+                _ = self.cancel.cancelled() => Err(Fault::Cancelled),
+                r = self.host.functions.call(name, args, &info) => r.map_err(Fault::Error),
+            };
         }
+        let result = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return Err(Fault::Cancelled),
+            r = self.host.functions.invoke(name, args.clone(), &info) => r,
+        };
+        let (state, result) = match result {
+            Ok(value) => (CallState::Done(Ok(value.clone())), Ok(value)),
+            Err(CallFailure::Response(error)) => (CallState::Done(Err(error.clone())), Err(Fault::Error(error))),
+            Err(CallFailure::NotExecuted(error)) => (CallState::NotExecuted(error.clone()), Err(Fault::Error(error))),
+            Err(CallFailure::Unknown(error)) => {
+                if delivery == Delivery::AtMostOnce {
+                    return Err(self.unknown(reference));
+                }
+                // A transient transport failure remains retryable, including after restart.
+                return Err(Fault::Error(error));
+            }
+        };
+        self.save(&key, Record::Call { logical, function: name.into(), arguments: args, effect, delivery, state })?;
+        result
     }
 
     /// Branches run concurrently, each on the fork's input and a copy of the
@@ -692,6 +1118,10 @@ impl Run<'_> {
         ctx: &Value,
         scope: &Scope,
     ) -> Result<Value, Fault> {
+        let winner_key = format!("{fork}#winner");
+        if let Some(Record::Winner { output }) = self.record(&winner_key) {
+            return Ok(output);
+        }
         let runs = branches.iter().enumerate().map(|(i, (name, branch))| {
             let reference = format!("{fork}/fork/branches/{i}/{name}");
             let mut ctx = ctx.clone();
@@ -699,19 +1129,48 @@ impl Run<'_> {
             async move { self.task(branch, name, &reference, Some(fork), input, &mut ctx, scope).await.map(|(v, _)| v) }
         });
         if !compete {
-            // In declaration order; the first fault cancels the rest.
-            return Ok(Value::Array(try_join_all(runs).await?));
+            if self.journal.is_none() {
+                return Ok(Value::Array(try_join_all(runs).await?));
+            }
+            let mut pending: FuturesUnordered<_> =
+                runs.enumerate().map(|(i, run)| async move { (i, run.await) }).collect();
+            let mut output = vec![Value::Null; branches.len()];
+            let mut wake: Option<i64> = None;
+            while let Some((i, result)) = pending.next().await {
+                match result {
+                    Ok(value) => output[i] = value,
+                    Err(Fault::Waiting(deadline)) => wake = Some(wake.map_or(deadline, |old| old.min(deadline))),
+                    Err(error) => {
+                        if self.has_unknown(fork) && !matches!(error, Fault::Storage(_)) {
+                            return Err(self.unknown(fork));
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            return match wake {
+                Some(deadline) => Err(Fault::Waiting(deadline)),
+                None => Ok(Value::Array(output)),
+            };
         }
         // The first branch to complete wins and the others are dropped; the
         // fork faults only when every branch has.
         let mut racing: FuturesUnordered<_> = runs.collect();
         let mut last = None;
+        let mut wake: Option<i64> = None;
         while let Some(r) = racing.next().await {
             match r {
-                Ok(v) => return Ok(v),
+                Ok(v) => {
+                    self.save(&winner_key, Record::Winner { output: v.clone() })?;
+                    return Ok(v);
+                }
+                Err(Fault::Waiting(deadline)) => wake = Some(wake.map_or(deadline, |old| old.min(deadline))),
                 Err(Fault::Error(e)) => last = Some(e),
                 Err(stop) => return Err(stop),
             }
+        }
+        if let Some(deadline) = wake {
+            return Err(Fault::Waiting(deadline));
         }
         Err(last.unwrap_or_else(|| WorkflowError::runtime("a competing fork needs a branch")).into())
     }
@@ -745,10 +1204,10 @@ impl Run<'_> {
 
     // ── 5. try, retries and durations ──────────────────────────────────────
 
-    /// `try`: run the body; a caught error is retried by the policy, then
-    /// handled by `catch.do` and `catch.then`. A retry restores the context
-    /// the body started with, and is never made once the failed attempt
-    /// started a `Write` call: a side effect is not replayed automatically.
+    /// A retry restores the original context and gets its own invocation path.
+    /// In a durable run a protected call keeps the first attempt's identity
+    /// (`logical`), so a write that succeeded is not repeated; ephemeral runs
+    /// keep no results and so never retry an attempt that started a write.
     #[allow(clippy::too_many_arguments)]
     async fn attempt(
         &self,
@@ -760,29 +1219,58 @@ impl Run<'_> {
         scope: &Scope,
         desc: &Value,
     ) -> Result<(Value, Option<Flow>), Fault> {
-        let began = Instant::now();
+        let began = desc["startedAt"]["epoch"]["milliseconds"]
+            .as_i64()
+            .ok_or_else(|| Fault::Fatal(WorkflowError::runtime("missing retry start time")))?;
         let snapshot = ctx.clone();
         let mut attempt: u32 = 1;
         loop {
             let writes = self.writes.load(Ordering::SeqCst);
-            let error =
-                match self.list(tasks, format!("{reference}/try"), Some(reference), input.clone(), ctx, scope).await {
-                    Ok(next) => return Ok(ended(next)),
-                    Err(Fault::Error(e)) => e,
-                    Err(stop) => return Err(stop),
-                };
+            let attempt_ref = if self.journal.is_none() || attempt == 1 {
+                format!("{reference}/try")
+            } else {
+                let attempt_ref = format!("{reference}/try[{attempt}]");
+                self.attempts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((attempt_ref.clone(), format!("{reference}/try")));
+                attempt_ref
+            };
+            let error = match self.list(tasks, attempt_ref.clone(), Some(reference), input.clone(), ctx, scope).await {
+                Ok(next) => return Ok(ended(next)),
+                Err(Fault::Error(e)) => e,
+                Err(stop) => return Err(stop),
+            };
             let mut caught = scope.clone();
             caught.push((catch.as_.clone(), error.to_value()));
             let args = self.args(ctx, input, &Value::Null, desc, &caught);
             if !self.catches(catch, &error, input, &args)? {
                 return Err(error.into());
             }
-            if let Some(retry) = &catch.retry
-                && self.writes.load(Ordering::SeqCst) == writes
-                && let Some(delay) = self.retry_delay(retry, attempt, began, input, &args)?
-            {
+            let decision_key = format!("{reference}#retry-decision[{attempt}]");
+            let delay = match self.record(&decision_key) {
+                Some(Record::Retry { delay_ms }) => delay_ms.map(Duration::from_millis),
+                Some(_) => return Err(Fault::Storage(WorkflowError::runtime("invalid retry record"))),
+                None => {
+                    let safe = if self.journal.is_some() {
+                        !self.blocks_retry(&attempt_ref)
+                    } else {
+                        self.writes.load(Ordering::SeqCst) == writes
+                    };
+                    let delay = match &catch.retry {
+                        Some(retry) if safe => self.retry_delay(retry, attempt, began, input, &args)?,
+                        _ => None,
+                    };
+                    self.save(
+                        &decision_key,
+                        Record::Retry { delay_ms: delay.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)) },
+                    )?;
+                    delay
+                }
+            };
+            if let Some(delay) = delay {
                 self.observe(Event::TaskRetrying { reference, attempt, delay, error: &error });
-                self.sleep(delay).await?;
+                self.sleep(delay, &format!("{reference}#retry[{attempt}]")).await?;
                 *ctx = snapshot.clone();
                 attempt += 1;
                 continue;
@@ -826,7 +1314,7 @@ impl Run<'_> {
         &self,
         retry: &Retry,
         attempt: u32,
-        began: Instant,
+        began: i64,
         input: &Value,
         args: &Args,
     ) -> Result<Option<Duration>, Fault> {
@@ -851,7 +1339,9 @@ impl Run<'_> {
             delay += (self.duration(from, input, args)? + self.duration(to, input, args)?) / 2;
         }
         if let Some(limit) = &retry.duration
-            && began.elapsed() + delay > self.duration(limit, input, args)?
+            && Duration::from_millis(self.host.clock.now().timestamp_millis().saturating_sub(began).max(0) as u64)
+                + delay
+                > self.duration(limit, input, args)?
         {
             return Ok(None);
         }
@@ -869,7 +1359,27 @@ impl Run<'_> {
         }
     }
 
-    async fn sleep(&self, d: Duration) -> Result<(), Fault> {
+    async fn sleep(&self, d: Duration, key: &str) -> Result<(), Fault> {
+        if self.journal.is_some() {
+            let deadline_ms = match self.record(key) {
+                Some(Record::Timer { deadline_ms }) => deadline_ms,
+                Some(_) => return Err(Fault::Storage(WorkflowError::runtime("invalid timer record"))),
+                None => {
+                    let deadline_ms = self
+                        .host
+                        .clock
+                        .now()
+                        .timestamp_millis()
+                        .saturating_add(i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+                    self.save(key, Record::Timer { deadline_ms })?;
+                    deadline_ms
+                }
+            };
+            if deadline_ms > self.host.clock.now().timestamp_millis() {
+                return Err(Fault::Waiting(deadline_ms));
+            }
+            return Ok(());
+        }
         tokio::select! {
             _ = self.cancel.cancelled() => Err(Fault::Cancelled),
             _ = tokio::time::sleep(d) => Ok(()),
@@ -946,6 +1456,7 @@ mod tests {
                 Event::TaskSkipped { reference, .. } => format!("skip {reference}"),
                 Event::TaskCompleted { reference, .. } => format!("done {reference}"),
                 Event::TaskFaulted { reference, .. } => format!("fault {reference}"),
+                Event::TaskSuspended { reference, .. } => format!("wait {reference}"),
                 Event::TaskRetrying { reference, attempt, delay, .. } => {
                     format!("retry {reference} #{attempt} after {}s", delay.as_secs())
                 }

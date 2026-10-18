@@ -50,6 +50,7 @@ pub type TaskList = Vec<(String, Task)>;
 
 #[derive(Clone, Debug)]
 pub struct Task {
+    pub delivery: crate::durable::Delivery,
     pub when: Option<String>,
     pub input: Option<Input>,
     pub output: Option<Output>,
@@ -96,7 +97,7 @@ pub enum Items {
     Inline(Vec<Value>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Flow {
     Continue,
     Exit,
@@ -416,6 +417,7 @@ impl Parser {
             // once the named retries/timeouts are in place.
             for name in f.keys() {
                 let placeholder = Task {
+                    delivery: crate::durable::Delivery::default(),
                     when: None,
                     input: None,
                     output: None,
@@ -510,7 +512,20 @@ impl Parser {
         let export = m.get("export").map(|o| self.output(o, &format!("{at}/export")));
         let timeout = m.get("timeout").and_then(|t| self.timeout(t, &format!("{at}/timeout")));
         let then = m.get("then").and_then(|t| self.flow(t, &format!("{at}/then")));
-        Some(Task { when, input, output, export, timeout, then, kind: kind?, definition: v.clone() })
+        let delivery = match m.get("metadata").and_then(|m| m.get("delivery")) {
+            None => crate::durable::Delivery::AtLeastOnce,
+            Some(v) => match serde_json::from_value(v.clone()) {
+                Ok(policy) if m.contains_key("call") => policy,
+                _ => {
+                    self.fail(
+                        &format!("{at}/metadata/delivery"),
+                        "expected at_least_once or at_most_once on a call task",
+                    );
+                    crate::durable::Delivery::AtLeastOnce
+                }
+            },
+        };
+        Some(Task { delivery, when, input, output, export, timeout, then, kind: kind?, definition: v.clone() })
     }
 
     fn for_task(&mut self, m: &Map<String, Value>, at: &str) -> Option<Kind> {
@@ -1013,6 +1028,12 @@ impl Validator<'_> {
             Kind::Call { function, with } => {
                 let name = function_name(function);
                 let local = self.wf.uses.functions.iter().any(|(n, _)| n == name);
+                if local && t.delivery != crate::durable::Delivery::AtLeastOnce {
+                    self.problems.push(problem(
+                        &format!("{at}/metadata/delivery"),
+                        "put delivery on the external call inside the reusable function",
+                    ));
+                }
                 if !local && !self.catalog.has(name) {
                     self.problems.push(problem(&format!("{at}/call"), format!("unknown function `{function}`")));
                 }
@@ -1106,6 +1127,9 @@ impl Validator<'_> {
 pub struct CallSite {
     pub reference: String,
     pub function: String,
+    /// The arguments as written: a template, or one expression.
+    pub with: Option<Value>,
+    pub delivery: crate::durable::Delivery,
 }
 
 /// Every call site, including those inside reusable functions, in
@@ -1118,9 +1142,12 @@ pub fn call_sites(wf: &Workflow) -> Vec<CallSite> {
     }
     fn task(t: &Task, at: &str, out: &mut Vec<CallSite>) {
         match &t.kind {
-            Kind::Call { function, .. } => {
-                out.push(CallSite { reference: at.to_string(), function: function_name(function).to_string() })
-            }
+            Kind::Call { function, with } => out.push(CallSite {
+                reference: at.to_string(),
+                function: function_name(function).to_string(),
+                with: with.clone(),
+                delivery: t.delivery,
+            }),
             Kind::Do(tasks) | Kind::For { tasks, .. } => list(tasks, &format!("{at}/do"), out),
             Kind::Fork { branches, .. } => list(branches, &format!("{at}/fork/branches"), out),
             Kind::Try { tasks, catch } => {

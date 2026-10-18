@@ -110,6 +110,7 @@ impl Observer for Journal {
             Event::TaskCompleted { reference, output } => {
                 Entry::Completed { reference: reference.to_string(), output: (*output).clone() }
             }
+            Event::TaskSuspended { .. } => panic!("ephemeral test host suspended"),
             Event::TaskFaulted { reference, error } => {
                 Entry::Faulted { reference: reference.to_string(), error: (*error).clone() }
             }
