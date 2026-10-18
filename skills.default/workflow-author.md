@@ -30,6 +30,10 @@ re-planned on every fire.
    just `null` at run time and the workflow quietly does the wrong thing on
    every run. The reply is the only truth about names, units and meanings:
    never fill them in from what you know of the service behind a function.
+   A probe shows the shape of the data, not the data a run will see: never
+   write the values it happened to return (texts, names, ids, amounts)
+   into the definition; judge what matters by criteria (`llm_decide`) or
+   by fields, never by the sample's words.
 4. Design it with the principles below, write the definition and call
    `save_workflow(name, definition)`. It checks the definition against the
    language, the functions and their argument names. Fix every reported
@@ -80,7 +84,9 @@ judge. Build the pipeline the task needs from these parts, no more:
   never write a chat id into the definition.
 - **Bookkeeping last.** Stamp a watermark or append to a journal only after
   the delivery it stands for succeeded, so a failure cannot mark unsent
-  data as handled.
+  data as handled. Data a run read and judged not worth sending is handled
+  too: advance the watermark on that path as well, or the next run reads
+  and judges it again.
 - **Nothing new.** Decide it explicitly: skip the delivery with `if`, or
   send a short note. For a frequent schedule a note on every quiet run is
   noise; say which you chose.
