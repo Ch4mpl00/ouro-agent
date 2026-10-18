@@ -8,9 +8,8 @@
 //   3. calls       — generic steps: call a tool, check the result
 //   4. memory      — project / document sentences
 //   5. signals     — the queue
-//   6. scheduler   — time zone, tasks, ticks
-//   7. surface     — the tool list
-//   8. main        — sequential run, a clean database per scenario
+//   6. surface     — the tool list
+//   7. main        — sequential run, a clean database per scenario
 //
 //   cargo test --test specs                      (Docker needed for Postgres)
 //   TEST_DATABASE_URL=postgres://… cargo test --test specs
@@ -20,11 +19,9 @@ mod support;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use chrono::{DateTime, Utc};
 use cucumber::gherkin::Step;
 use cucumber::writer::Stats as _;
 use cucumber::{World, given, then, when};
-use mcp_tools::scheduler;
 use serde_json::{Value, json};
 use support::{Client, Outcome, Server, connect, start_test_server, test_database};
 
@@ -72,7 +69,6 @@ struct Spec {
     remembered: HashMap<String, Value>,
     delivered: Vec<i64>,
     queued: Vec<i64>,
-    last_task: Option<i64>,
 }
 
 impl std::fmt::Debug for Spec {
@@ -83,14 +79,7 @@ impl std::fmt::Debug for Spec {
 
 impl Spec {
     fn new() -> Self {
-        Self {
-            client: None,
-            last: None,
-            remembered: HashMap::new(),
-            delivered: Vec::new(),
-            queued: Vec::new(),
-            last_task: None,
-        }
+        Self { client: None, last: None, remembered: HashMap::new(), delivered: Vec::new(), queued: Vec::new() }
     }
 
     async fn client(&mut self) -> &Client {
@@ -301,71 +290,12 @@ async fn exactly_once(spec: &mut Spec) {
     );
 }
 
-// ── 6. scheduler ─────────────────────────────────────────────────────────────
-
-fn instant(text: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(text).unwrap_or_else(|_| panic!("not an ISO time: {text}")).with_timezone(&Utc)
-}
-
-#[given(expr = "the user's time zone is {string}")]
-async fn time_zone(spec: &mut Spec, zone: String) {
-    let outcome = spec.call("set_timezone", json!({ "tz": zone })).await;
-    assert!(matches!(&outcome, Outcome::Ok(v) if v["ok"] == true), "setting the time zone: {outcome:?}");
-}
-
-#[given(expr = "a {word} task {string} saying {string} created at {string}")]
-async fn task(spec: &mut Spec, kind: String, cron: String, prompt: String, created: String) {
-    let recurring = match kind.as_str() {
-        "recurring" => true,
-        "one-shot" => false,
-        other => panic!("a task is recurring or one-shot, not {other}"),
-    };
-    let row = env().scheduler.insert(&cron, recurring, &prompt, None).await.expect("task inserted");
-    env()
-        .db
-        .client()
-        .await
-        .expect("db")
-        .execute("UPDATE scheduled_tasks SET created_at = $1 WHERE id = $2", &[&instant(&created), &row.id])
-        .await
-        .expect("backdated");
-    spec.last_task = Some(row.id);
-}
-
-#[given(expr = "it last fired for the slot {string}")]
-async fn last_fired(spec: &mut Spec, slot: String) {
-    let id = spec.last_task.expect("a task was created earlier in the scenario");
-    env()
-        .db
-        .client()
-        .await
-        .expect("db")
-        .execute("UPDATE scheduled_tasks SET last_run_at = $1 WHERE id = $2", &[&instant(&slot).timestamp(), &id])
-        .await
-        .expect("marked fired");
-}
-
-#[given(expr = "the scheduler ticks at {string}")]
-#[when(expr = "the scheduler ticks at {string}")]
-async fn tick(_spec: &mut Spec, now: String) {
-    scheduler::tick(&env().scheduler, &env().signals, instant(&now)).await.expect("tick");
-}
-
 #[then(expr = "{int} signal(s) is/are waiting")]
 async fn waiting(_spec: &mut Spec, count: i64) {
     assert_eq!(env().signals.count_pending().await.expect("count"), count, "signals waiting in the queue");
 }
 
-#[then(expr = "the next signal is a {string} signal for the slot {string}")]
-async fn next_signal_slot(spec: &mut Spec, source: String, slot: String) {
-    spec.call("get_next_signal", json!({})).await;
-    let signal = spec.result()["signal"].clone();
-    assert_eq!(signal["source"], source, "the signal's source: {signal:#}");
-    let content = signal["content"].as_str().unwrap_or_default();
-    assert!(content.contains(&format!("Slot: {slot}")), "the signal's slot:\n{content}");
-}
-
-// ── 7. surface ───────────────────────────────────────────────────────────────
+// ── 6. surface ───────────────────────────────────────────────────────────────
 
 #[then("the server offers exactly these tools:")]
 async fn offers_tools(spec: &mut Spec, step: &Step) {
@@ -384,7 +314,7 @@ async fn offers_tools(spec: &mut Spec, step: &Step) {
     assert_eq!(actual, expected, "the tool surface");
 }
 
-// ── 8. main ──────────────────────────────────────────────────────────────────
+// ── 7. main ──────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {

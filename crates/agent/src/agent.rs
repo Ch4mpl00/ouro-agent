@@ -40,6 +40,7 @@ pub struct EngineDeps {
     pub codex: SharedCodex,
     pub decisions: Option<Arc<crate::decisions::DecisionClient>>,
     pub workflows: Arc<dyn crate::flows::WorkflowStore>,
+    pub schedule: Arc<dyn crate::schedule::ScheduleStore>,
 }
 pub struct Engine {
     pub deps: EngineDeps,
@@ -510,6 +511,11 @@ impl AgentLoop {
             }
             "invoke_sub_agent" => self.worker(engine, args, span).await,
             name if crate::flows::TOOLS.contains(&name) => crate::flows::tool(engine, name, args),
+            name if crate::schedule::TOOLS.contains(&name) => {
+                let tz = &self.opts.session.env.timezone;
+                let (store, workflows) = (&*engine.deps.schedule, &*engine.deps.workflows);
+                crate::schedule::tool(store, workflows, tz, name, args, chrono::Utc::now()).await
+            }
             _ => anyhow::bail!("unknown synthetic tool {name}"),
         }
     }

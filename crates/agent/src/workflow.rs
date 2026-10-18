@@ -771,7 +771,12 @@ pub struct WorkflowRunner {
 }
 pub fn create_workflow_runner(engine: Arc<Engine>, known_skills: Vec<String>) -> anyhow::Result<Arc<WorkflowRunner>> {
     let mut tools = crate::mcp::model_tools(&*engine.deps.mcp);
-    tools.extend(synthetic_definitions().iter().filter(|t| t.name == "set_memory").cloned());
+    tools.extend(
+        synthetic_definitions()
+            .iter()
+            .filter(|t| t.name == "set_memory" || crate::schedule::TOOLS.contains(&t.name.as_str()))
+            .cloned(),
+    );
     let schema = WorkflowSchema::new(tools.iter().map(|t| t.name.clone()).collect(), known_skills)?;
     Ok(Arc::new(WorkflowRunner { engine, schema, tools, max_attempts: 3, max_passes: 3 }))
 }
@@ -1027,6 +1032,20 @@ impl WorkflowRunner {
                         })?;
                         self.engine.deps.memory.set(key, value)?;
                         json!({"ok":true,"key":key})
+                    } else if crate::schedule::TOOLS.contains(&tool.as_str()) {
+                        let deps = &self.engine.deps;
+                        let tz = &ctx.session.env.timezone;
+                        let raw = crate::schedule::tool(
+                            &*deps.schedule,
+                            &*deps.workflows,
+                            tz,
+                            tool,
+                            &args,
+                            chrono::Utc::now(),
+                        )
+                        .await
+                        .map_err(|e| WorkflowError::Tool { tool: tool.clone(), message: e.to_string() })?;
+                        parse_tool_json(&raw)
                     } else {
                         let raw = self.engine.deps.mcp.call_tool(tool, args, &ctx.cancel).await.map_err(|e| {
                             if is_aborted(&e) {

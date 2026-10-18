@@ -9,7 +9,6 @@
 
 pub mod fake_gmail;
 pub mod fake_telegram;
-pub mod wall_cron;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -240,7 +239,7 @@ async fn serve_overridden(
     let http = reqwest::Client::new();
     let settings = Settings::new(db.clone());
     let signals = Signals::new(db.clone());
-    let scheduler = Scheduler::new(db.clone(), settings.clone());
+    let scheduler = Scheduler::new(db.clone());
     let deps = Arc::new(Deps {
         settings,
         signals: signals.clone(),

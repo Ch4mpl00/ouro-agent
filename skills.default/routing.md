@@ -60,8 +60,8 @@ actions: wait for delivery success first.
 
 A drafted workflow runs only after the user confirms it in the chat. On
 their yes, call `activate_workflow(name, version)`, then `schedule_task`
-with `payload: {"workflow": "<name>"}` and a one-line `prompt` saying what
-it does (none if a schedule for it already exists: `list_scheduled_tasks`).
+with `workflow: "<name>"` and a one-line `prompt` saying what it does
+(none if a schedule for it already exists: `list_scheduled_tasks`).
 Never activate on your own judgement.
 
 User knowledge ("запомни", "что помнишь про") uses MCP `remember`,

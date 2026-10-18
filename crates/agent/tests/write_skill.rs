@@ -90,6 +90,7 @@ fn engine(model: Model, tools: &[&str], store: Arc<FsSkillStore>) -> Arc<agent::
         codex: Arc::new(NoCodex),
         decisions: None,
         workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
+        schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
     })
 }
 

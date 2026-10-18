@@ -225,6 +225,7 @@ impl Exec {
             codex: codex.clone(),
             decisions: setup.decisions,
             workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
+            schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
         });
         let runner = create_workflow_runner(engine.clone(), vec!["news-query".into()]).unwrap();
         Exec { runner, engine, mcp, llm, persist, codex, tracer, written }
@@ -615,14 +616,14 @@ async fn stringifies_a_whole_placeholder_prompt_bound_to_a_non_string_value() {
 async fn parses_json_output_and_binds_the_object_so_later_steps_can_dot_into_it() {
     let e = Exec::new(Setup {
         llm: vec![answer(&json!({"cancelId":10,"cron_expr":"0 9 L * *"}).to_string())],
-        tools: vec![("cancel_scheduled_task", Reply::Json(json!({"cancelled":true})))],
+        tools: vec![("cancel_reminder", Reply::Json(json!({"cancelled":true})))],
         ..Setup::default()
     });
     let ctx = base_ctx();
     let (r, _) = e
         .run(plan(json!([
             {"kind":"llm_compose","preset":"base","prompt":"Emit the reschedule plan as JSON","input":{},"bind":"target"},
-            {"kind":"tool","tool":"cancel_scheduled_task","args":{"id":"${target.cancelId}"}},
+            {"kind":"tool","tool":"cancel_reminder","args":{"id":"${target.cancelId}"}},
             {"kind":"terminal"},
         ])), &ctx)
         .await;
@@ -630,7 +631,7 @@ async fn parses_json_output_and_binds_the_object_so_later_steps_can_dot_into_it(
     // Bound as a parsed object, not a raw JSON string.
     assert_eq!(ctx.store.get("target").unwrap(), json!({"cancelId":10,"cron_expr":"0 9 L * *"}));
     // ${target.cancelId} resolved to the literal 10.
-    let call = e.tool_calls().into_iter().find(|(n, _)| n == "cancel_scheduled_task").unwrap();
+    let call = e.tool_calls().into_iter().find(|(n, _)| n == "cancel_reminder").unwrap();
     assert_eq!(Value::Object(call.1), json!({"id":10}));
 }
 
@@ -638,18 +639,18 @@ async fn parses_json_output_and_binds_the_object_so_later_steps_can_dot_into_it(
 async fn resolves_deep_dot_access_into_a_nested_parsed_object() {
     let e = Exec::new(Setup {
         llm: vec![answer(&json!({"schedule":{"cron":"0 9 L * *","recurring":true}}).to_string())],
-        tools: vec![("schedule_task", Reply::Json(json!({"id":11})))],
+        tools: vec![("create_reminder", Reply::Json(json!({"id":11})))],
         ..Setup::default()
     });
     let (r, _) = e
         .run(plan(json!([
             {"kind":"llm_compose","preset":"base","prompt":"plan","input":{},"bind":"plan"},
-            {"kind":"tool","tool":"schedule_task","args":{"cron_expr":"${plan.schedule.cron}","recurring":"${plan.schedule.recurring}"}},
+            {"kind":"tool","tool":"create_reminder","args":{"cron_expr":"${plan.schedule.cron}","recurring":"${plan.schedule.recurring}"}},
             {"kind":"terminal"},
         ])), &base_ctx())
         .await;
     assert!(ok(&r));
-    let call = e.tool_calls().into_iter().find(|(n, _)| n == "schedule_task").unwrap();
+    let call = e.tool_calls().into_iter().find(|(n, _)| n == "create_reminder").unwrap();
     // Whole-string placeholders preserve type.
     assert_eq!(Value::Object(call.1), json!({"cron_expr":"0 9 L * *","recurring":true}));
 }
@@ -732,14 +733,14 @@ async fn keeps_json_looking_but_invalid_output_as_the_raw_string() {
 async fn fails_with_missing_binding_when_dotting_into_a_field_the_parsed_object_lacks() {
     let e = Exec::new(Setup {
         llm: vec![answer(&json!({"cancelId":10}).to_string())],
-        tools: vec![("cancel_scheduled_task", Reply::Json(json!({"cancelled":true})))],
+        tools: vec![("cancel_reminder", Reply::Json(json!({"cancelled":true})))],
         ..Setup::default()
     });
     let (r, _) = e
         .run(
             plan(json!([
                 {"kind":"llm_compose","preset":"base","prompt":"plan","input":{},"bind":"target"},
-                {"kind":"tool","tool":"cancel_scheduled_task","args":{"id":"${target.missingField}"}},
+                {"kind":"tool","tool":"cancel_reminder","args":{"id":"${target.missingField}"}},
                 {"kind":"terminal"},
             ])),
             &base_ctx(),
@@ -748,7 +749,7 @@ async fn fails_with_missing_binding_when_dotting_into_a_field_the_parsed_object_
     let (reason, index, _, _) = failure(&r);
     assert_eq!((reason, index), ("missing_binding", 1));
     // The tool never ran — substitution failed before dispatch.
-    assert!(!e.tool_calls().iter().any(|(n, _)| n == "cancel_scheduled_task"));
+    assert!(!e.tool_calls().iter().any(|(n, _)| n == "cancel_reminder"));
 }
 
 #[tokio::test]
@@ -757,14 +758,14 @@ async fn fails_with_missing_binding_when_dotting_into_a_string_valued_compose_re
     // dots into it, must fail — not silently expand to "undefined".
     let e = Exec::new(Setup {
         llm: vec![answer("just some prose, no fields here")],
-        tools: vec![("cancel_scheduled_task", Reply::Json(json!({"cancelled":true})))],
+        tools: vec![("cancel_reminder", Reply::Json(json!({"cancelled":true})))],
         ..Setup::default()
     });
     let (r, _) = e
         .run(
             plan(json!([
                 {"kind":"llm_compose","preset":"base","prompt":"plan","input":{},"bind":"target"},
-                {"kind":"tool","tool":"cancel_scheduled_task","args":{"id":"${target.cancelId}"}},
+                {"kind":"tool","tool":"cancel_reminder","args":{"id":"${target.cancelId}"}},
                 {"kind":"terminal"},
             ])),
             &base_ctx(),

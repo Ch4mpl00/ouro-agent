@@ -16,7 +16,7 @@ use std::sync::{Mutex, OnceLock};
 use async_trait::async_trait;
 use mcp_tools::db::Db;
 use mcp_tools::gmail::{GmailModule, SUBSCRIPTIONS};
-use mcp_tools::scheduler::SignalSink;
+use mcp_tools::signals::SignalSink;
 use mcp_tools::signals::Signals;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};

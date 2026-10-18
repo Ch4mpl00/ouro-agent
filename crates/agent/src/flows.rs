@@ -4,10 +4,10 @@
 // 3. tracing (owf events → spans under the signal's trace, as `workflow.rs`
 // writes them); 4. running one for a scheduler signal.
 //
-// A scheduled task whose payload names a workflow (`{ "workflow": "…" }`)
-// runs its active version here. The supervisor hands a run that faulted
-// before any `Write` call to the agent loop; one that faulted after goes to
-// recovery, which only reports.
+// A scheduled task naming a workflow (`schedule_task` with `workflow`; its
+// fire's payload is `{ "workflow": "…" }`) runs its active version here.
+// The supervisor hands a run that faulted before any `Write` call to the
+// agent loop; one that faulted after goes to recovery, which only reports.
 use crate::{
     agent::Engine,
     db::AgentDb,
@@ -876,7 +876,7 @@ pub fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::R
             store.activate(name, version)?;
             Ok(json!({
                 "ok": true, "name": name, "version": version,
-                "next": format!("It runs whenever a scheduled task fires with payload {{\"workflow\": \"{name}\"}}; create one with schedule_task if none exists. Existing schedules run the new version."),
+                "next": format!("It runs whenever a task scheduled with schedule_task(workflow: \"{name}\") fires; create one if none exists. Existing schedules run the new version."),
             })
             .to_string())
         }

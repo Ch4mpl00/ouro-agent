@@ -183,3 +183,37 @@ pub fn render_context(env: &EnvData) -> anyhow::Result<String> {
 pub fn iso(t: DateTime<Utc>) -> String {
     t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
+
+// The environment note for a signal the agent raises itself (a scheduled
+// fire): where to send by default and which forum topics exist. MCP attaches
+// the same note to a queued signal (`mcp_tools::signals::env_context`), from
+// the same TELEGRAM_DEFAULT_CHAT_ID / TELEGRAM_TOPICS_JSON, so a skill reads
+// both alike; crates/mcp/tests/schedule_handover.rs holds the two together.
+pub fn telegram_env_note(default_chat_id: Option<&str>, topics: &[(String, i64)]) -> Option<String> {
+    let mut lines = Vec::new();
+    if let Some(chat_id) = default_chat_id {
+        lines.push(format!("Default Telegram chat id: {chat_id}."));
+    }
+    if !topics.is_empty() {
+        lines.push("Available Telegram forum topics (name → thread_id):".to_owned());
+        for (name, id) in topics {
+            lines.push(format!("  - {name}: {id}"));
+        }
+        lines.push(
+            "When sending a message that semantically belongs to one of these topics, \
+             pass the matching messageThreadId to send_telegram_message."
+                .to_owned(),
+        );
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(["", "## Environment"].into_iter().map(str::to_owned).chain(lines).collect::<Vec<_>>().join("\n"))
+}
+
+// TELEGRAM_TOPICS_JSON='{"bills":42}', in the order written. Lenient as MCP
+// is: a malformed map is no topics, and an id that is not an integer is dropped.
+pub fn parse_telegram_topics(raw: Option<&str>) -> Vec<(String, i64)> {
+    let Some(Ok(Value::Object(entries))) = raw.map(serde_json::from_str::<Value>) else { return Vec::new() };
+    entries.into_iter().filter_map(|(name, id)| id.as_i64().map(|id| (name, id))).collect()
+}

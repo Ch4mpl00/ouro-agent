@@ -21,7 +21,7 @@ use mcp_tools::signals::Signals;
 use mcp_tools::skills::SkillCatalog;
 use mcp_tools::telegram::{TelegramConfig, TelegramModule};
 use mcp_tools::userbot::Userbot;
-use mcp_tools::{fetch, fs, news, pg, scheduler, telegram, toolsets};
+use mcp_tools::{fetch, fs, news, pg, telegram, toolsets};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
     let news_repo = NewsRepository::new(pool.clone(), embedder.clone());
     let settings = Settings::new(db.clone());
     let signals = Signals::new(db.clone());
-    let scheduler = Scheduler::new(db.clone(), settings.clone());
+    let scheduler = Scheduler::new(db.clone());
     let telegram = TelegramModule::new(TelegramConfig::from_env(), http.clone(), db.clone());
     let gmail = GmailModule::new(db.clone(), http.clone());
     let userbot = Userbot::new(db.clone());
@@ -94,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
     let deps = Arc::new(Deps {
         settings,
         signals: signals.clone(),
-        scheduler: scheduler.clone(),
+        scheduler,
         telegram: telegram.clone(),
         gmail: gmail.clone(),
         monobank: Monobank::new(http.clone()),
@@ -138,7 +138,6 @@ async fn main() -> anyhow::Result<()> {
             cancel.clone(),
         ));
         background.spawn(gmail.run_poller(signals.clone(), cancel.clone()));
-        background.spawn(scheduler::run_poller(scheduler, signals, cancel.clone()));
         let providers: Vec<Box<dyn NewsProvider>> = vec![
             Box::new(HackerNews::new(http.clone(), fetcher.clone())),
             Box::new(Habr::new(http.clone(), fetcher.clone())),

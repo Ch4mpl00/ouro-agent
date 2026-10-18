@@ -29,7 +29,7 @@ async fn count(url: &str, sql: &str) -> i64 {
 }
 
 #[test]
-fn the_state_database_is_created_migrated_and_seeded_once_and_every_instance_comes_up() {
+fn the_state_database_is_created_and_migrated_once_and_every_instance_comes_up() {
     let db = env();
     TestRunner::new(Config::with_cases(12))
         .run(&(2usize..=6), |instances| {
@@ -58,16 +58,16 @@ fn the_state_database_is_created_migrated_and_seeded_once_and_every_instance_com
                     versions.iter().collect::<HashSet<_>>().len(),
                     "each migration recorded once"
                 );
-                let seeded_once = count(&state_url, "SELECT count(*) FROM scheduled_tasks").await;
 
                 // A later boot finds everything in place and changes nothing.
                 Db::connect_state(&db.url, &state_url).await.unwrap();
                 assert_eq!(
-                    count(&state_url, "SELECT count(*) FROM scheduled_tasks").await,
-                    seeded_once,
-                    "a reboot seeds nothing again"
+                    count(&state_url, "SELECT count(*) FROM state_migrations").await,
+                    versions.len() as i64,
+                    "a reboot migrates nothing again"
                 );
-                assert_eq!(seeded_once, 3, "the system tasks, once");
+                // The agent owns the schedule now; the state database seeds no tasks.
+                assert_eq!(count(&state_url, "SELECT count(*) FROM scheduled_tasks").await, 0);
             });
             Ok(())
         })

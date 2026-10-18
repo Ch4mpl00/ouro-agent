@@ -10,13 +10,14 @@ use agent::{
     flows::create_durable_flows,
     langfuse::LangfuseTracer,
     local_recorder::local_recorder_tracer,
-    mcp::{ConnectOptions, Mcp, McpClient, RETRY_UNTIL_UP, open_from_env},
+    mcp::{ConnectOptions, Mcp, McpClient, RETRY_UNTIL_UP, SharedMcp, open_from_env},
     models::{DEFAULT_DECISION_MODEL, Presets, default_presets},
     providers::{
         DEEPSEEK_BASE_URL, GEMINI_BASE_URL, HttpApi, OPENAI_BASE_URL, ProviderKind, RetryOpts, SharedProvider,
         openrouter_api, provider, with_retry,
     },
-    session::EnvDeps,
+    schedule::{ScheduleStore, SupervisorSink, run_ticks},
+    session::{EnvDeps, parse_telegram_topics, telegram_env_note},
     skills::{FsSkillStore, SkillStore},
     supervisor::{ERROR_BACKOFF, NextSignal, create_supervisor_with_cancel, run_poll_loop},
     tracing::{Tracer, tee_tracer},
@@ -68,6 +69,8 @@ struct Config {
     journal: bool,
     journal_model: String,
     journal_options: ActivityOptions,
+    // The environment note a scheduled fire carries.
+    env_context: Option<String>,
 }
 fn configuration() -> anyhow::Result<Config> {
     let deepseek_key = required("DEEPSEEK_API_KEY", "")?;
@@ -99,6 +102,14 @@ fn configuration() -> anyhow::Result<Config> {
     journal_options.budget.total_chars =
         usize::try_from(positive("ACTIVITY_JOURNAL_MAX_INPUT_CHARS", journal_options.budget.total_chars as u64)?)?;
     let journal_model = std::env::var("ACTIVITY_JOURNAL_MODEL").unwrap_or_else(|_| presets.base.model.clone());
+    // The same two variables MCP reads for the note on a queued signal.
+    let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let default_chat_id = var("TELEGRAM_DEFAULT_CHAT_ID");
+    if default_chat_id.is_none() {
+        eprintln!("[config] TELEGRAM_DEFAULT_CHAT_ID is not set: scheduled tasks run without a default chat");
+    }
+    let topics = parse_telegram_topics(var("TELEGRAM_TOPICS_JSON").as_deref());
+    let env_context = telegram_env_note(default_chat_id.as_deref(), &topics);
     Ok(Config {
         root,
         db,
@@ -110,6 +121,7 @@ fn configuration() -> anyhow::Result<Config> {
         journal: std::env::var("ACTIVITY_JOURNAL").as_deref() != Ok("off"),
         journal_model,
         journal_options,
+        env_context,
     })
 }
 fn retry_provider(kind: ProviderKind, api: Arc<dyn agent::providers::JsonApi>) -> SharedProvider {
@@ -184,6 +196,7 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
             skill_store: skills.clone(),
             memory: db.clone(),
             workflows: db.clone(),
+            schedule: db.clone(),
             tracer,
             codex: codex_client(&std::env::var("CODEX_URL").unwrap_or_else(|_| "http://localhost:3010".into())),
             decisions: Some(decision_client(
@@ -226,6 +239,26 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
             eprintln!(
                 "[supervisor] entering main loop (scheduler → saved workflow or planner, other sources → agent-loop)"
             );
+            // The agent owns the schedule: its first start imports the tasks
+            // MCP held (or seeds the system ones), and a 30 s tick fires them
+            // through the supervisor, one signal at a time with the queue's.
+            let tick_cancel = stopping.child_token();
+            let ticks = if !once {
+                match agent::schedule::initialize(&*db, &*mcp, &stopping).await {
+                    Ok(0) => {}
+                    Ok(n) => eprintln!("[schedule] first start: {n} tasks"),
+                    Err(error) => eprintln!("[schedule] first start failed, retried on the next: {error:#}"),
+                }
+                let store: Arc<dyn ScheduleStore> = db.clone();
+                let sink = Arc::new(SupervisorSink {
+                    supervisor: supervisor.clone(),
+                    env_context: config.env_context.clone(),
+                });
+                let shared: SharedMcp = mcp.clone();
+                Some(tokio::spawn(run_ticks(store, sink, shared, tick_cancel.clone())))
+            } else {
+                None
+            };
             let durable_cancel = stopping.child_token();
             let recovery = if !once {
                 let cancel = durable_cancel.clone();
@@ -264,6 +297,10 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
                     }
                 }
             };
+            tick_cancel.cancel();
+            if let Some(ticks) = ticks {
+                let _ = ticks.await;
+            }
             durable_cancel.cancel();
             if let Some(recovery) = recovery {
                 let _ = recovery.await;

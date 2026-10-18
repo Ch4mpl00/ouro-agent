@@ -26,8 +26,8 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::Db;
-use crate::scheduler::SignalSink;
 use crate::server::{McpTools, ToolResult, invalid_params, respond};
+use crate::signals::SignalSink;
 use crate::signals::Signals;
 use crate::time::{iso_from_unix_ms, parse_js_date};
 

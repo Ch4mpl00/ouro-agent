@@ -114,12 +114,12 @@ flowchart LR
         P1[Gmail poller<br/>1 min] --> Q
         P2[Telegram bot<br/>long-poll] --> Q
         P3[Userbot channels<br/>30 min] --> Q
-        P4[Scheduler<br/>cron, 30 s] --> Q
         Q[(signals queue<br/>mcp_state)]
         T[MCP tools<br/>gmail / telegram / news / …]
     end
 
     subgraph agent [crates/agent]
+        P4[Schedule<br/>cron, 30 s] -->|fires| S
         S[Supervisor loop] -->|get_next_signal| Q
         S -->|source = scheduler| W[Workflow<br/>compile → execute]
         S -->|other sources| L[Primary AgentLoop]
@@ -134,7 +134,9 @@ flowchart LR
 ```
 
 1. A poller notices something new and records a signal (source, content, envContext) —
-   one row in the `signals` queue.
+   one row in the `signals` queue. Scheduled tasks are the agent's own
+   (`crates/agent/src/schedule.rs`): its tick hands each due fire straight to
+   the supervisor, one signal at a time with the queue's.
 2. The supervisor (`crates/agent/src/supervisor.rs`) loops on
    `get_next_signal`; with an empty queue it waits on `wait_for_signal`,
    which answers the moment a poller records one — no polling delay.
@@ -175,8 +177,8 @@ history) · **Telegram userbot** (read-only MTProto channel reading) ·
 semantic `search_news` over HN + Habr + channel posts) · **PDF / files** ·
 **Skills** (`list_skills`, `read_skill`) · **Unified memory** (projects of
 markdown documents + facts, semantic `recall` across both, versioned
-patch/revert) · **Signals queue** · **Scheduler** (cron tasks) · **Env**
-(timezone)
+patch/revert) · **Signals queue** · **Env** (timezone). Scheduled tasks
+(`schedule_task` and the rest) are the agent's own tools.
 
 ## Layout
 
@@ -190,7 +192,7 @@ mcp-tools/
     │                       memory.rs, scheduler.rs, …; main.rs is the composition
     │                       root, src/bin the one-shot CLIs, specs/ the executable
     │                       specification
-    ├── agent/              supervisor.rs (poll loop), workflow.rs (scheduler path),
+    ├── agent/              supervisor.rs (poll loop), schedule.rs (cron tasks), workflow.rs (scheduler path),
     │                       agent.rs (engine + AgentLoop), mcp.rs (client),
     │                       skills.rs, tracing/langfuse
     ├── codex/              codex-service

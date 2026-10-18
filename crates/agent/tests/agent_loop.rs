@@ -1065,6 +1065,7 @@ fn engine_with(openrouter: Option<Arc<dyn ChatProvider>>) -> Arc<agent::agent::E
         codex: Arc::new(NoCodex),
         decisions: None,
         workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
+        schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
     })
 }
 

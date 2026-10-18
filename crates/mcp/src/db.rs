@@ -8,9 +8,8 @@
 //   1. handle  — `Db`, a cloneable, injected pool on `mcp_state`
 //   2. locate  — which database, and creating it on first boot
 //   3. schema  — versioned migrations under an advisory lock
-//   4. seed    — system scheduled tasks, once per fresh database
-//   5. format  — timestamps as the agent has always seen them
-//   6. import  — one-shot copy of the old sqlite `tokens.db`
+//   4. format  — timestamps as the agent has always seen them
+//   5. import  — one-shot copy of the old sqlite `tokens.db`
 //
 // A separate database rather than tables next to news_items: different
 // lifecycle (small, hot, transactional vs. large and append-mostly), and it
@@ -34,7 +33,7 @@ pub struct Db {
 pub type Client = deadpool_postgres::Object;
 
 impl Db {
-    // Creates the database if missing, migrates it, seeds it.
+    // Creates the database if missing and migrates it.
     pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
         let config = state_config(database_url)?;
         ensure_database(database_url, &config).await?;
@@ -45,11 +44,7 @@ impl Db {
         let db = Self { pool: pg::connect_config(config)? };
         let client = db.client().await?;
         pg::lock(&client, STATE_LOCK).await?;
-        let result = async {
-            migrate(&client).await?;
-            seed_system_tasks(&client).await
-        }
-        .await;
+        let result = migrate(&client).await;
         pg::unlock(&client, STATE_LOCK).await?;
         result?;
         Ok(db)
@@ -231,81 +226,7 @@ async fn migrate(client: &Client) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── 4. seed ──────────────────────────────────────────────────────────────────
-
-const SEEDED_FLAG: &str = "system.seeded_default_tasks";
-
-struct SystemTask {
-    cron: &'static str,
-    // None → fires as a generic `scheduler` signal; the scheduler skill maps
-    // the prompt body to the right composer sub-agent.
-    source: Option<&'static str>,
-    prompt: &'static str,
-}
-
-const SYSTEM_TASKS: &[SystemTask] = &[
-    SystemTask {
-        cron: "0 9 * * *",
-        source: None,
-        prompt: "Daily news-digest tick. Read posts from the user's subscribed \
-                 Telegram channels since the watermark in your session context, \
-                 filter to the four predefined categories (Одеса/Україна, ПМР/Молдова, \
-                 Конфликт РФ-Украина, Мир), and post a topical digest to Telegram.",
-    },
-    SystemTask {
-        cron: "0 8 * * *",
-        source: None,
-        prompt: "Daily tech-digest tick. Compose a personalized IT news digest \
-                 for the user (Hacker News, Habr) and post to Telegram. Query \
-                 the news store via search_news with topics matching the \
-                 interests in the system prompt — the pollers keep it fresh, \
-                 no need to fetch articles.",
-    },
-    SystemTask {
-        cron: "0 4 * * *",
-        source: Some("dreaming"),
-        prompt: "Daily dreaming tick. Review the signals processed since the \
-                 previous dreaming fire (see 'Previous fire' header above) and \
-                 consider whether any skill files deserve an edit based on \
-                 patterns, recurring user feedback, or failure modes you \
-                 observed. Use list_signals(since=<previous fire>) to scope \
-                 the review. Edit skills via write_skill when warranted.",
-    },
-];
-
-// Once per fresh database, guarded by a settings flag rather than row
-// presence: a system task the user cancelled must stay cancelled. An import
-// from the old sqlite file copies that flag along with the tasks.
-async fn seed_system_tasks(client: &Client) -> anyhow::Result<()> {
-    if client.query_opt("SELECT 1 FROM settings WHERE key = $1", &[&SEEDED_FLAG]).await?.is_some() {
-        return Ok(());
-    }
-    client.batch_execute("BEGIN").await?;
-    let seeded = async {
-        for task in SYSTEM_TASKS {
-            client
-                .execute(
-                    "INSERT INTO scheduled_tasks (cron_expr, recurring, prompt, source) VALUES ($1, true, $2, $3)",
-                    &[&task.cron, &task.prompt, &task.source],
-                )
-                .await?;
-        }
-        client.execute("INSERT INTO settings (key, value) VALUES ($1, '1')", &[&SEEDED_FLAG]).await?;
-        anyhow::Ok(())
-    }
-    .await;
-    match seeded {
-        Ok(()) => client.batch_execute("COMMIT").await?,
-        Err(err) => {
-            client.batch_execute("ROLLBACK").await?;
-            return Err(err);
-        }
-    }
-    tracing::info!(count = SYSTEM_TASKS.len(), "seeded system scheduled tasks");
-    Ok(())
-}
-
-// ── 5. format ────────────────────────────────────────────────────────────────
+// ── 4. format ────────────────────────────────────────────────────────────────
 
 // "2026-10-02 09:00:00", UTC — sqlite's datetime('now'), which is what
 // created_at / consumed_at have always looked like to the agent.
@@ -313,7 +234,7 @@ pub fn sql_time(t: DateTime<Utc>) -> String {
     t.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-// ── 6. import ────────────────────────────────────────────────────────────────
+// ── 5. import ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Serialize, PartialEq)]
 pub struct ImportReport {
@@ -451,8 +372,8 @@ pub async fn import_sqlite(db: &Db, sqlite: &Path) -> anyhow::Result<ImportRepor
         .await?;
         report.settings += 1;
     }
-    // The fresh database seeded its own system tasks on connect; the file's
-    // tasks — including any the user cancelled or edited — replace them.
+    // Tasks an older release seeded here on connect give way to the file's
+    // — including any the user cancelled or edited.
     if !tasks.is_empty() {
         tx.execute("DELETE FROM scheduled_tasks", &[]).await?;
     }
@@ -499,18 +420,6 @@ pub async fn import_sqlite(db: &Db, sqlite: &Path) -> anyhow::Result<ImportRepor
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn seeds_system_tasks_once_and_respects_cancellations() {
-        let Some(db) = Db::test().await else { return };
-        let client = db.client().await.unwrap();
-        const COUNT: &str = "SELECT count(*) FROM scheduled_tasks";
-        assert_eq!(client.query_one(COUNT, &[]).await.unwrap().get::<_, i64>(0), 3);
-        client.execute("DELETE FROM scheduled_tasks WHERE source = 'dreaming'", &[]).await.unwrap();
-        migrate(&client).await.unwrap();
-        seed_system_tasks(&client).await.unwrap();
-        assert_eq!(client.query_one(COUNT, &[]).await.unwrap().get::<_, i64>(0), 2);
-    }
 
     #[tokio::test]
     async fn imports_a_ts_era_sqlite_file_once() {
@@ -565,10 +474,7 @@ mod tests {
         assert_eq!((popped.id, popped.created_at.as_str()), (301, "2026-10-02 09:00:00"));
         // Sequences moved past the imported ids.
         assert_eq!(signals.record("x", "y").await.unwrap(), 302);
-        let tasks = crate::scheduler::Scheduler::new(db.clone(), crate::settings::Settings::new(db.clone()))
-            .list_active()
-            .await
-            .unwrap();
+        let tasks = crate::scheduler::Scheduler::new(db.clone()).list_active().await.unwrap();
         assert_eq!(tasks.iter().map(|t| t.id).collect::<Vec<_>>(), [2, 9]);
         assert_eq!(crate::settings::Settings::new(db.clone()).timezone().await, chrono_tz::Europe::Kiev);
     }

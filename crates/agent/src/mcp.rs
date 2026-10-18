@@ -164,7 +164,9 @@ pub type Open = Arc<dyn Fn() -> BoxFuture<'static, anyhow::Result<Client>> + Sen
 
 // MCP tools only the supervisor calls, never offered to a model: an agent
 // loop or a workflow plan blocking on the signal queue would stall its run.
-pub const SUPERVISOR_ONLY_TOOLS: &[&str] = &["wait_for_signal"];
+// `list_scheduled_tasks` is MCP's old schedule, read once to import it; the
+// one a model sees is the agent's own (schedule.rs).
+pub const SUPERVISOR_ONLY_TOOLS: &[&str] = &["wait_for_signal", "list_scheduled_tasks"];
 
 // The tools a model may see and call.
 pub fn model_tools(mcp: &dyn Mcp) -> Vec<ToolDef> {

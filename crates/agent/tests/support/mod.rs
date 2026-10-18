@@ -146,6 +146,7 @@ pub fn fixture(provider: Arc<dyn ChatProvider>, definitions: &[&str], skills: &[
         codex: Arc::new(NoCodex),
         decisions: None,
         workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
+        schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
     });
     Fixture { root, db, skills: store, mcp, engine }
 }
@@ -445,6 +446,7 @@ impl Harness {
             codex: Arc::new(NoCodex),
             decisions: None,
             workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
+            schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
         });
         Harness { engine, session, mcp, persist, model }
     }

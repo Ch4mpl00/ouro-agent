@@ -62,7 +62,7 @@ impl TelegramConfig {
 
 // Lenient by design: a malformed map degrades to "no topics" rather than
 // failing boot, and non-integer ids are dropped.
-fn parse_topics(raw: Option<&str>) -> Vec<(String, i64)> {
+pub fn parse_topics(raw: Option<&str>) -> Vec<(String, i64)> {
     let Some(raw) = raw else { return Vec::new() };
     let Ok(Value::Object(entries)) = serde_json::from_str(raw) else {
         if !raw.trim().is_empty() {

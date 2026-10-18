@@ -169,6 +169,20 @@ impl Signals {
     }
 }
 
+// What a poller records signals into, behind a trait so a test can fail the
+// write.
+#[async_trait::async_trait]
+pub trait SignalSink: Send + Sync {
+    async fn record(&self, source: &str, content: &str) -> anyhow::Result<()>;
+}
+
+#[async_trait::async_trait]
+impl SignalSink for Signals {
+    async fn record(&self, source: &str, content: &str) -> anyhow::Result<()> {
+        Signals::record(self, source, content).await.map(drop)
+    }
+}
+
 // ── 2. env context ───────────────────────────────────────────────────────────
 
 // Attached to every popped signal so the agent knows where to send

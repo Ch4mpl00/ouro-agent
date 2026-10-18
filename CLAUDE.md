@@ -42,11 +42,17 @@ deletion.
 ## How a signal turns into action
 
 1. A poller inside `crates/mcp` fires on its own cadence — Gmail (1 min),
-   Telegram bot getUpdates (long-poll), userbot channels (30 min),
-   scheduler (30s, fires cron rows from `scheduled_tasks`).
+   Telegram bot getUpdates (long-poll), userbot channels (30 min).
 2. When it sees something new, it records a signal (`Signals::record`),
    which inserts a row into the `signals` queue in the `mcp_state` Postgres
-   database.
+   database. Scheduled tasks are the agent's own (`crates/agent/src/schedule.rs`):
+   cron rows in agent.db, a 30 s tick that claims each slot once and hands
+   the fire straight to the supervisor as a `scheduler` (or the task's own
+   source) signal, with the `envContext` a queued signal carries (the agent
+   builds it from the same `TELEGRAM_DEFAULT_CHAT_ID` / `TELEGRAM_TOPICS_JSON`
+   in its own env). Fire ids start above 10⁹, so `scheduler:<id>` never lands
+   on an older MCP signal's trace. The first start imports the tasks MCP held
+   (`list_scheduled_tasks`, kept read-only for that) or seeds the system ones.
 3. The supervisor (`crates/agent/src/supervisor.rs`, composed in `main.rs`)
    loops on `get_next_signal`. With an empty queue it blocks on
    `wait_for_signal`, which MCP answers the moment a poller records a signal
@@ -55,7 +61,7 @@ deletion.
    lose one. `wait_for_signal` is supervisor-only — never offered to a model
    (`agent::mcp::SUPERVISOR_ONLY_TOOLS`). Routing is by source: a `scheduler`
    signal whose payload names a saved workflow (`{"workflow": …}`, set by
-   `schedule_task`) runs its active version (`flows.rs` over `crates/owf`, no
+   `schedule_task(workflow: …)`) runs its active version (`flows.rs` over `crates/owf`, no
    model deciding the steps); other `scheduler` signals run through the
    workflow module (`workflow.rs`: compile → execute); every other source
    runs the primary agent loop (`agent.rs`). A compile failure, or a saved
@@ -116,6 +122,9 @@ mcp-tools/
     │   ├── src/workflow.rs                 dynamic workflows: DSL, variables, compile, execute
     │   ├── src/flows.rs                    saved workflows: store, function catalog, tracing,
     │   │                                   scheduled runs, the authoring tools
+    │   ├── src/durable.rs                  saved workflows' run state: admission, leases, checkpoints
+    │   ├── src/schedule.rs                 scheduled tasks: cron rows, the 30 s tick, the schedule
+    │   │                                   tools, the first start's import
     │   ├── src/agent.rs                    the engine and the ReAct agent loop
     │   ├── src/activity.rs                 traces → ouro/activity journal notes (background
     │   │                                   task inside the supervisor)
@@ -157,7 +166,9 @@ data directory remains under `packages/`, gitignored.
 - **`mcp_state`** (Postgres database next to the news store;
   `crates/mcp/src/db.rs`) — MCP's private state: OAuth tokens and the userbot
   session, Gmail watermarks, the Telegram cursor and chat log, the `signals`
-  queue, `scheduled_tasks`, settings. The server derives it from
+  queue, settings (the user's time zone), and the `scheduled_tasks` MCP
+  fired before the agent owned the schedule, read once by the agent's first
+  start. The server derives it from
   `DATABASE_URL` (same server, database name `mcp_state`;
   `STATE_DATABASE_URL` overrides) and creates + migrates it on boot (versioned
   migrations inline in `db.rs`). It replaced the sqlite `tokens.db`
@@ -165,8 +176,10 @@ data directory remains under `packages/`, gitignored.
   code — go through MCP tools.
 - **`packages/agent/data/agent.db`** (sqlite) — agent's domain state:
   `memory` (freeform KV, e.g. `news_digest.last_read_at`), the local trace
-  mirror (`traces` + per-node `judgements`), `improver_state` and the
-  activity journal's progress. Migrations live in `crates/agent/migrations`
+  mirror (`traces` + per-node `judgements`), `improver_state`, the
+  activity journal's progress, the schedule (`scheduled_tasks`,
+  `scheduled_fires`), saved workflows (`workflows`) and their durable runs
+  (`workflow_runs`, `workflow_records`). Migrations live in `crates/agent/migrations`
   (drizzle's sqlite format and journal, applied on boot by `AgentDb::open`
   under the same race-tolerant boot the TS client had); a new one is a new
   `.sql` file plus a journal entry, and an applied one never changes (a test
@@ -305,8 +318,10 @@ also see them when running `claude` locally with `.mcp.json` registered.
   `doc_history`, `revert_patch`, `journal_append`, `journal_tail`
 - **Signals queue** — `get_next_signal`, `wait_for_signal` (supervisor
   only: blocks until a signal is pending, takes nothing), `list_signals`
-- **Scheduler** — `schedule_task`, `list_scheduled_tasks`,
-  `cancel_scheduled_task`
+- **Scheduler** — `list_scheduled_tasks` (supervisor only: the tasks MCP
+  held, read by the agent's first start). `schedule_task`,
+  `list_scheduled_tasks` and `cancel_scheduled_task` as a model sees them
+  are the agent's synthetic tools (`schedule.rs`).
 - **Env** — `get_timezone`, `set_timezone`
 - **Third-party (via gateway)** — when `gateway.config.json` lists upstreams,
   `gateway.rs` makes own-MCP an MCP *client* to them too and re-exposes

@@ -240,9 +240,21 @@ impl Supervisor {
         *done = true;
     }
     pub async fn run_signal(&self, signal: &PendingSignal) -> anyhow::Result<String> {
-        check(&self.cancel)?;
-        let _active = self.active.acquire().await.map_err(|_| aborted())?;
-        check(&self.cancel)?;
+        self.start(signal).await.unwrap_or_else(|| Err(aborted()))
+    }
+    // Runs `signal` unless the supervisor is stopping, which comes back as
+    // None: nothing of the signal ran, so a scheduled fire can give its slot back.
+    pub async fn start(&self, signal: &PendingSignal) -> Option<anyhow::Result<String>> {
+        if self.cancel.is_cancelled() {
+            return None;
+        }
+        let _active = self.active.acquire().await.ok()?;
+        if self.cancel.is_cancelled() {
+            return None;
+        }
+        Some(self.run_active(signal).await)
+    }
+    async fn run_active(&self, signal: &PendingSignal) -> anyhow::Result<String> {
         let id = format!("{}:{}", signal.source, signal.id);
         let saved = signal.saved_workflow();
         let use_workflow = signal.source == "scheduler" && saved.is_none();

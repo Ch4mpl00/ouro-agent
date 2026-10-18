@@ -125,6 +125,7 @@ fn world(replies: Vec<&str>) -> World {
         codex: Arc::new(NoCodex),
         decisions: None,
         workflows: Arc::new(MemoryWorkflows::default()),
+        schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
     });
     World { engine, mcp, tracer, written, persist }
 }

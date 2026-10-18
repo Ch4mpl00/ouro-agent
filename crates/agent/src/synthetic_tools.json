@@ -264,7 +264,7 @@
     "type": "function",
     "function": {
       "name": "activate_workflow",
-      "description": "Make a saved version of a workflow the one that runs; the version active before retires. Call it ONLY after the user explicitly confirmed this version in the chat. A scheduled task with payload {\"workflow\": name} then runs it without the agent.",
+      "description": "Make a saved version of a workflow the one that runs; the version active before retires. Call it ONLY after the user explicitly confirmed this version in the chat. A task scheduled with schedule_task(workflow: name) then runs it without the agent.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -315,6 +315,73 @@
         },
         "required": [
           "name"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "schedule_task",
+      "description": "Register a cron-driven task. When the cron matches, the agent gets a `scheduler` signal with the given prompt and acts on it (send a Telegram message, run a check, etc). Cron is standard 5-field (minute hour day-of-month month day-of-week) evaluated in the user's configured timezone. For one-shot reminders set `recurring: false` and use a specific cron like '30 14 12 5 *' (14:30 on May 12); the task auto-deactivates after the first fire. For repeating tasks use a generic cron like '0 9 * * *' (every day 9:00). Convert natural-language times into cron syntax before calling this tool. With `workflow`, each fire runs that saved workflow's active version instead of planning the task.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "cron_expr": {
+            "type": "string",
+            "minLength": 1,
+            "description": "5-field cron: minute hour day-of-month month day-of-week."
+          },
+          "recurring": {
+            "type": "boolean",
+            "description": "false: fire once, then retire."
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "description": "What the fire asks the agent to do (the signal's text)."
+          },
+          "workflow": {
+            "type": "string",
+            "minLength": 1,
+            "description": "A saved workflow with an active version to run on each fire."
+          }
+        },
+        "required": [
+          "cron_expr",
+          "recurring",
+          "prompt"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_scheduled_tasks",
+      "description": "Show every task that may still fire — recurring tasks (always) and one-shots that haven't been triggered yet. Each row includes the cron expression, prompt, the saved workflow it runs (if any), last fire time, and the next 1-3 upcoming fire timestamps in the user's timezone for sanity-checking.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "cancel_scheduled_task",
+      "description": "Permanently remove a task by id. Use this when the user says 'forget about that reminder' or 'stop the daily X'. Returns { ok: true, id } on success, { ok: false, id } if no such task.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "id"
         ]
       }
     }

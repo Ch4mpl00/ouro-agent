@@ -275,7 +275,6 @@ mod tests {
             [
                 "add_note",
                 "append_doc",
-                "cancel_scheduled_task",
                 "create_project",
                 "doc_history",
                 "download_gmail_attachment",
@@ -303,7 +302,6 @@ mod tests {
                 "recall",
                 "remember",
                 "revert_patch",
-                "schedule_task",
                 "search_news",
                 "send_telegram_chat_action",
                 "send_telegram_message",

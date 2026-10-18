@@ -319,7 +319,14 @@ fn migration_files_hash_like_drizzle_recorded_them() {
     let hashes: Vec<String> = migrations.iter().map(|m| m.hash[..16].to_owned()).collect();
     assert_eq!(
         hashes,
-        ["8da75a8e64421e83", "d156e1a7e2498f5f", "834b8c53900bee1d", "000d00df8145f548", "183eb6e8b49f84c6"]
+        [
+            "8da75a8e64421e83",
+            "d156e1a7e2498f5f",
+            "834b8c53900bee1d",
+            "000d00df8145f548",
+            "183eb6e8b49f84c6",
+            "c9403db5895dfcf0"
+        ]
     );
     let rust = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
     for migration in &migrations {

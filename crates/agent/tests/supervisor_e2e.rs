@@ -421,6 +421,7 @@ async fn run(plans: &[(i64, Plan)]) -> Run {
         codex: Arc::new(NoCodex),
         decisions: None,
         workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
+        schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
     });
     let known: Vec<String> = skill_store
         .list_skills()

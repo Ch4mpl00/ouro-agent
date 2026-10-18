@@ -283,6 +283,43 @@ async fn an_interrupted_saved_workflow_is_left_to_durable_recovery() {
     assert!(!obs.iter().any(|o| o.name == "recovery"));
     supervisor.shutdown().await;
 }
+// A scheduled fire runs on the supervisor like a queued signal: with the
+// environment note one carries, and its saved workflow when the task names
+// one. A supervisor that is stopping starts nothing: the slot goes back.
+#[tokio::test]
+async fn a_scheduled_fire_runs_as_a_signal_with_mcps_note_and_its_workflow() {
+    use agent::schedule::{FIRST_FIRE_ID, Fire, FireSink, Fired, SupervisorSink};
+    let model = Arc::new(Scripted::new(vec![assistant("done")]));
+    let (f, _, workflow, supervisor) = setup(model.clone(), Stage::Success);
+    let head = "document: { dsl: '1.0.4', namespace: agent, name: w, version: '1.0.0' }\n";
+    let saved = f.engine.deps.workflows.save("w", &format!("{head}do: [ {{ a: {{ set: {{ done: true }} }} }} ]"), None);
+    f.engine.deps.workflows.activate("w", saved.unwrap().version).unwrap();
+    let env_context = agent::session::telegram_env_note(Some("4242"), &[]);
+    let sink = SupervisorSink { supervisor: supervisor.clone(), env_context };
+    let fire = |n: i64, source: &str, workflow: Option<&str>| Fire {
+        id: FIRST_FIRE_ID + n,
+        task_id: n,
+        source: source.into(),
+        content: format!("Scheduled task #{n} fired.\n\nDaily dreaming tick."),
+        workflow: workflow.map(str::to_owned),
+        slot: chrono::Utc::now(),
+    };
+
+    assert_eq!(sink.fire(fire(1, "dreaming", None)).await, Fired::Started);
+    let system = model.seen.lock().unwrap()[0].messages[0]["content"].as_str().unwrap().to_owned();
+    assert!(system.contains("Default Telegram chat id: 4242."), "the note reaches the prompt: {system}");
+    assert!(f.db.get_trace(&format!("dreaming:{}", FIRST_FIRE_ID + 1)).unwrap().is_some());
+
+    assert_eq!(sink.fire(fire(2, "scheduler", Some("w"))).await, Fired::Started);
+    let (_, obs) = f.db.get_trace(&format!("scheduler:{}", FIRST_FIRE_ID + 2)).unwrap().unwrap();
+    assert!(obs.iter().any(|o| o.name == "runner"), "the saved workflow ran");
+    assert_eq!(workflow.called.load(Ordering::SeqCst), 0, "no planner");
+    assert_eq!(model.seen.lock().unwrap().len(), 1, "no model call for the workflow");
+
+    supervisor.shutdown().await;
+    assert_eq!(sink.fire(fire(3, "scheduler", None)).await, Fired::NotStarted);
+    assert!(f.db.get_trace(&format!("scheduler:{}", FIRST_FIRE_ID + 3)).unwrap().is_none());
+}
 #[tokio::test]
 async fn compile_and_replan_failures_fall_back_but_execute_failure_only_recovers() {
     for stage in [Stage::Compile, Stage::Replan, Stage::Execute] {
