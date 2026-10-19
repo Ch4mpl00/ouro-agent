@@ -166,9 +166,7 @@ They are discoverable alongside domain skills rather than loaded by source.
 Ask the agent to save supplied Telegram rules; it writes the live file with
 `routable: true` and a scope paragraph. Discovery includes the channel in its
 context and can find new rules immediately, before the next index refresh.
-Deployment preserves the removed Telegram default as a live skill once on
-upgrade, without replacing existing live rules. Fresh installations can create
-their rules through the agent.
+A fresh installation has none until the agent is asked to save them.
 
 Skills are named after signal sources — one per domain (bills, news digests,
 Telegram chat, scheduled tasks, …) plus a few meta-skills: `orchestrator` (the short discovery prompt),
