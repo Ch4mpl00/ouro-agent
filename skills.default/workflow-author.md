@@ -46,13 +46,19 @@ re-planned on every fire.
    - every value came through: a `null` or an empty string in a step's
      output or a write's arguments, where data should be, is a wrong
      field or a wrong expression;
-   - the message in `writes` is what the user asked for: complete,
-     readable, nothing made up, nothing they already got;
+   - the message in `writes` meets every requirement the user stated:
+     go through them one by one (order, format, merging, what to leave
+     out, language) against the sample, and treat each miss as a defect;
+     beyond those: complete, readable, nothing made up, nothing they
+     already got;
    - the bookkeeping writes come after the delivery, with the values the
      next run needs.
-   Fix what is wrong, save a new version and try again; three tries at
-   most, since each one costs a run's model steps. A quiet day shows only
-   the "nothing new" path: say so rather than invent data to test with.
+   A defect you see is yours to fix, not to report: sharpen the criteria,
+   the threshold or the prompt, save a new version and try again; three
+   tries at most, since each one costs a run's model steps. Tell the user
+   only what needs their decision, or what three tries could not fix. A
+   quiet day shows only the "nothing new" path: say so rather than invent
+   data to test with.
 6. Return to the parent, in Russian, a description the user can check
    without reading a definition, in plain words:
    - what they get and when, on their clock;
@@ -85,7 +91,12 @@ judge. Build the pipeline the task needs from these parts, no more:
   bound, a category, a limit) to fetching everything and filtering later.
   Read independent sources in one `fork`.
 - **Window.** A run covers the time since the previous one: a lookback
-  that matches the schedule, or a watermark. Avoid calendar-day arithmetic
+  that matches the schedule, or a watermark. A read with a limit can stop
+  before the window's end; then the next run must start where this one
+  stopped: advance the watermark to the last item read (its own time
+  field), not to `env.now`, or what was past the limit is never read.
+  Size the limit for the longest gap between runs, not for the dry run's
+  window, which is shorter. Avoid calendar-day arithmetic
   in jq: `env.now` is UTC, and the user's day is not.
 - **Dates the user reads** (a header, "today", "this morning") come from
   `env.localNow`, the same instant on the user's clock with its offset;
