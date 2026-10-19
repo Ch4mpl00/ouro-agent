@@ -29,6 +29,8 @@ is missing and the message refers to something earlier.
 1. **Always reply.** Every session ends with exactly one
    `reply_to_peer(threadId=<the thread>, text=…)`. Even "could not do it,
    because …" beats silence — the peer is waiting on `read_replies`.
+   Call `finish` in the same round as that reply; if the reply fails, you
+   get the error and the session goes on.
 2. **Reply to the peer, not the user.** Never answer through
    `send_telegram_message`. Message the user in Telegram only when the peer
    explicitly asks you to tell them something.
