@@ -419,7 +419,7 @@ volume — written by the `dreaming` skill when it self-revises).
 `read_skill(name)` reads `skills/<name>.md` first, falls back to
 `skills.default/<name>.md`. Naming is signal-source-based:
 
-- `nashdom-bill`, `news-digest`, `tech-digest`, `dreaming`, `scheduler`,
+- `nashdom-bill`, `tech-digest`, `dreaming`, `scheduler`,
   `telegram` — primary domain skills, loaded per signal.source.
 - `routing`, `orchestrator`, `worker` — always loaded on the agent-loop path
   (`worker` is the default skill for a sub-agent with no domain skill).
