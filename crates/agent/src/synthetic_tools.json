@@ -483,5 +483,42 @@
         "additionalProperties": false
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "find_skills",
+      "description": "Discover skills useful for the current request through the agent decision client. Include signal source and delivery channel in context. Independently scores every routable live/default skill from 0 to 1, filters and sorts, then returns names, descriptions, scores and content_hash. Read applicable communication and domain skills with read_skill and expected_hash. New or changed skills use their current first paragraph until the index catches up. Does not execute skills or grant permissions.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000
+          },
+          "context": {
+            "type": "string",
+            "maxLength": 8000
+          },
+          "threshold": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.5
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 10
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false
+      }
+    }
   }
 ]

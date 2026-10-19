@@ -460,6 +460,16 @@ impl AgentLoop {
         span: Arc<dyn Span>,
     ) -> anyhow::Result<String> {
         match name {
+            "find_skills" => {
+                let params: crate::skills::FindSkillsParams = serde_json::from_value(json!(args))?;
+                params.validate()?;
+                let client = engine.deps.decisions.as_deref().ok_or_else(|| anyhow::anyhow!(
+                    "find_skills needs the agent decision client; use list_skills/read_skill while unavailable"
+                ))?;
+                let index = crate::skills::read_skill_index(&*engine.deps.mcp, &self.cancel).await?;
+                let scope: Scope = span;
+                Ok(crate::skills::find_skills(&*engine.deps.skill_store, &index, client, &params, &scope, &self.cancel).await?.to_string())
+            }
             "hash_value" => {
                 let value = args.get("value").ok_or_else(|| anyhow::anyhow!("value is required"))?;
                 Ok(json!({"hash":crate::skills::hash_value(value)}).to_string())

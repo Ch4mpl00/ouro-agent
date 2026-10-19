@@ -19,7 +19,7 @@ use mcp_tools::scheduler::Scheduler;
 use mcp_tools::server::{Deps, HttpOptions, McpTools};
 use mcp_tools::settings::Settings;
 use mcp_tools::signals::Signals;
-use mcp_tools::skills::{JevSkillScorer, SkillCatalog, SkillScorer};
+use mcp_tools::skills::SkillCatalog;
 use mcp_tools::telegram::{TelegramConfig, TelegramModule};
 use mcp_tools::userbot::Userbot;
 use mcp_tools::{fetch, fs, news, pg, telegram, toolsets};
@@ -103,13 +103,6 @@ async fn main() -> anyhow::Result<()> {
         monobank: Monobank::new(http.clone()),
         userbot: Arc::new(userbot.clone()),
         skills: SkillCatalog::new(PathBuf::from("skills"), PathBuf::from("skills.default")),
-        skill_scorer: env("OPEN_ROUTER_API_KEY").map(|key| -> Arc<dyn SkillScorer> {
-            Arc::new(JevSkillScorer::new(
-                http.clone(),
-                key,
-                env("SKILL_SEARCH_MODEL").unwrap_or_else(|| "typesafe/jev-1.13".into()),
-            ))
-        }),
         fetcher: fetcher.clone(),
         files: {
             let cwd = std::env::current_dir()?;

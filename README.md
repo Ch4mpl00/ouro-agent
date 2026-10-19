@@ -186,7 +186,7 @@ run makes no model calls or document writes. Subsequent workflow versions and
 schedule edits survive restarts. The catalog's consumer can verify each stored
 content hash against `skill_catalog_snapshot` before using a description.
 
-The primary loop starts with a short instruction to call MCP `find_skills`
+The primary loop starts with a short instruction to call the agent's `find_skills` tool
 with the current request and brief context, then consult useful candidates
 through `read_skill`. There is no runtime router or routing workflow in front
 of ReAct. Discovery independently scores every routable skill through Jev,
@@ -195,10 +195,13 @@ Unindexed/changed skills use current file descriptions until the index catches
 up. `read_skill` includes patches and can reject a mismatched `expected_hash`.
 The old `routing` skill is no longer loaded by default.
 
-`find_skills` is in the default MCP surface (`skill-search` toolset). Configure
-`OPEN_ROUTER_API_KEY` in the MCP environment; `SKILL_SEARCH_MODEL` optionally
-overrides `typesafe/jev-1.13`. Without a scorer, discovery reports an explicit
-error and the primary can fall back to listing/reading skills itself.
+`find_skills` is a synthetic AgentLoop tool. It reads the local skill catalog,
+loads the description index through MCP memory, and uses the agent's existing
+typed decision client to score candidates. Credentials and model configuration
+belong to the agent (`OPEN_ROUTER_API_KEY`, `AGENT_DECISION_MODEL`, default
+`typesafe/jev-1.13`). MCP only stores/reads the index and exports skill files
+for other clients; it does not run skill discovery. If the agent decision
+client is unavailable, the loop can fall back to `list_skills`/`read_skill`.
 
 ## MCP tools
 
@@ -210,7 +213,7 @@ integration:
 history) · **Telegram userbot** (read-only MTProto channel reading) ·
 **Monobank** (transactions) · **News / RAG** (headlines, article fetch,
 semantic `search_news` over HN + Habr + channel posts) · **PDF / files** ·
-**Skills** (`find_skills`, `list_skills`, `read_skill`) · **Unified memory** (projects of
+**Skills export** (`list_skills`, `read_skill`) · **Unified memory** (projects of
 markdown documents + facts, semantic `recall` across both, versioned
 patch/revert) · **Signals queue** · **Env** (timezone). Scheduled tasks
 (`schedule_task` and the rest) are the agent's own tools.

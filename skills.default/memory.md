@@ -4,32 +4,39 @@ tools: [remember, recall, get_fact, read_doc, update_fact, list_memory, create_p
 
 # Personal knowledge: remember and recall
 
-Личные факты, которые пользователь просит запомнить, живут в базе
-знаний (MCP-инструменты `remember` / `recall`). Это **инлайн**, без
-sub-agent — один вызов инструмента, не редакторская работа.
+Save and retrieve personal facts the user asks you to remember through
+MCP `remember` and `recall`. Handle these requests directly: they normally
+need one tool call rather than a separate worker.
 
-**Запомнить.** Триггеры: "запомни, что …", "запиши …", "заметка: …",
-"не забудь …", "на будущее …".
+## Remember
 
-1. Сформулируй `body` как самодостаточный факт: раскрой местоимения и
-   назови субъект явно ("Лёша платит за интернет 1-го числа", не
-   "платит 1-го"). Если фраза ссылается на прошлый контекст ("запомни
-   это") — используй историю из начального контекста и разверни.
-2. Сам придумай 3–6 коротких тегов в нижнем регистре, по которым потом
-   будешь это искать (люди, темы, объекты): `["роутер","пароль","wifi"]`.
-3. `remember(body=…, tags=[…], source="telegram")`.
-4. Подтверди коротко — "Запомнил ✅" (можно эхо: что именно записал).
+Triggers include "remember that", "write this down", "make a note",
+"do not forget", and "for future reference", in the user's language.
 
-**Вспомнить.** Триггеры: "что ты помнишь про …", "что я записывал про
-…", "напомни …", "что знаешь про …", "какой у меня …", "когда …" —
-когда речь о личном сохранённом факте, а не о новостях.
+1. Make `body` self-contained: resolve pronouns and name the subject.
+   For example, "Alex pays for internet on the first of each month",
+   rather than "pays on the first". Resolve "remember this" against the
+   supplied conversation history.
+2. Choose 3–6 short lowercase retrieval tags covering people, topics,
+   and objects, such as `["router", "password", "wifi"]`.
+3. Call `remember(body=..., tags=[...], source="telegram")`.
+4. Briefly confirm in the user's language; optionally restate the saved fact.
 
-1. `recall(query=<суть вопроса своими словами>)`. Можно добавить
-   `tags=[…]`, если у пользователя явная категория.
-2. При необходимости прочитай найденные ссылки через `get_fact` / `read_doc`. Ответь по сохранённым данным. Если релевантного нет (пусто или
-   явно не про то) — честно скажи, что такого не записано, не выдумывай.
+## Recall
 
-**Заметки vs новости.** "что нового / что пишут про OpenAI" → новостной поиск. "что Я записывал / что ТЫ помнишь про <моё>",
-пароли, кто-кому-платит, адреса, личные предпочтения → база знаний.
-Сомневаешься между «личным» и «новостью» о личном предмете → сначала
-`recall`, и только если пусто — новости.
+Triggers include "what do you remember about", "what did I save",
+"remind me", "what is my", and "when does", when asking about a saved
+personal fact rather than news.
+
+1. Call `recall(query=<the meaning of the question>)`. Add `tags` when
+   the user specifies a clear category.
+2. Follow relevant references with `get_fact` or `read_doc` as needed.
+   Answer from saved evidence. If nothing relevant was saved, say so;
+   do not invent an answer.
+
+## Personal notes versus news
+
+"What is new about OpenAI?" requests news. "What did I save about my...",
+passwords, payment arrangements, addresses, and personal preferences request
+personal knowledge. If a personal subject could mean either, try `recall`
+first and search news only when no relevant personal fact exists.

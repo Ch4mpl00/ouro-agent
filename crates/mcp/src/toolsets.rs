@@ -38,7 +38,6 @@ pub enum Toolset {
     Userbot,
     Scheduler,
     Skills,
-    SkillSearch,
     // Unified memory — shared by every agent, safe to hand out.
     Memory,
     // ask_ouro, read_replies — the peer endpoint's side of a conversation
@@ -49,7 +48,7 @@ pub enum Toolset {
 }
 
 impl Toolset {
-    pub const ALL: [Toolset; 18] = [
+    pub const ALL: [Toolset; 17] = [
         Toolset::Gmail,
         Toolset::Telegram,
         Toolset::TelegramSend,
@@ -64,7 +63,6 @@ impl Toolset {
         Toolset::Userbot,
         Toolset::Scheduler,
         Toolset::Skills,
-        Toolset::SkillSearch,
         Toolset::Memory,
         Toolset::Peer,
         Toolset::PeerReply,
@@ -86,7 +84,6 @@ impl Toolset {
             Toolset::Userbot => "userbot",
             Toolset::Scheduler => "scheduler",
             Toolset::Skills => "skills",
-            Toolset::SkillSearch => "skill-search",
             Toolset::Memory => "memory",
             Toolset::Peer => "peer",
             Toolset::PeerReply => "peer-reply",
@@ -116,7 +113,6 @@ pub const DEFAULT_TOOLSETS: &[Toolset] = &[
     Toolset::Userbot,
     Toolset::Scheduler,
     Toolset::Memory,
-    Toolset::SkillSearch,
     Toolset::PeerReply,
 ];
 
@@ -183,7 +179,6 @@ impl Toolset {
             Toolset::Userbot => McpTools::userbot_tools(),
             Toolset::Scheduler => McpTools::scheduler_tools(),
             Toolset::Skills => McpTools::skills_tools(),
-            Toolset::SkillSearch => McpTools::skill_search_tools(),
             Toolset::Memory => McpTools::memory_tools(),
             Toolset::Peer => McpTools::peer_tools(),
             Toolset::PeerReply => McpTools::peer_reply_tools(),
@@ -288,6 +283,14 @@ mod tests {
     }
 
     #[test]
+    fn skill_discovery_is_not_an_mcp_capability() {
+        assert!(parse_toolsets(Some("skill-search")).is_err());
+        for toolset in Toolset::ALL {
+            assert!(!tool_names(&[toolset]).contains(&"find_skills".to_owned()));
+        }
+    }
+
+    #[test]
     fn the_default_surface_matches_the_ts_server() {
         let all = tool_names(DEFAULT_TOOLSETS);
         assert_eq!(
@@ -302,7 +305,6 @@ mod tests {
                 "fetch_article",
                 "fetch_url",
                 "find_notes",
-                "find_skills",
                 "get_fact",
                 "get_next_signal",
                 "get_peer_thread",

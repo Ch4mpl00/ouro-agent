@@ -1455,23 +1455,24 @@ async fn primary_discovers_and_reads_effective_skill_instructions_in_the_same_lo
         "unused",
         null(),
     );
-    let mcp = ToolMcp::returning(
-        vec![agent::providers::ToolDef::new(
-            "find_skills",
-            "discover",
-            json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}),
-        )],
-        &json!({"skills":[{"name":"domain","score":0.9,"content_hash":hash}]}).to_string(),
-    );
+    struct Scorer;
+    #[async_trait]
+    impl agent::providers::JsonApi for Scorer {
+        async fn post(&self, _: &str, _: Value, _: &CancellationToken) -> anyhow::Result<Value> {
+            Ok(json!({"model":"jev-test","answers":{"skill_0":{"type":"noul","noul":0.9}}}))
+        }
+    }
+    let mcp = ToolMcp::returning(vec![], &json!({"ok":false,"error":"doc_not_found"}).to_string());
     let engine = Arc::get_mut(&mut h.engine).unwrap();
     engine.deps.mcp = mcp.clone();
+    engine.deps.decisions = Some(agent::decisions::decision_client("jev-test".into(), Arc::new(Scorer)));
     engine.deps.skill_store = store;
     engine.deps.skills = vec!["orchestrator".into()];
     let mut opts = h.options();
     opts.skills = vec![];
     let loop_ = h.engine.start_loop(opts).await.unwrap();
     assert_eq!(loop_.send("do domain task".into()).await.unwrap(), "task completed");
-    assert_eq!(mcp.calls.lock().unwrap().iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["find_skills"]);
+    assert_eq!(mcp.calls.lock().unwrap().iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["read_doc"]);
     assert_eq!(h.engine.loop_ids().await.len(), 1, "no worker needed to consult a skill");
     h.engine.shutdown().await;
 }

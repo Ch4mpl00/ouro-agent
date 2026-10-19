@@ -1,45 +1,43 @@
-//! Agent writes and MCP discovery share the live directory, without an index refresh.
-#[path = "../../agent/tests/support/mod.rs"]
+//! Agent-local discovery sees new live rules without an index refresh.
+#[path = "support/mod.rs"]
 mod agent_support;
+use agent::{decisions::decision_client, providers::JsonApi};
 use agent::{mcp::Mcp, providers::ToolDef, skills::FsSkillStore, tracing::NullTracer};
 use agent_support::{Harness, answer, call, calls, last_json, task_context, turn};
 use async_trait::async_trait;
-use mcp_tools::skills::{SkillCandidate, SkillCatalog, SkillScorer, find_skills};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 struct Scorer;
 #[async_trait]
-impl SkillScorer for Scorer {
-    async fn score(&self, query: &str, context: &str, skills: &[SkillCandidate]) -> anyhow::Result<Vec<f64>> {
-        assert_eq!(query, "What's new?");
-        assert!(context.contains("telegram"));
-        let telegram = skills.iter().find(|s| s.name == "telegram").unwrap();
-        assert!(telegram.description.contains("every Telegram message"));
-        Ok(skills.iter().map(|s| if s.name == "telegram" { 0.99 } else { 0.9 }).collect())
+impl JsonApi for Scorer {
+    async fn post(&self, _: &str, body: Value, _: &CancellationToken) -> anyhow::Result<Value> {
+        assert_eq!(body["state"]["current_request"], "What's new?");
+        assert!(body["state"]["context"].as_str().unwrap().contains("telegram"));
+        let skills = body["state"]["skills"].as_array().unwrap();
+        let telegram = skills.iter().find(|s| s["name"] == "telegram").unwrap();
+        assert!(telegram["description"].as_str().unwrap().contains("every Telegram message"));
+        let answers: Map<String, Value> = skills
+            .iter()
+            .enumerate()
+            .map(|(n, s)| (format!("skill_{n}"), json!({"type":"noul","noul":if s["name"]=="telegram"{0.99}else{0.9}})))
+            .collect();
+        Ok(json!({"model":"jev-test","answers":answers}))
     }
 }
 
-struct Discovery(SkillCatalog);
+struct MemoryOnly;
 #[async_trait]
-impl Mcp for Discovery {
+impl Mcp for MemoryOnly {
     fn tools(&self) -> Vec<ToolDef> {
-        vec![ToolDef::new("find_skills", "Discover skills", json!({"type":"object"}))]
+        Vec::new()
     }
     async fn call_tool(&self, name: &str, args: Map<String, Value>, _: &CancellationToken) -> anyhow::Result<String> {
-        assert_eq!(name, "find_skills");
-        Ok(find_skills(
-            &self.0,
-            &json!({}),
-            &Scorer,
-            args["query"].as_str().unwrap(),
-            args["context"].as_str().unwrap(),
-            0.5,
-            10,
-        )
-        .await?
-        .to_string())
+        assert_eq!(name, "read_doc", "discovery must not be delegated to MCP");
+        assert_eq!(args["project"], "agent-system");
+        assert_eq!(args["doc"], "skill-index.md");
+        Ok(json!({"ok":false,"error":"doc_not_found"}).to_string())
     }
 }
 
@@ -101,7 +99,8 @@ async fn primary_saves_live_rules_then_a_new_session_discovers_them_alongside_do
     let engine = Arc::get_mut(&mut h.engine).unwrap();
     engine.deps.skills = vec!["orchestrator".into()];
     engine.deps.skill_store = Arc::new(FsSkillStore::new(root.path()));
-    engine.deps.mcp = Arc::new(Discovery(SkillCatalog::new(live.clone(), defaults.clone())));
+    engine.deps.mcp = Arc::new(MemoryOnly);
+    engine.deps.decisions = Some(decision_client("jev-test".into(), Arc::new(Scorer)));
     let mut opts = h.options();
     opts.skills.clear();
     assert_eq!(

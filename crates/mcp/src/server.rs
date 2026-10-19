@@ -55,7 +55,6 @@ pub struct Deps {
     pub monobank: Monobank,
     pub userbot: SharedAccount,
     pub skills: SkillCatalog,
-    pub skill_scorer: Option<Arc<dyn crate::skills::SkillScorer>>,
     // The SSRF-guarded client behind fetch_url (fetch.rs).
     pub fetcher: crate::fetch::SharedFetch,
     // Which local files read_file / read_pdf may open.
