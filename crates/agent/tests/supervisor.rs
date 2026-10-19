@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 struct ContextMcp {
     calls: Mutex<Vec<(String, Map<String, Value>)>>,
     history: Mutex<Vec<Value>>,
+    thread: Mutex<Vec<Value>>,
     notes: Mutex<Vec<String>>,
     queue: Mutex<VecDeque<Value>>,
     closed: AtomicUsize,
@@ -35,7 +36,7 @@ struct ContextMcp {
 #[async_trait]
 impl Mcp for ContextMcp {
     fn tools(&self) -> Vec<ToolDef> {
-        ["get_timezone", "get_telegram_chat_history", "journal_tail", "t1"]
+        ["get_timezone", "get_telegram_chat_history", "get_peer_thread", "journal_tail", "t1"]
             .iter()
             .map(|n| ToolDef::new(n, n, json!({"type":"object"})))
             .collect()
@@ -65,6 +66,7 @@ impl Mcp for ContextMcp {
         Ok(match name {
             "get_timezone" => json!({"timezone":"Europe/Chisinau"}),
             "get_telegram_chat_history" => json!({"messages":self.history.lock().unwrap().clone()}),
+            "get_peer_thread" => json!({"threadId":3,"messages":self.thread.lock().unwrap().clone()}),
             "journal_tail" => {
                 json!({"entries":self.notes.lock().unwrap().iter().map(|s|json!({"body":s})).collect::<Vec<_>>()})
             }
@@ -85,6 +87,8 @@ fn signal(source: &str, id: i64) -> PendingSignal {
         source: source.into(),
         content: if source == "telegram" {
             "Telegram message in chat -10042 (forum topic thread_id=7).\nText: \"давай\"".into()
+        } else if source == "peer" {
+            PEER_MESSAGE.into()
         } else {
             "do the task".into()
         },
@@ -93,12 +97,17 @@ fn signal(source: &str, id: i64) -> PendingSignal {
         payload: None,
     }
 }
+const PEER_MESSAGE: &str = "Message from peer agent \"claude-code\" (via chatgpt), thread 3:\n\nА умножить на 3?";
+fn peer_message(id: i64, direction: &str, text: &str, at: &str) -> Value {
+    json!({"id":id,"direction":direction,"actor":"chatgpt","from":null,"text":text,"created_at":at})
+}
 fn history(id: i64, text: &str, role: &str, chat: i64, thread: Option<i64>, at: &str) -> Value {
     json!({"id":id,"chat_id":chat,"thread_id":thread,"role":role,"text":text,"created_at":at})
 }
 const SKILLS: &[(&str, &str)] = &[
     ("telegram", "---\ntools: *\n---\nTELEGRAM"),
     ("scheduler", "---\ntools: *\n---\nSCHEDULER"),
+    ("peer", "---\ntools: *\n---\nPEER"),
     ("orchestrator", "---\ntools: []\n---\nORCHESTRATOR"),
     ("routing", "---\ntools: []\n---\nROUTING"),
     ("recovery", "---\ntools: []\n---\nRECOVERY"),
@@ -406,6 +415,42 @@ async fn nontelegram_and_spoofed_headers_do_not_fetch_history() {
             .contains("unavailable")
     );
     assert!(mcp.calls.lock().unwrap().is_empty());
+}
+// A peer signal runs on the parent with its own skill, like Telegram: the
+// thread's earlier turns come before the message, Telegram history never.
+#[tokio::test]
+async fn a_peer_signal_loads_its_skill_and_the_earlier_turns_of_its_thread() {
+    let model = Arc::new(Scripted::new(vec![assistant("done")]));
+    let (_f, mcp, workflow, supervisor) = setup(model.clone(), Stage::Success);
+    mcp.thread.lock().unwrap().extend([
+        peer_message(1, "in", "Сколько будет 2+2?", "2026-09-06 11:59:00"),
+        peer_message(2, "out", "4", "2026-09-06 11:59:30"),
+        peer_message(3, "in", "А умножить на 3?", "2026-09-06 12:00:00"),
+        peer_message(4, "in", "queued later", "2026-09-06 12:00:05"),
+    ]);
+    supervisor.run_signal(&signal("peer", 42)).await.unwrap();
+    assert_eq!(workflow.called.load(Ordering::SeqCst), 0);
+    let seen = model.seen.lock().unwrap().clone();
+    let system = seen[0].messages[0]["content"].as_str().unwrap();
+    assert!(system.contains("PEER"));
+    assert!(!system.contains("Delegate the domain work"));
+    let input = seen[0].messages[1]["content"].as_str().unwrap();
+    assert!(input.contains("Сколько будет 2+2?") && input.contains("\"role\":\"ouro\""), "{input}");
+    assert!(!input.contains("queued later"));
+    assert!(input.ends_with(PEER_MESSAGE));
+    let calls = mcp.calls.lock().unwrap().clone();
+    assert!(calls.iter().any(|(n, a)| n == "get_peer_thread" && a["threadId"] == 3));
+    assert!(calls.iter().any(|(n, _)| n == "journal_tail"));
+    assert!(!calls.iter().any(|(n, _)| n == "get_telegram_chat_history"));
+    supervisor.shutdown().await;
+}
+#[tokio::test]
+async fn a_new_peer_thread_is_the_message_alone() {
+    let mcp = ContextMcp::default();
+    mcp.thread.lock().unwrap().push(peer_message(1, "in", "А умножить на 3?", "2026-09-06 12:00:00"));
+    let signal = signal("peer", 42);
+    let input = prepare_peer_input(&signal, &mcp, &null_scope(), &CancellationToken::new()).await.unwrap();
+    assert_eq!(input, signal.content);
 }
 #[test]
 fn oversized_history_prefers_recent_whole_messages_and_utf8_safe_tail() {

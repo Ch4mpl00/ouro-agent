@@ -23,6 +23,7 @@ use mcp_tools::knowledge::KnowledgeRepository;
 use mcp_tools::memory::{MemoryService, PgMemoryStore};
 use mcp_tools::monobank::Monobank;
 use mcp_tools::news::NewsRepository;
+use mcp_tools::peer::Peer;
 use mcp_tools::pg::{self, PgPool};
 use mcp_tools::scheduler::Scheduler;
 use mcp_tools::server::{Deps, HttpOptions, McpTools};
@@ -57,10 +58,10 @@ pub struct TestDatabase {
 }
 
 impl TestDatabase {
-    pub async fn drop_all(self) {
+    pub async fn drop_all(&self) {
         let Ok(pool) = pg::connect(&self.admin) else { return };
         let Ok(client) = pool.get().await else { return };
-        for name in self.names {
+        for name in &self.names {
             let _ = client.batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")).await;
         }
     }
@@ -239,10 +240,20 @@ async fn serve_overridden(
     let http = reqwest::Client::new();
     let settings = Settings::new(db.clone());
     let signals = Signals::new(db.clone());
+    let peer = Peer::new(db.clone());
     let scheduler = Scheduler::new(db.clone());
+    // Rows another instance on the same database inserts wake this one's
+    // waiters, as in main.rs.
+    tokio::spawn(
+        db.clone().listen(
+            vec![("signals", signals.arrivals()), ("peer_messages", peer.arrivals())],
+            CancellationToken::new(),
+        ),
+    );
     let deps = Arc::new(Deps {
         settings,
         signals: signals.clone(),
+        peer,
         scheduler: scheduler.clone(),
         // No bot token: sending fails as a tool error, nothing leaves the box.
         telegram: TelegramModule::new(telegram.unwrap_or_default(), http.clone(), db.clone()),

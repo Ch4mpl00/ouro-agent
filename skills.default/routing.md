@@ -6,7 +6,7 @@ tools: []
 
 Choose a domain skill for each focused piece of work. The source name is a
 hint, while the user's actual request determines the task. Transport skills
-(`telegram`, `scheduler`) are loaded on the parent; domain skills are loaded
+(`telegram`, `peer`, `scheduler`) are loaded on the parent; domain skills are loaded
 by `invoke_sub_agent`. Use `list_skills` to discover an unfamiliar domain.
 Do not `read_skill` just to delegate: the child loads its named skills.
 

@@ -14,6 +14,7 @@ use mcp_tools::knowledge::KnowledgeRepository;
 use mcp_tools::memory::{MemoryService, PgMemoryStore};
 use mcp_tools::monobank::Monobank;
 use mcp_tools::news::{Habr, HackerNews, NewsProvider, NewsRepository, TelegramChannels};
+use mcp_tools::peer::Peer;
 use mcp_tools::scheduler::Scheduler;
 use mcp_tools::server::{Deps, HttpOptions, McpTools};
 use mcp_tools::settings::Settings;
@@ -66,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
     let news_repo = NewsRepository::new(pool.clone(), embedder.clone());
     let settings = Settings::new(db.clone());
     let signals = Signals::new(db.clone());
+    let peer = Peer::new(db.clone());
     let scheduler = Scheduler::new(db.clone());
     let telegram = TelegramModule::new(TelegramConfig::from_env(), http.clone(), db.clone());
     let gmail = GmailModule::new(db.clone(), http.clone());
@@ -94,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
     let deps = Arc::new(Deps {
         settings,
         signals: signals.clone(),
+        peer: peer.clone(),
         scheduler,
         telegram: telegram.clone(),
         gmail: gmail.clone(),
@@ -129,6 +132,11 @@ async fn main() -> anyhow::Result<()> {
     // tools, not pollers, so they run on every instance.
     background.spawn(telegram.typing.clone().run(cancel.clone()));
     background.spawn(telegram.status.clone().run(cancel.clone()));
+    // Wakes this instance's waiters on rows another instance inserted: the
+    // tunnel's peer messages for the supervisor, its replies for the peer.
+    background.spawn(
+        db.clone().listen(vec![("signals", signals.arrivals()), ("peer_messages", peer.arrivals())], cancel.clone()),
+    );
     if pollers_enabled {
         background.spawn(telegram::run_poller(
             telegram.bot.clone(),

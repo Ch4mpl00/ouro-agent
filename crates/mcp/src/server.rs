@@ -33,6 +33,7 @@ use crate::knowledge::KnowledgeRepository;
 use crate::memory::MemoryService;
 use crate::monobank::Monobank;
 use crate::news::NewsRepository;
+use crate::peer::Peer;
 use crate::scheduler::Scheduler;
 use crate::settings::Settings;
 use crate::signals::Signals;
@@ -47,6 +48,7 @@ use crate::userbot::SharedAccount;
 pub struct Deps {
     pub settings: Settings,
     pub signals: Signals,
+    pub peer: Peer,
     pub scheduler: Scheduler,
     pub telegram: TelegramModule,
     pub gmail: GmailModule,

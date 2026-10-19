@@ -9,7 +9,8 @@
 //   4. memory      — project / document sentences
 //   5. signals     — the queue
 //   6. surface     — the tool list
-//   7. main        — sequential run, a clean database per scenario
+//   7. peers       — a second instance on the same database, its calls and waits
+//   8. main        — sequential run, a clean database per scenario
 //
 //   cargo test --test specs                      (Docker needed for Postgres)
 //   TEST_DATABASE_URL=postgres://… cargo test --test specs
@@ -18,18 +19,22 @@ mod support;
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use cucumber::gherkin::Step;
 use cucumber::writer::Stats as _;
 use cucumber::{World, given, then, when};
 use serde_json::{Value, json};
-use support::{Client, Outcome, Server, connect, start_test_server, test_database};
+use support::{Client, Outcome, Server, TestDatabase, connect, start_test_server, start_test_server_as, test_database};
 
 // ── 1. environment ───────────────────────────────────────────────────────────
 
 // Built once; every scenario talks to the same server and wipes the data
 // before it starts.
 static ENV: OnceLock<Server> = OnceLock::new();
+static DATABASE: OnceLock<TestDatabase> = OnceLock::new();
+// Peer endpoints by actor, started on first use and kept for the run.
+static PEERS: tokio::sync::Mutex<Vec<(String, Server)>> = tokio::sync::Mutex::const_new(Vec::new());
 
 fn env() -> &'static Server {
     ENV.get().expect("environment is set up before the first scenario")
@@ -53,7 +58,7 @@ async fn wipe() -> anyhow::Result<()> {
         .await?
         .batch_execute(
             "TRUNCATE signals, scheduled_tasks, settings, telegram_messages, telegram_kv, gmail_kv,
-                      integration_account RESTART IDENTITY",
+                      integration_account, peer_messages, peer_threads RESTART IDENTITY",
         )
         .await?;
     Ok(())
@@ -65,10 +70,14 @@ async fn wipe() -> anyhow::Result<()> {
 #[world(init = Self::new)]
 struct Spec {
     client: Option<Client>,
+    // A session on the peer endpoint, once a scenario names one.
+    peer: Option<Client>,
     last: Option<Outcome>,
     remembered: HashMap<String, Value>,
     delivered: Vec<i64>,
     queued: Vec<i64>,
+    // A wait's answer and how long after its trigger it came.
+    waited: Option<(Outcome, Duration)>,
 }
 
 impl std::fmt::Debug for Spec {
@@ -79,7 +88,15 @@ impl std::fmt::Debug for Spec {
 
 impl Spec {
     fn new() -> Self {
-        Self { client: None, last: None, remembered: HashMap::new(), delivered: Vec::new(), queued: Vec::new() }
+        Self {
+            client: None,
+            peer: None,
+            last: None,
+            remembered: HashMap::new(),
+            delivered: Vec::new(),
+            queued: Vec::new(),
+            waited: None,
+        }
     }
 
     async fn client(&mut self) -> &Client {
@@ -197,6 +214,7 @@ async fn rejected(spec: &mut Spec) {
 }
 
 #[given(expr = "I remember {string} as {string}")]
+#[when(expr = "I remember {string} as {string}")]
 #[then(expr = "I remember {string} as {string}")]
 async fn remember(spec: &mut Spec, path: String, name: String) {
     let value = at(spec.result(), &path).unwrap_or_else(|| panic!("no `{path}` to remember")).clone();
@@ -314,13 +332,123 @@ async fn offers_tools(spec: &mut Spec, step: &Step) {
     assert_eq!(actual, expected, "the tool surface");
 }
 
-// ── 7. main ──────────────────────────────────────────────────────────────────
+// ── 7. peers ─────────────────────────────────────────────────────────────────
+
+impl Spec {
+    fn peer(&self) -> &Client {
+        self.peer.as_ref().expect("the scenario names a peer endpoint first")
+    }
+
+    async fn peer_call(&mut self, tool: &str, args: Value) -> Outcome {
+        let outcome = support::call(self.peer(), tool, args).await;
+        self.last = Some(outcome.clone());
+        outcome
+    }
+}
+
+// A restricted instance serving `peer`, on the same database as the
+// supervisor's server: its own process state, so nothing it records wakes the
+// other in-process.
+#[given(expr = "a peer endpoint acting as {string}")]
+async fn peer_endpoint(spec: &mut Spec, actor: String) {
+    let mut peers = PEERS.lock().await;
+    if !peers.iter().any(|(a, _)| *a == actor) {
+        let database = DATABASE.get().expect("database is set up");
+        let server = start_test_server_as(database, Some("peer"), &actor).await.expect("peer endpoint starts");
+        peers.push((actor.clone(), server));
+    }
+    let url = &peers.iter().find(|(a, _)| *a == actor).expect("started").1.url;
+    spec.peer = Some(connect(url).await);
+}
+
+#[given(expr = "the peer called {string} with:")]
+#[when(expr = "the peer calls {string} with:")]
+async fn peer_calls_with(spec: &mut Spec, tool: String, step: &Step) {
+    let args = json_arg(spec, step);
+    spec.peer_call(&tool, args).await;
+}
+
+// The wait starts first; the trigger comes a moment later on the other
+// instance. The time that counts is from the trigger's answer to the wait's.
+async fn wait_then_trigger(
+    wait: impl Future<Output = Outcome>,
+    trigger: impl Future<Output = Outcome>,
+) -> (Outcome, Duration) {
+    let wait = async {
+        let outcome = wait.await;
+        (outcome, Instant::now())
+    };
+    let trigger = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let outcome = trigger.await;
+        assert!(matches!(outcome, Outcome::Ok(_)), "the trigger failed: {outcome:?}");
+        Instant::now()
+    };
+    let ((outcome, answered), triggered) = tokio::join!(wait, trigger);
+    (outcome, answered.saturating_duration_since(triggered))
+}
+
+#[when(expr = "the peer waits up to {int} seconds for a reply in thread {word} while I reply {string}")]
+async fn peer_waits_for_reply(spec: &mut Spec, seconds: u64, thread: String, text: String) {
+    let thread: i64 = spec.substitute(&thread).parse().expect("a thread id");
+    spec.client().await;
+    let wait = support::call(spec.peer(), "read_replies", json!({ "threadId": thread, "timeoutMs": seconds * 1000 }));
+    let reply = support::call(
+        spec.client.as_ref().expect("connected"),
+        "reply_to_peer",
+        json!({ "threadId": thread, "text": text }),
+    );
+    spec.waited = Some(wait_then_trigger(wait, reply).await);
+}
+
+#[then(expr = "the peer got {string} within {int} seconds")]
+async fn peer_got(spec: &mut Spec, text: String, seconds: u64) {
+    let (outcome, after) = spec.waited.clone().expect("a wait ran");
+    let Outcome::Ok(value) = &outcome else { panic!("the wait failed: {outcome:?}") };
+    let texts: Vec<&str> =
+        value["replies"].as_array().into_iter().flatten().filter_map(|r| r["text"].as_str()).collect();
+    assert_eq!(texts, [text.as_str()], "the replies the wait returned");
+    assert!(after < Duration::from_secs(seconds), "the reply took {after:?} to reach the waiting peer");
+}
+
+#[when(expr = "the supervisor waits up to {int} seconds for a signal while the peer asks {string}")]
+async fn supervisor_waits(spec: &mut Spec, seconds: u64, text: String) {
+    spec.client().await;
+    let wait = support::call(
+        spec.client.as_ref().expect("connected"),
+        "wait_for_signal",
+        json!({ "timeoutMs": seconds * 1000 }),
+    );
+    let ask = support::call(spec.peer(), "ask_ouro", json!({ "text": text }));
+    spec.waited = Some(wait_then_trigger(wait, ask).await);
+}
+
+#[then(expr = "the wait saw {int} pending signal(s) within {int} seconds")]
+async fn wait_saw(spec: &mut Spec, pending: i64, seconds: u64) {
+    let (outcome, after) = spec.waited.clone().expect("a wait ran");
+    let Outcome::Ok(value) = &outcome else { panic!("the wait failed: {outcome:?}") };
+    assert_eq!(value["pending"].as_i64(), Some(pending), "pending when the wait ended");
+    assert!(after < Duration::from_secs(seconds), "the wait ended {after:?} after the peer asked");
+}
+
+#[then("the peer endpoint offers exactly these tools:")]
+async fn peer_offers_tools(spec: &mut Spec, step: &Step) {
+    let mut expected: Vec<String> = docstring(step).split_whitespace().map(str::to_owned).collect();
+    expected.sort();
+    let mut actual: Vec<String> =
+        spec.peer().list_all_tools().await.expect("tools/list").into_iter().map(|t| t.name.into_owned()).collect();
+    actual.sort();
+    assert_eq!(actual, expected, "the peer endpoint's tool surface");
+}
+
+// ── 8. main ──────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {
     let db = test_database().await;
     let env = start_test_server(&db, None).await.expect("server starts");
     let _ = ENV.set(env);
+    let _ = DATABASE.set(db);
 
     let result = Spec::cucumber()
         // One scenario at a time: they share the server and its database.
@@ -332,7 +460,9 @@ async fn main() {
         .run(concat!(env!("CARGO_MANIFEST_DIR"), "/specs"))
         .await;
     let failed = result.execution_has_failed() || result.parsing_errors() > 0;
-    db.drop_all().await;
+    if let Some(db) = DATABASE.get() {
+        db.drop_all().await;
+    }
     if failed {
         std::process::exit(1);
     }

@@ -72,12 +72,13 @@ deletion.
    - `skills/orchestrator.md` + `skills/routing.md` — always; how to use
      working memory and when to delegate to a domain skill.
    - `skills/<signal.source>.md` (with `skills.default/` fallback) — only for
-     transport sources (`telegram`, `scheduler`); domain work is delegated to
+     transport sources (`telegram`, `peer`, `scheduler`); domain work is delegated to
      a sub-agent with that source's skill.
 4. Plus a session-context block (local time, tz, watermarks) and the signal's
    `envContext` (per-source env addendum, e.g. default Telegram chat id).
    For `telegram` signals the supervisor also preloads recent chat/topic
-   history (`supervisor.rs`) and the latest activity-journal notes before the
+   history (`supervisor.rs`), for `peer` signals the thread's earlier turns,
+   and for both the latest activity-journal notes before the
    first LLM turn.
 5. The signal's `content` is pushed as the first user message. The loop runs;
    every side effect (Telegram reply, DB write) is a tool call.
@@ -110,7 +111,7 @@ mcp-tools/
     │   ├── src/pg.rs                       the news/memory Postgres pool + drizzle-compatible migrator
     │   ├── src/toolsets.rs                 named tool groups (MCP_TOOLSETS scoping)
     │   ├── src/{gmail,telegram,userbot,monobank,scheduler,news,memory,pdf,fs,signals,
-    │   │        settings,skills,knowledge,gateway,embeddings,fetch,eval}.rs
+    │   │        settings,skills,knowledge,gateway,embeddings,fetch,eval,peer}.rs
     │   ├── src/bin/                        CLIs: gmail-auth, userbot-auth, mcp-setup, embed-backfill, …
     │   ├── migrations/pg/                  the Postgres migrations (applied files never change)
     │   ├── gateway.config.json             third-party MCP upstreams (git-tracked, secret-free)
@@ -166,7 +167,7 @@ data directory remains under `packages/`, gitignored.
 - **`mcp_state`** (Postgres database next to the news store;
   `crates/mcp/src/db.rs`) — MCP's private state: OAuth tokens and the userbot
   session, Gmail watermarks, the Telegram cursor and chat log, the `signals`
-  queue, settings (the user's time zone), and the `scheduled_tasks` MCP
+  queue, peer threads (`peer_threads` / `peer_messages`), settings (the user's time zone), and the `scheduled_tasks` MCP
   fired before the agent owned the schedule, read once by the agent's first
   start. The server derives it from
   `DATABASE_URL` (same server, database name `mcp_state`;
@@ -318,6 +319,13 @@ also see them when running `claude` locally with `.mcp.json` registered.
   `doc_history`, `revert_patch`, `journal_append`, `journal_tail`
 - **Signals queue** — `get_next_signal`, `wait_for_signal` (supervisor
   only: blocks until a signal is pending, takes nothing), `list_signals`
+- **Peer messaging** (`peer.rs`) — other agents talk to ouro. `ask_ouro`
+  and `read_replies` (toolset `peer`, the tunnel only) open or continue a
+  thread and long-poll ouro's answer; the message is a `peer` signal, and
+  ouro answers with `reply_to_peer` / reads `get_peer_thread` (`peer-reply`,
+  default surface). A peer is trusted as the user; instances wake each
+  other's waiters through Postgres `LISTEN/NOTIFY` (`db.rs`, wake-ups).
+  Decisions: `.claude/tasks/peer-messaging.md`.
 - **Scheduler** — `list_scheduled_tasks` (supervisor only: the tasks MCP
   held, read by the agent's first start). `schedule_task`,
   `list_scheduled_tasks` and `cancel_scheduled_task` as a model sees them
@@ -334,7 +342,7 @@ also see them when running `claude` locally with `.mcp.json` registered.
 One MCP process serves one audience. `crates/mcp/src/toolsets.rs` holds the
 named toolset → router map (`gmail`, `telegram`, `telegram-send`,
 `monobank`, `pdf`, `fs`, `signals`, `news-read`, `knowledge`, `dreaming`,
-`userbot`, `scheduler`, `skills`, `memory`);
+`userbot`, `scheduler`, `skills`, `memory`, `peer`, `peer-reply`);
 `MCP_TOOLSETS=news-read,telegram-send,skills` makes an instance register only
 those groups. Unset/empty = every group, i.e. the behaviour before scoping
 existed. An unknown name is a boot error.
@@ -537,7 +545,7 @@ as before. Native MCP binds loopback with `MCP_HOST=127.0.0.1`; Postgres
 and Codex publish only on loopback. Neither MCP endpoint is public.
 
 The restricted endpoint keeps `MCP_NO_POLLERS=1`,
-`MCP_TOOLSETS=news-read,telegram-send,skills,memory`, actor `chatgpt`,
+`MCP_TOOLSETS=news-read,telegram-send,skills,memory,peer`, actor `chatgpt`,
 and multi-session transport. The full MCP is actor `supervisor` and owns
 the only Telegram poller. Both share the same PG-backed memory; the
 restricted endpoint reads the same live skills through the state symlink.

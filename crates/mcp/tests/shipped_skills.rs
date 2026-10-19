@@ -75,6 +75,7 @@ fn all_shipped_skills_pass_the_agents_startup_validation_against_prods_mcp_surfa
                 "fetch_url",
                 "find_notes",
                 "get_fact",
+                "get_peer_thread",
                 "get_telegram_chat_history",
                 "get_timezone",
                 "journal_tail",

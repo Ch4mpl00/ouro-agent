@@ -7,10 +7,10 @@ Feature: The tools the agent sees
       """
       add_note append_doc create_project doc_history
       download_gmail_attachment edit_telegram_message fetch_article fetch_url
-      find_notes get_fact get_next_signal get_telegram_chat_history get_timezone
+      find_notes get_fact get_next_signal get_peer_thread get_telegram_chat_history get_timezone
       journal_append journal_tail list_memory list_monobank_transactions list_nashdom_mails list_news
       list_scheduled_tasks list_signals list_userbot_dialogs patch_doc read_doc
-      read_file read_pdf recall remember revert_patch search_news
+      read_file read_pdf recall remember reply_to_peer revert_patch search_news
       send_telegram_chat_action send_telegram_message set_timezone start_typing
       telegram_send_status update_fact wait_for_signal write_doc
       """

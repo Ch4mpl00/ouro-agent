@@ -16,6 +16,7 @@ pub mod memory;
 pub mod monobank;
 pub mod news;
 pub mod pdf;
+pub mod peer;
 pub mod pg;
 pub mod scheduler;
 pub mod server;

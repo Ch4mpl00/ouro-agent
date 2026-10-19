@@ -17,6 +17,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
+use tokio_postgres::GenericClient;
 
 use crate::db::{Db, sql_time};
 use crate::pg::{Query, storable_text, where_clause};
@@ -26,9 +27,10 @@ use crate::time::require_js_date;
 
 // ── 1. queue ─────────────────────────────────────────────────────────────────
 
-// Every signal is recorded by a poller in this process, through `record`,
-// so an in-process notification is enough to wake whoever waits for one;
-// `wait_for_pending` still re-checks the table on its deadline.
+// A signal recorded in this process wakes waiters through `arrived` at once;
+// one another instance recorded (a peer's message on the tunnel) wakes them
+// through the state database's LISTEN (db.rs, wake-ups), which is handed
+// `arrivals`. `wait_for_pending` still re-checks the table on its deadline.
 #[derive(Clone)]
 pub struct Signals {
     db: Db,
@@ -69,17 +71,25 @@ impl Signals {
         Self { db, arrived: Arc::new(Notify::new()) }
     }
 
+    pub fn arrivals(&self) -> Arc<Notify> {
+        self.arrived.clone()
+    }
+
     pub async fn record(&self, source: &str, content: &str) -> anyhow::Result<i64> {
-        let row = self
-            .db
-            .client()
-            .await?
+        let id = Self::insert(&**self.db.client().await?, source, content).await?;
+        self.arrived.notify_waiters();
+        Ok(id)
+    }
+
+    // The insert alone, on any client — for a caller that records a signal
+    // inside its own transaction (peer.rs); waiters wake on its commit.
+    pub async fn insert(client: &impl GenericClient, source: &str, content: &str) -> anyhow::Result<i64> {
+        let row = client
             .query_one(
                 "INSERT INTO signals (source, content) VALUES ($1, $2) RETURNING id",
                 &[&storable_text(source), &storable_text(content)],
             )
             .await?;
-        self.arrived.notify_waiters();
         Ok(row.get(0))
     }
 

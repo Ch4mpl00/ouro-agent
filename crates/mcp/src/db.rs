@@ -8,18 +8,24 @@
 //   1. handle  — `Db`, a cloneable, injected pool on `mcp_state`
 //   2. locate  — which database, and creating it on first boot
 //   3. schema  — versioned migrations under an advisory lock
-//   4. format  — timestamps as the agent has always seen them
-//   5. import  — one-shot copy of the old sqlite `tokens.db`
+//   4. wake-ups — LISTEN for other instances' inserts
+//   5. format  — timestamps as the agent has always seen them
+//   6. import  — one-shot copy of the old sqlite `tokens.db`
 //
 // A separate database rather than tables next to news_items: different
 // lifecycle (small, hot, transactional vs. large and append-mostly), and it
 // can be backed up or moved on its own.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use serde::Serialize;
-use tokio_postgres::Config;
+use tokio::sync::Notify;
+use tokio_postgres::{AsyncMessage, Config, NoTls};
+use tokio_util::sync::CancellationToken;
 
 use crate::pg::{self, PgPool};
 
@@ -28,6 +34,8 @@ use crate::pg::{self, PgPool};
 #[derive(Clone)]
 pub struct Db {
     pool: PgPool,
+    // Kept for the LISTEN connection, which can't be a pooled one.
+    config: Config,
 }
 
 pub type Client = deadpool_postgres::Object;
@@ -41,7 +49,7 @@ impl Db {
     }
 
     async fn open(config: Config) -> anyhow::Result<Self> {
-        let db = Self { pool: pg::connect_config(config)? };
+        let db = Self { pool: pg::connect_config(config.clone())?, config };
         let client = db.client().await?;
         pg::lock(&client, STATE_LOCK).await?;
         let result = migrate(&client).await;
@@ -127,9 +135,10 @@ async fn ensure_database(admin_url: &str, state: &Config) -> anyhow::Result<()> 
 const STATE_LOCK: i64 = 0x006d_6370_5f73_7461; // "mcp_sta"
 
 // Append-only: a change is a new entry, never an edit to an applied one.
-const MIGRATIONS: &[(i32, &str)] = &[(
-    1,
-    r#"
+const MIGRATIONS: &[(i32, &str)] = &[
+    (
+        1,
+        r#"
 -- OAuth / session credentials per integration: Gmail tokens (expires_at is
 -- an ISO string, as googleapis wrote it), the userbot's MTProto session.
 CREATE TABLE integration_account (
@@ -194,7 +203,42 @@ CREATE TABLE signals (
 );
 CREATE INDEX signals_pending ON signals (id) WHERE consumed_at IS NULL;
 "#,
-)];
+    ),
+    (
+        2,
+        r#"
+-- Conversations with other agents (peer.rs): a peer's message is 'in', ouro's
+-- answer 'out'. actor is the instance that wrote the row (MCP_MEMORY_ACTOR);
+-- sender is the name a peer gave itself, a label only.
+CREATE TABLE peer_threads (
+  id         bigserial PRIMARY KEY,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE peer_messages (
+  id         bigserial PRIMARY KEY,
+  thread_id  bigint NOT NULL REFERENCES peer_threads (id),
+  direction  text NOT NULL CHECK (direction IN ('in', 'out')),
+  actor      text NOT NULL,
+  sender     text,
+  text       text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX peer_messages_thread_id ON peer_messages (thread_id, id);
+
+-- An insert notifies the channel named after its table, so a waiter in
+-- another instance wakes at once (section 4).
+CREATE FUNCTION notify_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM pg_notify(TG_TABLE_NAME, '');
+  RETURN NULL;
+END $$;
+CREATE TRIGGER signals_notify AFTER INSERT ON signals
+  FOR EACH STATEMENT EXECUTE FUNCTION notify_insert();
+CREATE TRIGGER peer_messages_notify AFTER INSERT ON peer_messages
+  FOR EACH STATEMENT EXECUTE FUNCTION notify_insert();
+"#,
+    ),
+];
 
 async fn migrate(client: &Client) -> anyhow::Result<()> {
     client
@@ -226,7 +270,65 @@ async fn migrate(client: &Client) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── 4. format ────────────────────────────────────────────────────────────────
+// ── 4. wake-ups ──────────────────────────────────────────────────────────────
+
+// A waiter here (the supervisor's wait_for_signal, a peer's read_replies) must
+// wake on a row another instance inserted — the tunnel's message, the
+// supervisor's reply — which an in-process Notify never hears. The insert
+// triggers NOTIFY the table's channel; this LISTENs on one dedicated
+// connection and wakes the matching Notify. A lost connection is reopened, and
+// every waiter is woken when it is: a notification sent while nobody listened
+// is gone, and a woken waiter re-checks its table anyway.
+impl Db {
+    pub async fn listen(self, channels: Vec<(&'static str, Arc<Notify>)>, cancel: CancellationToken) {
+        while !cancel.is_cancelled() {
+            if let Err(err) = self.listen_once(&channels, &cancel).await {
+                tracing::warn!(error = %format!("{err:#}"), "state LISTEN connection lost");
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+        }
+    }
+
+    async fn listen_once(
+        &self,
+        channels: &[(&'static str, Arc<Notify>)],
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<()> {
+        let (client, mut connection) = self.config.connect(NoTls).await?;
+        // The connection only makes progress while polled, so the LISTEN runs
+        // alongside the loop that drains it.
+        let mut messages = futures::stream::poll_fn(move |cx| connection.poll_message(cx));
+        let sql: String = channels.iter().map(|(name, _)| format!("LISTEN {name};")).collect();
+        let listen = client.batch_execute(&sql);
+        tokio::pin!(listen);
+        let mut listening = false;
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                done = &mut listen, if !listening => {
+                    done?;
+                    listening = true;
+                    channels.iter().for_each(|(_, notify)| notify.notify_waiters());
+                }
+                message = messages.next() => match message {
+                    Some(Ok(AsyncMessage::Notification(n))) => {
+                        if let Some((_, notify)) = channels.iter().find(|(name, _)| *name == n.channel()) {
+                            notify.notify_waiters();
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(err)) => return Err(err.into()),
+                    None => anyhow::bail!("connection closed"),
+                },
+            }
+        }
+    }
+}
+
+// ── 5. format ────────────────────────────────────────────────────────────────
 
 // "2026-10-02 09:00:00", UTC — sqlite's datetime('now'), which is what
 // created_at / consumed_at have always looked like to the agent.
@@ -234,7 +336,7 @@ pub fn sql_time(t: DateTime<Utc>) -> String {
     t.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-// ── 5. import ────────────────────────────────────────────────────────────────
+// ── 6. import ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Serialize, PartialEq)]
 pub struct ImportReport {

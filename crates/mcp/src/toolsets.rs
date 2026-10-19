@@ -40,10 +40,15 @@ pub enum Toolset {
     Skills,
     // Unified memory — shared by every agent, safe to hand out.
     Memory,
+    // ask_ouro, read_replies — the peer endpoint's side of a conversation
+    // with ouro (peer.rs). Never on the supervisor's own server.
+    Peer,
+    // reply_to_peer, get_peer_thread — ouro's side.
+    PeerReply,
 }
 
 impl Toolset {
-    pub const ALL: [Toolset; 15] = [
+    pub const ALL: [Toolset; 17] = [
         Toolset::Gmail,
         Toolset::Telegram,
         Toolset::TelegramSend,
@@ -59,6 +64,8 @@ impl Toolset {
         Toolset::Scheduler,
         Toolset::Skills,
         Toolset::Memory,
+        Toolset::Peer,
+        Toolset::PeerReply,
     ];
 
     pub fn name(self) -> &'static str {
@@ -78,6 +85,8 @@ impl Toolset {
             Toolset::Scheduler => "scheduler",
             Toolset::Skills => "skills",
             Toolset::Memory => "memory",
+            Toolset::Peer => "peer",
+            Toolset::PeerReply => "peer-reply",
         }
     }
 
@@ -104,6 +113,7 @@ pub const DEFAULT_TOOLSETS: &[Toolset] = &[
     Toolset::Userbot,
     Toolset::Scheduler,
     Toolset::Memory,
+    Toolset::PeerReply,
 ];
 
 // ── 2. selection ─────────────────────────────────────────────────────────────
@@ -170,6 +180,8 @@ impl Toolset {
             Toolset::Scheduler => McpTools::scheduler_tools(),
             Toolset::Skills => McpTools::skills_tools(),
             Toolset::Memory => McpTools::memory_tools(),
+            Toolset::Peer => McpTools::peer_tools(),
+            Toolset::PeerReply => McpTools::peer_reply_tools(),
         }
     }
 }
@@ -217,7 +229,8 @@ mod tests {
     // Pins docker-compose's MCP_TOOLSETS for mcp-tunnel exactly. If this list
     // and that env var drift apart, ChatGPT silently gets a surface nobody
     // decided on — in either direction.
-    const TUNNEL: &[Toolset] = &[Toolset::NewsRead, Toolset::TelegramSend, Toolset::Skills, Toolset::Memory];
+    const TUNNEL: &[Toolset] =
+        &[Toolset::NewsRead, Toolset::TelegramSend, Toolset::Skills, Toolset::Memory, Toolset::Peer];
 
     #[test]
     fn exposes_exactly_the_tunnel_surface() {
@@ -225,6 +238,7 @@ mod tests {
             tool_names(TUNNEL),
             [
                 "append_doc",
+                "ask_ouro",
                 "create_project",
                 "doc_history",
                 "fetch_article",
@@ -236,6 +250,7 @@ mod tests {
                 "list_skills",
                 "patch_doc",
                 "read_doc",
+                "read_replies",
                 "read_skill",
                 "recall",
                 "remember",
@@ -284,6 +299,7 @@ mod tests {
                 "find_notes",
                 "get_fact",
                 "get_next_signal",
+                "get_peer_thread",
                 "get_telegram_chat_history",
                 "get_timezone",
                 "journal_append",
@@ -301,6 +317,7 @@ mod tests {
                 "read_pdf",
                 "recall",
                 "remember",
+                "reply_to_peer",
                 "revert_patch",
                 "search_news",
                 "send_telegram_chat_action",

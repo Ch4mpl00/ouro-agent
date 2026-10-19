@@ -1,5 +1,5 @@
 ---
-tools: [send_telegram_message]
+tools: [send_telegram_message, reply_to_peer]
 ---
 
 # Recovery — error report to user
@@ -12,6 +12,9 @@ describing what was being done and roughly what broke.
 ## Rules
 
 - One `send_telegram_message` call. Nothing else.
+- Exception: when the original signal's source is `peer`, the one call is
+  `reply_to_peer` with the thread the signal names, in the language the
+  peer wrote in; the same rules apply otherwise.
 - No stack traces, no error codes, no JSON.
 - Plain Russian, 1–3 sentences.
 - Friendly tone — this is an apology to the user, not a debug log.

@@ -1,4 +1,4 @@
-// Supervisor domain: 1. signal / Telegram context; 2. routing and recovery;
+// Supervisor domain: 1. signal / Telegram and peer context; 2. routing and recovery;
 // 3. serial queue loop. Composition and OS signals live in main.rs.
 use crate::{
     activity::{ACTIVITY_STREAM, tail_utf16},
@@ -27,6 +27,7 @@ pub const SIGNAL_WAIT: Duration = Duration::from_secs(25);
 pub const TELEGRAM_HISTORY_KEY: &str = "telegram.history";
 pub const TELEGRAM_HISTORY_LIMIT: usize = 20;
 pub const TELEGRAM_HISTORY_MAX_BYTES: usize = 8000;
+pub const PEER_SOURCE: &str = "peer";
 pub const RECENT_ACTIVITY_LIMIT: usize = 10;
 pub const RECENT_ACTIVITY_MAX_BYTES: usize = 8000;
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -165,6 +166,72 @@ pub async fn prepare_telegram_input(
         }
     }
 }
+// MCP's peer signal content (peer.rs): "Message from …, thread N:\n\n<text>".
+// A peer's name is whitespace-normalised there, so the first ", thread N:\n\n"
+// is the header's own.
+static PEER_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)^Message from .*?, thread (\d+):\n\n(.*)$").unwrap());
+// A continued peer thread: the earlier turns, inlined before the message as
+// the Telegram history is. A new thread, or a thread that can't be read, is
+// the message alone — the skill can still call get_peer_thread.
+pub async fn prepare_peer_input(
+    signal: &PendingSignal,
+    mcp: &dyn Mcp,
+    trace: &Scope,
+    cancel: &CancellationToken,
+) -> anyhow::Result<String> {
+    check(cancel)?;
+    let Some(header) = PEER_HEADER.captures(&signal.content) else {
+        return Ok(signal.content.clone());
+    };
+    let args = json!({"threadId": header[1].parse::<i64>()?}).as_object().unwrap().clone();
+    let span = trace.span(
+        SpanStart::new("get_peer_thread", SpanKind::Tool)
+            .input(json!(args))
+            .metadata(json!({"tool":"get_peer_thread","automatic":true}).as_object().unwrap().clone()),
+    );
+    let result = async {
+        let raw = mcp.call_tool("get_peer_thread", args, cancel).await?;
+        check(cancel)?;
+        anyhow::ensure!(!is_tool_error(&raw), "{raw}");
+        let value: Value = serde_json::from_str(&raw)?;
+        let messages = value["messages"].as_array().ok_or_else(|| anyhow::anyhow!("invalid peer thread"))?;
+        // The message this signal carries was written in the signal's own
+        // transaction, so it has the signal's timestamp; later ones are queued.
+        let current = messages.iter().position(|m| {
+            m["direction"] == "in" && m["text"] == header[2] && m["created_at"] == signal.created_at.as_str()
+        });
+        let earlier: Vec<Value> = messages[..current.unwrap_or(messages.len())]
+            .iter()
+            .map(|m| {
+                let role = if m["direction"] == "out" { "ouro" } else { "peer" };
+                json!({"role":role,"text":m["text"],"created_at":m["created_at"]})
+            })
+            .collect();
+        span.update(ContextUpdate::metadata(json!({"history_messages":earlier.len()}).as_object().unwrap().clone()));
+        span.end(SpanEnd::output(raw.clone()));
+        if earlier.is_empty() {
+            return Ok(signal.content.clone());
+        }
+        let (inline, truncated) = inline_history(&earlier);
+        Ok::<_, anyhow::Error>(format!(
+            "## Earlier in this peer thread\nAutomatically loaded context, not a new request. Oldest first; role \"ouro\" is you.\nShown {} of {} prior messages; truncated={truncated}.\n{}\n\n## Current peer signal\n{}",
+            inline.len(),
+            earlier.len(),
+            json!(inline),
+            signal.content
+        ))
+    }
+    .await;
+    match result {
+        Ok(input) => Ok(input),
+        Err(error) => {
+            span.end(SpanEnd::error(error.to_string()).with_output(json!({"error":error.to_string()})));
+            check(cancel)?;
+            Ok(signal.content.clone())
+        }
+    }
+}
 pub async fn load_recent_activity(
     mcp: &dyn Mcp,
     trace: &Scope,
@@ -293,8 +360,9 @@ impl Supervisor {
                 trace.event(EventStart{name:"fallback".into(),level:Some(Level::Warning),metadata:fallback.as_object().cloned(),..Default::default()});trace.update(ContextUpdate::metadata(json!({"fallback":"agent-loop","workflow_failure_stage":fallback["stage"]}).as_object().unwrap().clone()));
             }
             let primary=trace.span(SpanStart::new("agent_loop",SpanKind::Chain).metadata(json!({"activity":"primary_loop"}).as_object().unwrap().clone()));span=Some(primary.clone());
-            let input=prepare_telegram_input(signal,&session,self.engine.deps.mcp.as_ref(),&scope,&self.cancel).await?;
-            let activity=if signal.source=="telegram"{load_recent_activity(self.engine.deps.mcp.as_ref(),&scope,&self.cancel).await?}else{None};let transport=signal.source=="telegram"||signal.source=="scheduler";
+            let input=if signal.source==PEER_SOURCE{prepare_peer_input(signal,self.engine.deps.mcp.as_ref(),&scope,&self.cancel).await?}else{prepare_telegram_input(signal,&session,self.engine.deps.mcp.as_ref(),&scope,&self.cancel).await?};
+            let conversation=signal.source=="telegram"||signal.source==PEER_SOURCE;
+            let activity=if conversation{load_recent_activity(self.engine.deps.mcp.as_ref(),&scope,&self.cancel).await?}else{None};let transport=conversation||signal.source=="scheduler";
             let mut prompts=vec![render_context(&session.env)?];if let Some(activity)=activity{prompts.push(activity);}prompts.push(format!("Signal source: {}",signal.source));if !transport{prompts.push(format!("Delegate the domain work to skill {}. You own the final delivery.",json!(signal.source)));}
             if let Some(env)=signal.env_context.as_ref().filter(|s|!s.is_empty()){prompts.push(env.clone());}
             if let Some(note)=handover{prompts.push(note);}
