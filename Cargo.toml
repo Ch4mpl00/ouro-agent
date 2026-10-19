@@ -5,3 +5,12 @@ members = ["crates/mcp", "crates/agent", "crates/codex", "crates/evals", "crates
 # Symbols stripped: the binaries ship to the droplet on every Rust change.
 [profile.release]
 strip = true
+
+# Backtraces keep file:line, but no full debuginfo: every rebuild leaves the
+# previous test binaries in target/debug/deps, and full debuginfo made them
+# the bulk of target/ (27 of 34 GB in one checkout).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
