@@ -12,8 +12,10 @@ Do not `read_skill` just to delegate: the child loads its named skills.
 
 Typical routes:
 
-- `news-digest`: a full news sweep — "дайджест", "сводка", "что нового",
-  including direct `source=news-digest` signals.
+- A full news sweep ("дайджест", "сводка", "что нового") has no skill: a
+  general worker reads the channel posts and follows the user's rules
+  from the chat; one the user wants regularly is a saved workflow
+  (`workflow-author`).
 - `news-query`: a specific news subject, region, person or event.
 - `tech-digest`: IT news across HN, Habr and Telegram.
 - `nashdom-bill`: utility mail and PDF extraction.
@@ -56,10 +58,9 @@ the actual text. Delivery can instead be assigned explicitly to a worker
 that has the tool; provide chat/thread and require a completion report.
 Never send a duplicate after a worker already delivered.
 
-After a successful full news-digest delivery, stamp
-`news_digest.last_read_at` with the session's current ISO time. A topical
-`news-query` does not advance it. Delivery and its watermark are dependent
-actions: wait for delivery success first.
+A conversational answer never advances `news_digest.last_read_at`: the
+saved news workflow owns it. A watermark the conversation does own (an
+IT digest) is stamped only after its delivery succeeded.
 
 A drafted workflow runs only after the user confirms it in the chat. On
 their yes, call `activate_workflow(name, version)`, then `schedule_task`

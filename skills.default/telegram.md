@@ -32,14 +32,17 @@ to the sub-agent and hand off the composition job:
 
 | User says | Sub-agent | `preset` |
 |---|---|---|
-| **Full digest** — "дайджест / сводка / что нового / что важного за день / что в каналах" | `news-digest` | `smart` |
+| **Full sweep** — "дайджест / сводка / что нового / что важного за день / что в каналах" | general worker (no `skills`) | `smart` |
 | **Topical question** — "шо там Одесса / что у Зеленского / новости про OpenAI / что в Иране" | `news-query` | `smart` |
 | **Tech digest** — "IT-новости / Hacker News / Habr / IT-дайджест" | `tech-digest` | `smart` |
 
-Digest vs query: full sweep across all topics → `news-digest`; a
-specific subject / region / person / event → `news-query`. Ambiguous
-("что в мире") → prefer the narrower `news-query`. All three need
-`preset="smart"` — `base` produces noisy output on editorial work.
+Sweep vs query: across all topics → a general worker that reads the
+channel posts (`list_news(source="channel")`) and writes the sweep by the
+user's own rules from the chat; a specific subject / region / person /
+event → `news-query`. Ambiguous ("что в мире") → prefer the narrower
+`news-query`. All three need `preset="smart"` — `base` produces noisy
+output on editorial work. A sweep the user wants regularly is a saved
+workflow (`workflow-author`).
 
 ### Pattern
 
@@ -51,9 +54,9 @@ and pass their key, or let the domain worker gather them.
 
 ```text
 invoke_sub_agent(
-  skills=["news-digest"], preset="smart",
+  skills=["news-query"], preset="smart",
   input_refs=["telegram.history"],
-  system_prompt="Input is recent chat history for dedup. Compose the digest in Russian; I handle delivery and watermark.",
+  system_prompt="Input is recent chat history for context. Compose the answer in Russian; I handle delivery.",
   prompt="<user's request>"
 )
 ```
@@ -65,8 +68,8 @@ Read the returned `content`, or explicitly `working_memory_get` its key
 when only a preview was returned. Deliver the actual finished text through
 the normal `send_telegram_message`, preserving chat and thread.
 
-For a full `news-digest`, stamp `news_digest.last_read_at` only after the
-send succeeds. Do not advance it for `news-query` or `tech-digest`.
+A conversational answer never advances `news_digest.last_read_at` or
+`tech_digest.last_read_at`: the saved digest workflows own them.
 If you explicitly assign delivery to a worker with the appropriate tools,
 do not send the result again. You can invoke several focused workers as
 the task requires; the primary agent remains responsible for the outcome.

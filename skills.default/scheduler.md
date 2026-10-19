@@ -29,8 +29,8 @@ Recurring: yes | no (one-shot)
    хлеб"*, *"check Monobank balance and message me if negative"*).
 
 2. **Does the body map to a digest / delegated skill?** (per `routing.md`
-   table — typical triggers: "сводка новостей / news-digest tick",
-   "IT-новости / tech-digest", "квитанции / nashdom-bill"). If yes, go
+   table — typical triggers: "IT-новости / tech-digest", "квитанции /
+   nashdom-bill"). If yes, go
    to **§3 Delegated path**. Otherwise **§4 Inline path**.
 
 3. **§3 Delegated path.** Fetch chat history if needed for digest dedup:
@@ -43,7 +43,7 @@ Recurring: yes | no (one-shot)
 
    ```text
    invoke_sub_agent(
-     skills=["news-digest"], preset="smart",
+     skills=["tech-digest"], preset="smart",
      input_refs=["<history memory_key>"],
      system_prompt="Input is recent chat history for dedup. Return the finished Russian text; I handle delivery and bookkeeping.",
      prompt="<the scheduled task body>"
@@ -55,8 +55,8 @@ Recurring: yes | no (one-shot)
    useful, passing result keys between them instead of copying payloads.
    Read `content`, or explicitly read its memory key if the result was
    large, then send the finished text with `send_telegram_message`.
-   Only after a successful full news-digest delivery, update
-   `news_digest.last_read_at`. A topical query does not advance it.
+   Only after a successful tech-digest delivery, update
+   `tech_digest.last_read_at`. A topical query does not advance it.
    If delivery was explicitly assigned to a worker, inspect its completion
    report and do not deliver again.
 

@@ -84,7 +84,7 @@ is returned. Use the evidence to compose; the parent handles delivery.
 
 ## Don'ts
 
-- Don't return a 4-category digest — that's `news-digest`'s job.
+- Don't turn a topical question into a multi-section digest.
 - Don't include URLs.
 - Don't repeat the same event from three channels — consolidate.
 - Don't editorialize ("ситуация всё хуже", "тревожный сигнал") — report what

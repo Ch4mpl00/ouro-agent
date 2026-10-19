@@ -114,7 +114,8 @@ Only compose a reply WITHOUT retrieval when the task isn't a retrievable fact
 at all — translate this, draft a greeting, format these numbers, acknowledge
 a reminder. (A generic news sweep — «какие новости / что нового / что
 происходит / новости за сегодня» with NO named subject — is NOT a search:
-that's the news-digest shape below.)
+read the posts with `list_news(source="channel")` and compose from them by
+the task's own rules.)
 
 **Compute with a `code_agent` step, never do math in an `llm_compose`.**
 Anything that must be CALCULATED — exact arithmetic, counting, date/time math,
@@ -243,17 +244,13 @@ You get skill **names** only, not their contents — match by purpose. A
 skill named exactly like `signal.source` is usually its owner. How each
 pipeline is wired lives in the SHAPES below; this is just the routing:
 
-- `news-digest` — the full multi-category sweep: ANY generic news ask
-  with no named subject — «новости / какие новости (за сегодня) / что
-  нового / что происходит / дайджест / сводка / что важного».
 - `tech-digest` — IT/tech digest (YOU search the curated IT topics, a
   `decide` filter keeps the relevant ones, the skill formats — see its
   shape).
 - `news-query` — a question about a SPECIFIC topic / subject / region /
   person / event (the grounding rule above). Compose-only: YOU run
   `search_news` first, the skill judges relevance and writes the reply.
-  No agent. (No subject named → that's the `news-digest` sweep, not a
-  search.)
+  No agent.
 - `nashdom-bill` — parse a utility-bill PDF into a Telegram message.
 - `telegram` — open conversational turns you can't compose deterministically
   (a greeting, chit-chat). NOT for ambiguous-context messages — those
@@ -310,17 +307,6 @@ skill. Inline caps (NO source, stamp) are the easy-to-forget bits.
   fetches. sinceISO: COPY the env **Tech** last-read watermark verbatim —
   never the News one. `search_news` answers `{count, results}`, so the
   filter takes `${hits.results}` — not `.items`, which is `list_news`'s.)
-- **News digest** (scheduler/news-digest tick AND a telegram sweep ask) —
-  exactly this shape (full anchor below):
-  `[list_news(source="channel")] ‖ [journal_tail news-digest] → [decide preset=filter ← the anchor's rules] → [compose:news-digest ← kept posts + previous digests] → [send] → [stamp news_digest.last_read_at] ‖ [journal_append news-digest]`
-  (Copy the filter `prompt` and the compose `prompt` from the anchor
-  verbatim. Compose on `smart`. sinceISO: an explicit period («за сегодня /
-  за день») → the literal boundary per the time-words rule; otherwise COPY
-  the env watermark string verbatim — never re-convert its timezone. A
-  telegram-sourced sweep opens with `start_typing` + the status bubble and
-  clears it after the send; scheduler ticks skip typing/status as usual.
-  The journal stream `news-digest` holds the digests already sent — the
-  composer drops what they covered, and every digest is appended back.)
 - **Topical question** (telegram, about curated news):
   `[start_typing] → [status "🔎 собираю новости"] → [search_news: reformulated topic, NO source] → [status "🧠 готовлю выборку"] → [compose:news-query] → [send: answer] → [status ""]`
   (`status` = `telegram_send_status(id="status:${signal.id}", …)`; same id
@@ -375,31 +361,10 @@ send_telegram_message(chatId=<lit>, text="${reply}")
 terminal
 ```
 
-### Format anchor — news digest
-
-The steps in order (one JSON step per line). Copy both `prompt` strings
-character for character — the filter prompt IS the reader's interest
-profile, the compose prompt assigns the step its role:
-```
-{"kind":"parallel","steps":[
- {"kind":"tool","tool":"list_news","args":{"source":"channel","sinceISO":"<watermark>"},"bind":"posts"},
- {"kind":"tool","tool":"journal_tail","args":{"stream":"news-digest","n":2},"bind":"sent"}]}
-{"kind":"decide","preset":"filter","items":"${posts.items}","bind":"kept",
- "prompt":"items — посты Telegram-каналов. Пропускать в дайджест только то, что влияет на решения, безопасность, деньги или свободу передвижения читателя (живёт в Одессе, ФОП) или на развивающуюся ситуацию вокруг него. Каждый пост оценивается сам по себе: дубли одного события не учитываются. БРАТЬ: ФОП — единый налог, ЕСВ, НДС, группы, лимиты, КВЭДы, отчётность, проверки и штрафы ДПС, законопроекты о ФОП даже в первом чтении. Мобилизация и уклонисты — санкции (счета, авто, выезд, права, ID), бронирование, Резерв+ / Дія, системные изменения ТЦК, штрафы за учёт, прецедентные решения судов. Одесса и Украина — прилёты с реальным ущербом, ограничения света, транспорта, перекрытия, крупные кадровые и законодательные решения. ПМР и Молдова — интеграция ПМР, путь Молдовы в ЕС, военная активность вокруг ПМР, крупные экономические сдвиги. Война РФ–Украина — переговоры и мирные инициативы, существенные изменения на фронте, удары по критической инфраструктуре, новые виды вооружений, санкции с реальным эффектом, важные заявления Зеленского, Путина, Трампа. Мир — решения мировых лидеров с последствиями, крупные геополитические события, эпидемии, научные прорывы (не релизы ИИ-моделей), стихийные бедствия мирового масштаба. ПРОПУСКАТЬ: единичные бытовые происшествия, ДТП, преступления, поодиночные случаи с ТЦК; тактические бои за сёла, «уничтожили N техники», «источники сообщают», «эксперт сказал»; предложения одного нардепа без продвижения, местный колорит; культуру, историю, спорт, развлечения, знаменитостей, курьёзы, погоду; корпоративные новости, IT и релизы ИИ; рекламу, розыгрыши, взаимопиар, филлер. Изолированный случай, который ничего не поменял для читателя, — пропустить."}
-{"kind":"llm_compose","skill":"news-digest","preset":"smart",
- "prompt":"input.posts already passed a relevance filter — every post is worth considering, none is noise to re-screen. input.history is the previous digests already sent, newest first: drop every event they covered unless a post adds a substantive new development, and then report only that development. Apply the skill's categories, significance bar and consolidation (merge posts about the same event into one bullet), then compose the digest message. No posts left → a short quiet-day message.",
- "input":{"posts":"${kept}","history":"${sent.entries}","now":"${env.now}"},"bind":"digest"}
-{"kind":"tool","tool":"send_telegram_message","args":{"chatId":<lit>,"text":"${digest}"}}
-{"kind":"parallel","steps":[
- {"kind":"tool","tool":"set_memory","args":{"key":"news_digest.last_read_at","value":"${env.now}"}},
- {"kind":"tool","tool":"journal_append","args":{"stream":"news-digest","body":"${digest}"}}]}
-{"kind":"terminal"}
-```
-
 ### Format anchor — IT digest
 
-Same structure as the news digest; copy the `queries` and both `prompt`
-strings character for character:
+The steps in order (one JSON step per line); copy the `queries` and both
+`prompt` strings character for character:
 ```
 {"kind":"parallel","steps":[
  {"kind":"tool","tool":"search_news","args":{"queries":["AI model releases and benchmarks from Anthropic, OpenAI, Google DeepMind, DeepSeek, Mistral, xAI, Meta — релиз новой модели","LLM agents: tool use, planning, multi-agent systems, MCP — ИИ-агенты","LLM training and inference: fine-tuning, distillation, RLHF, MoE, quantization, KV cache, speculative decoding","open-weights models, evals and benchmarks of language models","AI coding tools: Cursor, Claude Code, Copilot, Cline, Aider, Codex — ИИ для разработчиков","RAG, vector databases, embeddings, agent frameworks — infrastructure for AI","TypeScript, Node.js and PHP: framework releases, notable libraries","React and Vue: major front-end framework news"],"k":150,"sinceISO":"<tech watermark>"},"bind":"hits"},
@@ -431,8 +396,8 @@ the IT digest anchor — where `k` goes up to 150.
 
 **Never set `source`** — search all sources, channels included — unless
 the user explicitly names a publication (`channel="FT"`). (This rule is
-about `search_news`; the news-digest shape's `list_news(source="channel")`
-is a different, bulk-fetch tool.) For a time-bound ask compute `sinceISO`
+about `search_news`; `list_news(source="channel")` is a different,
+bulk-fetch tool.) For a time-bound ask compute `sinceISO`
 from `env.now`; otherwise omit it (default 24h).
 
 | User says | queries: [...] |
@@ -451,13 +416,11 @@ A genuinely single, narrow topic → a plain `query` string is fine.
 - Delivery is your explicit `send` step (an agent sends only when it owns
   the whole conversational turn).
 - Digest workflows stamp their watermark (and journal) AFTER the send, never in parallel with it; ad-hoc queries don't stamp.
-- News digest: `list_news` ‖ `journal_tail` → `decide:filter` → ONE
-  `compose:news-digest` → send → stamp ‖ `journal_append`, both prompts
-  copied verbatim from its anchor. No `chunks`, no map steps, no chat
-  history.
-- IT digest: the same shape over `search_news` (the anchor's queries,
-  sinceISO = the Tech watermark, filter on `${hits.results}`), stream
-  `tech-digest`.
+- IT digest: `search_news` ‖ `journal_tail` → `decide:filter` → ONE
+  `compose:tech-digest` → send → stamp ‖ `journal_append`, the anchor's
+  queries and both prompts copied verbatim, sinceISO = the Tech
+  watermark, filter on `${hits.results}`, stream `tech-digest`. No
+  `chunks`, no map steps, no chat history.
 - `search_news`: no `source`, ≤8 queries, `k` ≤ 50 (150 only in front of
   a `decide` filter), one step per ask.
 - `llm_compose` with a `skill`: data via `input`, no duplicated prompt.
