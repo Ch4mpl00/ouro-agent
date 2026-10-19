@@ -19,7 +19,8 @@ use serde_json::{Map, Value, json};
 use std::collections::HashSet;
 use std::time::Duration;
 use support::host::{
-    Entry, Known, Options, execute, execute_workflow, hit_limit, is_limit, observed, pretty, try_execute_workflow,
+    Entry, Known, Options, execute, execute_workflow, hit_limit, is_limit, limits, observed, pretty,
+    try_execute_workflow,
 };
 use support::program::{
     Body, Data, Flow, GHOST, Profile, Program, Task, Template, definition, input, list_at, lists, program, task,
@@ -526,7 +527,8 @@ fn a_mutated_definition_parses_validates_and_runs_without_panicking() {
             && run::validate(&wf, &Known).is_ok()
         {
             // Whatever it does, it must not panic; a mutation may wait for days.
-            let opts = Options { limits: Limits { max_tasks: 60, max_attempts: 3 }, ..Options::default() };
+            let opts =
+                Options { limits: Limits { max_tasks: 60, max_attempts: 3, max_sleep: None }, ..Options::default() };
             let _ = try_execute_workflow(&wf, input, &opts);
         }
         Ok(())
@@ -565,7 +567,7 @@ fn the_task_ceiling_reports_a_fault_after_skipped_visits() {
         ]
     }))
     .unwrap();
-    let opts = Options { limits: Limits { max_tasks: 2, max_attempts: 1 }, ..Options::default() };
+    let opts = Options { limits: Limits { max_tasks: 2, max_attempts: 1, max_sleep: None }, ..Options::default() };
     let ran = execute_workflow(&wf, json!({ "n": 1 }), &opts);
     assert!(hit_limit(&ran.outcome));
     assert!(ran.journal.iter().any(|e| matches!(e, Entry::Faulted { error, .. } if is_limit(error))));
@@ -593,6 +595,27 @@ fn interrupted_children_close_before_their_parent() {
         let ran = execute_workflow(&wf, json!({ "n": 0 }), &Options::default());
         well_formed(&ran.journal, &ran.outcome.status).unwrap();
     }
+}
+
+#[test]
+fn a_sleep_ceiling_cuts_waits_and_retry_delays() {
+    let wf = model::parse(json!({
+        "document": { "dsl": "1.0.0", "namespace": "test", "name": "sleeps", "version": "0.1.0" },
+        "do": [
+            { "pause": { "wait": { "hours": 1 } } },
+            { "retried": {
+                "try": [ { "fail": { "raise": { "error": { "type": "https://example.com/failure", "status": 503 } } } } ],
+                "catch": { "retry": { "delay": { "minutes": 10 }, "limit": { "attempt": { "count": 3 } } } }
+            } }
+        ]
+    }))
+    .unwrap();
+    let uncut = execute_workflow(&wf, json!({}), &Options::default());
+    assert!(uncut.elapsed >= Duration::from_secs(3600 + 600), "{:?}", uncut.elapsed);
+    let opts = Options { limits: Limits { max_sleep: Some(Duration::ZERO), ..limits() }, ..Options::default() };
+    let cut = execute_workflow(&wf, json!({}), &opts);
+    assert_eq!(cut.elapsed, Duration::ZERO);
+    assert_eq!(observed(&cut.outcome), observed(&uncut.outcome));
 }
 
 #[test]

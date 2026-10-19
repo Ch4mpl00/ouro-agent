@@ -426,5 +426,28 @@
         ]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "try_workflow",
+      "description": "Dry-run a saved workflow version once, now, as a scheduled fire would run it: reads and model steps run for real on today's data, while every write (a message, a watermark, a journal entry) is only recorded with its arguments, so nothing changes. Returns the steps with their outputs, the writes it would have made and how the run ended.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "version": {
+            "type": "integer",
+            "description": "The version to run; the latest saved one by default."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
   }
 ]

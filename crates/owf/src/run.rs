@@ -146,11 +146,14 @@ pub struct Limits {
     pub max_tasks: usize,
     /// Attempts per `try`, the first included, whatever the policy says.
     pub max_attempts: u32,
+    /// The longest a `wait` or a retry delay sleeps (a dry run's `ZERO`);
+    /// `None`: as long as the definition says.
+    pub max_sleep: Option<Duration>,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_tasks: 10_000, max_attempts: 10 }
+        Self { max_tasks: 10_000, max_attempts: 10, max_sleep: None }
     }
 }
 
@@ -1365,6 +1368,7 @@ impl Run<'_> {
     }
 
     async fn sleep(&self, d: Duration, key: &str) -> Result<(), Fault> {
+        let d = self.host.limits.max_sleep.map_or(d, |max| d.min(max));
         if self.journal.is_some() {
             let deadline_ms = match self.record(key) {
                 Some(Record::Timer { deadline_ms }) => deadline_ms,

@@ -433,6 +433,48 @@ async fn the_author_sees_the_functions_and_probes_only_reads() {
     assert!(cut.len() < 7_000 && cut.contains("20000 characters in all"), "{}", cut.len());
 }
 
+// A dry run runs a draft's reads and model steps on the session's input and
+// only records its writes: nothing is sent, no watermark moves, and a wait
+// does not sleep.
+#[tokio::test]
+async fn a_dry_run_records_the_writes_and_changes_nothing() {
+    use agent::flows::try_draft;
+    let w = world(vec!["Today: Rust 2.0"]);
+    let draft = DIGEST.replace("do:\n", "do:\n  - pause: { wait: PT1H }\n");
+    w.engine.deps.workflows.save("digest", &draft, None).unwrap();
+    let env = task_context("author").env.clone();
+    let cancel = CancellationToken::new();
+    let trace = w.tracer.trace(TraceStart { id: "author".into(), name: "t".into(), ..Default::default() });
+    let scope: Scope = trace.clone();
+    let args = |v: Value| v.as_object().unwrap().clone();
+    let reply = try_draft(&w.engine, &args(json!({"name": "digest"})), &env, &scope, &cancel).await.unwrap();
+    trace.end();
+    let reply: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!((reply["status"].as_str(), reply["version"].as_i64()), (Some("completed"), Some(1)), "{reply}");
+
+    assert_eq!(w.calls().iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["search_news"], "only the read ran");
+    assert!(w.persist.0.lock().unwrap().is_empty(), "no watermark moved");
+    let writes: Vec<(&str, &str)> = reply["writes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| (w["function"].as_str().unwrap(), w["task"].as_str().unwrap()))
+        .collect();
+    assert_eq!(writes, [("send_telegram_message", "/do/3/send"), ("set_memory", "/do/4/mark")]);
+    assert_eq!(reply["writes"][0]["arguments"]["text"], "Today: Rust 2.0");
+    let compose = reply["steps"].as_array().unwrap().iter().find(|s| s["task"] == "/do/2/compose").unwrap();
+    assert_eq!(compose["output"], "Today: Rust 2.0");
+    let observations = w.written.all().pop().unwrap().observations;
+    let run = named(&observations, "dry-run");
+    assert_eq!(run.metadata.as_ref().unwrap()["workflow"], "digest");
+    assert_eq!(named(&observations, "call:search").parent_observation_id.as_deref(), Some(run.id.as_str()));
+
+    assert!(try_draft(&w.engine, &args(json!({"name": "nope"})), &env, &scope, &cancel).await.is_err());
+    w.engine.deps.workflows.save("digest", &DIGEST.replace("call: search_news", "call: search_web"), None).unwrap();
+    let invalid = try_draft(&w.engine, &args(json!({"name": "digest"})), &env, &scope, &cancel).await;
+    assert!(invalid.unwrap_err().to_string().contains("search_web"));
+}
+
 #[tokio::test]
 async fn a_workflow_sends_to_the_chat_its_input_names() {
     use agent::session::{EnvData, session};

@@ -167,7 +167,7 @@ impl Default for Options {
 
 /// Small enough that a cycle ends fast, large enough for real programs.
 pub fn limits() -> Limits {
-    Limits { max_tasks: 60, max_attempts: 3 }
+    Limits { max_tasks: 60, max_attempts: 3, max_sleep: None }
 }
 
 #[derive(Debug)]

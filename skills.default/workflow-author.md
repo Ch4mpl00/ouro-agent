@@ -38,15 +38,41 @@ re-planned on every fire.
    `save_workflow(name, definition)`. It checks the definition against the
    language, the functions and their argument names. Fix every reported
    problem and save again until it is accepted.
-5. Return to the parent, in Russian: what the workflow does step by step,
-   which calls change something (the reply's `calls` with
-   `effect: "write"`), what it does when there is nothing new, the schedule
-   you propose, and the name and version. Do not activate and do not
-   schedule: the user confirms first, and the parent does both after they
-   agree.
+5. Try it: `try_workflow(name)` runs the saved draft now, on today's data,
+   as a scheduled fire would, except that its writes are only recorded.
+   Read the report as the user would live with it:
+   - it ended `completed`, along the path you meant (which steps ran,
+     which were skipped);
+   - every value came through: a `null` or an empty string in a step's
+     output or a write's arguments, where data should be, is a wrong
+     field or a wrong expression;
+   - the message in `writes` is what the user asked for: complete,
+     readable, nothing made up, nothing they already got;
+   - the bookkeeping writes come after the delivery, with the values the
+     next run needs.
+   Fix what is wrong, save a new version and try again; three tries at
+   most, since each one costs a run's model steps. A quiet day shows only
+   the "nothing new" path: say so rather than invent data to test with.
+6. Return to the parent, in Russian, a description the user can check
+   without reading a definition, in plain words:
+   - what they get and when, on their clock;
+   - where it comes from, named the way the user knows it, not by
+     function names;
+   - how it picks what matters, what it does when there is nothing new,
+     and what it changes besides sending (what it remembers between
+     runs);
+   - the message the dry run would have sent, quoted as it is, as a
+     sample ("Вот что пришло бы сейчас: …"), or that today was
+     quiet;
+   - anything the user should know or decide (a source that was empty,
+     a choice you made for them).
+   No definition, YAML, JSON, function names or task paths. End with one
+   line for the parent: the workflow's name, its version and the cron
+   you propose. Do not activate and do not schedule: the user confirms
+   first, and the parent does both after they agree.
 
 To change a workflow: `read_workflow`, edit, `save_workflow` (a new
-version), and the same confirmation. Schedules name the workflow, not a
+version), and the same dry run and confirmation. Schedules name the workflow, not a
 version, so they run whatever version is active.
 
 ## Designing one

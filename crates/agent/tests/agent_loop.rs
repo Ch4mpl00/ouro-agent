@@ -1222,8 +1222,9 @@ async fn workers_receive_refs_and_isolated_history_and_cannot_delegate() {
     assert!(obs.iter().any(|o| o.name == "iter-0" && o.parent_observation_id.as_deref() == Some(&worker.id)));
     f.engine.shutdown().await;
 }
-// The workflow-author worker alone is offered the function catalog and the
-// probe: every other loop would pay for their schemas on every turn.
+// The workflow-author worker alone is offered the function catalog, the
+// probe and the dry run: every other loop would pay for their schemas on
+// every turn. It runs on `smart` at least, whatever preset the parent left.
 #[tokio::test]
 async fn only_the_workflow_author_is_offered_the_catalog_and_the_probe() {
     let model = Arc::new(Scripted::new(vec![
@@ -1240,10 +1241,12 @@ async fn only_the_workflow_author_is_offered_the_catalog_and_the_probe() {
     loop_.send("go".into()).await.unwrap();
     let seen = model.seen.lock().unwrap().clone();
     let offered = |i: usize, name: &str| seen[i].tools.iter().any(|t| t.name == name);
-    assert!(!offered(0, "workflow_functions") && !offered(0, "probe_function"), "the parent");
+    let author_tools = ["workflow_functions", "probe_function", "try_workflow"];
+    assert!(author_tools.iter().all(|t| !offered(0, t)), "the parent");
     assert!(offered(0, "search_news"), "the parent keeps its MCP tools");
-    assert!(offered(1, "workflow_functions") && offered(1, "probe_function"), "the author");
+    assert!(author_tools.iter().all(|t| offered(1, t)), "the author");
     assert!(!offered(1, "search_news"), "no MCP tool of its own");
+    assert_eq!(seen[1].model, default_presets().smart.model, "the author runs on smart");
     drop(seen);
     f.engine.shutdown().await;
 }

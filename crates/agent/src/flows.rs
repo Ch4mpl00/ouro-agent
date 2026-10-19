@@ -823,14 +823,20 @@ pub const TOOLS: &[&str] = &["save_workflow", "activate_workflow", "list_workflo
 
 // The workflow-author worker's own tools (`workflow-author` skill, which
 // takes no MCP tools of its own): the functions a workflow can call, one
-// line each or one in full, and a run of one read function, so that a
-// definition is built from a real reply without the worker being able to
-// change anything while it explores.
-pub const AUTHOR_TOOLS: &[&str] = &["workflow_functions", "probe_function"];
+// line each or one in full, a run of one read function, and a dry run of a
+// saved draft, so that a definition is built from real replies and checked
+// on real data without the worker being able to change anything.
+pub const AUTHOR_TOOLS: &[&str] = &["workflow_functions", "probe_function", "try_workflow"];
 
 // What a probe returns at most: enough to see a reply's shape, never a
 // whole store.
 const PROBE_MAX_CHARS: usize = 6000;
+
+// A dry run's report: each step's output cut to this, at most this many
+// steps, and the whole run stopped after this long.
+const DRY_STEP_MAX_CHARS: usize = 1500;
+const DRY_MAX_STEPS: usize = 80;
+const DRY_RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 fn effect_name(mcp: &dyn Mcp, wf: &owf::model::Workflow, function: &str) -> &'static str {
     match effect(mcp, function) {
@@ -872,7 +878,7 @@ pub fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::R
                 .collect();
             Ok(json!({
                 "ok": true, "name": name, "version": saved.version, "status": "draft", "calls": calls,
-                "next": "Show the user what it will do, the write calls above all, and activate this version only after they confirm it in the chat.",
+                "next": "Dry-run it (try_workflow) before the user sees it, then describe in words what it will do, the write calls above all; activate this version only after they confirm it in the chat.",
             })
             .to_string())
         }
@@ -1032,4 +1038,176 @@ pub async fn probe(engine: &Engine, args: &Map<String, Value>, cancel: &Cancella
         let head: String = raw.chars().take(PROBE_MAX_CHARS).collect();
         format!("{head}\n… [cut: {total} characters in all; the shape above is the whole reply's]")
     })
+}
+
+fn cut(value: &Value, max: usize) -> Value {
+    let text = match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let total = text.chars().count();
+    if total <= max {
+        return value.clone();
+    }
+    let head: String = text.chars().take(max).collect();
+    Value::String(format!("{head}… [cut: {total} characters in all]"))
+}
+
+// A dry run's catalog: reads and model steps run as in a scheduled run;
+// a write is recorded with its arguments and answered with a stub instead.
+struct DryRun {
+    functions: Functions,
+    writes: Mutex<Vec<Value>>,
+}
+
+const DRY_WRITE_REPLY: &str = r#"{"ok":true,"dryRun":true}"#;
+
+impl DryRun {
+    fn intercept(&self, name: &str, args: &Value, reference: &str) -> Option<Value> {
+        (effect(&*self.functions.engine.deps.mcp, name) == Some(Effect::Write)).then(|| {
+            let write = json!({"task": reference, "function": name, "arguments": args});
+            self.writes.lock().unwrap_or_else(|e| e.into_inner()).push(write);
+            serde_json::from_str(DRY_WRITE_REPLY).expect("the stub reply")
+        })
+    }
+}
+
+#[async_trait]
+impl owf::run::Functions for DryRun {
+    fn effect(&self, name: &str) -> Option<Effect> {
+        owf::run::Functions::effect(&self.functions, name)
+    }
+
+    async fn invoke(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
+        match self.intercept(name, &args, info.reference) {
+            Some(stub) => Ok(stub),
+            None => owf::run::Functions::invoke(&self.functions, name, args, info).await,
+        }
+    }
+
+    async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError> {
+        match self.intercept(name, &args, info.reference) {
+            Some(stub) => Ok(stub),
+            None => owf::run::Functions::call(&self.functions, name, args, info).await,
+        }
+    }
+}
+
+// The steps a dry run reports, besides tracing them: the tasks that do
+// something (`call`, `set`, `raise`, `wait`) with their outputs, the skipped
+// ones, faults and retries. A container's output repeats its children's.
+struct DrySteps {
+    spans: Arc<Spans>,
+    kinds: Mutex<HashMap<String, &'static str>>,
+    steps: Mutex<Vec<Value>>,
+    omitted: std::sync::atomic::AtomicUsize,
+}
+
+impl Observer for DrySteps {
+    fn event(&self, event: &Event<'_>) {
+        self.spans.event(event);
+        let kind = |reference: &str| self.kinds.lock().unwrap_or_else(|e| e.into_inner()).get(reference).copied();
+        let step = match event {
+            Event::TaskStarted { reference, kind, .. } => {
+                self.kinds.lock().unwrap_or_else(|e| e.into_inner()).insert(reference.to_string(), *kind);
+                return;
+            }
+            Event::TaskCompleted { reference, output } => match kind(reference) {
+                Some(kind @ ("call" | "set" | "raise" | "wait")) => {
+                    json!({"task": reference, "kind": kind, "output": cut(output, DRY_STEP_MAX_CHARS)})
+                }
+                _ => return,
+            },
+            Event::TaskSkipped { reference, .. } => json!({"task": reference, "skipped": true}),
+            Event::TaskFaulted { reference, error } => json!({"task": reference, "error": error.to_string()}),
+            Event::TaskRetrying { reference, attempt, error, .. } => {
+                json!({"task": reference, "retry": attempt, "error": error.to_string()})
+            }
+            Event::TaskSuspended { .. } => return,
+        };
+        let mut steps = self.steps.lock().unwrap_or_else(|e| e.into_inner());
+        if steps.len() < DRY_MAX_STEPS {
+            steps.push(step);
+        } else {
+            self.omitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// `try_workflow`: runs a saved version (the latest by default) once on the
+/// session's input, as a scheduled fire would, except that nothing changes:
+/// every write is recorded and answered with a stub, waits and retry delays
+/// don't sleep, and nothing is journaled. Returns the steps, the writes it
+/// would have made and how it ended.
+pub async fn try_draft(
+    engine: &Arc<Engine>,
+    args: &Map<String, Value>,
+    env: &crate::session::EnvData,
+    scope: &Scope,
+    cancel: &CancellationToken,
+) -> anyhow::Result<String> {
+    let name = args.get("name").and_then(Value::as_str).filter(|n| !n.is_empty());
+    let name = name.ok_or_else(|| anyhow::anyhow!("name: Expected nonempty string"))?;
+    let version = match args.get("version") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            Some(v.as_i64().filter(|v| *v > 0).ok_or_else(|| anyhow::anyhow!("version: Expected positive integer"))?)
+        }
+    };
+    let saved =
+        engine.deps.workflows.get(name, version)?.ok_or_else(|| anyhow::anyhow!("no saved workflow `{name}`"))?;
+    let wf = check(&*engine.deps.mcp, &saved.definition).map_err(anyhow::Error::msg)?;
+    let signal = WorkflowSignal { id: 0, source: "scheduler".into(), content: String::new(), env_context: None };
+    let input = Value::Object(signal_input(&signal, env));
+    let root = scope.span(
+        SpanStart::new("dry-run", SpanKind::Chain)
+            .input(input.clone())
+            .metadata(metadata(json!({"workflow":name,"workflow_version":saved.version,"engine":"owf"}))),
+    );
+    let spans = Arc::new(Spans { root: root.clone(), open: Mutex::default() });
+    let functions = Arc::new(DryRun {
+        functions: Functions { engine: engine.clone(), spans: spans.clone() },
+        writes: Mutex::default(),
+    });
+    let steps =
+        Arc::new(DrySteps { spans, kinds: Mutex::default(), steps: Mutex::default(), omitted: Default::default() });
+    let host = Host {
+        functions: functions.clone(),
+        observer: steps.clone(),
+        clock: Arc::new(SystemClock),
+        limits: Limits { max_sleep: Some(std::time::Duration::ZERO), ..Limits::default() },
+        runtime: json!({"name":"agent-supervisor","version":env!("CARGO_PKG_VERSION")}),
+    };
+    let stop = cancel.child_token();
+    let execution = owf::run::run(&host, &wf, "dry-run", input, &stop);
+    tokio::pin!(execution);
+    let mut timed_out = false;
+    let outcome = tokio::select! {
+        outcome = &mut execution => outcome,
+        _ = tokio::time::sleep(DRY_RUN_TIMEOUT) => {
+            timed_out = true;
+            stop.cancel();
+            execution.await
+        }
+    };
+    let (status, output, error) = match &outcome.status {
+        RunStatus::Completed(output) => ("completed", cut(output, DRY_STEP_MAX_CHARS), Value::Null),
+        RunStatus::Faulted(error) | RunStatus::Interrupted(error) => ("faulted", Value::Null, json!(error)),
+        RunStatus::Cancelled if timed_out => ("timed_out", Value::Null, Value::Null),
+        RunStatus::Cancelled => anyhow::bail!("cancelled"),
+        RunStatus::Waiting { .. } => ("waiting", Value::Null, Value::Null),
+    };
+    root.end(match &outcome.status {
+        RunStatus::Completed(output) => SpanEnd::output(output.clone()),
+        _ => SpanEnd::error(status),
+    });
+    let writes = std::mem::take(&mut *functions.writes.lock().unwrap_or_else(|e| e.into_inner()));
+    let report = std::mem::take(&mut *steps.steps.lock().unwrap_or_else(|e| e.into_inner()));
+    let omitted = steps.omitted.load(std::sync::atomic::Ordering::Relaxed);
+    Ok(json!({
+        "name": name, "version": saved.version, "status": status, "error": error, "output": output,
+        "steps": report, "omitted_steps": omitted, "writes": writes,
+        "note": format!("A dry run: reads and model steps ran for real on today's data; nothing changed. Each write above was recorded, not made, and answered with {DRY_WRITE_REPLY}, so a step that reads a write's reply saw that stub. Waits and retry delays did not sleep."),
+    })
+    .to_string())
 }

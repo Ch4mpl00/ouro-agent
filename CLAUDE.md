@@ -424,8 +424,10 @@ volume — written by the `dreaming` skill when it self-revises).
 - `routing`, `orchestrator`, `worker` — always loaded on the agent-loop path
   (`worker` is the default skill for a sub-agent with no domain skill).
 - `planner` — the workflow compiler's system prompt (scheduler signals).
-- `workflow-author` — a worker skill: drafts a saved workflow with
-  `save_workflow`; the parent activates it once the user confirms.
+- `workflow-author` — a worker skill (on `smart` at least): drafts a saved
+  workflow with `save_workflow`, dry-runs it with `try_workflow` (real reads
+  and model steps, writes only recorded) and describes it in words with a
+  sample; the parent activates it once the user confirms.
 - `recovery` — spawned on a failed signal to phrase the failure to the user.
 
 The improver (`crates/evals`) writes an append-only overlay at

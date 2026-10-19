@@ -524,6 +524,10 @@ impl AgentLoop {
             name if crate::flows::TOOLS.contains(&name) => crate::flows::tool(engine, name, args),
             "workflow_functions" => crate::flows::functions(engine, args),
             "probe_function" => crate::flows::probe(engine, args, &self.cancel).await,
+            "try_workflow" => {
+                let scope: crate::tracing::Scope = span;
+                crate::flows::try_draft(engine, args, &self.opts.session.env, &scope, &self.cancel).await
+            }
             name if crate::schedule::TOOLS.contains(&name) => {
                 let tz = &self.opts.session.env.timezone;
                 let (store, workflows) = (&*engine.deps.schedule, &*engine.deps.workflows);
@@ -571,7 +575,12 @@ impl AgentLoop {
         opts.skills = if skills.is_empty() { vec!["worker".into()] } else { skills };
         opts.allow_skill_writes = self.opts.allow_skill_writes && opts.skills.iter().any(|s| s == "dreaming");
         opts.include_engine_skills = false;
-        opts.preset = preset;
+        // A workflow is written in a language the cheap preset gets wrong:
+        // the author never runs below `smart`.
+        opts.preset = match preset {
+            PresetName::Base if opts.skills.iter().any(|s| s == "workflow-author") => PresetName::Smart,
+            preset => preset,
+        };
         opts.max_iterations = iterations;
         opts.parent_id = Some(self.opts.id.clone());
         opts.session_id = self.opts.session_id.clone();
