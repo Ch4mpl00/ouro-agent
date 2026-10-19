@@ -833,10 +833,13 @@ pub const AUTHOR_TOOLS: &[&str] = &["workflow_functions", "probe_function", "try
 // whole store.
 const PROBE_MAX_CHARS: usize = 6000;
 
-// A dry run's report: each step's output cut to this, at most this many
-// steps, and the whole run stopped after this long.
-const DRY_STEP_MAX_CHARS: usize = 1500;
-const DRY_MAX_STEPS: usize = 80;
+// A dry run's report, small enough to come back whole: each step's output
+// cut to this, at most this many steps and path entries, a write's argument
+// cut to that; the whole run stopped after this long.
+const DRY_STEP_MAX_CHARS: usize = 400;
+const DRY_MAX_STEPS: usize = 40;
+const DRY_MAX_PATH: usize = 120;
+const DRY_WRITE_MAX_CHARS: usize = 5000;
 const DRY_RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 fn effect_name(mcp: &dyn Mcp, wf: &owf::model::Workflow, function: &str) -> &'static str {
@@ -846,6 +849,70 @@ fn effect_name(mcp: &dyn Mcp, wf: &owf::model::Workflow, function: &str) -> &'st
         None if wf.uses.functions.iter().any(|(n, _)| n == function) => "function",
         None => "unknown",
     }
+}
+
+// Flows that are legal but usually a mistake, for the author: a task a jump
+// leads to that also runs right after the task before it, because that one
+// does not jump (a "nothing new" text after the real one overwrites it).
+// A shared tail does this on purpose, so it is a warning, not a problem.
+pub fn warnings(wf: &owf::model::Workflow) -> Vec<String> {
+    use owf::model::{Flow, Kind, Task, TaskList};
+    fn jumps_to(task: &Task, target: &str) -> bool {
+        let goto = |flow: &Flow| matches!(flow, Flow::Goto(t) if t == target);
+        task.then.as_ref().is_some_and(goto)
+            || match &task.kind {
+                Kind::Switch(cases) => cases.iter().any(|(_, case)| goto(&case.then)),
+                Kind::Try { catch, .. } => catch.then.as_ref().is_some_and(goto),
+                _ => false,
+            }
+    }
+    fn falls_through(task: &Task) -> bool {
+        match &task.kind {
+            Kind::Raise(_) => false,
+            Kind::Switch(cases) => {
+                cases.iter().any(|(_, case)| case.then == Flow::Continue)
+                    || !cases.iter().any(|(_, c)| c.when.is_none())
+            }
+            _ => matches!(task.then, None | Some(Flow::Continue)),
+        }
+    }
+    fn list(tasks: &TaskList, at: &str, out: &mut Vec<String>) {
+        for (i, (name, task)) in tasks.iter().enumerate() {
+            if let Some((previous, before)) = i.checked_sub(1).map(|j| (&tasks[j].0, &tasks[j].1)) {
+                let from: Vec<&str> =
+                    tasks.iter().filter(|(n, t)| n != previous && jumps_to(t, name)).map(|(n, _)| n.as_str()).collect();
+                if !from.is_empty() && falls_through(before) {
+                    out.push(format!(
+                        "{at}/{i}/{name}: a jump from `{}` leads here, and it also runs right after `{previous}`, which does not jump; if it belongs to another branch, end `{previous}` with `then:` the task that should follow it",
+                        from.join("`, `")
+                    ));
+                }
+            }
+            inner(task, &format!("{at}/{i}/{name}"), out);
+        }
+    }
+    // The lists inside a task; a fork's branches run side by side, so only
+    // what each one holds.
+    fn inner(task: &Task, at: &str, out: &mut Vec<String>) {
+        match &task.kind {
+            Kind::Do(tasks) | Kind::For { tasks, .. } => list(tasks, &format!("{at}/do"), out),
+            Kind::Try { tasks, catch } => {
+                list(tasks, &format!("{at}/try"), out);
+                if let Some(handler) = &catch.tasks {
+                    list(handler, &format!("{at}/catch/do"), out);
+                }
+            }
+            Kind::Fork { branches, .. } => {
+                for (j, (branch, task)) in branches.iter().enumerate() {
+                    inner(task, &format!("{at}/fork/branches/{j}/{branch}"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    list(&wf.tasks, "/do", &mut out);
+    out
 }
 
 pub fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::Result<String> {
@@ -877,11 +944,15 @@ pub fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::R
                 .into_iter()
                 .map(|c| json!({"reference":c.reference,"function":c.function,"effect":effect_name(mcp, &wf, &c.function)}))
                 .collect();
-            Ok(json!({
+            let mut reply = json!({
                 "ok": true, "name": name, "version": saved.version, "status": "draft", "calls": calls,
                 "next": "Dry-run it (try_workflow) before the user sees it, then describe in words what it will do, the write calls above all; activate this version only after they confirm it in the chat.",
-            })
-            .to_string())
+            });
+            let warnings = warnings(&wf);
+            if !warnings.is_empty() {
+                reply["warnings"] = json!(warnings);
+            }
+            Ok(reply.to_string())
         }
         "activate_workflow" => {
             let name = text("name")?;
@@ -1094,26 +1165,43 @@ impl owf::run::Functions for DryRun {
     }
 }
 
-// The steps a dry run reports, besides tracing them: the tasks that do
+// What a dry run reports, besides tracing it: the path (every task that
+// started, by name, in order; skipped ones marked), and the tasks that do
 // something (`call`, `set`, `raise`, `wait`) with their outputs, the skipped
 // ones, faults and retries. A container's output repeats its children's.
+#[derive(Default)]
+struct DryReport {
+    kinds: HashMap<String, &'static str>,
+    path: Vec<String>,
+    steps: Vec<Value>,
+    omitted: usize,
+}
+
 struct DrySteps {
     spans: Arc<Spans>,
-    kinds: Mutex<HashMap<String, &'static str>>,
-    steps: Mutex<Vec<Value>>,
-    omitted: std::sync::atomic::AtomicUsize,
+    report: Mutex<DryReport>,
 }
 
 impl Observer for DrySteps {
     fn event(&self, event: &Event<'_>) {
         self.spans.event(event);
-        let kind = |reference: &str| self.kinds.lock().unwrap_or_else(|e| e.into_inner()).get(reference).copied();
+        let mut report = self.report.lock().unwrap_or_else(|e| e.into_inner());
+        let mut walk = |step: String| {
+            if report.path.len() < DRY_MAX_PATH {
+                report.path.push(step);
+            }
+        };
+        match event {
+            Event::TaskStarted { reference, kind, .. } if *kind != "do" => walk(task_name(reference).to_owned()),
+            Event::TaskSkipped { reference, .. } => walk(format!("{} (skipped)", task_name(reference))),
+            _ => {}
+        }
         let step = match event {
             Event::TaskStarted { reference, kind, .. } => {
-                self.kinds.lock().unwrap_or_else(|e| e.into_inner()).insert(reference.to_string(), *kind);
+                report.kinds.insert(reference.to_string(), *kind);
                 return;
             }
-            Event::TaskCompleted { reference, output } => match kind(reference) {
+            Event::TaskCompleted { reference, output } => match report.kinds.get(*reference).copied() {
                 Some(kind @ ("call" | "set" | "raise" | "wait")) => {
                     json!({"task": reference, "kind": kind, "output": cut(output, DRY_STEP_MAX_CHARS)})
                 }
@@ -1126,11 +1214,10 @@ impl Observer for DrySteps {
             }
             Event::TaskSuspended { .. } => return,
         };
-        let mut steps = self.steps.lock().unwrap_or_else(|e| e.into_inner());
-        if steps.len() < DRY_MAX_STEPS {
-            steps.push(step);
+        if report.steps.len() < DRY_MAX_STEPS {
+            report.steps.push(step);
         } else {
-            self.omitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            report.omitted += 1;
         }
     }
 }
@@ -1170,8 +1257,7 @@ pub async fn try_draft(
         functions: Functions { engine: engine.clone(), spans: spans.clone() },
         writes: Mutex::default(),
     });
-    let steps =
-        Arc::new(DrySteps { spans, kinds: Mutex::default(), steps: Mutex::default(), omitted: Default::default() });
+    let steps = Arc::new(DrySteps { spans, report: Mutex::default() });
     let host = Host {
         functions: functions.clone(),
         observer: steps.clone(),
@@ -1202,13 +1288,25 @@ pub async fn try_draft(
         RunStatus::Completed(output) => SpanEnd::output(output.clone()),
         _ => SpanEnd::error(status),
     });
-    let writes = std::mem::take(&mut *functions.writes.lock().unwrap_or_else(|e| e.into_inner()));
-    let report = std::mem::take(&mut *steps.steps.lock().unwrap_or_else(|e| e.into_inner()));
-    let omitted = steps.omitted.load(std::sync::atomic::Ordering::Relaxed);
-    Ok(json!({
+    let writes: Vec<Value> = std::mem::take(&mut *functions.writes.lock().unwrap_or_else(|e| e.into_inner()))
+        .into_iter()
+        .map(|mut write| {
+            if let Some(Value::Object(args)) = write.get_mut("arguments") {
+                args.values_mut().for_each(|v| *v = cut(v, DRY_WRITE_MAX_CHARS));
+            }
+            write
+        })
+        .collect();
+    let report = std::mem::take(&mut *steps.report.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut reply = json!({
         "name": name, "version": saved.version, "status": status, "error": error, "output": output,
-        "steps": report, "omitted_steps": omitted, "writes": writes,
+        "path": report.path, "steps": report.steps, "omitted_steps": report.omitted, "writes": writes,
         "note": format!("A dry run: reads and model steps ran for real on today's data; nothing changed. Each write above was recorded, not made, and answered with {DRY_WRITE_REPLY}, so a step that reads a write's reply saw that stub. Waits and retry delays did not sleep."),
-    })
-    .to_string())
+        "next": "Check the path, every write's arguments and the message against each thing the user asked for. Anything wrong or questionable is yours to fix: change the definition, save a new version and try it again (three tries in all) before you report. Report only what needs the user's decision.",
+    });
+    let warnings = warnings(&wf);
+    if !warnings.is_empty() {
+        reply["warnings"] = json!(warnings);
+    }
+    Ok(reply.to_string())
 }

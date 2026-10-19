@@ -226,6 +226,47 @@ fn definitions_are_checked_against_what_the_agent_can_call() {
     assert!(model.contains("`llm_compose` takes no argument `skills`"), "{model}");
 }
 
+// A task a jump leads to that also runs after a task that does not jump is
+// flagged; the same branch ended with `then`, or a shared tail reached from
+// the task before it, is not.
+#[test]
+fn a_jump_target_that_a_task_falls_into_is_a_warning() {
+    let definition = |compose_then: &str| {
+        format!(
+            r#"
+document: {{ dsl: '1.0.4', namespace: agent, name: digest, version: '1.0.0' }}
+do:
+  - route:
+      switch:
+        - quiet: {{ when: '${{ . == [] }}', then: quiet_text }}
+        - busy: {{ then: compose }}
+  - compose:
+      set: '${{ "digest" }}'{compose_then}
+  - quiet_text:
+      set: '${{ "nothing new" }}'
+      then: send
+  - send:
+      fork:
+        branches:
+          - inner:
+              do:
+                - a: {{ set: '${{ 1 }}', if: '${{ false }}', then: c }}
+                - b: {{ set: '${{ 2 }}' }}
+                - c: {{ set: '${{ 3 }}' }}
+"#
+        )
+    };
+    let parse = |text: &str| owf::model::parse_yaml(text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+    let warned = agent::flows::warnings(&parse(&definition("")));
+    assert_eq!(warned.len(), 2, "{warned:?}");
+    assert!(
+        warned[0].starts_with("/do/2/quiet_text: a jump from `route` leads here") && warned[0].contains("`compose`")
+    );
+    assert!(warned[1].starts_with("/do/3/send/fork/branches/0/inner/do/2/c: a jump from `a`"), "{}", warned[1]);
+    let fixed = agent::flows::warnings(&parse(&definition("\n      then: send")));
+    assert_eq!(fixed.len(), 1, "only the nested one is left: {fixed:?}");
+}
+
 // ── runs ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -464,6 +505,8 @@ async fn a_dry_run_records_the_writes_and_changes_nothing() {
     assert_eq!(reply["writes"][0]["arguments"]["text"], "Today: Rust 2.0");
     let compose = reply["steps"].as_array().unwrap().iter().find(|s| s["task"] == "/do/2/compose").unwrap();
     assert_eq!(compose["output"], "Today: Rust 2.0");
+    assert_eq!(reply["path"], json!(["pause", "search", "compose", "send", "mark"]));
+    assert!(reply["next"].as_str().unwrap().contains("fix"), "{reply}");
     let observations = w.written.all().pop().unwrap().observations;
     let run = named(&observations, "dry-run");
     assert_eq!(run.metadata.as_ref().unwrap()["workflow"], "digest");

@@ -17,12 +17,12 @@ re-planned on every fire.
    which data, how often, and what counts as new or relevant. Ask the
    parent back only when a choice would change what the user gets.
 2. Find what you will build on. `workflow_functions` lists every function
-   a workflow can call; `workflow_functions(name)` shows one in full.
-   `list_skills` shows the skills; read the ones that hold rules for this
-   kind of task (categories, tone, prompts already tuned for it) and reuse
-   them rather than inventing your own. This skill is already loaded, and
-   skills that steer the agent itself (routing, transports) hold nothing a
-   workflow runs: skip them.
+   a workflow can call; `workflow_functions(name)` shows one in full. The
+   user's ask is the whole specification: every rule they gave (what to
+   take, what to drop, the order, the format, the tone) goes into the
+   definition itself, word for word where it matters. Do not build on
+   other skills, and use `llm_compose`'s `skill` only for one the user
+   names.
 3. Call every read function the workflow will call with `probe_function`,
    with the arguments the workflow will pass, and build each expression from
    the fields you saw in the reply. Do not skip this: `save_workflow`
@@ -37,12 +37,16 @@ re-planned on every fire.
 4. Design it with the principles below, write the definition and call
    `save_workflow(name, definition)`. It checks the definition against the
    language, the functions and their argument names. Fix every reported
-   problem and save again until it is accepted.
+   problem and save again until it is accepted; a `warnings` list in the
+   accepted reply names flows that are legal but usually a mistake: fix
+   them too unless you meant exactly that.
 5. Try it: `try_workflow(name)` runs the saved draft now, on today's data,
    as a scheduled fire would, except that its writes are only recorded.
    Read the report as the user would live with it:
-   - it ended `completed`, along the path you meant (which steps ran,
-     which were skipped);
+   - it ended `completed`, and its `path` is the one you meant: every
+     task that ran, in order; a task of another branch in it (the "nothing
+     new" text after the real one) means a task falls through into the
+     next;
    - every value came through: a `null` or an empty string in a step's
      output or a write's arguments, where data should be, is a wrong
      field or a wrong expression;
@@ -52,8 +56,10 @@ re-planned on every fire.
      beyond those: complete, readable, nothing made up, nothing they
      already got;
    - the bookkeeping writes come after the delivery, with the values the
-     next run needs.
-   A defect you see is yours to fix, not to report: sharpen the criteria,
+     next run needs: after a read with a limit, the watermark is the last
+     item read, not `env.now`.
+   A defect you see is yours to fix, not to report, and so is anything
+   you would call questionable (a noisy selection, a split event): sharpen the criteria,
    the threshold or the prompt, save a new version and try again; three
    tries at most, since each one costs a run's model steps. Tell the user
    only what needs their decision, or what three tries could not fix. A
@@ -107,8 +113,9 @@ judge. Build the pipeline the task needs from these parts, no more:
   under `news_digest.last_read_at` / `tech_digest.last_read_at`; any other
   key `set_memory` writes cannot be read back by a workflow. For anything
   else, keep a journal stream named after the workflow: `journal_append`
-  what you delivered, `journal_tail` it at the start, and let the model
-  steps leave out what it already covers.
+  what you delivered (the real text, never a "nothing new" note),
+  `journal_tail` it at the start, and let the model steps leave out what
+  it already covers.
 - **Selection.** Many items of which some matter → `filter_relevant` with
   the criteria spelled out (what to take, what to drop). It judges each
   item on its own, so it cannot tell that two items report the same
@@ -119,10 +126,11 @@ judge. Build the pipeline the task needs from these parts, no more:
   (`[.rows[] | select(.value < 0) | .value] | add`), never a model step: a
   model adds cost and can miscount. Hand the model the computed numbers and
   let it only write the text.
-- **Synthesis.** Text for a person → `llm_compose`, with a skill that holds
-  this kind of text's rules when there is one. Pass the data in `input`,
-  keep the prompt to what this run adds. `preset: smart` for what the user
-  reads, `base` for mechanical reshaping.
+- **Synthesis.** Text for a person → `llm_compose`. A model step sees its
+  prompt and its `input`, nothing else: not this conversation, not the
+  user's messages, not other steps. Write the user's rules for the text
+  into its prompt in full, and pass the data in `input`. `preset: smart`
+  for what the user reads, `base` for mechanical reshaping.
 - **Delivery.** `send_telegram_message` to
   `$workflow.input.env.telegramChatId` unless the user named another chat;
   never write a chat id into the definition.
@@ -221,16 +229,16 @@ prompt: |
 
 Data flow: each task's output is the next task's input. The workflow's
 input is `{ env: { timezone, now, localNow, newsLastReadAt,
-techLastReadAt, userEmail, telegramChatId }, signal: { source, content, id
-} }`, available
-everywhere as `$workflow.input`. Keep a result for later tasks with
+techLastReadAt, userEmail, telegramChatId }, signal: { source, content,
+id } }`, available everywhere as `$workflow.input`. Keep a result for later tasks with
 `export: { as: '${ $context + { name: . } }' }` and read `$context.name`.
 
 Functions besides the ones `workflow_functions` lists from the tools:
 
-- `llm_compose { skill?, prompt?, input?, preset? }` — one generation with
-  that skill; `input` is an object shown to the model as tagged sections;
-  `preset` is `base` (default), `smart` or `smartest`. Returns the reply,
+- `llm_compose { skill?, prompt?, input?, preset? }` — one generation
+  (with `skill`'s instructions when one is named); `input` is an object
+  shown to the model as tagged sections; `preset` is `base` (default),
+  `smart` or `smartest`. Returns the reply,
   parsed when it is JSON.
 - `filter_relevant { items, prompt, threshold? }` — keeps the items of the
   array that pass the rules in `prompt`. Not a chat model: a classifier

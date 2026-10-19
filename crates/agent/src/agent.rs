@@ -411,7 +411,9 @@ impl AgentLoop {
                 return Err(error);
             }
         };
-        let presented = if call.name.starts_with("working_memory_") {
+        // A dry run's report is bounded and read whole: storing it would
+        // only cost a turn to read it back.
+        let presented = if call.name.starts_with("working_memory_") || call.name == "try_workflow" {
             raw.clone()
         } else {
             let stored = store_tool_result(&self.opts.session.memory, &raw);

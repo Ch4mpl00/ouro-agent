@@ -487,7 +487,10 @@ impl Parser {
         } else if let Some(s) = m.get("set") {
             self.only(m, at, &[COMMON, &["set"]].concat());
             if !(s.is_object() || s.as_str().is_some_and(|t| expr::strip(t).is_some())) {
-                self.fail(&format!("{at}/set"), "expected an object or a `${ … }` expression");
+                self.fail(
+                    &format!("{at}/set"),
+                    "expected an object or a `${ … }` expression (a fixed text is `set: '${ \"…\" }'`)",
+                );
             }
             Some(Kind::Set(s.clone()))
         } else if let Some(s) = m.get("switch") {
