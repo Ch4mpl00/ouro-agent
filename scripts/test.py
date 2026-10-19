@@ -9,6 +9,10 @@
 #   scripts/test.py                  # everything
 #   scripts/test.py -p mcp-tools     # passed through to cargo (packages, …)
 #   TEST_JOBS=4 scripts/test.py      # how many binaries at once (default 6)
+#   TARGET_LIMIT_GB=40 scripts/test.py  # clean target/ above this (default 25)
+#
+# Every rebuild leaves the previous test binaries behind in target/debug/deps,
+# so target/ only grows; past the limit the run starts with `cargo clean`.
 #
 # Isolation: each test file takes its own fresh database in the shared test
 # Postgres (crates/mcp/tests/support/container.rs), and servers bind free
@@ -26,6 +30,18 @@ ROOT = Path(__file__).resolve().parent.parent
 LOGS = ROOT / "target" / "test-logs"
 TIMES = LOGS / "times.json"
 JOBS = int(os.environ.get("TEST_JOBS", "6"))
+TARGET_LIMIT_GB = float(os.environ.get("TARGET_LIMIT_GB", "25"))
+
+
+def keep_target_small():
+    target = ROOT / "target"
+    if not target.exists():
+        return
+    du = subprocess.run(["du", "-sk", str(target)], stdout=subprocess.PIPE, text=True)
+    size_gb = int(du.stdout.split()[0]) / 1024 / 1024 if du.returncode == 0 else 0
+    if size_gb > TARGET_LIMIT_GB:
+        print(f"[test] target/ is {size_gb:.0f} GB (limit {TARGET_LIMIT_GB:.0f}); cargo clean", flush=True)
+        subprocess.run(["cargo", "clean"], cwd=ROOT, check=True)
 
 
 def build(cargo_args):
@@ -58,14 +74,16 @@ def run(name, exe, cwd):
 
 
 def main():
-    LOGS.mkdir(parents=True, exist_ok=True)
-    started = time.monotonic()
-    binaries = build(sys.argv[1:])
-    built = time.monotonic() - started
+    # Read before the clean below, which takes target/test-logs with it.
     try:
         previous = json.loads(TIMES.read_text())
     except (OSError, ValueError):
         previous = {}
+    keep_target_small()
+    LOGS.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    binaries = build(sys.argv[1:])
+    built = time.monotonic() - started
     # Longest first, so the slow ones don't start last and stretch the run.
     binaries.sort(key=lambda b: -previous.get(b[0], 0))
     print(f"[test] built in {built:.0f}s; running {len(binaries)} test binaries, {JOBS} at a time", flush=True)
