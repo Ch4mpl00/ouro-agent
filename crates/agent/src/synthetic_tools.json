@@ -106,7 +106,7 @@
     "type": "function",
     "function": {
       "name": "finish",
-      "description": "End this session in the same round as your last actions, instead of spending another turn on a final message. Call it alongside calls whose results you don't need to read: never together with a call whose answer decides what you do next (a worker, a search, a read). `result` is your final answer; a worker's parent receives it. If any other call in this round fails, the session does not end: you get the errors and continue. Call it at most once per round.",
+      "description": "End this session in the same round as your last actions, instead of spending another turn on a final message. Typically: the final delivery and `finish` side by side in one round. It is safe to pair them: if any other call in this round fails, the session does not end and you get the errors to act on. Never pair it with a call whose answer decides what you do next (a worker, a search, a read). `result` is your final answer; a worker's parent receives it. Call it at most once per round.",
       "parameters": {
         "type": "object",
         "properties": {
