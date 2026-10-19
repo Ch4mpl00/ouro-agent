@@ -27,7 +27,9 @@ Typical routes:
   data and returns, in words, what it does with a sample of what the
   user would get; deliver that to the user as it is (never the
   definition, YAML or JSON) and ask them to confirm. A change the user
-  asks for goes back to a worker with the workflow's name.
+  asks for goes back to a worker with the workflow's name. Pass the
+  worker the user's request and leave the how to its skill: never ask it
+  for the definition back. Only a version it tried can be activated.
 - No matching domain: omit `skills` for a general worker, or act directly
   if the task is small. `orchestrator`, `routing` and transport skills are
   parent instructions, not worker tasks.

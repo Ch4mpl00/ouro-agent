@@ -1241,7 +1241,7 @@ async fn only_the_workflow_author_is_offered_the_catalog_and_the_probe() {
     loop_.send("go".into()).await.unwrap();
     let seen = model.seen.lock().unwrap().clone();
     let offered = |i: usize, name: &str| seen[i].tools.iter().any(|t| t.name == name);
-    let author_tools = ["workflow_functions", "probe_function", "try_workflow"];
+    let author_tools = ["workflow_functions", "probe_function", "try_workflow", "save_workflow"];
     assert!(author_tools.iter().all(|t| !offered(0, t)), "the parent");
     assert!(offered(0, "search_news"), "the parent keeps its MCP tools");
     assert!(author_tools.iter().all(|t| offered(1, t)), "the author");

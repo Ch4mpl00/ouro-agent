@@ -43,6 +43,13 @@
       "when": 1792411200002,
       "tag": "0005_agent_schedule",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1792411200003,
+      "tag": "0006_workflow_tried",
+      "breakpoints": true
     }
   ]
 }

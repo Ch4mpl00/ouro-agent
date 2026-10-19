@@ -30,6 +30,11 @@ fn store_contract(store: &dyn WorkflowStore) {
     assert_eq!((v1.version, v1.status, v2.version), (1, Status::Draft, 2));
     assert_eq!(store.active("digest").unwrap(), None, "a saved version is a draft");
 
+    assert!(!v1.tried, "a saved version is untried");
+    store.mark_tried("digest", 1).unwrap();
+    assert!(store.get("digest", Some(1)).unwrap().unwrap().tried);
+    assert!(!store.get("digest", Some(2)).unwrap().unwrap().tried, "per version");
+    assert!(store.mark_tried("digest", 9).is_err());
     store.activate("digest", 1).unwrap();
     assert_eq!(store.active("digest").unwrap().map(|w| w.definition), Some("one".into()));
     store.activate("digest", 2).unwrap();
@@ -506,6 +511,7 @@ async fn a_dry_run_records_the_writes_and_changes_nothing() {
     let compose = reply["steps"].as_array().unwrap().iter().find(|s| s["task"] == "/do/2/compose").unwrap();
     assert_eq!(compose["output"], "Today: Rust 2.0");
     assert_eq!(reply["path"], json!(["pause", "search", "compose", "send", "mark"]));
+    assert!(w.engine.deps.workflows.get("digest", Some(1)).unwrap().unwrap().tried, "a completed dry run marks it");
     assert!(reply["next"].as_str().unwrap().contains("fix"), "{reply}");
     let observations = w.written.all().pop().unwrap().observations;
     let run = named(&observations, "dry-run");
@@ -642,6 +648,9 @@ fn the_authoring_tools_save_drafts_and_activate_only_valid_versions() {
     assert_eq!(listed["workflows"][0]["active_version"], Value::Null);
 
     assert!(tool(&w, "activate_workflow", json!({"name":"digest","version":2})).is_err());
+    let untried = tool(&w, "activate_workflow", json!({"name":"digest","version":1})).unwrap_err();
+    assert!(untried.to_string().contains("has not completed a dry run"), "{untried}");
+    w.engine.deps.workflows.mark_tried("digest", 1).unwrap();
     tool(&w, "activate_workflow", json!({"name":"digest","version":1})).unwrap();
     let listed = tool(&w, "list_workflows", json!({})).unwrap();
     assert_eq!((listed["count"].clone(), listed["workflows"][0]["active_version"].clone()), (json!(1), json!(1)));

@@ -50,7 +50,8 @@ impl Status {
 }
 
 // A version never changes once saved; only its status moves (draft → active
-// → retired), with at most one active version per name.
+// → retired), with at most one active version per name. `tried`: a dry run
+// of it completed, which activation requires.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SavedWorkflow {
     pub name: String,
@@ -60,6 +61,7 @@ pub struct SavedWorkflow {
     pub definition: String,
     pub note: Option<String>,
     pub created_at: String,
+    pub tried: bool,
 }
 
 pub trait WorkflowStore: Send + Sync {
@@ -67,6 +69,8 @@ pub trait WorkflowStore: Send + Sync {
     fn save(&self, name: &str, definition: &str, note: Option<&str>) -> anyhow::Result<SavedWorkflow>;
     // Makes `version` the active one; the version active before retires.
     fn activate(&self, name: &str, version: i64) -> anyhow::Result<()>;
+    // Records that a dry run of `version` completed.
+    fn mark_tried(&self, name: &str, version: i64) -> anyhow::Result<()>;
     // A version, or the newest one when `version` is None.
     fn get(&self, name: &str, version: Option<i64>) -> anyhow::Result<Option<SavedWorkflow>>;
     fn active(&self, name: &str) -> anyhow::Result<Option<SavedWorkflow>>;
@@ -74,16 +78,16 @@ pub trait WorkflowStore: Send + Sync {
     fn list(&self) -> anyhow::Result<Vec<SavedWorkflow>>;
 }
 
-const COLUMNS: &str = "name, version, status, definition, note, created_at";
+const COLUMNS: &str = "name, version, status, definition, note, created_at, tried_at IS NOT NULL";
 
-fn saved(row: &rusqlite::Row) -> rusqlite::Result<(String, i64, String, String, Option<String>, String)> {
-    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+type Row = (String, i64, String, String, Option<String>, String, bool);
+
+fn saved(row: &rusqlite::Row) -> rusqlite::Result<Row> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
 }
 
-fn into_saved(
-    (name, version, status, definition, note, created_at): (String, i64, String, String, Option<String>, String),
-) -> anyhow::Result<SavedWorkflow> {
-    Ok(SavedWorkflow { name, version, status: Status::parse(&status)?, definition, note, created_at })
+fn into_saved((name, version, status, definition, note, created_at, tried): Row) -> anyhow::Result<SavedWorkflow> {
+    Ok(SavedWorkflow { name, version, status: Status::parse(&status)?, definition, note, created_at, tried })
 }
 
 impl WorkflowStore for AgentDb {
@@ -114,6 +118,15 @@ impl WorkflowStore for AgentDb {
             params![name, version],
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    fn mark_tried(&self, name: &str, version: i64) -> anyhow::Result<()> {
+        let changed = self.conn().execute(
+            "UPDATE workflows SET tried_at = datetime('now') WHERE name = ?1 AND version = ?2",
+            params![name, version],
+        )?;
+        anyhow::ensure!(changed > 0, "no version {version} of workflow `{name}`");
         Ok(())
     }
 
@@ -171,6 +184,7 @@ impl WorkflowStore for MemoryWorkflows {
             definition: definition.into(),
             note: note.map(str::to_owned),
             created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            tried: false,
         };
         all.push(saved.clone());
         Ok(saved)
@@ -189,6 +203,13 @@ impl WorkflowStore for MemoryWorkflows {
                 w.status = Status::Retired;
             }
         }
+        Ok(())
+    }
+
+    fn mark_tried(&self, name: &str, version: i64) -> anyhow::Result<()> {
+        let mut all = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = all.iter_mut().find(|w| w.name == name && w.version == version);
+        saved.ok_or_else(|| anyhow::anyhow!("no version {version} of workflow `{name}`"))?.tried = true;
         Ok(())
     }
 
@@ -962,6 +983,10 @@ pub fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::R
                 .ok_or_else(|| anyhow::anyhow!("no version {version} of workflow `{name}`"))?;
             // Tools may have changed since it was saved.
             check(mcp, &saved.definition).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(
+                saved.tried,
+                "version {version} of `{name}` has not completed a dry run; the workflow-author worker tries it (try_workflow) before it is shown to the user"
+            );
             store.activate(name, version)?;
             Ok(json!({
                 "ok": true, "name": name, "version": version,
@@ -1288,6 +1313,9 @@ pub async fn try_draft(
         RunStatus::Completed(output) => SpanEnd::output(output.clone()),
         _ => SpanEnd::error(status),
     });
+    if status == "completed" {
+        engine.deps.workflows.mark_tried(name, saved.version)?;
+    }
     let writes: Vec<Value> = std::mem::take(&mut *functions.writes.lock().unwrap_or_else(|e| e.into_inner()))
         .into_iter()
         .map(|mut write| {

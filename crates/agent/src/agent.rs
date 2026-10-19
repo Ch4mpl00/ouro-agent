@@ -378,7 +378,9 @@ impl AgentLoop {
         match name {
             "invoke_sub_agent" => self.opts.parent_id.is_none(),
             "write_skill" => self.opts.allow_skill_writes && self.skill_names.iter().any(|n| n == "dreaming"),
-            name if crate::flows::AUTHOR_TOOLS.contains(&name) => {
+            // Writing a workflow is the author's alone; other loops read,
+            // activate and schedule the versions it saved and tried.
+            name if crate::flows::AUTHOR_TOOLS.contains(&name) || name == "save_workflow" => {
                 self.skill_names.iter().any(|n| n == "workflow-author")
             }
             _ => true,
