@@ -134,8 +134,9 @@ judge. Build the pipeline the task needs from these parts, no more:
   branch on a model's free text, such as an exact sentinel phrase from
   `llm_compose`: a changed letter or a full stop sends the wrong branch.
   When the step that writes the text is also the one that knows (it
-  deduplicates, it counts what is left), have it answer JSON and branch on
-  a field instead.
+  deduplicates, it counts what is left), give it `json: true`, spell out
+  the object in its prompt (`{"quiet": true}` or `{"quiet": false, "text":
+  …}`) and branch on a field (`.quiet == true`).
 - **Synthesis.** Text for a person → `llm_compose`. A model step sees its
   prompt and its `input`, nothing else: not this conversation, not the
   user's messages, not other steps. Write the user's rules for the text
@@ -245,11 +246,13 @@ id } }`, available everywhere as `$workflow.input`. Keep a result for later task
 
 Functions besides the ones `workflow_functions` lists from the tools:
 
-- `llm_compose { skill?, prompt?, input?, preset? }` — one generation
+- `llm_compose { skill?, prompt?, input?, preset?, json? }` — one generation
   (with `skill`'s instructions when one is named); `input` is an object
   shown to the model as tagged sections; `preset` is `base` (default),
-  `smart` or `smartest`. Returns the reply,
-  parsed when it is JSON.
+  `smart` or `smartest`. Returns the reply, parsed when it is JSON. With
+  `json: true` the model must answer one JSON object (describe its fields
+  in the prompt); any other reply faults the step instead of flowing on as
+  text.
 - `filter_relevant { items, prompt, threshold? }` — keeps the items of the
   array that pass the rules in `prompt`. Not a chat model: a classifier
   answers "passes / does not pass" for every item separately (in batches

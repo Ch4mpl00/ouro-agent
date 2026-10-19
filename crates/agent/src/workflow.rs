@@ -1087,7 +1087,8 @@ impl WorkflowRunner {
                     span.update(ContextUpdate::input(json!({"skill":skill,"prompt":user})));
                     let scope: Scope = span.clone();
                     let output =
-                        compose(&self.engine, preset, skill.as_deref(), &user, bind, &scope, &ctx.cancel).await?;
+                        compose(&self.engine, preset, skill.as_deref(), &user, false, bind, &scope, &ctx.cancel)
+                            .await?;
                     store.set(bind, output.clone())?;
                     output
                 }
@@ -1222,11 +1223,15 @@ impl WorkflowRunner {
 /// (with its patch) as the system message, `user` as the only user message.
 /// Traced as `llm_compose:<label>` tagged `judge_node: compose`, which is how
 /// the judge finds compose nodes. A reply that is JSON comes back parsed.
+/// With `json` the provider is held to one JSON object, and a reply that is
+/// not one is an error rather than text a branch would misread.
+#[allow(clippy::too_many_arguments)]
 pub async fn compose(
     engine: &Engine,
     preset: &str,
     skill: Option<&str>,
     user: &str,
+    json: bool,
     label: &str,
     scope: &Scope,
     cancel: &CancellationToken,
@@ -1256,13 +1261,22 @@ pub async fn compose(
     if let Some(system) = system {
         messages.push(providers::system(&system));
     }
-    messages.push(providers::user(user));
+    // OpenAI refuses JSON mode unless the messages ask for JSON.
+    if json {
+        messages.push(providers::user(&format!("{user}\n\nReply with one JSON object.")));
+    } else {
+        messages.push(providers::user(user));
+    }
+    let mut model_parameters = json!({"reasoning_effort":preset.reasoning_effort.as_str(),"tools_mode":"none"});
+    if json {
+        model_parameters["response_format"] = json!("json_object");
+    }
     let mut params = CompletionParams {
         model: preset.model,
         messages: &mut messages,
         reasoning_effort: preset.reasoning_effort,
         tools: Vec::new(),
-        response_format: None,
+        response_format: json.then(|| json!({"type":"json_object"})),
         trace: None,
         cancel: cancel.clone(),
     };
@@ -1272,12 +1286,7 @@ pub async fn compose(
         scope,
         Observation {
             name: format!("llm_compose:{label}"),
-            model_parameters: Some(
-                json!({"reasoning_effort":preset.reasoning_effort.as_str(),"tools_mode":"none"})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            ),
+            model_parameters: model_parameters.as_object().cloned(),
             metadata: Some(json!({"judge_node":"compose","skill":skill}).as_object().unwrap().clone()),
         },
         None,
@@ -1290,7 +1299,18 @@ pub async fn compose(
     .await
     .map_err(|e| if is_aborted(&e) { e } else { WorkflowError::Llm(e.to_string()).into() })?;
     check(cancel)?;
-    Ok(parse_tool_json(providers::content(&result.message).unwrap_or_default()))
+    let reply = providers::content(&result.message).unwrap_or_default();
+    if json {
+        return match serde_json::from_str::<Value>(reply.trim()) {
+            Ok(object @ Value::Object(_)) => Ok(object),
+            _ => Err(WorkflowError::Llm(format!(
+                "the reply is not a JSON object: {}",
+                crate::activity::clip(reply, 200)
+            ))
+            .into()),
+        };
+    }
+    Ok(parse_tool_json(reply))
 }
 
 // ── 5. runner facade ─────────────────────────────────────────────────────

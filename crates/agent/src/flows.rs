@@ -251,7 +251,7 @@ type ModelFunction = (&'static str, Effect, &'static [&'static str], &'static [&
 const MODEL_FUNCTIONS: &[ModelFunction] = &[
     ("hash_value", Effect::Read, &["value"], &["value"]),
     ("skill_catalog_snapshot", Effect::Read, &[], &[]),
-    ("llm_compose", Effect::Read, &["preset", "skill", "prompt", "input"], &[]),
+    ("llm_compose", Effect::Read, &["preset", "skill", "prompt", "input", "json"], &[]),
     ("filter_relevant", Effect::Read, &["items", "prompt", "threshold"], &["items", "prompt"]),
     ("choose", Effect::Read, &["question", "options", "input", "min_confidence", "default"], &["question", "options"]),
     ("set_memory", Effect::Write, &["key", "value"], &["key", "value"]),
@@ -403,9 +403,14 @@ impl owf::run::Functions for Functions {
                     Some(Value::Object(input)) => parts.push(render_input_xml(input)),
                     Some(_) => return Err(invalid(name, "`input` must be an object")),
                 }
+                let json = match args.get("json") {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(json)) => *json,
+                    Some(_) => return Err(invalid(name, "`json` must be true or false")),
+                };
                 let user = parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("\n\n");
                 span.update(crate::tracing::ContextUpdate::input(json!({"skill":skill,"prompt":user})));
-                compose(&self.engine, preset, skill, &user, label, &span, info.cancel).await.map_err(failed)
+                compose(&self.engine, preset, skill, &user, json, label, &span, info.cancel).await.map_err(failed)
             }
             "filter_relevant" => {
                 let decisions = self.engine.deps.decisions.as_ref().ok_or_else(|| {

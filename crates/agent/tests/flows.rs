@@ -805,3 +805,59 @@ fn choose_is_in_the_catalog_and_refuses_at_most_once() {
     let error = check(&*w.engine.deps.mcp, &pinned).unwrap_err();
     assert!(error.contains("model adapters do not yet support at_most_once"), "{error}");
 }
+
+// ── llm_compose json ────────────────────────────────────────────────────────
+
+const QUIET_OR_DIGEST: &str = r#"
+document: { dsl: '1.0.4', namespace: agent, name: digest, version: '1.0.0' }
+do:
+  - compose:
+      call: llm_compose
+      with: { prompt: 'Answer {"quiet": true} or {"quiet": false, "text": the digest}.', json: true }
+  - route:
+      switch:
+        - quiet: { when: '${ .quiet == true }', then: end }
+        - digest: { then: send }
+  - send:
+      call: send_telegram_message
+      with: { text: '${ .text }' }
+"#;
+
+// A compose step asked for JSON holds the provider to one object, and the
+// switch reads a field of it: no sentinel phrase to misspell.
+#[tokio::test]
+async fn a_json_compose_answers_an_object_a_switch_branches_on() {
+    for (reply, sent) in [(r#"{"quiet": true}"#, None), (r#"{"quiet": false, "text": "Rust 2.0"}"#, Some("Rust 2.0"))] {
+        let w = world(vec![reply]);
+        w.activate("digest", QUIET_OR_DIGEST);
+        let (result, observations) = w.run("digest").await;
+        assert!(matches!(result, FlowResult::Completed(_)), "{reply}: {result:?}");
+        let texts: Vec<Value> = w.calls().into_iter().map(|(_, args)| args["text"].clone()).collect();
+        assert_eq!(texts, sent.map(|t| json!(t)).into_iter().collect::<Vec<_>>(), "{reply}");
+        let generation = named(&observations, "llm_compose:compose");
+        assert_eq!(generation.model_parameters.as_ref().unwrap()["response_format"], "json_object");
+        assert!(generation.input.to_string().contains("Reply with one JSON object."), "{}", generation.input);
+    }
+}
+
+// A reply that is not one object faults before the send: the text a
+// sentinel branch would have mistaken for a digest never goes out.
+#[tokio::test]
+async fn a_json_compose_that_answers_text_faults_before_any_write() {
+    for reply in ["Тихий день.", "[1, 2]", r#"{"quiet": tr"#] {
+        let w = world(vec![reply]);
+        w.activate("digest", QUIET_OR_DIGEST);
+        let (result, _) = w.run("digest").await;
+        let FlowResult::Faulted { error, effects_started } = result else { panic!("{reply}: {result:?}") };
+        assert!(!effects_started && error.to_string().contains("not a JSON object"), "{reply}: {error}");
+        assert!(w.calls().is_empty(), "{reply}");
+    }
+    let w = world(vec![]);
+    let bad = QUIET_OR_DIGEST.replace("json: true", "json: 'yes'");
+    w.activate("digest", &bad);
+    let (result, _) = w.run("digest").await;
+    assert!(
+        matches!(result, FlowResult::Faulted { ref error, .. } if error.to_string().contains("`json` must be true or false")),
+        "{result:?}"
+    );
+}
