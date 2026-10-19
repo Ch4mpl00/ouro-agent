@@ -842,7 +842,7 @@ async fn runs_a_signal_directly_and_records_parent_worker_tool_io_memory_referen
     let (primary, primary_written) = recording();
     let (mirror, mirror_written) = recording();
     let payload = "article ".repeat(2_000) + "source tail";
-    let h = Harness::new(
+    let mut h = Harness::new(
         task_context("task"),
         vec![
             turn(|_| call("search_news", json!({"query":"latest"}))),
@@ -856,6 +856,7 @@ async fn runs_a_signal_directly_and_records_parent_worker_tool_io_memory_referen
         &payload,
         Arc::new(tee_tracer(primary, mirror)),
     );
+    Arc::get_mut(&mut h.engine).unwrap().deps.skills = vec!["orchestrator".into()];
     let runner = supervisor(&h, Arc::new(NeverWorkflow));
     assert_eq!(runner.run_signal(&signal("telegram", SIGNAL_CONTENT)).await.unwrap(), "finished");
     assert_eq!(primary_written.len(), 1);
@@ -867,7 +868,7 @@ async fn runs_a_signal_directly_and_records_parent_worker_tool_io_memory_referen
     assert_eq!(trace.tags, ["telegram", "agent-loop"]);
     let agent = find(&trace.observations, "agent_loop");
     assert_eq!(agent.meta("preset"), Some(&json!("smart")));
-    assert_eq!(agent.meta("skills"), Some(&json!(["telegram"])));
+    assert_eq!(agent.meta("skills"), Some(&json!(["orchestrator"])));
     let worker = find(&trace.observations, "invoke_sub_agent");
     let search = find(&trace.observations, "search_news");
     let generations: Vec<_> = trace.observations.iter().filter(|o| o.kind == ObservationType::Generation).collect();
@@ -950,13 +951,13 @@ async fn recovers_a_failed_primary_loop_in_the_same_trace_and_releases_both_loop
 }
 
 #[tokio::test]
-async fn delegates_domain_signals_without_loading_the_domain_skill_into_the_parent() {
+async fn discovers_domain_skills_without_preloading_them_into_the_parent() {
     let (tracer, written) = recording();
     let h = Harness::new(task_context("task"), vec![turn(|_| answer("done"))], "unused", tracer);
     supervisor(&h, Arc::new(NeverWorkflow)).run_signal(&signal("news-digest", SIGNAL_CONTENT)).await.unwrap();
     assert_eq!(find(&written.all()[0].observations, "agent_loop").meta("skills"), Some(&json!([])));
     let system = h.model.requests.lock().unwrap()[0][0]["content"].as_str().unwrap().to_owned();
-    assert!(system.contains("Delegate the domain work to skill \"news-digest\""));
+    assert!(system.contains("Discover useful skills with find_skills"));
 }
 
 #[tokio::test]
@@ -993,7 +994,7 @@ async fn exports_the_primary_loop_and_nested_worker_through_the_langfuse_adapter
     let exported = Arc::new(Exported::default());
     let langfuse = Arc::new(LangfuseTracer::with_sink(exported.clone()));
     let tracer = Arc::new(tee_tracer(langfuse, local));
-    let h = Harness::new(
+    let mut h = Harness::new(
         task_context("task"),
         vec![
             turn(|_| call("search_news", json!({"query":"latest"}))),
@@ -1007,6 +1008,7 @@ async fn exports_the_primary_loop_and_nested_worker_through_the_langfuse_adapter
         &"large result ".repeat(1_000),
         tracer.clone(),
     );
+    Arc::get_mut(&mut h.engine).unwrap().deps.skills = vec!["orchestrator".into()];
     supervisor(&h, Arc::new(NeverWorkflow)).run_signal(&signal("telegram", SIGNAL_CONTENT)).await.unwrap();
     let spans = exported.0.lock().unwrap().clone();
     let by_name = |name: &str| spans.iter().find(|s| s.name == name).unwrap().clone();
@@ -1250,7 +1252,7 @@ async fn only_the_workflow_author_is_offered_the_catalog_and_the_probe() {
     drop(seen);
     f.engine.shutdown().await;
 }
-// A loop asking for a skill it already runs gets a note, not a second copy.
+// A non-writing worker asking for an already loaded skill gets a note.
 #[tokio::test]
 async fn reading_a_skill_the_loop_already_runs_returns_a_note() {
     let model = Arc::new(Scripted::new(vec![
@@ -1261,6 +1263,7 @@ async fn reading_a_skill_the_loop_already_runs_returns_a_note() {
     let f = fixture(model.clone(), &[], &skills);
     let mut opts = LoopOptions::new("loop", context());
     opts.skills = vec!["author".into()];
+    opts.parent_id = Some("parent".into());
     f.engine.start_loop(opts).await.unwrap().send("go".into()).await.unwrap();
     let seen = model.seen.lock().unwrap().clone();
     let replies: Vec<String> = seen[1]
@@ -1412,4 +1415,63 @@ async fn a_model_is_never_offered_or_allowed_the_supervisors_wait_for_signal() {
     let reply = seen[1].1.iter().find(|m| m["role"] == "tool").unwrap();
     assert!(text(reply["content"].as_str().unwrap()).contains("unavailable"));
     f.engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn primary_discovers_and_reads_effective_skill_instructions_in_the_same_loop() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("skills.default")).unwrap();
+    std::fs::create_dir(root.path().join("skills")).unwrap();
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills.default");
+    std::fs::copy(repo.join("orchestrator.md"), root.path().join("skills.default/orchestrator.md")).unwrap();
+    std::fs::write(root.path().join("skills.default/domain.md"), "---\ntools: []\n---\nDOMAIN RULES").unwrap();
+    std::fs::write(root.path().join("skills/domain.patch.md"), "EFFECTIVE PATCH").unwrap();
+    let store = Arc::new(FsSkillStore::new(root.path()));
+    let snapshot = agent::skills::catalog_snapshot(&*store).await.unwrap();
+    let hash = snapshot["skills"].as_array().unwrap().iter().find(|s| s["name"] == "domain").unwrap()["content_hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let expected = hash.clone();
+    let mut h = Harness::new(
+        task_context("discovery"),
+        vec![
+            turn(|p| {
+                assert!(mentions(&p.messages, "In your first tool round"));
+                assert!(!mentions(&p.messages, "Typical routes:"));
+                call("find_skills", json!({"query":"do domain task"}))
+            }),
+            turn(move |p| {
+                assert!(last_json(&p.messages)["content"].as_str().unwrap().contains("domain"));
+                call("read_skill", json!({"name":"domain","expected_hash":expected}))
+            }),
+            turn(|p| {
+                let result: Value = serde_json::from_str(last_json(&p.messages)["content"].as_str().unwrap()).unwrap();
+                assert!(result["content"].as_str().unwrap().contains("DOMAIN RULES"));
+                assert!(result["content"].as_str().unwrap().contains("EFFECTIVE PATCH"));
+                answer("task completed")
+            }),
+        ],
+        "unused",
+        null(),
+    );
+    let mcp = ToolMcp::returning(
+        vec![agent::providers::ToolDef::new(
+            "find_skills",
+            "discover",
+            json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}),
+        )],
+        &json!({"skills":[{"name":"domain","score":0.9,"content_hash":hash}]}).to_string(),
+    );
+    let engine = Arc::get_mut(&mut h.engine).unwrap();
+    engine.deps.mcp = mcp.clone();
+    engine.deps.skill_store = store;
+    engine.deps.skills = vec!["orchestrator".into()];
+    let mut opts = h.options();
+    opts.skills = vec![];
+    let loop_ = h.engine.start_loop(opts).await.unwrap();
+    assert_eq!(loop_.send("do domain task".into()).await.unwrap(), "task completed");
+    assert_eq!(mcp.calls.lock().unwrap().iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["find_skills"]);
+    assert_eq!(h.engine.loop_ids().await.len(), 1, "no worker needed to consult a skill");
+    h.engine.shutdown().await;
 }

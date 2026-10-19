@@ -106,6 +106,12 @@ impl Fixture {
     async fn new(source: &str, fail_send: bool, wait_model: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_owned();
+        // These fixtures exercise one supplied signal, not system maintenance.
+        AgentDb::open(root.join("agent.db"))
+            .unwrap()
+            .conn()
+            .execute("DELETE FROM scheduled_tasks WHERE workflow = 'skill-index'", [])
+            .unwrap();
         std::fs::create_dir(root.join("skills.default")).unwrap();
         for (name, tools, body) in [
             ("orchestrator", "*", "ORCHESTRATOR"),

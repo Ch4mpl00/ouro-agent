@@ -274,6 +274,25 @@ def import_state():
     run(["docker", "rm", *legacy])
 
 
+def migrate_telegram_skill(defaults, shipped, live):
+    """Keep the removed Telegram default as agent-owned state on upgrade."""
+    old, target = defaults / "telegram.md", live / "telegram.md"
+    if (shipped / "telegram.md").exists() or not old.exists() or target.exists() or target.is_symlink():
+        return None
+    text = old.read_text()
+    header = re.match(r"\A---\n(.*?)\n---(?:\n|$)", text, re.S)
+    if not header:
+        raise RuntimeError("cannot migrate Telegram skill without frontmatter")
+    metadata = re.sub(r"(?m)^routable:[^\n]*", "routable: true", header[1])
+    text = ("---\n" + metadata + "\n---\n\n# Telegram communication\n\n"
+            "Apply to every Telegram message and reply, regardless of topic; combine with relevant domain skills.\n\n"
+            + text[header.end():].lstrip())
+    live.mkdir(parents=True, exist_ok=True)
+    with target.open("x") as file:
+        file.write(text)
+    return target
+
+
 def install_files(payload, repository, affected):
     (PREFIX / "bin").mkdir(exist_ok=True)
     app = PREFIX / "app"
@@ -289,6 +308,9 @@ def install_files(payload, repository, affected):
         def tree_hashes(directory):
             return {str(p.relative_to(directory)): digest(p) for p in directory.rglob("*") if p.is_file()}
         shipped = payload / "skills.default"
+        migrated = migrate_telegram_skill(defaults, shipped, STATE / "skills")
+        if migrated:
+            shutil.chown(migrated, "ouro", "ouro")
         if not defaults.exists() or tree_hashes(defaults) != tree_hashes(shipped):
             if defaults.exists():
                 shutil.rmtree(defaults)

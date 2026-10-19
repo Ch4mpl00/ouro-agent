@@ -1,4 +1,5 @@
 ---
+routable: false
 tools: *
 ---
 
@@ -40,5 +41,5 @@ is missing and the message refers to something earlier.
   with the result; data over prose. Markdown is fine.
 - Name what you changed (documents, facts, scheduled tasks, messages sent)
   with its identifiers, so the peer can check or build on it.
-- Delegate domain work to sub-agents as `routing` describes; you own the
-  reply.
+- Discover useful skills with `find_skills` and read their instructions.
+  Delegate focused subtasks only when useful; you own the reply.

@@ -91,7 +91,7 @@ generation input records exactly the context that iteration saw. Recovery
 is recorded in the same trace. Langfuse export uses the configured
 `LANGFUSE_*` credentials; without them the local recorder still runs.
 
-Routing is deterministic and by source, not by content. `scheduler` signals
+Execution paths still depend on the source. `scheduler` signals
 are compiled into a workflow (`workflow.rs`: compile → execute) as before —
 a cron body is known in advance, so a plan is cheaper and more predictable
 than an agentic loop. Every other source runs the primary AgentLoop. A
@@ -143,9 +143,10 @@ flowchart LR
 3. The supervisor creates the session context and trace. A `scheduler`
    signal goes to the workflow runner (`planner` compiles the steps, the
    executor walks them); every other source starts the primary AgentLoop with
-   `orchestrator` and `routing` instructions. Telegram signals also load their
-   transport skill (and their recent chat history).
-4. Domain work is delegated with the appropriate skill and memory references.
+   the short `orchestrator` instructions. Telegram signals include recent chat
+   history and a technical delivery target; communication rules are discovered.
+4. The loop discovers and reads useful skills, works directly or delegates
+   focused subtasks with the appropriate skill and memory references.
    The parent decides subsequent actions and delivers the result. On a fatal
    loop error, a bounded recovery agent reports the failure in the same session.
 
@@ -156,14 +157,48 @@ signals with `source=<name>`.** No supervisor change.
 
 Markdown prompts, two-layered: `skills.default/` is git-tracked and shipped in
 the deployment; `skills/` is a gitignored live overlay (`/var/lib/ouro/skills` on prod) that the
-agent's `dreaming` skill rewrites when it self-revises. `read_skill(name)`
-checks the overlay first.
+primary agent can create or update via `write_skill` when asked to save standing
+instructions. Authorized `dreaming` workers can also revise skills.
+`read_skill(name)` checks the overlay first.
+
+Telegram communication rules live only in `skills/telegram.md`, outside Git.
+They are discoverable alongside domain skills rather than loaded by source.
+Ask the agent to save supplied Telegram rules; it writes the live file with
+`routable: true` and a scope paragraph. Discovery includes the channel in its
+context and can find new rules immediately, before the next index refresh.
+Deployment preserves the removed Telegram default as a live skill once on
+upgrade, without replacing existing live rules. Fresh installations can create
+their rules through the agent.
 
 Skills are named after signal sources — one per domain (bills, news digests,
-Telegram chat, scheduled tasks, …) plus a few meta-skills: `routing` (always
-loaded on the primary), `orchestrator`, `worker`, `recovery`, `planner`
+Telegram chat, scheduled tasks, …) plus a few meta-skills: `orchestrator` (the short discovery prompt),
+`worker`, `recovery`, `planner`
 (the workflow compiler's prompt, used for scheduler signals), and `dreaming`
 (self-revision).
+
+The agent's migrations install an editable `skill-index` workflow, a first-run
+task and a daily 05:00 task in the configured timezone. It snapshots effective
+skills (including overlays and patches), compares content/generator hashes,
+generates only changed routing descriptions, and assembles the JSON with jq.
+The result is one versioned memory document, `agent-system/skill-index.md`,
+written with `searchable: false` so it does not produce embeddings. An unchanged
+run makes no model calls or document writes. Subsequent workflow versions and
+schedule edits survive restarts. The catalog's consumer can verify each stored
+content hash against `skill_catalog_snapshot` before using a description.
+
+The primary loop starts with a short instruction to call MCP `find_skills`
+with the current request and brief context, then consult useful candidates
+through `read_skill`. There is no runtime router or routing workflow in front
+of ReAct. Discovery independently scores every routable skill through Jev,
+filters/sorts results, and returns short descriptions and source hashes.
+Unindexed/changed skills use current file descriptions until the index catches
+up. `read_skill` includes patches and can reject a mismatched `expected_hash`.
+The old `routing` skill is no longer loaded by default.
+
+`find_skills` is in the default MCP surface (`skill-search` toolset). Configure
+`OPEN_ROUTER_API_KEY` in the MCP environment; `SKILL_SEARCH_MODEL` optionally
+overrides `typesafe/jev-1.13`. Without a scorer, discovery reports an explicit
+error and the primary can fall back to listing/reading skills itself.
 
 ## MCP tools
 
@@ -175,7 +210,7 @@ integration:
 history) · **Telegram userbot** (read-only MTProto channel reading) ·
 **Monobank** (transactions) · **News / RAG** (headlines, article fetch,
 semantic `search_news` over HN + Habr + channel posts) · **PDF / files** ·
-**Skills** (`list_skills`, `read_skill`) · **Unified memory** (projects of
+**Skills** (`find_skills`, `list_skills`, `read_skill`) · **Unified memory** (projects of
 markdown documents + facts, semantic `recall` across both, versioned
 patch/revert) · **Signals queue** · **Env** (timezone). Scheduled tasks
 (`schedule_task` and the rest) are the agent's own tools.

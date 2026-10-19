@@ -82,7 +82,7 @@
     "type": "function",
     "function": {
       "name": "set_memory",
-      "description": "Persist a small piece of agent-side state to the local memory KV. Use for watermarks, last-seen markers, counters, or any note the agent wants to recall in a future session. Well-known keys (e.g. `news_digest.last_read_at`) are auto-injected into the `Current context` block of future system prompts. Values are stored as strings — JSON-stringify complex payloads yourself.",
+      "description": "Persist a small piece of agent-side state to the local memory KV. Use for watermarks, last-seen markers, counters, or any note the agent wants to recall in a future session. Well-known keys (e.g. `news_digest.last_read_at`) are auto-injected into the `Current context` block of future system prompts. Values are stored as strings \u2014 JSON-stringify complex payloads yourself.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -106,7 +106,7 @@
     "type": "function",
     "function": {
       "name": "code_agent",
-      "description": "Delegate a computational / coding task to a sandboxed code agent (Codex). It writes AND runs code (Python with pandas/openpyxl, or Node) and returns ONLY the final result. Use it for anything that must be COMPUTED rather than recalled or written by an LLM: exact arithmetic, counting, date/time math, statistics, parsing or aggregating CSV/Excel/JSON data, string/data transformations, regex extraction, unit conversions. Do NOT use it for web access, reasoning, or composing prose — only code/computation. State the task precisely and say exactly what the output should be (e.g. 'return just the number'). Put any data the code needs in `data` — it is delivered to the program on stdin (for a binary file like .xlsx, base64-encode it and say so in the task).",
+      "description": "Delegate a computational / coding task to a sandboxed code agent (Codex). It writes AND runs code (Python with pandas/openpyxl, or Node) and returns ONLY the final result. Use it for anything that must be COMPUTED rather than recalled or written by an LLM: exact arithmetic, counting, date/time math, statistics, parsing or aggregating CSV/Excel/JSON data, string/data transformations, regex extraction, unit conversions. Do NOT use it for web access, reasoning, or composing prose \u2014 only code/computation. State the task precisely and say exactly what the output should be (e.g. 'return just the number'). Put any data the code needs in `data` \u2014 it is delivered to the program on stdin (for a binary file like .xlsx, base64-encode it and say so in the task).",
       "parameters": {
         "type": "object",
         "properties": {
@@ -129,13 +129,17 @@
     "type": "function",
     "function": {
       "name": "read_skill",
-      "description": "Return the raw text of a skill (`skills/<name>.md`). Reads the live overlay if present, otherwise falls back to the shipped default (`skills.default/<name>.md`). Use this to consult another skill's rules mid-session (e.g. the telegram handler reading `news-digest` before composing a digest).",
+      "description": "Read a skill to use its instructions in this session. Returns effective live/default text with improver patches, tools and content_hash. Does not execute the skill or grant additional tool permissions. Pass expected_hash from find_skills to reject a changed version. If required tools are unavailable here, delegate to a worker with that named skill. Follow effectiveInstructions; editableBody is the unpatched body for revisions and tools/routable are its metadata.",
       "parameters": {
         "type": "object",
         "properties": {
           "name": {
             "type": "string",
             "description": "Skill name without .md extension (matches signal source)."
+          },
+          "expected_hash": {
+            "type": "string",
+            "description": "Optional content_hash returned by find_skills."
           }
         },
         "required": [
@@ -148,7 +152,7 @@
     "type": "function",
     "function": {
       "name": "write_skill",
-      "description": "Overwrite a skill with new content. Always writes to the live overlay — the shipped default stays intact, so deleting the live file at any time restores the original. Used by the `dreaming` skill to revise instructions based on observed patterns. Pass the complete new body; the file is replaced, not patched.",
+      "description": "Create or replace an agent-managed skill in the persistent live overlay, outside Git. Use when the user asks to save or change standing instructions. Supply the full Markdown file with YAML frontmatter (tools: * or a tool list, routable: true for discoverable skills) and a first paragraph explaining when it applies. When revising, read first and use editableBody with the returned tools/routable metadata to avoid copying improver patches. Live changes are available to find_skills immediately; the description index catches up later. A live-only skill has no shipped fallback.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -183,7 +187,7 @@
     "type": "function",
     "function": {
       "name": "invoke_sub_agent",
-      "description": "Delegate a focused task to a sub-agent with a clean context. The sub-agent loads ONLY the skills you name (no routing, no parent history), has access to the tools allowed by those skills, runs to completion, and returns its result through working memory. Short results include content; large results include a memory_key and preview. Use this whenever the user's request maps to a dedicated domain skill — e.g. `news-digest`, `tech-digest`, `channel-digest`, `nashdom-bill`. DO NOT also `read_skill` that skill yourself: delegation replaces local loading, keeping your own context lean. Side effects performed inside the sub-agent (Telegram messages, memory writes, etc.) take effect immediately — if the sub-agent's skill sends the user-facing reply itself, you don't need to forward its output again.",
+      "description": "Delegate a focused subtask when useful or when required tools are unavailable here. The worker loads only the named skills, without parent history, and returns its result through shared working memory. Small results include content; large ones include memory_key and preview. Give it the relevant context and delivery role. Its side effects take effect immediately: do not duplicate a reply already sent by a worker. Reading a skill does not require delegation.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -200,7 +204,7 @@
           },
           "prompt": {
             "type": "string",
-            "description": "Task / user-facing request to hand to the sub-agent — goes in as a user message and shows up as the sub-agent's trace input. Use the user's verbatim wording when possible. For self-initiated tasks (no user message) put the trigger description here."
+            "description": "Task / user-facing request to hand to the sub-agent \u2014 goes in as a user message and shows up as the sub-agent's trace input. Use the user's verbatim wording when possible. For self-initiated tasks (no user message) put the trigger description here."
           },
           "input_refs": {
             "type": "array",
@@ -221,7 +225,7 @@
               "smart",
               "smartest"
             ],
-            "description": "Model preset for the sub-agent. `base` — cheap chat model, no thinking (default; use for simple one-offs and lookups). `smart` — DeepSeek with thinking on (use for real editorial / parsing work: digests, semantic dedup, PDF amount extraction). Default `base`."
+            "description": "Model preset for the sub-agent. `base` \u2014 cheap chat model, no thinking (default; use for simple one-offs and lookups). `smart` \u2014 DeepSeek with thinking on (use for real editorial / parsing work: digests, semantic dedup, PDF amount extraction). Default `base`."
           }
         },
         "required": [
@@ -234,7 +238,7 @@
     "type": "function",
     "function": {
       "name": "save_workflow",
-      "description": "Validate a saved-workflow definition (Open Workflow Specification DSL 1.0, YAML) and store it as a new draft version of `name`. Problems come back with the path of the task and property to fix; fix them all and save again. The reply lists every call the workflow makes with its effect (read/write) — show the user the write calls before asking them to confirm. A draft never runs; see activate_workflow.",
+      "description": "Validate a saved-workflow definition (Open Workflow Specification DSL 1.0, YAML) and store it as a new draft version of `name`. Problems come back with the path of the task and property to fix; fix them all and save again. The reply lists every call the workflow makes with its effect (read/write) \u2014 show the user the write calls before asking them to confirm. A draft never runs; see activate_workflow.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -323,7 +327,7 @@
     "type": "function",
     "function": {
       "name": "schedule_task",
-      "description": "Register a cron-driven task. When the cron matches, the agent gets a `scheduler` signal with the given prompt and acts on it (send a Telegram message, run a check, etc). Cron is standard 5-field (minute hour day-of-month month day-of-week) evaluated in the user's configured timezone. For one-shot reminders set `recurring: false` and use a specific cron like '30 14 12 5 *' (14:30 on May 12); the task auto-deactivates after the first fire. For repeating tasks use a generic cron like '0 9 * * *' (every day 9:00). Convert natural-language times into cron syntax before calling this tool. To run something once right away (\"прогони сейчас\"), set `cron_expr: \"now\"`: it fires within half a minute, after the current conversation turn ends. With `workflow`, each fire runs that saved workflow's active version instead of planning the task.",
+      "description": "Register a cron-driven task. When the cron matches, the agent gets a `scheduler` signal with the given prompt and acts on it (send a Telegram message, run a check, etc). Cron is standard 5-field (minute hour day-of-month month day-of-week) evaluated in the user's configured timezone. For one-shot reminders set `recurring: false` and use a specific cron like '30 14 12 5 *' (14:30 on May 12); the task auto-deactivates after the first fire. For repeating tasks use a generic cron like '0 9 * * *' (every day 9:00). Convert natural-language times into cron syntax before calling this tool. To run something once right away (\"\u043f\u0440\u043e\u0433\u043e\u043d\u0438 \u0441\u0435\u0439\u0447\u0430\u0441\"), set `cron_expr: \"now\"`: it fires within half a minute, after the current conversation turn ends. With `workflow`, each fire runs that saved workflow's active version instead of planning the task.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -359,7 +363,7 @@
     "type": "function",
     "function": {
       "name": "list_scheduled_tasks",
-      "description": "Show every task that may still fire — recurring tasks (always) and one-shots that haven't been triggered yet. Each row includes the cron expression, prompt, the saved workflow it runs (if any), last fire time, and the next 1-3 upcoming fire timestamps in the user's timezone for sanity-checking.",
+      "description": "Show every task that may still fire \u2014 recurring tasks (always) and one-shots that haven't been triggered yet. Each row includes the cron expression, prompt, the saved workflow it runs (if any), last fire time, and the next 1-3 upcoming fire timestamps in the user's timezone for sanity-checking.",
       "parameters": {
         "type": "object",
         "properties": {},
@@ -447,6 +451,36 @@
         "required": [
           "name"
         ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "hash_value",
+      "description": "Compute SHA-256 of canonical JSON; object key order does not affect the hash.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "value": {}
+        },
+        "required": [
+          "value"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "skill_catalog_snapshot",
+      "description": "Return all active skills as {skills:[{name,content,content_hash,routable,tools}]}. Content includes live/default resolution and improver patches. Hashes cover effective instructions and execution metadata. No model calls or writes.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
       }
     }
   }

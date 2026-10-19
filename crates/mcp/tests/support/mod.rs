@@ -164,6 +164,7 @@ pub struct Overrides {
     pub gmail_api_root: Option<String>,
     pub storage_dir: Option<PathBuf>,
     pub monobank: Option<Monobank>,
+    pub skill_scorer: Option<Arc<dyn mcp_tools::skills::SkillScorer>>,
 }
 
 pub async fn start_test_server_with(
@@ -233,7 +234,8 @@ async fn serve_overridden(
     embedder: SharedEmbedder,
     overrides: Overrides,
 ) -> anyhow::Result<Server> {
-    let Overrides { actor, fetcher, account, telegram, files, gmail_api_root, storage_dir, monobank } = overrides;
+    let Overrides { actor, fetcher, account, telegram, files, gmail_api_root, storage_dir, monobank, skill_scorer } =
+        overrides;
     let actor = actor.unwrap_or_else(|| "spec".into());
     let pool = pg::connect(database_url)?;
     pg::migrate(&pool).await?;
@@ -264,6 +266,7 @@ async fn serve_overridden(
         monobank: monobank.unwrap_or_else(|| Monobank::new(http.clone())),
         userbot: account.unwrap_or_else(|| Arc::new(Userbot::new(db.clone()))),
         skills: SkillCatalog::new(PathBuf::from("skills"), PathBuf::from("../../skills.default")),
+        skill_scorer,
         fetcher: fetcher.unwrap_or_else(|| Arc::new(GuardedFetch::new())),
         // Nothing to read in a spec run but the shipped skills.
         files: files.unwrap_or_else(|| {

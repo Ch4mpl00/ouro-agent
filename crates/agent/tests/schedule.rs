@@ -197,6 +197,7 @@ async fn insert(db: &dyn ScheduleStore, cron: &str, recurring: bool, prompt: &st
 fn store() -> (tempfile::TempDir, AgentDb) {
     let dir = tempfile::tempdir().unwrap();
     let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
+    db.conn().execute("DELETE FROM scheduled_tasks", []).unwrap();
     (dir, db)
 }
 

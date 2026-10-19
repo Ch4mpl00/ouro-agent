@@ -457,7 +457,7 @@ fn concurrent_reindexes_of_one_source_leave_one_set_of_rows() {
         let f = memory.remember("router password on the sticker", None, None).await.unwrap();
         memory.create_project("p", "P").await.unwrap();
         let written = memory
-            .write_doc(WriteDoc {
+            .write_doc(WriteDoc { searchable: None,
                 project: "p",
                 doc: "notes.md",
                 body: "## A\n\nalpha\n\n## B\n\nbeta",
@@ -500,7 +500,7 @@ fn the_index_describes_the_last_write_of_a_document_whatever_order_the_embedding
                 .await;
                 memory.create_project("p", "P").await.unwrap();
                 memory
-                    .write_doc(WriteDoc {
+                    .write_doc(WriteDoc { searchable: None,
                         project: "p",
                         doc: "notes.md",
                         body: "start",

@@ -1,4 +1,5 @@
 ---
+routable: false
 tools: [send_telegram_message, reply_to_peer]
 ---
 

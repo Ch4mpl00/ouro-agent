@@ -78,6 +78,29 @@ class Selection(unittest.TestCase):
 
 
 class Configuration(unittest.TestCase):
+    def test_removed_telegram_default_migrates_once_and_preserves_live_edits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            defaults, shipped, live = (root / name for name in ["old", "new", "live"])
+            defaults.mkdir()
+            shipped.mkdir()
+            old = defaults / "telegram.md"
+            old.write_text("---\nroutable: false\ntools: *\n---\n# Telegram\n\nPersonal rules\n")
+            target = deploy.migrate_telegram_skill(defaults, shipped, live)
+            self.assertEqual(target, live / "telegram.md")
+            self.assertIn("routable: true", target.read_text())
+            self.assertIn("Personal rules", target.read_text())
+            self.assertIn("every Telegram message", target.read_text())
+            target.write_text("User revised rules")
+            self.assertIsNone(deploy.migrate_telegram_skill(defaults, shipped, live))
+            self.assertEqual(target.read_text(), "User revised rules")
+            target.unlink()
+            (shipped / "telegram.md").write_text(old.read_text())
+            self.assertIsNone(deploy.migrate_telegram_skill(defaults, shipped, live))
+            (shipped / "telegram.md").unlink()
+            old.unlink()
+            self.assertIsNone(deploy.migrate_telegram_skill(defaults, shipped, live))
+
     def test_payload_extracts_through_a_symlinked_temporary_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

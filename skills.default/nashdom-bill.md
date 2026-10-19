@@ -4,6 +4,12 @@ tools: [list_nashdom_mails, download_gmail_attachment, read_pdf, send_telegram_m
 
 # NashDom — стиль уведомления
 
+For a user asking whether bills arrived, list subjects, dates and senders first.
+Do not claim payment is due until the PDF has been read: a bill can have zero
+balance. Process or extract the PDFs when requested, rather than treating a
+listing question as authorization for the whole automatic bill workflow.
+
+
 Сигнал `source=nashdom-bill` уже самодостаточен: в `content` лежит инструкция,
 все нужные id (messageId, attachmentId) и сама команда что делать. Выполняй
 по шагам из сигнала. По умолчанию верни родителю готовый текст уведомления: он отвечает за

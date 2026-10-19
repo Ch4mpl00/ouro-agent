@@ -13,7 +13,9 @@ re-planned on every fire.
 
 ## Procedure
 
-1. Pin down the ask: what the user wants to receive or have done, from
+1. For a requested time today, compare it with the current local time. If it
+   already passed, ask what time/date to use; never silently move it to tomorrow.
+   Pin down the ask: what the user wants to receive or have done, from
    which data, how often, and what counts as new or relevant. Ask the
    parent back only when a choice would change what the user gets.
 2. Find what you will build on. `workflow_functions` lists every function
@@ -247,7 +249,21 @@ Functions besides the ones `workflow_functions` lists from the tools:
   default, higher keeps fewer). Write the prompt as rules an item either
   passes or fails; it sees one item at a time, never the others.
 - `set_memory { key, value }` — stamps one of the two watermarks above.
+- `hash_value { value }` — SHA-256 of canonical JSON (object key order does
+  not matter); returns `{ hash }`. No model call or writes.
+- `skill_catalog_snapshot {}` — returns `{ skills: [{ name, content,
+  content_hash, routable, tools }] }` from the agent's active skill store.
+  Content includes live/default resolution and improver patches. The hash
+  covers effective content and execution metadata; `routable` defaults to
+  true and can be disabled in skill frontmatter. No model calls or writes.
 
+The installed `skill-index` workflow maintains a JSON document at
+`agent-system/skill-index.md` using the memory tools. Its prompt and jq
+pipeline live in its definition and can be edited through ordinary workflow
+versions. `write_doc(searchable: false)` keeps service documents out of
+recall and embeddings; later writes and patches preserve that setting when
+it is omitted. Memory tools can return `{ ok: false, error: ... }` as a normal
+reply: always check `ok` before treating a write as successful.
 ## Reference
 
 Every construct of the table in one definition. Its function names stand

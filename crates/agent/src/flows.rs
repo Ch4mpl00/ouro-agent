@@ -249,6 +249,8 @@ impl WorkflowStore for MemoryWorkflows {
 // effect, the arguments it takes and the ones it needs.
 type ModelFunction = (&'static str, Effect, &'static [&'static str], &'static [&'static str]);
 const MODEL_FUNCTIONS: &[ModelFunction] = &[
+    ("hash_value", Effect::Read, &["value"], &["value"]),
+    ("skill_catalog_snapshot", Effect::Read, &[], &[]),
     ("llm_compose", Effect::Read, &["preset", "skill", "prompt", "input"], &[]),
     ("filter_relevant", Effect::Read, &["items", "prompt", "threshold"], &["items", "prompt"]),
     ("set_memory", Effect::Write, &["key", "value"], &["key", "value"]),
@@ -357,6 +359,13 @@ impl owf::run::Functions for Functions {
         let span = self.spans.scope(info.reference);
         let label = info.reference.rsplit('/').next().unwrap_or(name);
         match name {
+            "hash_value" => {
+                let value = args.get("value").ok_or_else(|| invalid(name, "`value` is required"))?;
+                Ok(json!({"hash":crate::skills::hash_value(value)}))
+            }
+            "skill_catalog_snapshot" => {
+                crate::skills::catalog_snapshot(&*self.engine.deps.skill_store).await.map_err(failed)
+            }
             "llm_compose" => {
                 let preset = text(&args, name, "preset")?.unwrap_or("base");
                 let skill = text(&args, name, "skill")?;
@@ -1113,6 +1122,17 @@ pub async fn probe(engine: &Engine, args: &Map<String, Value>, cancel: &Cancella
     let mcp = &*engine.deps.mcp;
     let name = args.get("name").and_then(Value::as_str).filter(|n| !n.is_empty());
     let name = name.ok_or_else(|| anyhow::anyhow!("name: Expected nonempty string"))?;
+    if name == "skill_catalog_snapshot" || name == "hash_value" {
+        crate::errors::check(cancel)?;
+        let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+        let value = if name == "skill_catalog_snapshot" {
+            crate::skills::catalog_snapshot(&*engine.deps.skill_store).await?
+        } else {
+            let value = arguments.get("value").ok_or_else(|| anyhow::anyhow!("value is required"))?;
+            json!({"hash":crate::skills::hash_value(value)})
+        };
+        return Ok(cut(&value, PROBE_MAX_CHARS).to_string());
+    }
     anyhow::ensure!(
         !MODEL_FUNCTIONS.iter().any(|f| f.0 == name),
         "`{name}` is a model step; probe the reads that feed it instead"

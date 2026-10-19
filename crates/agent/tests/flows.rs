@@ -45,7 +45,8 @@ fn store_contract(store: &dyn WorkflowStore) {
 
     assert!(store.activate("digest", 9).is_err());
     assert_eq!(store.active("digest").unwrap().map(|w| w.version), Some(2), "a failed activation changes nothing");
-    let listed: Vec<(String, i64)> = store.list().unwrap().into_iter().map(|w| (w.name, w.version)).collect();
+    let listed: Vec<(String, i64)> =
+        store.list().unwrap().into_iter().filter(|w| w.name != "skill-index").map(|w| (w.name, w.version)).collect();
     assert_eq!(listed, [("digest".to_string(), 2), ("other".to_string(), 1)]);
 }
 

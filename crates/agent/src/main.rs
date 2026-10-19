@@ -196,7 +196,7 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
             providers,
             mcp: mcp.clone(),
             presets: config.presets.clone(),
-            skills: vec!["orchestrator".into(), "routing".into()],
+            skills: vec!["orchestrator".into()],
             skill_store: skills.clone(),
             memory: db.clone(),
             workflows: db.clone(),

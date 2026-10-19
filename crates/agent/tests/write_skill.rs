@@ -1,7 +1,7 @@
 // Port of test/write-skill.test.ts: write_skill through the real AgentLoop
 // and skill store on temp directories. A skill is the system prompt of every
-// later signal, so two things must hold whatever a model writes: only the
-// dreaming flow can write one at all, and no write leaves a skill the agent
+// later signal, so two things must hold whatever a model writes: primary
+// agents and authorized dreaming workers can write, and no write leaves a skill the agent
 // can't load — the supervisor validates every skill at startup, and a broken
 // one keeps it from starting.
 mod support;
@@ -118,7 +118,7 @@ impl WorkflowRun for Exhausted {
 }
 
 // Loading a skill is not authorization. A model may request dreaming in any
-// signal, but only the supervisor's actual dreaming signal may write.
+// signal, but only the supervisor's actual dreaming signal authorizes a worker.
 #[tokio::test]
 async fn delegating_to_dreaming_only_writes_for_an_authorized_signal() {
     for source in ["telegram", "scheduler", "news-digest", "dreaming"] {
@@ -181,7 +181,7 @@ async fn delegating_to_dreaming_only_writes_for_an_authorized_signal() {
         for (child, write) in &offered {
             assert_eq!(
                 *write,
-                *child && authorized,
+                !*child || authorized,
                 "{source}: authority follows the signal, not the requested skill or prompt"
             );
         }
@@ -226,6 +226,7 @@ async fn revise(
     writes: Vec<Write>,
     skills: Vec<String>,
     allow_skill_writes: bool,
+    primary: bool,
     witnessed: &Mutex<BTreeSet<&'static str>>,
 ) -> Result<(), TestCaseError> {
     let dir = tempfile::tempdir().unwrap();
@@ -251,19 +252,20 @@ async fn revise(
     let mut opts = LoopOptions::new("loop", support::task_context("loop"));
     opts.skills = skills.clone();
     opts.allow_skill_writes = allow_skill_writes;
+    opts.parent_id = if primary { None } else { Some("parent".into()) };
     opts.include_engine_skills = false;
     opts.max_iterations = writes.len() + 1;
     let loop_ = engine.start_loop(opts).await.unwrap();
     loop_.send("revise the skills".into()).await.unwrap();
     engine.end_loop("loop").await;
 
-    let dreaming = allow_skill_writes && skills.iter().any(|s| s == "dreaming");
+    let authorized = primary || (allow_skill_writes && skills.iter().any(|s| s == "dreaming"));
     let first = offered.lock().unwrap()[0].clone();
-    prop_assert_eq!(first.iter().any(|t| t == "write_skill"), dreaming, "write_skill offered to a {} loop", skills[0]);
+    prop_assert_eq!(first.iter().any(|t| t == "write_skill"), authorized, "write_skill offered to a {} loop", skills[0]);
     let live = live_files(&live_dir);
-    if !dreaming {
-        witnessed.lock().unwrap().insert("refused outside dreaming");
-        prop_assert!(live.is_empty(), "nothing written outside the dreaming flow");
+    if !authorized {
+        witnessed.lock().unwrap().insert("refused unauthorized worker");
+        prop_assert!(live.is_empty(), "nothing written by unauthorized workers");
     }
     for f in &live {
         prop_assert!(
@@ -277,7 +279,7 @@ async fn revise(
     if !live.is_empty() {
         witnessed.lock().unwrap().insert("a valid revision lands");
     }
-    if dreaming
+    if authorized
         && writes.iter().any(|w| {
             !w.content.starts_with("---\ntools: *")
                 && !w.content.starts_with("---\ntools: [send")
@@ -294,19 +296,19 @@ async fn revise(
 }
 
 #[test]
-fn is_offered_only_to_an_authorized_dreaming_flow_and_never_leaves_a_skill_the_agent_cant_start_with() {
+fn authorized_writers_never_leave_a_skill_the_agent_cant_start_with() {
     let runs = std::env::var("PROPERTY_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(120);
     let witnessed = Mutex::new(BTreeSet::new());
     let mut runner = TestRunner::new(Config { cases: runs, ..Config::default() });
     let skills = prop::sample::select(vec!["dreaming", "telegram", "worker"]).prop_map(|s| vec![s.to_owned()]);
     runner
-        .run(&(prop::collection::vec(write(), 1..=5), skills, any::<bool>()), |(writes, skills, allow)| {
+        .run(&(prop::collection::vec(write(), 1..=5), skills, any::<bool>(), any::<bool>()), |(writes, skills, allow, primary)| {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-            runtime.block_on(revise(writes, skills, allow, &witnessed))
+            runtime.block_on(revise(writes, skills, allow, primary, &witnessed))
         })
         .unwrap();
     assert_eq!(
         witnessed.into_inner().unwrap().into_iter().collect::<Vec<_>>(),
-        ["a broken revision is offered", "a valid revision lands", "refused outside dreaming"]
+        ["a broken revision is offered", "a valid revision lands", "refused unauthorized worker"]
     );
 }

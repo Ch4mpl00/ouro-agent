@@ -87,6 +87,7 @@ struct Skills {
 impl SkillStore for Skills {
     async fn read_skill(&self, name: &str) -> anyhow::Result<Option<SkillFile>> {
         Ok(self.bodies.get(name).map(|body| SkillFile {
+            routable: true,
             body: body.clone(),
             tools: SkillTools::All,
             source: SkillSource::Default,

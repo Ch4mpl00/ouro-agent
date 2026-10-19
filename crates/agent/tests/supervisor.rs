@@ -188,10 +188,10 @@ async fn routing_uses_workflow_only_for_scheduler_and_domain_signals_are_delegat
             assert!(system.contains("Default Telegram chat id: 999."));
             assert!(system.contains("ORCHESTRATOR"));
             assert_eq!(seen[0].model, "gemini-3.7-flash");
-            assert_eq!(system.contains("TELEGRAM"), source == "telegram");
-            if source != "telegram" {
-                assert!(system.contains(&format!("Delegate the domain work to skill {}", json!(source))));
-            }
+            assert!(!system.contains("TELEGRAM"), "communication rules are discovered, never autoloaded");
+            assert!(system.contains("Discover useful skills with find_skills"));
+            assert_eq!(system.contains("Delivery: use send_telegram_message"), source == "telegram");
+            assert!(seen[0].tools.iter().any(|t| t.name == "write_skill"));
         }
         let (trace, obs) = f.db.get_trace(&format!("{source}:42")).unwrap().unwrap();
         assert_eq!(trace.metadata.as_ref().unwrap()["activity"], "run");

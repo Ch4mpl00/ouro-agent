@@ -359,7 +359,12 @@ pub struct AnySkill;
 #[async_trait]
 impl SkillStore for AnySkill {
     async fn read_skill(&self, _: &str) -> anyhow::Result<Option<SkillFile>> {
-        Ok(Some(SkillFile { body: "test skill".into(), tools: SkillTools::All, source: SkillSource::Default }))
+        Ok(Some(SkillFile {
+            routable: true,
+            body: "test skill".into(),
+            tools: SkillTools::All,
+            source: SkillSource::Default,
+        }))
     }
     async fn read_patch(&self, _: &str) -> anyhow::Result<Option<String>> {
         Ok(None)

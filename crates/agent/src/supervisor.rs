@@ -362,12 +362,13 @@ impl Supervisor {
             let primary=trace.span(SpanStart::new("agent_loop",SpanKind::Chain).metadata(json!({"activity":"primary_loop"}).as_object().unwrap().clone()));span=Some(primary.clone());
             let input=if signal.source==PEER_SOURCE{prepare_peer_input(signal,self.engine.deps.mcp.as_ref(),&scope,&self.cancel).await?}else{prepare_telegram_input(signal,&session,self.engine.deps.mcp.as_ref(),&scope,&self.cancel).await?};
             let conversation=signal.source=="telegram"||signal.source==PEER_SOURCE;
-            let activity=if conversation{load_recent_activity(self.engine.deps.mcp.as_ref(),&scope,&self.cancel).await?}else{None};let transport=conversation||signal.source=="scheduler";
-            let mut prompts=vec![render_context(&session.env)?];if let Some(activity)=activity{prompts.push(activity);}prompts.push(format!("Signal source: {}",signal.source));if !transport{prompts.push(format!("Delegate the domain work to skill {}. You own the final delivery.",json!(signal.source)));}
+            let activity=if conversation{load_recent_activity(self.engine.deps.mcp.as_ref(),&scope,&self.cancel).await?}else{None};let transport=signal.source==PEER_SOURCE||signal.source=="scheduler";
+            let mut prompts=vec![render_context(&session.env)?];if let Some(activity)=activity{prompts.push(activity);}prompts.push(format!("Signal source: {}",signal.source));prompts.push("Discover useful skills with find_skills before domain work; the source is only a hint. You own delivery.".into());
+            if signal.source=="telegram"{prompts.push("Delivery: use send_telegram_message for the current signal's chatId and optional messageThreadId. A final assistant message alone is not delivered to Telegram.".into());}
             if let Some(env)=signal.env_context.as_ref().filter(|s|!s.is_empty()){prompts.push(env.clone());}
             if let Some(note)=handover{prompts.push(note);}
             let mut opts=LoopOptions::new(&id,session);opts.cancel=self.cancel.clone();opts.skills=if transport{vec![signal.source.clone()]}else{Vec::new()};opts.allow_skill_writes=signal.source=="dreaming";opts.system_prompt=Some(prompts.join("\n\n"));opts.preset=if signal.source=="scheduler"{crate::models::PresetName::Base}else{crate::models::PresetName::Smart};opts.trace_scope=Some(primary.clone());
-            let agent=self.engine.start_loop(opts).await?;loop_=Some(agent.clone());let output=agent.send(input).await?;primary.end(SpanEnd::output(output.clone()));trace.update(ContextUpdate{output:Some(json!(output)),metadata:Some(json!({"skills":if transport{vec![signal.source.as_str(),"orchestrator","routing"]}else{vec!["orchestrator","routing"]}}).as_object().unwrap().clone()),..Default::default()});Ok::<_,anyhow::Error>(output)
+            let loaded_skills:Vec<_>=opts.skills.iter().chain(self.engine.deps.skills.iter()).cloned().collect();let agent=self.engine.start_loop(opts).await?;loop_=Some(agent.clone());let output=agent.send(input).await?;primary.end(SpanEnd::output(output.clone()));trace.update(ContextUpdate{output:Some(json!(output)),metadata:Some(json!({"skills":loaded_skills}).as_object().unwrap().clone()),..Default::default()});Ok::<_,anyhow::Error>(output)
         }.await;
         if let Err(error) = &outcome {
             if let Some(span) = &span {

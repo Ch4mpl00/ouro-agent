@@ -1,12 +1,13 @@
 // Skills: two-layer overlay of markdown files.
 //
 //   skills/<name>.md          — live (gitignored, a Docker volume). Mutable;
-//                               `dreaming` writes here.
+//                               the primary agent and authorized dreaming write here.
 //   skills.default/<name>.md  — defaults (git-tracked). The shipped baseline.
 //
 // read_skill returns the live version if present, else the default, else
 // None. save_skill always writes the live overlay — defaults are never touched
-// at runtime, so deleting a live file resets a skill.
+// at runtime. Deleting a live file restores its default if one exists;
+// a live-only skill is removed instead.
 //
 // The improver (crates/evals) appends lessons to `skills/<name>.patch.md`; the runtime
 // glues them onto the END of a skill's system text with `append_patch`. The
@@ -20,6 +21,8 @@ use std::sync::LazyLock;
 use async_trait::async_trait;
 use regex::Regex;
 use serde::Serialize;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 pub const PATCH_MARKER: &str = "<!-- improver-patch -->";
 
@@ -36,6 +39,7 @@ static FRONTMATTER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^---\s*\r?\n
 static TOOLS_WILDCARD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^tools:\s*\*\s*$").unwrap());
 static TOOLS_ARRAY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^tools:\s*\[(.*?)\]\s*$").unwrap());
 static TOOL_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-z_][a-z0-9_]*$").unwrap());
+static ROUTABLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^routable:[ \t]*([^\r\n]*)").unwrap());
 
 fn validate_name(name: &str) -> anyhow::Result<()> {
     if !NAME_PATTERN.is_match(name) {
@@ -82,6 +86,7 @@ pub struct SkillFile {
     pub body: String,
     pub tools: SkillTools,
     pub source: SkillSource,
+    pub routable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -108,8 +113,16 @@ fn parse_skill(name: &str, raw: &str, source: SkillSource) -> anyhow::Result<Ski
     };
     let frontmatter = m.get(1).map_or("", |g| g.as_str());
     let body = raw[m.get(0).map_or(0, |g| g.end())..].to_owned();
+    let routable = match ROUTABLE.captures(frontmatter) {
+        None => true,
+        Some(value) => match value[1].split('#').next().unwrap_or_default().trim() {
+            "true" => true,
+            "false" => false,
+            _ => anyhow::bail!("skill \"{name}\": routable must be true or false"),
+        },
+    };
     if TOOLS_WILDCARD.is_match(frontmatter) {
-        return Ok(SkillFile { body, tools: SkillTools::All, source });
+        return Ok(SkillFile { body, tools: SkillTools::All, source, routable });
     }
     let Some(t) = TOOLS_ARRAY.captures(frontmatter) else {
         anyhow::bail!(
@@ -128,7 +141,31 @@ fn parse_skill(name: &str, raw: &str, source: SkillSource) -> anyhow::Result<Ski
             anyhow::bail!("skill \"{name}\" ({}): tool name \"{tool}\" is not a valid identifier", source.as_str());
         }
     }
-    Ok(SkillFile { body, tools: SkillTools::Named(tools), source })
+    Ok(SkillFile { body, tools: SkillTools::Named(tools), source, routable })
+}
+
+/// Stable JSON fingerprint, independent of object insertion order.
+pub fn hash_value(value: &Value) -> String {
+    let mut value = value.clone();
+    value.sort_all_objects();
+    hex::encode(Sha256::digest(value.to_string()))
+}
+
+/// The same live/default resolution and patch composition as execution.
+/// Generation and the decision to refresh an entry belong to the workflow.
+pub async fn catalog_snapshot(store: &dyn SkillStore) -> anyhow::Result<Value> {
+    let mut skills = Vec::new();
+    for entry in store.list_skills().await? {
+        let Some(mut skill) = store.read_skill(&entry.name).await? else { continue };
+        if let Some(patch) = store.read_patch(&entry.name).await? {
+            skill.body = append_patch(&skill.body, &patch);
+        }
+        let basis = json!({"content":skill.body,"tools":skill.tools.to_json(),"routable":skill.routable});
+        skills.push(json!({"name":entry.name,"content":skill.body,"tools":skill.tools.to_json(),
+            "routable":skill.routable,"content_hash":hash_value(&basis)}));
+    }
+    skills.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Ok(json!({"skills":skills}))
 }
 
 // The tools a skill's content declares, or why it is not a loadable skill —
@@ -247,17 +284,25 @@ fn iso(time: std::time::SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(time).format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
-async fn read_dir(dir: &Path, source: SkillSource) -> Vec<SkillEntry> {
-    let Ok(mut entries) = tokio::fs::read_dir(dir).await else { return Vec::new() };
+async fn read_dir(dir: &Path, source: SkillSource) -> anyhow::Result<Vec<SkillEntry>> {
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
     let mut out = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    while let Some(entry) = entries.next_entry().await? {
         let file = entry.file_name().to_string_lossy().into_owned();
         // A `<name>.patch.md` overlay is not a skill of its own.
         let Some(name) = file.strip_suffix(".md") else { continue };
         if file.ends_with(".patch.md") || !NAME_PATTERN.is_match(name) {
             continue;
         }
-        let Ok(meta) = tokio::fs::metadata(entry.path()).await else { continue };
+        let meta = match tokio::fs::metadata(entry.path()).await {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
         if !meta.is_file() {
             continue;
         }
@@ -268,7 +313,7 @@ async fn read_dir(dir: &Path, source: SkillSource) -> Vec<SkillEntry> {
             modified_at: meta.modified().map(iso).unwrap_or_default(),
         });
     }
-    out
+    Ok(out)
 }
 
 // JS localeCompare on skill names (ICU root collation, case-insensitive
@@ -322,8 +367,8 @@ impl SkillStore for FsSkillStore {
             read_dir(&self.live_dir, SkillSource::Live),
             read_dir(&self.defaults_dir, SkillSource::Default)
         );
-        let mut by_name: Vec<SkillEntry> = defaults;
-        for entry in live {
+        let mut by_name: Vec<SkillEntry> = defaults?;
+        for entry in live? {
             match by_name.iter_mut().find(|e| e.name == entry.name) {
                 Some(slot) => *slot = entry,
                 None => by_name.push(entry),

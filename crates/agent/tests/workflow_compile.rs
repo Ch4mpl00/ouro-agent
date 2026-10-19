@@ -70,6 +70,7 @@ struct Planner(Option<&'static str>);
 impl SkillStore for Planner {
     async fn read_skill(&self, name: &str) -> anyhow::Result<Option<SkillFile>> {
         Ok(self.0.filter(|_| name == "planner").map(|body| SkillFile {
+            routable: true,
             body: body.into(),
             tools: SkillTools::Named(Vec::new()),
             source: SkillSource::Default,

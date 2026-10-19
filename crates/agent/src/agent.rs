@@ -377,7 +377,10 @@ impl AgentLoop {
     fn visible(&self, name: &str) -> bool {
         match name {
             "invoke_sub_agent" => self.opts.parent_id.is_none(),
-            "write_skill" => self.opts.allow_skill_writes && self.skill_names.iter().any(|n| n == "dreaming"),
+            "write_skill" => {
+                self.opts.parent_id.is_none()
+                    || (self.opts.allow_skill_writes && self.skill_names.iter().any(|n| n == "dreaming"))
+            }
             // Writing a workflow is the author's alone; other loops read,
             // activate and schedule the versions it saved and tried.
             name if crate::flows::AUTHOR_TOOLS.contains(&name) || name == "save_workflow" => {
@@ -457,6 +460,13 @@ impl AgentLoop {
         span: Arc<dyn Span>,
     ) -> anyhow::Result<String> {
         match name {
+            "hash_value" => {
+                let value = args.get("value").ok_or_else(|| anyhow::anyhow!("value is required"))?;
+                Ok(json!({"hash":crate::skills::hash_value(value)}).to_string())
+            }
+            "skill_catalog_snapshot" => {
+                Ok(crate::skills::catalog_snapshot(&*engine.deps.skill_store).await?.to_string())
+            }
             "set_memory" => {
                 let key = string_arg(args, "key", true)?;
                 let value = string_arg(args, "value", false)?;
@@ -494,14 +504,31 @@ impl AgentLoop {
                 // A skill this loop already runs is in its instructions: a
                 // second copy would cost its size again on every turn. A loop
                 // that may rewrite skills still gets the text it edits.
-                if self.skill_names.iter().any(|n| n == name) && !self.opts.allow_skill_writes {
+                if self.skill_names.iter().any(|n| n == name)
+                    && !self.visible("write_skill")
+                    && !args.contains_key("expected_hash")
+                {
                     return Ok(json!({"name": name, "found": true, "loaded": true, "content": null,
                         "note": "Already part of your instructions."})
                     .to_string());
                 }
                 Ok(match engine.deps.skill_store.read_skill(name).await? {
                     None => json!({"name": name, "found": false, "content": null}),
-                    Some(skill) => json!({"name": name, "found": true, "content": skill.body, "tools": skill.tools.to_json(), "source": skill.source, "sizeBytes": skill.body.len()}),
+                    Some(mut skill) => {
+                        let editable_body = skill.body.clone();
+                        if let Some(patch)=engine.deps.skill_store.read_patch(name).await? {
+                            skill.body=crate::skills::append_patch(&skill.body,&patch);
+                        }
+                        let content_hash=crate::skills::hash_value(&json!({"content":skill.body,"tools":skill.tools.to_json(),"routable":skill.routable}));
+                        if let Some(expected)=optional_string(args,"expected_hash")? {
+                            anyhow::ensure!(expected==content_hash,"Skill changed since find_skills; search again");
+                        }
+                        let mut result=json!({"name": name,"found":true,"content":if self.opts.allow_skill_writes { &editable_body } else { &skill.body },"effectiveInstructions":skill.body,"content_hash":content_hash,"tools":skill.tools.to_json(),"routable":skill.routable,"source":skill.source,"sizeBytes":skill.body.len()});
+                        if self.visible("write_skill") {
+                            result["editableBody"]=json!(editable_body);
+                        }
+                        result
+                    },
                 }.to_string())
             }
             "write_skill" => {

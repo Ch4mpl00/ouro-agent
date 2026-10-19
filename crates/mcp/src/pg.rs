@@ -71,6 +71,7 @@ const MIGRATIONS: &[Migration] = &[
     Migration { when: 1791823358054, sql: include_str!("../migrations/pg/0005_memory_journal.sql") },
     Migration { when: 1791902517698, sql: include_str!("../migrations/pg/0006_memory_journal_metadata.sql") },
     Migration { when: 1791974288634, sql: include_str!("../migrations/pg/0007_news_embedding_hnsw.sql") },
+    Migration { when: 1792411200004, sql: include_str!("../migrations/pg/0008_memory_doc_searchable.sql") },
 ];
 
 const BREAKPOINT: &str = "--> statement-breakpoint";
@@ -282,6 +283,7 @@ mod tests {
                 ("5114e44328f417de".to_owned(), 1791823358054),
                 ("4b9f63ec641fecd7".to_owned(), 1791902517698),
                 ("36b2a3cfb860bb24".to_owned(), 1791974288634),
+                ("3b2c82d4661f2a4f".to_owned(), 1792411200004),
             ]
         );
     }
@@ -303,6 +305,7 @@ mod tests {
                 "5114e44328f417de",
                 "4b9f63ec641fecd7",
                 "36b2a3cfb860bb24",
+                "3b2c82d4661f2a4f",
             ]
         );
         assert!(MIGRATIONS.windows(2).all(|w| w[0].when < w[1].when));

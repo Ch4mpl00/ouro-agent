@@ -137,6 +137,12 @@ async fn check(skills: &BTreeMap<&'static str, SkillFiles>) -> Result<(), String
         if exported.effective_instructions != in_force {
             return Err(format!("{at}: {name} instructions in force"));
         }
+        let hash = agent::skills::hash_value(
+            &serde_json::json!({"content":in_force,"tools":loaded.tools.to_json(),"routable":loaded.routable}),
+        );
+        if exported.content_hash().unwrap() != hash {
+            return Err(format!("{at}: {name} snapshot hash"));
+        }
         if exported.summary.patched != (in_force != loaded.body) {
             return Err(format!("{at}: {name} patched flag"));
         }

@@ -96,6 +96,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0004_durable_runs", include_str!("../migrations/0004_durable_runs.sql")),
     ("0005_agent_schedule", include_str!("../migrations/0005_agent_schedule.sql")),
     ("0006_workflow_tried", include_str!("../migrations/0006_workflow_tried.sql")),
+    ("0007_system_skill_index", include_str!("../migrations/0007_system_skill_index.sql")),
 ];
 
 pub struct Migration {

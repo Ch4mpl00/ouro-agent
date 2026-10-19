@@ -89,6 +89,7 @@ pub struct Project {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DocSummary {
+    pub searchable: bool,
     pub name: String,
     pub summary: Option<String>,
     pub version: i32,
@@ -100,6 +101,7 @@ pub struct DocSummary {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Doc {
+    pub searchable: bool,
     pub id: i64,
     pub project_id: i64,
     pub name: String,
@@ -114,6 +116,7 @@ pub struct Doc {
 impl Doc {
     fn summary_view(&self) -> DocSummary {
         DocSummary {
+            searchable: self.searchable,
             name: self.name.clone(),
             summary: self.summary.clone(),
             version: self.version,
@@ -748,6 +751,7 @@ pub trait MemoryStore: Send + Sync {
         name: &str,
         summary: Option<&str>,
         body: &str,
+        searchable: bool,
         patch: NewPatch,
     ) -> anyhow::Result<Option<(Doc, DocPatch)>>;
     // The new body and its patch, atomically. None when `expected_version` no
@@ -759,6 +763,7 @@ pub trait MemoryStore: Send + Sync {
         expected_version: i32,
         body: &str,
         summary: Option<Option<&str>>,
+        searchable: Option<bool>,
         patch: NewPatch,
     ) -> anyhow::Result<Option<(Doc, DocPatch)>>;
 
@@ -832,6 +837,7 @@ fn project_of(r: &tokio_postgres::Row) -> Project {
 fn doc_of(r: &tokio_postgres::Row) -> Doc {
     let body: String = r.get("body_md");
     Doc {
+        searchable: r.get("searchable"),
         id: r.get("id"),
         project_id: r.get("project_id"),
         name: r.get("name"),
@@ -943,15 +949,16 @@ impl MemoryStore for PgMemoryStore {
         name: &str,
         summary: Option<&str>,
         body: &str,
+        searchable: bool,
         patch: NewPatch,
     ) -> anyhow::Result<Option<(Doc, DocPatch)>> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
         let Some(row) = tx
             .query_opt(
-                "INSERT INTO memory_project_docs (project_id, name, summary, body_md) VALUES ($1, $2, $3, $4)
+                "INSERT INTO memory_project_docs (project_id, name, summary, body_md, searchable) VALUES ($1, $2, $3, $4, $5)
                  ON CONFLICT DO NOTHING RETURNING *",
-                &[&project_id, &name, &summary, &body],
+                &[&project_id, &name, &summary, &body, &searchable],
             )
             .await?
         else {
@@ -969,30 +976,30 @@ impl MemoryStore for PgMemoryStore {
         expected_version: i32,
         body: &str,
         summary: Option<Option<&str>>,
+        searchable: Option<bool>,
         patch: NewPatch,
     ) -> anyhow::Result<Option<(Doc, DocPatch)>> {
         // The version in the WHERE clause matches no row once another agent
         // has moved on; the caller reports a conflict instead of overwriting.
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
-        let row = match summary {
-            None => {
-                tx.query_opt(
-                    "UPDATE memory_project_docs SET body_md = $1, version = $2, updated_at = now()
-                          WHERE id = $3 AND version = $4 RETURNING *",
-                    &[&body, &(expected_version + 1), &doc_id, &expected_version],
-                )
-                .await?
-            }
-            Some(summary) => {
-                tx.query_opt(
-                    "UPDATE memory_project_docs SET body_md = $1, summary = $2, version = $3, updated_at = now()
-                          WHERE id = $4 AND version = $5 RETURNING *",
-                    &[&body, &summary, &(expected_version + 1), &doc_id, &expected_version],
-                )
-                .await?
-            }
-        };
+        let row = tx
+            .query_opt(
+                "UPDATE memory_project_docs SET body_md = $1,
+                 summary = CASE WHEN $2 THEN $3 ELSE summary END,
+                 searchable = COALESCE($4, searchable), version = $5, updated_at = now()
+             WHERE id = $6 AND version = $7 RETURNING *",
+                &[
+                    &body,
+                    &summary.is_some(),
+                    &summary.flatten(),
+                    &searchable,
+                    &(expected_version + 1),
+                    &doc_id,
+                    &expected_version,
+                ],
+            )
+            .await?;
         let Some(row) = row else { return Ok(None) };
         let patch = insert_patch(&tx, doc_id, &patch).await?;
         tx.commit().await?;
@@ -1295,7 +1302,7 @@ impl Indexer {
     }
 
     pub async fn index_doc(&self, project: &Project, doc: &Doc) -> anyhow::Result<()> {
-        let chunks = chunk_markdown(&doc.body, self.chunk_chars);
+        let chunks = if doc.searchable { chunk_markdown(&doc.body, self.chunk_chars) } else { Vec::new() };
         let texts: Vec<String> =
             chunks.iter().map(|c| build_index_text(&project.title, &doc.name, &c.heading_path, &c.text)).collect();
         let vectors = self.embed_texts(&texts).await;
@@ -1424,6 +1431,8 @@ pub struct DocList {
 }
 
 pub struct WriteDoc<'a> {
+    // None preserves an existing setting; new documents are searchable.
+    pub searchable: Option<bool>,
     pub project: &'a str,
     pub doc: &'a str,
     pub body: &'a str,
@@ -1477,6 +1486,7 @@ pub type PatchIdGen = Arc<dyn Fn() -> String + Send + Sync>;
 
 // One write, as `commit` records it.
 struct Change<'a> {
+    searchable: Option<bool>,
     body: &'a str,
     // None keeps the stored summary.
     summary: Option<Option<&'a str>>,
@@ -1572,7 +1582,7 @@ impl MemoryService {
             rationale: change.rationale,
         };
         let Some((updated, patch)) =
-            self.store.update_doc(doc.id, doc.version, change.body, change.summary, patch).await?
+            self.store.update_doc(doc.id, doc.version, change.body, change.summary, change.searchable, patch).await?
         else {
             return Ok(None);
         };
@@ -1628,8 +1638,10 @@ impl MemoryService {
             actor: input.actor.to_owned(),
             rationale: input.rationale.map(str::to_owned),
         };
-        let Some((created, patch)) =
-            self.store.create_doc(project.id, input.doc, input.summary, input.body, patch).await?
+        let Some((created, patch)) = self
+            .store
+            .create_doc(project.id, input.doc, input.summary, input.body, input.searchable.unwrap_or(true), patch)
+            .await?
         else {
             let theirs = self.store.get_doc(project.id, input.doc).await?;
             return Ok(Err(theirs.ok_or_else(|| raced(&project.slug, input.doc))?));
@@ -1670,6 +1682,7 @@ impl MemoryService {
                 &project,
                 &existing,
                 Change {
+                    searchable: input.searchable,
                     body: input.body,
                     summary: input.summary.map(Some),
                     kind: PatchKind::Write,
@@ -1706,6 +1719,7 @@ impl MemoryService {
                     &project,
                     &doc,
                     Change {
+                        searchable: None,
                         body: &body,
                         summary: None,
                         kind: PatchKind::Append,
@@ -1742,6 +1756,7 @@ impl MemoryService {
                 &project,
                 &doc,
                 Change {
+                    searchable: None,
                     body: &body,
                     summary: None,
                     kind: PatchKind::Patch,
@@ -1818,6 +1833,7 @@ impl MemoryService {
                 &project,
                 &doc,
                 Change {
+                    searchable: None,
                     body: &body,
                     summary: None,
                     kind: PatchKind::Revert,
@@ -2227,6 +2243,8 @@ struct PatchDocParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct WriteDocParams {
+    /// Whether this document participates in recall/embeddings. Default true on creation; omitted preserves it.
+    searchable: Option<bool>,
     project: String,
     /// Filename, e.g. "roadmap.md".
     doc: String,
@@ -2450,6 +2468,7 @@ impl McpTools {
         let memory = &self.deps.memory;
         run(memory
             .write_doc(WriteDoc {
+                searchable: p.searchable,
                 project: &p.project,
                 doc: &p.doc,
                 body: &p.body,
@@ -2665,6 +2684,7 @@ pub mod testing {
             name: &str,
             summary: Option<&str>,
             body: &str,
+            searchable: bool,
             patch: NewPatch,
         ) -> anyhow::Result<Option<(Doc, DocPatch)>> {
             let mut s = self.lock();
@@ -2672,6 +2692,7 @@ pub mod testing {
                 return Ok(None);
             }
             let doc = Doc {
+                searchable,
                 id: next(&mut s),
                 project_id,
                 name: name.into(),
@@ -2692,6 +2713,7 @@ pub mod testing {
             expected_version: i32,
             body: &str,
             summary: Option<Option<&str>>,
+            searchable: Option<bool>,
             patch: NewPatch,
         ) -> anyhow::Result<Option<(Doc, DocPatch)>> {
             let hook = self.before_update.lock().unwrap().as_ref().map(|h| h(doc_id));
@@ -2704,6 +2726,9 @@ pub mod testing {
                 return Ok(None);
             }
             doc.body = body.into();
+            if let Some(searchable) = searchable {
+                doc.searchable = searchable;
+            }
             if let Some(summary) = summary {
                 doc.summary = summary.map(str::to_owned);
             }
@@ -3124,7 +3149,16 @@ mod tests {
     }
 
     fn write<'a>(project: &'a str, doc: &'a str, body: &'a str) -> WriteDoc<'a> {
-        WriteDoc { project, doc, body, summary: None, expected_version: None, actor: ACTOR, rationale: None }
+        WriteDoc {
+            searchable: None,
+            project,
+            doc,
+            body,
+            summary: None,
+            expected_version: None,
+            actor: ACTOR,
+            rationale: None,
+        }
     }
 
     #[tokio::test]
@@ -3133,6 +3167,7 @@ mod tests {
         h.service.create_project("leetcode-graphs", "Графы для интервью").await.unwrap();
         h.service
             .write_doc(WriteDoc {
+                searchable: None,
                 summary: Some("Цель и рамки проекта"),
                 ..write("leetcode-graphs", "passport.md", "# Паспорт\n\nЦель.\n")
             })
@@ -3140,6 +3175,7 @@ mod tests {
             .unwrap();
         h.service
             .write_doc(WriteDoc {
+                searchable: None,
                 summary: Some("Список тем"),
                 ..write("leetcode-graphs", "roadmap.md", "# Roadmap\n")
             })
@@ -3198,7 +3234,7 @@ mod tests {
         let (c, d) = code(h.service.write_doc(write("p", "a.md", "two\n")).await.unwrap_err());
         assert_eq!((c, &d["currentVersion"]), ("version_required", &json!(1)));
         assert_eq!(h.service.read_doc("p", "a.md").await.unwrap().body, "one\n");
-        let ahead = WriteDoc { expected_version: Some(3), ..write("p", "new.md", "x") };
+        let ahead = WriteDoc { searchable: None, expected_version: Some(3), ..write("p", "new.md", "x") };
         assert_eq!(code(h.service.write_doc(ahead).await.unwrap_err()).0, "version_conflict");
     }
 
@@ -3262,7 +3298,7 @@ mod tests {
                     rationale: None,
                 };
                 let body = format!("{}\nfrom other agent\n", current.body);
-                store.update_doc(doc_id, current.version, &body, None, theirs).await.unwrap();
+                store.update_doc(doc_id, current.version, &body, None, None, theirs).await.unwrap();
             })
         }));
         h.service.append_doc("p", "log.md", "mine", None, ACTOR, None).await.unwrap();
@@ -3364,11 +3400,49 @@ mod tests {
         assert_eq!(hits[0].r#ref, "doc:graphs/progress.md#0");
 
         h.service
-            .write_doc(WriteDoc { expected_version: Some(1), ..write("graphs", "progress.md", "") })
+            .write_doc(WriteDoc { searchable: None, expected_version: Some(1), ..write("graphs", "progress.md", "") })
             .await
             .unwrap();
         let hits = h.service.recall("dijkstra прогресс графы", None, None, None, Utc::now()).await.unwrap();
         assert!(hits.iter().all(|hit| !hit.r#ref.starts_with("doc:")));
+    }
+
+    #[tokio::test]
+    async fn unsearchable_documents_keep_versions_and_history_and_stay_out_of_recall() {
+        let h = harness();
+        h.service.create_project("system", "System").await.unwrap();
+        h.service
+            .write_doc(WriteDoc { searchable: Some(false), ..write("system", "index.md", "alpha") })
+            .await
+            .unwrap();
+        assert!(!h.service.read_doc("system", "index.md").await.unwrap().searchable);
+        assert!(h.service.recall("beta gamma alpha", None, None, None, Utc::now()).await.unwrap().is_empty());
+        h.service.patch_doc("system", "index.md", 1, vec![edit("alpha", "beta")], ACTOR, None).await.unwrap();
+        let doc = h.service.read_doc("system", "index.md").await.unwrap();
+        assert_eq!((doc.body.as_str(), doc.version, doc.searchable), ("beta", 2, false));
+        assert_eq!(h.service.history("system", "index.md", 10).await.unwrap().len(), 2);
+        assert!(h.service.recall("beta gamma alpha", None, None, None, Utc::now()).await.unwrap().is_empty());
+        h.service
+            .write_doc(WriteDoc {
+                searchable: Some(true),
+                expected_version: Some(2),
+                ..write("system", "index.md", "beta")
+            })
+            .await
+            .unwrap();
+        assert!(!h.service.recall("beta gamma alpha", None, None, None, Utc::now()).await.unwrap().is_empty());
+        h.service
+            .write_doc(WriteDoc {
+                searchable: Some(false),
+                expected_version: Some(3),
+                ..write("system", "index.md", "gamma")
+            })
+            .await
+            .unwrap();
+        assert!(
+            h.service.recall("beta gamma alpha", None, None, None, Utc::now()).await.unwrap().is_empty(),
+            "disabling search removes existing chunks"
+        );
     }
 
     #[tokio::test]
@@ -3420,6 +3494,7 @@ mod tests {
 
         let created = service
             .write_doc(WriteDoc {
+                searchable: None,
                 summary: Some("roadmap"),
                 ..write(&slug, "roadmap.md", "## Темы\n\n- [ ] BFS\n- [ ] Dijkstra\n")
             })
@@ -3471,7 +3546,10 @@ mod tests {
         assert_eq!(archived.len(), 1);
 
         // Emptying a document drops its chunks from the projection.
-        service.write_doc(WriteDoc { expected_version: Some(4), ..write(&slug, "roadmap.md", "") }).await.unwrap();
+        service
+            .write_doc(WriteDoc { searchable: None, expected_version: Some(4), ..write(&slug, "roadmap.md", "") })
+            .await
+            .unwrap();
         let after = service.recall("Dijkstra темы", Some(50), None, None, Utc::now()).await.unwrap();
         assert!(after.iter().all(|h| !h.r#ref.starts_with(&format!("doc:{slug}/"))));
     }
