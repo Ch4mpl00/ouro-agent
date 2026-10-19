@@ -407,7 +407,7 @@ async fn the_author_sees_the_functions_and_probes_only_reads() {
         line("send_telegram_message").as_deref(),
         Some("send_telegram_message(chatId?: any, text: any) write — send")
     );
-    assert!(line("llm_decide").unwrap().starts_with("llm_decide(items, prompt, threshold?) read"));
+    assert!(line("filter_relevant").unwrap().starts_with("filter_relevant(items, prompt, threshold?) read"));
     assert_eq!(line("get_next_signal"), None, "the signal queue is the supervisor's");
     let one: Value = serde_json::from_str(
         &functions(&w.engine, json!({"name": "send_telegram_message"}).as_object().unwrap()).unwrap(),
@@ -476,16 +476,20 @@ async fn a_dry_run_records_the_writes_and_changes_nothing() {
 }
 
 #[tokio::test]
-async fn a_workflow_sends_to_the_chat_its_input_names() {
+async fn a_workflow_sends_to_the_chat_its_input_names_on_the_users_clock() {
     use agent::session::{EnvData, session};
     let w = world(vec![]);
     w.activate(
         "ping",
         r#"document: { dsl: '1.0.4', namespace: t, name: ping, version: '0.1.0' }
-do: [ { send: { call: send_telegram_message, with: { chatId: '${ $workflow.input.env.telegramChatId }', text: hi } } } ]
+do: [ { send: { call: send_telegram_message, with: { chatId: '${ $workflow.input.env.telegramChatId }', text: '${ $workflow.input.env.localNow }' } } } ]
 "#,
     );
-    let env = EnvData { telegram_chat_id: Some("4242".into()), ..task_context("scheduler:8").env.clone() };
+    let env = EnvData {
+        telegram_chat_id: Some("4242".into()),
+        timezone: "Europe/Kiev".into(),
+        ..task_context("scheduler:8").env.clone()
+    };
     let signal = WorkflowSignal { id: 8, source: "scheduler".into(), content: "go".into(), env_context: None };
     let trace = w.tracer.trace(TraceStart { id: "scheduler:8".into(), name: "t".into(), ..Default::default() });
     let scope: Scope = trace.clone();
@@ -496,7 +500,10 @@ do: [ { send: { call: send_telegram_message, with: { chatId: '${ $workflow.input
     assert!(matches!(result, FlowResult::Completed(_)), "{result:?}");
     assert_eq!(
         w.calls(),
-        [("send_telegram_message".to_string(), json!({"chatId":"4242","text":"hi"}).as_object().unwrap().clone())]
+        [(
+            "send_telegram_message".to_string(),
+            json!({"chatId":"4242","text":"2026-09-06T15:00:00+03:00"}).as_object().unwrap().clone()
+        )]
     );
 }
 

@@ -758,9 +758,15 @@ pub fn render_signal_prompt(signal: &WorkflowSignal, env: &EnvData, prior: Optio
     lines.join("\n")
 }
 // What a run starts from: the session's environment and the signal. A saved
-// workflow (`flows.rs`) gets the same object as its input.
+// workflow (`flows.rs`) gets the same object as its input. `localNow` is the
+// same instant on the user's clock, with its offset (UTC when the zone is
+// unknown), for the dates a run shows the user.
 pub fn signal_input(signal: &WorkflowSignal, env: &EnvData) -> Map<String, Value> {
-    json!({"env":{"timezone":env.timezone,"now":iso(env.now),"newsLastReadAt":env.news_last_read_at,"techLastReadAt":env.tech_last_read_at,"userEmail":env.user_email,"telegramChatId":env.telegram_chat_id},"signal":{"source":signal.source,"content":signal.content,"id":signal.id}}).as_object().unwrap().clone()
+    let local_now = match env.timezone.parse::<chrono_tz::Tz>() {
+        Ok(zone) => env.now.with_timezone(&zone).to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+        Err(_) => env.now.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+    };
+    json!({"env":{"timezone":env.timezone,"now":iso(env.now),"localNow":local_now,"newsLastReadAt":env.news_last_read_at,"techLastReadAt":env.tech_last_read_at,"userEmail":env.user_email,"telegramChatId":env.telegram_chat_id},"signal":{"source":signal.source,"content":signal.content,"id":signal.id}}).as_object().unwrap().clone()
 }
 pub struct WorkflowRunner {
     pub engine: Arc<Engine>,

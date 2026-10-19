@@ -66,6 +66,9 @@ their yes, call `activate_workflow(name, version)`, then `schedule_task`
 with `workflow: "<name>"` and a one-line `prompt` saying what it does
 (none if a schedule for it already exists: `list_scheduled_tasks`).
 Never activate on your own judgement.
+To run a saved workflow once on request ("прогони сейчас"), schedule it
+with `cron_expr: "now"`: it runs as soon as this turn ends, sends what it
+would send on schedule and moves its watermarks.
 
 User knowledge ("запомни", "что помнишь про") uses MCP `remember`,
 `recall`, `get_fact` and `read_doc` directly. It is distinct from temporary

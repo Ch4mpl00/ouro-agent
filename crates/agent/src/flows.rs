@@ -223,13 +223,13 @@ impl WorkflowStore for MemoryWorkflows {
 
 // ── 2. function catalog ────────────────────────────────────────────────────
 
-// The model steps a workflow may call besides MCP tools, the same ones the
-// planner's workflows have: the name, the effect, the arguments it takes and
-// the ones it needs.
+// The runtime's own steps a workflow may call besides MCP tools (a
+// generation, the decision classifier's filter, a watermark): the name, the
+// effect, the arguments it takes and the ones it needs.
 type ModelFunction = (&'static str, Effect, &'static [&'static str], &'static [&'static str]);
 const MODEL_FUNCTIONS: &[ModelFunction] = &[
     ("llm_compose", Effect::Read, &["preset", "skill", "prompt", "input"], &[]),
-    ("llm_decide", Effect::Read, &["items", "prompt", "threshold"], &["items", "prompt"]),
+    ("filter_relevant", Effect::Read, &["items", "prompt", "threshold"], &["items", "prompt"]),
     ("set_memory", Effect::Write, &["key", "value"], &["key", "value"]),
 ];
 
@@ -352,7 +352,7 @@ impl owf::run::Functions for Functions {
                 span.update(crate::tracing::ContextUpdate::input(json!({"skill":skill,"prompt":user})));
                 compose(&self.engine, preset, skill, &user, label, &span, info.cancel).await.map_err(failed)
             }
-            "llm_decide" => {
+            "filter_relevant" => {
                 let decisions = self.engine.deps.decisions.as_ref().ok_or_else(|| {
                     WorkflowError::runtime("no decision model configured (OPEN_ROUTER_API_KEY)".to_string())
                 })?;
@@ -721,7 +721,8 @@ pub fn check(mcp: &dyn Mcp, definition: &str) -> Result<owf::model::Workflow, St
     owf::model::validate(&wf, &Known(mcp)).map_err(|e| e.to_string())?;
     let mut problems = Vec::new();
     for site in owf::model::call_sites(&wf) {
-        if site.delivery == Delivery::AtMostOnce && matches!(site.function.as_str(), "llm_compose" | "llm_decide") {
+        if site.delivery == Delivery::AtMostOnce && matches!(site.function.as_str(), "llm_compose" | "filter_relevant")
+        {
             problems
                 .push(format!("{}/metadata/delivery: model adapters do not yet support at_most_once", site.reference));
         }
@@ -970,7 +971,7 @@ pub fn functions(engine: &Engine, args: &Map<String, Value>) -> anyhow::Result<S
     if let Some(name) = args.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()) {
         if let Some((_, _, takes, needs)) = MODEL_FUNCTIONS.iter().find(|f| f.0 == name) {
             return Ok(json!({"name": name, "effect": effect_of(name), "takes": takes, "needs": needs,
-                "description": "A model step of the workflow runtime; the skill describes it."})
+                "description": "A step of the workflow runtime; the skill describes it."})
             .to_string());
         }
         let tool = tools.iter().find(|t| t.name == name).ok_or_else(|| anyhow::anyhow!("no function `{name}`"))?;
@@ -987,7 +988,7 @@ pub fn functions(engine: &Engine, args: &Map<String, Value>) -> anyhow::Result<S
         let args: Vec<String> =
             takes.iter().map(|a| if needs.contains(a) { a.to_string() } else { format!("{a}?") }).collect();
         let effect = if *effect == Effect::Read { "read" } else { "write" };
-        lines.push(format!("{name}({}) {effect} — a model step; see the skill", args.join(", ")));
+        lines.push(format!("{name}({}) {effect} — a runtime step; see the skill", args.join(", ")));
     }
     for tool in &tools {
         let schema = &tool.parameters;

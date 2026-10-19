@@ -89,7 +89,7 @@ External-event/user-input waits and a durable signal inbox with upstream
 lease/ack are still tracked in `.claude/tasks/durable-workflows.md`.
 Durability starts at run admission; the current destructive MCP dequeue has
 an earlier delivery gap. The agent rejects `at_most_once` on `llm_compose`
-and `llm_decide` until their provider adapters expose a single-attempt path;
+and `filter_relevant` until their provider adapters expose a single-attempt path;
 those calls currently use `at_least_once`. Delivery on a reusable function
 belongs on its external call tasks.
 

@@ -6,7 +6,7 @@ tools: []
 
 A saved workflow is a recurring task written down once as a definition and
 then run on a schedule without an agent deciding what to do next. Only its
-explicit `llm_compose` / `llm_decide` steps call a model. Write one when the
+explicit `llm_compose` and `filter_relevant` steps call a model. Write one when the
 user wants something done regularly ("присылай каждое утро …", "раз в
 неделю проверяй …"), or when an existing scheduled task should stop being
 re-planned on every fire.
@@ -32,7 +32,7 @@ re-planned on every fire.
    never fill them in from what you know of the service behind a function.
    A probe shows the shape of the data, not the data a run will see: never
    write the values it happened to return (texts, names, ids, amounts)
-   into the definition; judge what matters by criteria (`llm_decide`) or
+   into the definition; judge what matters by criteria (`filter_relevant`) or
    by fields, never by the sample's words.
 4. Design it with the principles below, write the definition and call
    `save_workflow(name, definition)`. It checks the definition against the
@@ -87,6 +87,10 @@ judge. Build the pipeline the task needs from these parts, no more:
 - **Window.** A run covers the time since the previous one: a lookback
   that matches the schedule, or a watermark. Avoid calendar-day arithmetic
   in jq: `env.now` is UTC, and the user's day is not.
+- **Dates the user reads** (a header, "today", "this morning") come from
+  `env.localNow`, the same instant on the user's clock with its offset;
+  pass it to the model step that writes them. `env.now` (UTC) is for
+  function arguments.
 - **State between runs.** The input carries two watermarks,
   `env.newsLastReadAt` and `env.techLastReadAt`, stamped with `set_memory`
   under `news_digest.last_read_at` / `tech_digest.last_read_at`; any other
@@ -94,9 +98,12 @@ judge. Build the pipeline the task needs from these parts, no more:
   else, keep a journal stream named after the workflow: `journal_append`
   what you delivered, `journal_tail` it at the start, and let the model
   steps leave out what it already covers.
-- **Selection.** Many items of which some matter → `llm_decide` with the
-  criteria spelled out (what to take, what to drop). Items an expression
-  can judge (a field, a threshold, a date) → jq, no model.
+- **Selection.** Many items of which some matter → `filter_relevant` with
+  the criteria spelled out (what to take, what to drop). It judges each
+  item on its own, so it cannot tell that two items report the same
+  thing: merging and leaving out what was already sent belong to the
+  `llm_compose` that writes the text. Items an expression can judge (a
+  field, a threshold, a date) → jq, no model.
 - **Computation.** Sums, counts, filters, sorting and grouping are jq
   (`[.rows[] | select(.value < 0) | .value] | add`), never a model step: a
   model adds cost and can miscount. Hand the model the computed numbers and
@@ -134,7 +141,7 @@ duplicate effect. For calls where a duplicate is unacceptable, set
 `metadata: { delivery: at_most_once }` on the `call` task. An unknown outcome
 then stops the run without retry; execution can be lost if the agent crashes
 before dispatch. Put this metadata on external calls inside reusable
-functions, not on their callers. `llm_compose` and `llm_decide` currently
+functions, not on their callers. `llm_compose` and `filter_relevant` currently
 support only the default policy. Do not wrap unknown outcomes in retries.
 
 A `try` retry does not repeat a write that already succeeded: the retry
@@ -202,8 +209,9 @@ prompt: |
 ```
 
 Data flow: each task's output is the next task's input. The workflow's
-input is `{ env: { timezone, now, newsLastReadAt, techLastReadAt,
-userEmail, telegramChatId }, signal: { source, content, id } }`, available
+input is `{ env: { timezone, now, localNow, newsLastReadAt,
+techLastReadAt, userEmail, telegramChatId }, signal: { source, content, id
+} }`, available
 everywhere as `$workflow.input`. Keep a result for later tasks with
 `export: { as: '${ $context + { name: . } }' }` and read `$context.name`.
 
@@ -213,8 +221,12 @@ Functions besides the ones `workflow_functions` lists from the tools:
   that skill; `input` is an object shown to the model as tagged sections;
   `preset` is `base` (default), `smart` or `smartest`. Returns the reply,
   parsed when it is JSON.
-- `llm_decide { items, prompt, threshold? }` — keeps the items of the array
-  that the decision model judges relevant by `prompt`.
+- `filter_relevant { items, prompt, threshold? }` — keeps the items of the
+  array that pass the rules in `prompt`. Not a chat model: a classifier
+  answers "passes / does not pass" for every item separately (in batches
+  of 25), with a probability; an item is kept from `threshold` up (0.3 by
+  default, higher keeps fewer). Write the prompt as rules an item either
+  passes or fails; it sees one item at a time, never the others.
 - `set_memory { key, value }` — stamps one of the two watermarks above.
 
 ## Reference

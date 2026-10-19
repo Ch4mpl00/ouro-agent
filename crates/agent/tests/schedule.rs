@@ -830,6 +830,35 @@ async fn a_one_shot_task_fires_once_and_is_gone() {
     assert_eq!(listed.unwrap()["count"], 0);
 }
 
+// `now` is a one-shot whatever `recurring` says: the next tick fires it with
+// the workflow it names, once; a runner that was stopping leaves it for the
+// tick after.
+#[tokio::test]
+async fn a_now_task_fires_once_on_the_next_tick() {
+    let (_dir, db) = store();
+    let created = ms("2026-10-02T14:30:10Z");
+    let args = json!({"cron_expr": "now", "recurring": true, "prompt": "run the digest", "workflow": "digest"});
+    let reply = call(&db, &workflows(), "Europe/Kiev", "schedule_task", args, created).await.unwrap();
+    assert_eq!((&reply["ok"], &reply["task"]["recurring"]), (&json!(true), &json!(0)), "{reply}");
+    assert_eq!(reply["upcoming_fires"], json!([iso(created)]));
+    let listed = call(&db, &workflows(), "Europe/Kiev", "list_scheduled_tasks", json!({}), created + 1_000).await;
+    assert_eq!(listed.unwrap()["tasks"][0]["upcoming_fires"], json!([iso(created + 1_000)]));
+
+    let recorder = Recorder::default();
+    recorder.refuse.store(true, Ordering::SeqCst);
+    schedule::tick(&db, &recorder, tz_of("Europe/Kiev"), at(created + 20_000)).await.unwrap();
+    recorder.refuse.store(false, Ordering::SeqCst);
+    for now in [created + 50_000, created + 80_000] {
+        schedule::tick(&db, &recorder, tz_of("Europe/Kiev"), at(now)).await.unwrap();
+    }
+    let fires = recorder.fires.lock().unwrap().clone();
+    assert_eq!(fires.len(), 1, "{fires:?}");
+    assert_eq!(fires[0].workflow.as_deref(), Some("digest"));
+    assert!(fires[0].content.contains("run the digest"), "{}", fires[0].content);
+    let listed = call(&db, &workflows(), "Europe/Kiev", "list_scheduled_tasks", json!({}), created + 90_000).await;
+    assert_eq!(listed.unwrap()["count"], 0);
+}
+
 #[tokio::test]
 async fn schedule_task_refuses_what_would_never_fire_as_written() {
     let (_dir, db) = store();

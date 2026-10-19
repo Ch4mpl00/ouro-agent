@@ -310,6 +310,10 @@ fn preview_next_fires(cron: &Cron, tz: Tz, count: usize, now: DateTime<Utc>) -> 
     out
 }
 
+// `cron_expr: "now"`: a one-shot due at once, fired by the first tick that
+// finds it (after the signal running at the time, like every fire).
+pub const NOW: &str = "now";
+
 // The slot a task's next fire is computed from: the slot it last fired for,
 // or — never fired — its creation time.
 fn anchor(task: &TaskRow) -> DateTime<Utc> {
@@ -354,14 +358,20 @@ pub trait FireSink: Send + Sync {
 pub async fn tick(store: &dyn ScheduleStore, sink: &dyn FireSink, tz: Tz, now: DateTime<Utc>) -> anyhow::Result<usize> {
     let mut fired = 0;
     for task in store.list_active().await? {
-        let cron = match parse_cron(&task.cron_expr) {
-            Ok(cron) => cron,
-            Err(err) => {
-                eprintln!("[schedule] task {} has an invalid cron {:?}, skipping: {err}", task.id, task.cron_expr);
-                continue;
-            }
+        let slot = if task.cron_expr == NOW {
+            // Its slot is its creation: a claimed one retires it.
+            task.created
+        } else {
+            let cron = match parse_cron(&task.cron_expr) {
+                Ok(cron) => cron,
+                Err(err) => {
+                    eprintln!("[schedule] task {} has an invalid cron {:?}, skipping: {err}", task.id, task.cron_expr);
+                    continue;
+                }
+            };
+            let Some(slot) = next_slot(&cron, tz, anchor(&task)) else { continue };
+            slot
         };
-        let Some(slot) = next_slot(&cron, tz, anchor(&task)) else { continue };
         if slot > now {
             continue;
         }
@@ -552,24 +562,29 @@ pub async fn tool(
                 args.get("recurring").and_then(Value::as_bool).ok_or_else(|| anyhow::anyhow!("recurring: Required"))?;
             anyhow::ensure!(!cron_expr.is_empty() && !prompt.is_empty(), "cron_expr and prompt must be non-empty");
             let workflow = args.get("workflow").and_then(Value::as_str).filter(|w| !w.is_empty()).map(str::to_owned);
-            if let Some(error) = field_count_error(&cron_expr) {
-                return failure(format!("Invalid cron expression: {error}"));
-            }
-            let cron = match parse_cron(&cron_expr) {
-                Ok(cron) => cron,
-                Err(err) => return failure(format!("Invalid cron expression: {err}")),
+            // `now` runs once, whatever `recurring` says.
+            let (recurring, upcoming_fires) = if cron_expr == NOW {
+                (false, vec![iso(now)])
+            } else {
+                if let Some(error) = field_count_error(&cron_expr) {
+                    return failure(format!("Invalid cron expression: {error}"));
+                }
+                let cron = match parse_cron(&cron_expr) {
+                    Ok(cron) => cron,
+                    Err(err) => return failure(format!("Invalid cron expression: {err}")),
+                };
+                // croner accepts a day that never comes (Nov 31) and would store a
+                // task that never fires; the TS server's parser refuses it.
+                if next_slot(&cron, tz, now).is_none() {
+                    return failure("Invalid cron expression: it never matches a date that exists".into());
+                }
+                (recurring, preview_next_fires(&cron, tz, upcoming_count(recurring), now))
             };
-            // croner accepts a day that never comes (Nov 31) and would store a
-            // task that never fires; the TS server's parser refuses it.
-            if next_slot(&cron, tz, now).is_none() {
-                return failure("Invalid cron expression: it never matches a date that exists".into());
-            }
             if let Some(workflow) = &workflow
                 && workflows.active(workflow)?.is_none()
             {
                 return failure(format!("Workflow `{workflow}` has no active version; activate it first"));
             }
-            let upcoming_fires = preview_next_fires(&cron, tz, upcoming_count(recurring), now);
             let task = store
                 .insert(&NewTask {
                     cron_expr,
@@ -591,9 +606,13 @@ pub async fn tool(
                 .map(|t| {
                     let recurring = t.recurring == 1;
                     // An invalid cron surfaces as an empty `upcoming_fires`.
-                    let upcoming_fires = parse_cron(&t.cron_expr)
-                        .map(|cron| preview_next_fires(&cron, tz, upcoming_count(recurring), now))
-                        .unwrap_or_default();
+                    let upcoming_fires = if t.cron_expr == NOW {
+                        vec![iso(now)]
+                    } else {
+                        parse_cron(&t.cron_expr)
+                            .map(|cron| preview_next_fires(&cron, tz, upcoming_count(recurring), now))
+                            .unwrap_or_default()
+                    };
                     ListedTask {
                         last_run_at_iso: t.last_run_at.and_then(|s| Utc.timestamp_opt(s, 0).single()).map(iso),
                         id: t.id,
