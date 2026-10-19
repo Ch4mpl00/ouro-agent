@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "mcp-tools": {
-      "command": "cargo",
-      "args": ["run", "--quiet", "--release", "-p", "mcp-tools", "--bin", "mcp-tools"]
+      "type": "http",
+      "url": "http://127.0.0.1:3001/mcp"
     }
   }
 }
