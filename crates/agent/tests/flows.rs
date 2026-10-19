@@ -115,6 +115,10 @@ struct World {
 }
 
 fn world(replies: Vec<&str>) -> World {
+    world_with(replies, None)
+}
+
+fn world_with(replies: Vec<&str>, decisions: Option<Arc<agent::decisions::DecisionClient>>) -> World {
     let llm: Arc<Scripted> = Arc::new(Scripted::new(replies.into_iter().map(assistant).collect()));
     let schema = |properties: &[&str], required: &[&str]| {
         let properties: Map<String, Value> = properties.iter().map(|p| (p.to_string(), json!({}))).collect();
@@ -151,7 +155,7 @@ fn world(replies: Vec<&str>) -> World {
         memory: persist.clone(),
         tracer: tracer.clone(),
         codex: Arc::new(NoCodex),
-        decisions: None,
+        decisions,
         workflows: Arc::new(MemoryWorkflows::default()),
         schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
     });
@@ -658,4 +662,146 @@ fn the_authoring_tools_save_drafts_and_activate_only_valid_versions() {
     let read = tool(&w, "read_workflow", json!({"name":"digest"})).unwrap();
     assert_eq!((read["definition"].as_str(), read["status"].as_str()), (Some(DIGEST), Some("active")));
     assert_eq!(tool(&w, "read_workflow", json!({"name":"nope"})).unwrap()["found"], false);
+}
+
+// ── choose: a jump where Jev decides ────────────────────────────────────────
+
+// Jev answering every choice with `choice` at `confidence`, or failing.
+struct Jev {
+    choice: &'static str,
+    confidence: f64,
+    fail: bool,
+    requests: std::sync::Mutex<Vec<Value>>,
+}
+#[async_trait]
+impl agent::providers::JsonApi for Jev {
+    async fn post(&self, _: &str, body: Value, _: &CancellationToken) -> anyhow::Result<Value> {
+        self.requests.lock().unwrap().push(body.clone());
+        anyhow::ensure!(!self.fail, "Jev is down");
+        let labels = body["questions"]["choice"]["criteria"].as_object().unwrap();
+        let probabilities: Map<String, Value> = labels
+            .keys()
+            .map(|l| (l.clone(), json!(if l == self.choice { self.confidence } else { 1.0 - self.confidence })))
+            .collect();
+        Ok(json!({"model":"jev-test","answers":{"choice":{"type":"choice","choice":self.choice,
+            "confidence":self.confidence,"probabilities":probabilities}}}))
+    }
+}
+fn jev_world(choice: &'static str, confidence: f64, fail: bool) -> (World, Arc<Jev>) {
+    let api = Arc::new(Jev { choice, confidence, fail, requests: Default::default() });
+    (world_with(vec![], Some(agent::decisions::decision_client("jev-test".into(), api.clone()))), api)
+}
+
+fn routed(with: &str) -> String {
+    format!(
+        r#"
+document: {{ dsl: '1.0.4', namespace: agent, name: routed, version: '1.0.0' }}
+do:
+  - search:
+      call: search_news
+      with: {{ query: rust }}
+  - route:
+      call: choose
+      with: {with}
+  - jump:
+      switch:
+        - quiet: {{ when: '${{ .choice == "quiet" }}', then: quiet_text }}
+        - digest: {{ when: '${{ .choice == "digest" }}', then: digest_text }}
+  - digest_text:
+      set: '${{ "digest" }}'
+      then: end
+  - quiet_text:
+      set: '${{ "quiet" }}'
+"#
+    )
+}
+const CHOOSE: &str = "{ question: Is there news worth a digest?, options: { digest: Something new and significant, quiet: Nothing worth sending }, input: { items: '${ .items }' } }";
+
+#[tokio::test]
+async fn choose_jumps_where_jev_decides() {
+    for (choice, expected) in [("digest", "digest"), ("quiet", "quiet")] {
+        let (w, api) = jev_world(choice, 0.9, false);
+        w.activate("routed", &routed(CHOOSE));
+        let (result, observations) = w.run("routed").await;
+        let FlowResult::Completed(output) = result else { panic!("{result:?}") };
+        assert_eq!(output, json!(expected));
+        let request = api.requests.lock().unwrap()[0].clone();
+        assert_eq!(request["state"]["input"]["items"][0]["title"], "Rust 2.0", "Jev judges the input");
+        assert!(request["questions"]["choice"]["instructions"].as_str().unwrap().starts_with("Is there news"));
+        let route = named(&observations, "call:route");
+        assert_eq!(route.metadata.as_ref().unwrap()["choice"], choice);
+        assert_eq!(route.metadata.as_ref().unwrap()["fallback"], false);
+        assert!(
+            observations
+                .iter()
+                .any(|o| o.name == "decide:choose" && o.parent_observation_id.as_deref() == Some(route.id.as_str()))
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unsure_choice_takes_the_default() {
+    let (w, _) = jev_world("quiet", 0.55, false);
+    w.activate("routed", &routed(&CHOOSE.replace(" }, input:", " }, min_confidence: 0.7, default: digest, input:")));
+    let (result, observations) = w.run("routed").await;
+    assert!(matches!(result, FlowResult::Completed(ref v) if v == "digest"), "{result:?}");
+    assert_eq!(named(&observations, "call:route").metadata.as_ref().unwrap()["fallback"], true);
+}
+
+#[tokio::test]
+async fn a_bad_choose_or_a_failed_jev_faults_before_any_write() {
+    let cases = [
+        ("valid", CHOOSE.to_owned(), true),
+        ("label", CHOOSE.replace("quiet: Nothing", "Quiet: Nothing"), false),
+        ("one option", "{ question: q, options: { only: x } }".to_owned(), false),
+        ("default alone", CHOOSE.replace(" }, input:", " }, default: digest, input:"), false),
+        ("unknown default", CHOOSE.replace(" }, input:", " }, min_confidence: 0.7, default: busy, input:"), false),
+        ("confidence range", CHOOSE.replace(" }, input:", " }, min_confidence: 2, default: digest, input:"), false),
+    ];
+    for (case, with, jev_down) in cases {
+        let (w, _) = jev_world("digest", 0.9, jev_down);
+        w.activate("routed", &routed(&with));
+        let (result, _) = w.run("routed").await;
+        let FlowResult::Faulted { error, effects_started } = result else { panic!("{case}: {result:?}") };
+        assert!(!effects_started, "{case}");
+        assert!(error.is(if jev_down { "runtime" } else { "validation" }), "{case}: {error:?}");
+    }
+    let w = world(vec![]);
+    w.activate("routed", &routed(CHOOSE));
+    let (result, _) = w.run("routed").await;
+    assert!(matches!(result, FlowResult::Faulted { ref error, .. } if error.to_string().contains("no decision model")));
+}
+
+#[test]
+fn a_switch_that_misses_or_invents_a_choose_option_is_a_warning() {
+    let parse = |text: &str| owf::model::parse_yaml(text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+    assert_eq!(agent::flows::warnings(&parse(&routed(CHOOSE))), Vec::<String>::new());
+    let three = CHOOSE.replace("quiet: Nothing worth sending", "quiet: Nothing worth sending, later: Wait a day");
+    let warned = agent::flows::warnings(&parse(&routed(&three)));
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert!(warned[0].starts_with("/do/1/route: choose option `later` has no case"), "{}", warned[0]);
+    let invented = routed(CHOOSE).replace(r#".choice == "quiet""#, r#".choice == "silent""#);
+    let warned = agent::flows::warnings(&parse(&invented));
+    assert_eq!(warned.len(), 2, "{warned:?}");
+    assert!(warned.iter().any(|w| w.contains("`quiet` has no case")));
+    assert!(warned.iter().any(|w| w.contains("compares with `silent`, which is not one of its options")));
+    let defaulted = routed(&three).replace(
+        "        - digest: { when: '${ .choice == \"digest\" }', then: digest_text }",
+        "        - digest: { then: digest_text }",
+    );
+    assert_eq!(agent::flows::warnings(&parse(&defaulted)), Vec::<String>::new(), "a default case covers the rest");
+}
+
+#[test]
+fn choose_is_in_the_catalog_and_refuses_at_most_once() {
+    let w = world(vec![]);
+    let catalog = agent::flows::functions(&w.engine, &Map::new()).unwrap();
+    assert!(
+        catalog.lines().any(|l| l.starts_with("choose(question, options, input?, min_confidence?, default?) read")),
+        "{catalog}"
+    );
+    let pinned = routed(CHOOSE)
+        .replace("      call: choose\n", "      call: choose\n      metadata: { delivery: at_most_once }\n");
+    let error = check(&*w.engine.deps.mcp, &pinned).unwrap_err();
+    assert!(error.contains("model adapters do not yet support at_most_once"), "{error}");
 }

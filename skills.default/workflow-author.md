@@ -128,6 +128,14 @@ judge. Build the pipeline the task needs from these parts, no more:
   (`[.rows[] | select(.value < 0) | .value] | add`), never a model step: a
   model adds cost and can miscount. Hand the model the computed numbers and
   let it only write the text.
+- **Branching on a judgement.** A path that depends on something an
+  expression cannot test (is this worth sending, which kind of request is
+  it) → `choose` with labelled options, then a `switch` on `.choice`. Never
+  branch on a model's free text, such as an exact sentinel phrase from
+  `llm_compose`: a changed letter or a full stop sends the wrong branch.
+  When the step that writes the text is also the one that knows (it
+  deduplicates, it counts what is left), have it answer JSON and branch on
+  a field instead.
 - **Synthesis.** Text for a person → `llm_compose`. A model step sees its
   prompt and its `input`, nothing else: not this conversation, not the
   user's messages, not other steps. Write the user's rules for the text
@@ -162,8 +170,8 @@ duplicate effect. For calls where a duplicate is unacceptable, set
 `metadata: { delivery: at_most_once }` on the `call` task. An unknown outcome
 then stops the run without retry; execution can be lost if the agent crashes
 before dispatch. Put this metadata on external calls inside reusable
-functions, not on their callers. `llm_compose` and `filter_relevant` currently
-support only the default policy. Do not wrap unknown outcomes in retries.
+functions, not on their callers. `llm_compose`, `filter_relevant` and `choose`
+currently support only the default policy. Do not wrap unknown outcomes in retries.
 
 A `try` retry does not repeat a write that already succeeded: the retry
 reuses its saved result and goes on, while a write that failed is sent
@@ -248,6 +256,42 @@ Functions besides the ones `workflow_functions` lists from the tools:
   of 25), with a probability; an item is kept from `threshold` up (0.3 by
   default, higher keeps fewer). Write the prompt as rules an item either
   passes or fails; it sees one item at a time, never the others.
+- `choose { question, options, input?, min_confidence?, default? }` — a
+  jump the classifier decides: `options` maps 2–255 labels (lowercase
+  letters, digits, `_`) to the criterion of each, and Jev picks one judging
+  `input` (up to 24 000 characters as JSON). Returns `{ choice, confidence,
+  probabilities, fallback }`. With `min_confidence` and `default` (one of the
+  options, given together), a less confident answer becomes `default` with
+  `fallback: true`. A classifier failure faults the run, never a silent
+  default: catch it with `try` when a branch is safe to take without it.
+  Follow it with a `switch` on `.choice` whose `then` targets are fixed;
+  saving warns when a case is missing for an option (and there is no
+  default case) or compares with a label that is not one. A dry run makes
+  the real choice, so it shows one branch: tell the user which.
+
+  ```yaml
+  document: { dsl: '1.0.4', namespace: agent, name: example, version: '1.0.0' }
+  do:
+    - gather:
+        call: search_news
+        with: { query: rust }
+        export: { as: '${ $context + { items: .items } }' }
+    - worth_sending:
+        call: choose
+        with:
+          question: Is there anything in input.items that is worth a digest?
+          options: { digest: Something new and significant, quiet: Nothing new or nothing significant }
+          input: { items: '${ $context.items }' }
+          min_confidence: 0.6
+          default: digest
+    - route:
+        switch:
+          - quiet: { when: '${ .choice == "quiet" }', then: end }
+          - digest: { then: compose }
+    - compose:
+        call: llm_compose
+        with: { prompt: Write the digest., input: { items: '${ $context.items }' } }
+  ```
 - `set_memory { key, value }` — stamps one of the two watermarks above.
 - `hash_value { value }` — SHA-256 of canonical JSON (object key order does
   not matter); returns `{ hash }`. No model call or writes.

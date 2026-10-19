@@ -253,6 +253,7 @@ const MODEL_FUNCTIONS: &[ModelFunction] = &[
     ("skill_catalog_snapshot", Effect::Read, &[], &[]),
     ("llm_compose", Effect::Read, &["preset", "skill", "prompt", "input"], &[]),
     ("filter_relevant", Effect::Read, &["items", "prompt", "threshold"], &["items", "prompt"]),
+    ("choose", Effect::Read, &["question", "options", "input", "min_confidence", "default"], &["question", "options"]),
     ("set_memory", Effect::Write, &["key", "value"], &["key", "value"]),
 ];
 
@@ -312,6 +313,30 @@ fn text<'a>(args: &'a Value, function: &str, key: &str) -> Result<Option<&'a str
         Some(_) => Err(invalid(function, format!("`{key}` must be a string"))),
     }
 }
+
+// `choose`'s options: 2–255 labels a jq string comparison can name, each
+// with a nonempty criterion.
+fn choose_options(args: &Value) -> Result<Map<String, Value>, String> {
+    let options =
+        args.get("options").and_then(Value::as_object).ok_or("`options` must be an object of label: criterion")?;
+    if !(2..=crate::decisions::MAX_CHOICE_OPTIONS).contains(&options.len()) {
+        return Err(format!("`options` needs 2–{} labels", crate::decisions::MAX_CHOICE_OPTIONS));
+    }
+    for (label, criterion) in options {
+        if !CHOICE_LABEL.is_match(label) {
+            return Err(format!(
+                "option `{label}`: a label is lowercase letters, digits and `_`, starting with a letter"
+            ));
+        }
+        if criterion.as_str().is_none_or(|c| c.trim().is_empty()) {
+            return Err(format!("option `{label}`: the criterion must be a nonempty string"));
+        }
+    }
+    Ok(options.clone())
+}
+
+static CHOICE_LABEL: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"^[a-z][a-z0-9_]*$").expect("valid label regex"));
 
 // A failure the model or a tool reported, as opposed to the transport.
 fn failed(e: anyhow::Error) -> WorkflowError {
@@ -399,6 +424,54 @@ impl owf::run::Functions for Functions {
                     .await
                     .map_err(failed)?;
                 Ok(json!(filtered.kept))
+            }
+            "choose" => {
+                let decisions = self.engine.deps.decisions.as_ref().ok_or_else(|| {
+                    WorkflowError::runtime("no decision model configured (OPEN_ROUTER_API_KEY)".to_string())
+                })?;
+                let question = text(&args, name, "question")?
+                    .filter(|q| !q.trim().is_empty())
+                    .ok_or_else(|| invalid(name, "`question` must be a nonempty string"))?;
+                let options = choose_options(&args).map_err(|e| invalid(name, e))?;
+                let input = args.get("input").cloned().unwrap_or(Value::Null);
+                if input.to_string().len() > crate::decisions::FILTER_MAX_BATCH_CHARS {
+                    return Err(invalid(
+                        name,
+                        format!(
+                            "`input` is over {} characters as JSON; pass the fields the choice needs",
+                            crate::decisions::FILTER_MAX_BATCH_CHARS
+                        ),
+                    ));
+                }
+                let floor = match (args.get("min_confidence"), args.get("default")) {
+                    (None | Some(Value::Null), None | Some(Value::Null)) => None,
+                    (Some(min), Some(Value::String(default))) => {
+                        let min = min
+                            .as_f64()
+                            .filter(|m| (0.0..=1.0).contains(m))
+                            .ok_or_else(|| invalid(name, "`min_confidence` must be a number from 0 to 1"))?;
+                        if !options.contains_key(default) {
+                            return Err(invalid(name, format!("`default` `{default}` is not one of the options")));
+                        }
+                        Some((min, default.clone()))
+                    }
+                    _ => return Err(invalid(name, "`min_confidence` and `default` (an option) go together")),
+                };
+                span.update(crate::tracing::ContextUpdate::input(
+                    json!({"question":question,"options":options,"input":input}),
+                ));
+                let answer = crate::decisions::choose(decisions, question, options, &input, &span, info.cancel)
+                    .await
+                    .map_err(failed)?;
+                let (choice, fallback) = match floor {
+                    Some((min, default)) if answer.confidence < min => (default, true),
+                    _ => (answer.choice, false),
+                };
+                span.update(crate::tracing::ContextUpdate::metadata(metadata(
+                    json!({"choice":choice,"confidence":answer.confidence,"fallback":fallback}),
+                )));
+                Ok(json!({"choice":choice,"confidence":answer.confidence,
+                    "probabilities":answer.probabilities,"fallback":fallback}))
             }
             "set_memory" => {
                 let key = text(&args, name, "key")?
@@ -751,7 +824,8 @@ pub fn check(mcp: &dyn Mcp, definition: &str) -> Result<owf::model::Workflow, St
     owf::model::validate(&wf, &Known(mcp)).map_err(|e| e.to_string())?;
     let mut problems = Vec::new();
     for site in owf::model::call_sites(&wf) {
-        if site.delivery == Delivery::AtMostOnce && matches!(site.function.as_str(), "llm_compose" | "filter_relevant")
+        if site.delivery == Delivery::AtMostOnce
+            && matches!(site.function.as_str(), "llm_compose" | "filter_relevant" | "choose")
         {
             problems
                 .push(format!("{}/metadata/delivery: model adapters do not yet support at_most_once", site.reference));
@@ -885,6 +959,9 @@ fn effect_name(mcp: &dyn Mcp, wf: &owf::model::Workflow, function: &str) -> &'st
 // leads to that also runs right after the task before it, because that one
 // does not jump (a "nothing new" text after the real one overwrites it).
 // A shared tail does this on purpose, so it is a warning, not a problem.
+// And a `choose` followed by its `switch` whose cases miss one of its
+// options (with no default case) or name one it doesn't have; only literal
+// options and `"label"` strings in `when` are compared, jq is not parsed.
 pub fn warnings(wf: &owf::model::Workflow) -> Vec<String> {
     use owf::model::{Flow, Kind, Task, TaskList};
     fn jumps_to(task: &Task, target: &str) -> bool {
@@ -906,8 +983,36 @@ pub fn warnings(wf: &owf::model::Workflow) -> Vec<String> {
             _ => matches!(task.then, None | Some(Flow::Continue)),
         }
     }
+    fn choose_cases(call: &Task, switch: &Task, at: &str, out: &mut Vec<String>) {
+        let (Kind::Call { function, with: Some(with) }, Kind::Switch(cases)) = (&call.kind, &switch.kind) else {
+            return;
+        };
+        let Some(options) = with.get("options").and_then(Value::as_object).filter(|_| function == "choose") else {
+            return;
+        };
+        let literal = regex::Regex::new(r#""([a-z][a-z0-9_]*)""#).expect("valid literal regex");
+        let named: Vec<&str> = cases
+            .iter()
+            .filter_map(|(_, case)| case.when.as_deref())
+            .filter(|when| when.contains("choice"))
+            .flat_map(|when| literal.captures_iter(when).map(|c| c.get(1).map_or("", |m| m.as_str())))
+            .collect();
+        if !cases.iter().any(|(_, case)| case.when.is_none()) {
+            for label in options.keys().filter(|l| !named.contains(&l.as_str())) {
+                out.push(format!(
+                    "{at}: choose option `{label}` has no case in the switch after it, and that switch has no default case"
+                ));
+            }
+        }
+        for label in named.iter().filter(|l| !options.contains_key(**l)) {
+            out.push(format!("{at}: the switch after it compares with `{label}`, which is not one of its options"));
+        }
+    }
     fn list(tasks: &TaskList, at: &str, out: &mut Vec<String>) {
         for (i, (name, task)) in tasks.iter().enumerate() {
+            if let Some((_, next)) = tasks.get(i + 1) {
+                choose_cases(task, next, &format!("{at}/{i}/{name}"), out);
+            }
             if let Some((previous, before)) = i.checked_sub(1).map(|j| (&tasks[j].0, &tasks[j].1)) {
                 let from: Vec<&str> =
                     tasks.iter().filter(|(n, t)| n != previous && jumps_to(t, name)).map(|(n, _)| n.as_str()).collect();
