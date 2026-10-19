@@ -39,3 +39,7 @@ partial preview. Check action results before claiming success. Bookkeeping
 follows successful delivery. Do not blindly repeat uncertain side effects.
 A final assistant message alone does not deliver to an external channel.
 Finish the work now; there is no automatic turn for promises to act later.
+When your last actions need no reading back, such as delivering the reply
+and its bookkeeping, call `finish` in the same round instead of spending
+another turn on a closing message. Never pair it with a call whose answer
+decides what you do next, such as a worker, a search or a read.

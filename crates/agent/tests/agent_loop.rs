@@ -1476,3 +1476,89 @@ async fn primary_discovers_and_reads_effective_skill_instructions_in_the_same_lo
     assert_eq!(h.engine.loop_ids().await.len(), 1, "no worker needed to consult a skill");
     h.engine.shutdown().await;
 }
+
+// ── finish: the round's decision ────────────────────────────────────────────
+
+fn harness(turns: Vec<Turn>) -> Harness {
+    Harness::new(task_context("finish"), turns, "found", null())
+}
+
+#[tokio::test]
+async fn finish_alongside_the_last_action_ends_the_session_without_another_turn() {
+    let h = harness(vec![turn(|_| calls(&[("search_news", json!({})), ("finish", json!({"result":"sent"}))]))]);
+    let loop_ = h.start().await;
+    assert_eq!(loop_.send("go".into()).await.unwrap(), "sent");
+    assert_eq!(h.model.requests.lock().unwrap().len(), 1);
+    assert_eq!(h.mcp.calls.lock().unwrap().iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["search_news"]);
+    // Every call of the round is answered, so the transcript stays valid.
+    let messages = loop_.messages.lock().await;
+    assert_eq!(messages.iter().filter(|m| m["role"] == "tool").count(), 2);
+    drop(messages);
+    h.engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn finish_alone_or_without_a_result_ends_with_an_empty_answer() {
+    let h = harness(vec![turn(|_| call("finish", json!({})))]);
+    assert_eq!(h.start().await.send("go".into()).await.unwrap(), "");
+    h.engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_failed_call_in_the_round_keeps_the_session_going() {
+    let h = harness(vec![
+        turn(|_| calls(&[("search_news", json!({})), ("finish", json!({"result":"sent"}))])),
+        turn(|p| {
+            assert!(mentions(&p.messages, "[finish error] not finished: search_news failed"));
+            answer("recovered")
+        }),
+    ]);
+    *h.mcp.handler.lock().unwrap() = Arc::new(|_, _, _| Box::pin(async { Err(anyhow::anyhow!("down")) }));
+    assert_eq!(h.start().await.send("go".into()).await.unwrap(), "recovered");
+    h.engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_finishes_in_one_round_end_nothing() {
+    let h = harness(vec![
+        turn(|_| calls(&[("finish", json!({"result":"a"})), ("finish", json!({"result":"b"}))])),
+        turn(|p| {
+            let replies = p.messages.iter().filter(|m| m["role"] == "tool").count();
+            assert_eq!(replies, 2);
+            assert!(mentions(&p.messages, "[finish error] call finish once per round"));
+            answer("one at a time")
+        }),
+    ]);
+    assert_eq!(h.start().await.send("go".into()).await.unwrap(), "one at a time");
+    h.engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_invalid_finish_is_an_error_the_model_reads() {
+    let h = harness(vec![
+        turn(|_| call("finish", json!({"result": 5}))),
+        turn(|p| {
+            assert!(mentions(&p.messages, "[finish error]"));
+            answer("fixed")
+        }),
+    ]);
+    assert_eq!(h.start().await.send("go".into()).await.unwrap(), "fixed");
+    h.engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_worker_that_finishes_hands_its_result_to_the_parent() {
+    let h = harness(vec![
+        turn(|_| call("invoke_sub_agent", json!({"skills":["test"],"prompt":"do it"}))),
+        turn(|p| {
+            assert!(p.tools.iter().any(|t| t.name == "finish"), "workers may finish too");
+            call("finish", json!({"result":"worker result"}))
+        }),
+        turn(|p| {
+            assert_eq!(last_json(&p.messages)["content"], "worker result");
+            answer("done")
+        }),
+    ]);
+    assert_eq!(h.start().await.send("go".into()).await.unwrap(), "done");
+    h.engine.shutdown().await;
+}

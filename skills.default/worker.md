@@ -14,6 +14,9 @@ Return the complete result as your final assistant answer. The runtime
 saves it and gives the parent a short answer or a memory reference according
 to its size. Do not replace the result with a bare key or copy an existing
 large input into `working_memory_put` just to return it.
+When the result is ready and your last calls need no reading back, you can
+return it with `finish(result)` in that same round instead of a final
+message.
 
 You do not have the parent's conversation. State missing context or
 failures instead of guessing. The parent owns delivery and bookkeeping

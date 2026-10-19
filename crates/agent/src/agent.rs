@@ -365,9 +365,45 @@ impl AgentLoop {
             .collect()
             .await;
             results.sort_by_key(|(i, _)| *i);
+            let mut round = Vec::with_capacity(results.len());
             for (_, result) in results {
-                let (call, presented) = result?;
+                round.push(result?);
+            }
+            // `finish` is the round's decision, taken once every call has
+            // answered: one finish, itself valid, with no other call failed,
+            // ends the session without another turn. Otherwise its reply says
+            // why not, and the loop goes on.
+            let finishes: Vec<usize> =
+                round.iter().enumerate().filter(|(_, r)| r.0.name == "finish").map(|(i, _)| i).collect();
+            let failed: Vec<&str> =
+                round.iter().filter(|r| r.0.name != "finish" && r.2).map(|r| r.0.name.as_str()).collect();
+            let mut finished = None;
+            if finishes.len() > 1 {
+                for &i in &finishes {
+                    round[i].1 = "[finish error] call finish once per round".into();
+                }
+            } else if let [i] = finishes[..]
+                && !round[i].2
+            {
+                if failed.is_empty() {
+                    finished = Some(round[i].3.clone());
+                } else {
+                    round[i].1 = format!(
+                        "[finish error] not finished: {} failed; read the errors and continue",
+                        failed.join(", ")
+                    );
+                }
+            }
+            for (call, presented, _, _) in round {
                 messages.push(providers::tool_reply(&call.id, &presented));
+            }
+            if let Some(output) = finished {
+                self.scope.update(ContextUpdate {
+                    output: Some(json!(output)),
+                    metadata: Some(json!({"finished_by": "finish"}).as_object().cloned().unwrap_or_default()),
+                    ..Default::default()
+                });
+                return Ok(output);
             }
         }
         anyhow::bail!("session {} exceeded maxIterations={}", self.opts.id, self.opts.max_iterations)
@@ -389,11 +425,13 @@ impl AgentLoop {
             _ => true,
         }
     }
+    // The call, its reply as the model sees it, whether the call failed, and
+    // the `result` a valid `finish` carries.
     async fn dispatch(
         self: &Arc<Self>,
         engine: Arc<Engine>,
         call: providers::ToolCall,
-    ) -> anyhow::Result<(providers::ToolCall, String)> {
+    ) -> anyhow::Result<(providers::ToolCall, String, bool, String)> {
         let mut metadata = self.observation_meta.clone();
         metadata.insert("tool".into(), call.name.clone().into());
         metadata.insert("tool_call_id".into(), call.id.clone().into());
@@ -402,9 +440,13 @@ impl AgentLoop {
                 .input(json!({"raw_arguments": call.arguments}))
                 .metadata(metadata),
         );
+        let mut finish_result = String::new();
         let raw = match serde_json::from_str::<Value>(if call.arguments.is_empty() { "{}" } else { &call.arguments }) {
             Ok(Value::Object(args)) => {
                 span.update(ContextUpdate::input(Value::Object(args.clone())));
+                if call.name == "finish" {
+                    finish_result = args.get("result").and_then(Value::as_str).unwrap_or_default().to_owned();
+                }
                 self.invoke(&engine, &call.name, args, span.clone()).await
             }
             _ => Ok("[tool error] arguments must be a JSON object".to_owned()),
@@ -425,8 +467,9 @@ impl AgentLoop {
             span.update(ContextUpdate::metadata(json!({"memory_key": stored.memory_key, "result_size_bytes": stored.size_bytes, "result_truncated": stored.truncated}).as_object().cloned().unwrap_or_default()));
             stored.to_json().to_string()
         };
-        span.end(if is_tool_error(&raw) { SpanEnd::error(raw.clone()).with_output(raw) } else { SpanEnd::output(raw) });
-        Ok((call, presented))
+        let failed = is_tool_error(&raw);
+        span.end(if failed { SpanEnd::error(raw.clone()).with_output(raw) } else { SpanEnd::output(raw) });
+        Ok((call, presented, failed, finish_result))
     }
     async fn invoke(
         self: &Arc<Self>,
@@ -469,6 +512,15 @@ impl AgentLoop {
                 let index = crate::skills::read_skill_index(&*engine.deps.mcp, &self.cancel).await?;
                 let scope: Scope = span;
                 Ok(crate::skills::find_skills(&*engine.deps.skill_store, &index, client, &params, &scope, &self.cancel).await?.to_string())
+            }
+            // Only validates: ending the session is the round's decision
+            // (run_until_settled), taken once every call has answered.
+            "finish" => {
+                if let Some(extra) = args.keys().find(|k| *k != "result") {
+                    anyhow::bail!("unknown argument `{extra}`");
+                }
+                optional_string(args, "result")?;
+                Ok(json!({"ok": true}).to_string())
             }
             "hash_value" => {
                 let value = args.get("value").ok_or_else(|| anyhow::anyhow!("value is required"))?;

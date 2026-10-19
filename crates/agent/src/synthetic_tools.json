@@ -105,6 +105,23 @@
   {
     "type": "function",
     "function": {
+      "name": "finish",
+      "description": "End this session in the same round as your last actions, instead of spending another turn on a final message. Call it alongside calls whose results you don't need to read: never together with a call whose answer decides what you do next (a worker, a search, a read). `result` is your final answer; a worker's parent receives it. If any other call in this round fails, the session does not end: you get the errors and continue. Call it at most once per round.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "type": "string",
+            "description": "Your final answer for this session (optional)."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "code_agent",
       "description": "Delegate a computational / coding task to a sandboxed code agent (Codex). It writes AND runs code (Python with pandas/openpyxl, or Node) and returns ONLY the final result. Use it for anything that must be COMPUTED rather than recalled or written by an LLM: exact arithmetic, counting, date/time math, statistics, parsing or aggregating CSV/Excel/JSON data, string/data transformations, regex extraction, unit conversions. Do NOT use it for web access, reasoning, or composing prose \u2014 only code/computation. State the task precisely and say exactly what the output should be (e.g. 'return just the number'). Put any data the code needs in `data` \u2014 it is delivered to the program on stdin (for a binary file like .xlsx, base64-encode it and say so in the task).",
       "parameters": {
