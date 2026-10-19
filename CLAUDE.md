@@ -28,6 +28,31 @@ the agent's client and skill loader against the real server). Deployed as
 three native systemd services; Postgres, Codex and tunnel-client stay in
 Docker (`docker-compose.yml`). See README.md, Deploy, for the current layout.
 
+## The main principle: the agent's freedom and generality
+
+**Strive for the greatest freedom and generality of the agent.** Weigh every
+design decision against it first.
+
+- **The runtime informs; the agent decides and acts.** The supervisor may
+  gather context before the first turn: history, the activity journal, the
+  skills Jev preselects. It never takes an action on the agent's behalf. A
+  typing indicator, a reply or a write is a tool call the agent chooses to
+  make.
+- **Behaviour lives in skills, not in Rust.** How to talk in Telegram, when to
+  delegate, what a digest looks like: all of it is skill text, which the agent
+  can find, read and rewrite (`write_skill`). The code may gather context
+  differently per channel (Telegram history, a peer thread), but it never
+  hard-codes how the agent behaves in a channel, a source or a task.
+- **General mechanisms over special cases.** Prefer one general mechanism
+  (skill search, memory, workflows, sub-agents) to a branch for one situation,
+  even when the branch would save a model turn. An optimisation that takes a
+  decision away from the agent is the wrong one: make the agent better
+  informed instead.
+
+Example: Telegram's `start_typing` costs a model turn, yet the supervisor does
+not call it automatically. Whether and when to show typing is the agent's
+choice.
+
 **Everything was TypeScript until 2026-10.** The MCP server went to Rust on
 2026-10-14, the agent on 2026-10-15, and the TS packages (`packages/mcp`,
 `packages/agent`, `packages/codex`, the tooling) were deleted afterwards.
