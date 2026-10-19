@@ -67,6 +67,7 @@ impl Mcp for ContextMcp {
             "get_timezone" => json!({"timezone":"Europe/Chisinau"}),
             "get_telegram_chat_history" => json!({"messages":self.history.lock().unwrap().clone()}),
             "get_peer_thread" => json!({"threadId":3,"messages":self.thread.lock().unwrap().clone()}),
+            "read_doc" => json!({"ok":false,"error":"doc_not_found"}),
             "journal_tail" => {
                 json!({"entries":self.notes.lock().unwrap().iter().map(|s|json!({"body":s})).collect::<Vec<_>>()})
             }
@@ -153,11 +154,19 @@ fn setup(
     model: Arc<dyn agent::providers::ChatProvider>,
     stage: Stage,
 ) -> (Fixture, Arc<ContextMcp>, Arc<FakeWorkflow>, Arc<Supervisor>) {
+    setup_with(model, stage, None)
+}
+fn setup_with(
+    model: Arc<dyn agent::providers::ChatProvider>,
+    stage: Stage,
+    decisions: Option<Arc<agent::decisions::DecisionClient>>,
+) -> (Fixture, Arc<ContextMcp>, Arc<FakeWorkflow>, Arc<Supervisor>) {
     let mut f = fixture(model, &[], SKILLS);
     let mcp = Arc::new(ContextMcp::default());
     let deps = &mut Arc::get_mut(&mut f.engine).unwrap().deps;
     deps.mcp = mcp.clone();
     deps.skills = vec!["orchestrator".into(), "routing".into()];
+    deps.decisions = decisions;
     let workflow = Arc::new(FakeWorkflow { stage, called: AtomicUsize::new(0) });
     let supervisor = create_supervisor(
         f.engine.clone(),
@@ -189,7 +198,8 @@ async fn routing_uses_workflow_only_for_scheduler_and_domain_signals_are_delegat
             assert!(system.contains("ORCHESTRATOR"));
             assert_eq!(seen[0].model, "gemini-3.7-flash");
             assert!(!system.contains("TELEGRAM"), "communication rules are discovered, never autoloaded");
-            assert!(system.contains("Discover useful skills with find_skills"));
+            assert!(system.contains("Call find_skills only when the task needs something specific"));
+            assert!(!system.contains("Skills selected for this request"), "no decision client, nothing preselected");
             assert_eq!(system.contains("Delivery: use send_telegram_message"), source == "telegram");
             assert!(seen[0].tools.iter().any(|t| t.name == "write_skill"));
         }
@@ -442,6 +452,74 @@ async fn a_peer_signal_loads_its_skill_and_the_earlier_turns_of_its_thread() {
     assert!(calls.iter().any(|(n, a)| n == "get_peer_thread" && a["threadId"] == 3));
     assert!(calls.iter().any(|(n, _)| n == "journal_tail"));
     assert!(!calls.iter().any(|(n, _)| n == "get_telegram_chat_history"));
+    supervisor.shutdown().await;
+}
+// Jev for preselection: the telegram skill fits, nothing else does; `broken`
+// answers without scores.
+struct Jev {
+    broken: bool,
+    requests: Mutex<Vec<Value>>,
+}
+#[async_trait]
+impl agent::providers::JsonApi for Jev {
+    async fn post(&self, _: &str, body: Value, _: &CancellationToken) -> anyhow::Result<Value> {
+        self.requests.lock().unwrap().push(body.clone());
+        let answers: Map<String, Value> = if self.broken {
+            Map::new()
+        } else {
+            body["state"]["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .map(|(n, s)| {
+                    let p = if s["name"] == "telegram" { 0.97 } else { 0.05 };
+                    (format!("skill_{n}"), json!({"type":"noul","noul":p}))
+                })
+                .collect()
+        };
+        Ok(json!({"model":"jev-test","answers":answers}))
+    }
+}
+fn jev(broken: bool) -> (Arc<Jev>, Arc<agent::decisions::DecisionClient>) {
+    let api = Arc::new(Jev { broken, requests: Mutex::new(Vec::new()) });
+    (api.clone(), agent::decisions::decision_client("jev-test".into(), api))
+}
+// The skills a message needs are chosen before the first turn and inlined,
+// so the model starts with the channel's rules instead of searching for them.
+#[tokio::test]
+async fn a_signal_starts_with_the_skills_jev_selects_for_it() {
+    let model = Arc::new(Scripted::new(vec![assistant("done")]));
+    let (api, client) = jev(false);
+    let (f, _mcp, _workflow, supervisor) = setup_with(model.clone(), Stage::Success, Some(client));
+    supervisor.run_signal(&signal("telegram", 42)).await.unwrap();
+    let seen = model.seen.lock().unwrap().clone();
+    let system = seen[0].messages[0]["content"].as_str().unwrap();
+    let selected = system.split("## Skills selected for this request").nth(1).expect("a preselected block");
+    assert!(selected.contains("### Skill `telegram`") && selected.contains("TELEGRAM"), "{system}");
+    assert!(!selected.contains("### Skill `orchestrator`"), "loaded skills are never inlined twice");
+    assert!(!selected.contains("SCHEDULER"));
+    let request = api.requests.lock().unwrap()[0].clone();
+    assert!(request["state"]["current_request"].as_str().unwrap().contains("давай"));
+    assert!(request["state"]["context"].as_str().unwrap().starts_with("Signal source: telegram"));
+    let (trace, obs) = f.db.get_trace("telegram:42").unwrap().unwrap();
+    assert_eq!(trace.metadata.as_ref().unwrap()["skills"], json!(["orchestrator", "routing", "telegram"]));
+    let search = obs.iter().find(|o| o.name == "find_skills").expect("an automatic find_skills span");
+    assert_eq!(search.meta("automatic"), Some(&json!(true)));
+    supervisor.shutdown().await;
+}
+#[tokio::test]
+async fn a_failed_preselection_leaves_the_search_to_the_model() {
+    let model = Arc::new(Scripted::new(vec![assistant("done")]));
+    let (_api, client) = jev(true);
+    let (f, _mcp, _workflow, supervisor) = setup_with(model.clone(), Stage::Success, Some(client));
+    assert_eq!(supervisor.run_signal(&signal("telegram", 42)).await.unwrap(), "done");
+    let seen = model.seen.lock().unwrap().clone();
+    let system = seen[0].messages[0]["content"].as_str().unwrap();
+    assert!(!system.contains("Skills selected for this request"));
+    assert!(seen[0].tools.iter().any(|t| t.name == "find_skills"));
+    let (_, obs) = f.db.get_trace("telegram:42").unwrap().unwrap();
+    assert!(obs.iter().any(|o| o.name == "find_skills" && o.level == "ERROR"));
     supervisor.shutdown().await;
 }
 #[tokio::test]

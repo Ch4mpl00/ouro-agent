@@ -2,11 +2,12 @@
 // 3. serial queue loop. Composition and OS signals live in main.rs.
 use crate::{
     activity::{ACTIVITY_STREAM, tail_utf16},
-    agent::{AgentLoop, Engine, LoopOptions},
+    agent::{AgentLoop, Engine, EngineDeps, LoopOptions},
     errors::{aborted, check, is_aborted},
     flows::{FlowResult, FlowRun},
     mcp::{Mcp, SharedMcp},
     session::{EnvDeps, Format, Session, gather_env_data, render_context, session},
+    skills::{FindSkillsParams, append_patch, find_skills, read_skill_index},
     tool_results::is_tool_error,
     tracing::{ContextUpdate, EventStart, Level, Scope, Span, SpanEnd, SpanKind, SpanStart, Trace, TraceStart},
     workflow::{RunResult, WorkflowRun, WorkflowSignal},
@@ -30,6 +31,12 @@ pub const TELEGRAM_HISTORY_MAX_BYTES: usize = 8000;
 pub const PEER_SOURCE: &str = "peer";
 pub const RECENT_ACTIVITY_LIMIT: usize = 10;
 pub const RECENT_ACTIVITY_MAX_BYTES: usize = 8000;
+// Skill preselection: a stricter bar than find_skills' default 0.5, since
+// every inlined skill costs its size on every turn.
+pub const PRESELECT_THRESHOLD: f64 = 0.7;
+pub const PRESELECT_LIMIT: usize = 3;
+const PRESELECT_REQUEST_CHARS: usize = 4000;
+const PRESELECT_CONTEXT_CHARS: usize = 6000;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PendingSignal {
     pub id: i64,
@@ -260,6 +267,77 @@ pub async fn load_recent_activity(
     }
 }
 
+// The skills a signal needs, chosen before the first turn by the same Jev
+// scoring as find_skills (with a stricter bar) and inlined whole, so the
+// model starts with its channel's rules instead of spending two turns on
+// find_skills + read_skill. Skills already loaded are skipped. Without a
+// decision client, or on any failure, nothing is inlined and the model can
+// still search itself.
+pub async fn preselect_skills(
+    deps: &EngineDeps,
+    request: &str,
+    context: &str,
+    loaded: &[String],
+    trace: &Scope,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Option<(Vec<String>, String)>> {
+    check(cancel)?;
+    let Some(client) = deps.decisions.as_deref() else { return Ok(None) };
+    let (store, mcp) = (deps.skill_store.as_ref(), deps.mcp.as_ref());
+    let params = FindSkillsParams {
+        query: request.chars().take(PRESELECT_REQUEST_CHARS).collect(),
+        context: Some(tail_chars(context, PRESELECT_CONTEXT_CHARS)),
+        threshold: Some(PRESELECT_THRESHOLD),
+        limit: Some(PRESELECT_LIMIT),
+    };
+    let span = trace.span(
+        SpanStart::new("find_skills", SpanKind::Tool)
+            .input(json!(params))
+            .metadata(json!({"tool":"find_skills","automatic":true}).as_object().unwrap().clone()),
+    );
+    let result = async {
+        let index = read_skill_index(mcp, cancel).await?;
+        let scope: Scope = span.clone();
+        let found = find_skills(store, &index, client, &params, &scope, cancel).await?;
+        check(cancel)?;
+        let mut names = Vec::new();
+        let mut sections = Vec::new();
+        for skill in found["skills"].as_array().into_iter().flatten() {
+            let Some(name) = skill["name"].as_str().filter(|n| !loaded.iter().any(|l| l == n)) else { continue };
+            let Some(file) = store.read_skill(name).await? else { continue };
+            let body = match store.read_patch(name).await? {
+                Some(patch) => append_patch(&file.body, &patch),
+                None => file.body,
+            };
+            sections.push(format!("### Skill `{name}`\n\n{}", body.trim()));
+            names.push(name.to_owned());
+        }
+        span.update(ContextUpdate::metadata(json!({"preselected":names}).as_object().unwrap().clone()));
+        span.end(SpanEnd::output(found));
+        if names.is_empty() {
+            return Ok(None);
+        }
+        Ok::<_, anyhow::Error>(Some((names, format!(
+            "## Skills selected for this request\nChosen automatically by relevance before your first turn and already loaded: follow the ones that apply, never read_skill them again. A skill that needs tools you lack is for a worker: delegate to it by name.\n\n{}",
+            sections.join("\n\n")
+        ))))
+    }
+    .await;
+    match result {
+        Ok(selected) => Ok(selected),
+        Err(error) => {
+            span.end(SpanEnd::error(error.to_string()).with_output(json!({"error":error.to_string()})));
+            check(cancel)?;
+            Ok(None)
+        }
+    }
+}
+
+fn tail_chars(text: &str, max: usize) -> String {
+    let skip = text.chars().count().saturating_sub(max);
+    text.chars().skip(skip).collect()
+}
+
 // ── 2. routing / recovery ────────────────────────────────────────────────
 pub struct Supervisor {
     pub engine: Arc<Engine>,
@@ -363,12 +441,15 @@ impl Supervisor {
             let input=if signal.source==PEER_SOURCE{prepare_peer_input(signal,self.engine.deps.mcp.as_ref(),&scope,&self.cancel).await?}else{prepare_telegram_input(signal,&session,self.engine.deps.mcp.as_ref(),&scope,&self.cancel).await?};
             let conversation=signal.source=="telegram"||signal.source==PEER_SOURCE;
             let activity=if conversation{load_recent_activity(self.engine.deps.mcp.as_ref(),&scope,&self.cancel).await?}else{None};let transport=signal.source==PEER_SOURCE||signal.source=="scheduler";
-            let mut prompts=vec![render_context(&session.env)?];if let Some(activity)=activity{prompts.push(activity);}prompts.push(format!("Signal source: {}",signal.source));prompts.push("Discover useful skills with find_skills before domain work; the source is only a hint. You own delivery.".into());
+            let loaded:Vec<String>=if transport{vec![signal.source.clone()]}else{Vec::new()}.into_iter().chain(self.engine.deps.skills.iter().cloned()).collect();
+            let preselected=preselect_skills(&self.engine.deps,&signal.content,&format!("Signal source: {}\n\n{input}",signal.source),&loaded,&scope,&self.cancel).await?;
+            let mut prompts=vec![render_context(&session.env)?];if let Some(activity)=activity{prompts.push(activity);}prompts.push(format!("Signal source: {}",signal.source));prompts.push("Call find_skills only when the task needs something specific that the skills already in your instructions don't cover; the source is only a hint. You own delivery.".into());
+            let preselected_names=preselected.as_ref().map(|(names,_)|names.clone()).unwrap_or_default();if let Some((_,block))=preselected{prompts.push(block);}
             if signal.source=="telegram"{prompts.push("Delivery: use send_telegram_message for the current signal's chatId and optional messageThreadId. A final assistant message alone is not delivered to Telegram.".into());}
             if let Some(env)=signal.env_context.as_ref().filter(|s|!s.is_empty()){prompts.push(env.clone());}
             if let Some(note)=handover{prompts.push(note);}
             let mut opts=LoopOptions::new(&id,session);opts.cancel=self.cancel.clone();opts.skills=if transport{vec![signal.source.clone()]}else{Vec::new()};opts.allow_skill_writes=signal.source=="dreaming";opts.system_prompt=Some(prompts.join("\n\n"));opts.preset=if signal.source=="scheduler"{crate::models::PresetName::Base}else{crate::models::PresetName::Smart};opts.trace_scope=Some(primary.clone());
-            let loaded_skills:Vec<_>=opts.skills.iter().chain(self.engine.deps.skills.iter()).cloned().collect();let agent=self.engine.start_loop(opts).await?;loop_=Some(agent.clone());let output=agent.send(input).await?;primary.end(SpanEnd::output(output.clone()));trace.update(ContextUpdate{output:Some(json!(output)),metadata:Some(json!({"skills":loaded_skills}).as_object().unwrap().clone()),..Default::default()});Ok::<_,anyhow::Error>(output)
+            let loaded_skills:Vec<_>=loaded.into_iter().chain(preselected_names).collect();let agent=self.engine.start_loop(opts).await?;loop_=Some(agent.clone());let output=agent.send(input).await?;primary.end(SpanEnd::output(output.clone()));trace.update(ContextUpdate{output:Some(json!(output)),metadata:Some(json!({"skills":loaded_skills}).as_object().unwrap().clone()),..Default::default()});Ok::<_,anyhow::Error>(output)
         }.await;
         if let Err(error) = &outcome {
             if let Some(span) = &span {

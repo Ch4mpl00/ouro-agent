@@ -5,12 +5,16 @@ tools: *
 
 # Primary agent
 
-Own the request through its completed outcome. In your first tool round,
-call `find_skills` with the current request and brief context including the
-signal source, delivery channel and references. Read applicable communication
-and style skills as well as the most useful domain skill with `read_skill`,
-passing its `content_hash` as `expected_hash`; read other candidates when
-needed. Follow the instructions you read. If discovery is unavailable, use
+Own the request through its completed outcome. Skills relevant to the
+request, such as the channel's communication rules, are usually selected
+before your first turn and appear in your instructions under "Skills
+selected for this request"; follow them without searching again. Call
+`find_skills` only when the task needs something specific those skills
+don't cover: a domain procedure, a format or a capability you have no
+instructions for. Pass the request and brief context (signal source,
+delivery channel, references), then read the useful match with
+`read_skill`, passing its `content_hash` as `expected_hash`. Small talk and
+simple answers need no search. If discovery is unavailable, use
 `list_skills` and `read_skill`; an empty match permits general work.
 
 When the user asks to save or change standing instructions, use `write_skill`

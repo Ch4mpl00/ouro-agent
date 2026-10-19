@@ -144,8 +144,11 @@ flowchart LR
    signal goes to the workflow runner (`planner` compiles the steps, the
    executor walks them); every other source starts the primary AgentLoop with
    the short `orchestrator` instructions. Telegram signals include recent chat
-   history and a technical delivery target; communication rules are discovered.
-4. The loop discovers and reads useful skills, works directly or delegates
+   history and a technical delivery target. Before the first turn the
+   supervisor asks Jev which skills fit the signal and inlines them (the
+   channel's communication rules, usually).
+4. The loop searches for further skills only when it needs something
+   specific, works directly or delegates
    focused subtasks with the appropriate skill and memory references.
    The parent decides subsequent actions and delivers the result. On a fatal
    loop error, a bounded recovery agent reports the failure in the same session.
@@ -162,7 +165,8 @@ instructions. Authorized `dreaming` workers can also revise skills.
 `read_skill(name)` checks the overlay first.
 
 Telegram communication rules live only in `skills/telegram.md`, outside Git.
-They are discoverable alongside domain skills rather than loaded by source.
+They are discoverable alongside domain skills rather than loaded by source,
+and preselection inlines them for a Telegram message.
 Ask the agent to save supplied Telegram rules; it writes the live file with
 `routable: true` and a scope paragraph. Discovery includes the channel in its
 context and can find new rules immediately, before the next index refresh.
@@ -184,10 +188,17 @@ run makes no model calls or document writes. Subsequent workflow versions and
 schedule edits survive restarts. The catalog's consumer can verify each stored
 content hash against `skill_catalog_snapshot` before using a description.
 
-The primary loop starts with a short instruction to call the agent's `find_skills` tool
-with the current request and brief context, then consult useful candidates
-through `read_skill`. There is no runtime router or routing workflow in front
-of ReAct. Discovery independently scores every routable skill through Jev,
+Before the primary loop starts, the supervisor preselects skills
+(`preselect_skills`): the same Jev scoring as `find_skills`, on the signal's
+content with its source and preloaded history as context, at a stricter bar
+(≥ 0.7, at most 3). The matches are inlined whole (with patches) into the
+system prompt under "Skills selected for this request" and recorded in the
+trace as an automatic `find_skills` span; skills already loaded are skipped.
+Without a decision client, or on any failure, nothing is inlined. The loop
+calls `find_skills` itself only when the task needs something those skills
+don't cover, then consults useful candidates through `read_skill`. There is
+no runtime router or routing workflow in front of ReAct. Discovery
+independently scores every routable skill through Jev,
 filters/sorts results, and returns short descriptions and source hashes.
 Unindexed/changed skills use current file descriptions until the index catches
 up. `read_skill` includes patches and can reject a mismatched `expected_hash`.

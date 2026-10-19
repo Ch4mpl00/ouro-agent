@@ -957,7 +957,7 @@ async fn discovers_domain_skills_without_preloading_them_into_the_parent() {
     supervisor(&h, Arc::new(NeverWorkflow)).run_signal(&signal("news-digest", SIGNAL_CONTENT)).await.unwrap();
     assert_eq!(find(&written.all()[0].observations, "agent_loop").meta("skills"), Some(&json!([])));
     let system = h.model.requests.lock().unwrap()[0][0]["content"].as_str().unwrap().to_owned();
-    assert!(system.contains("Discover useful skills with find_skills"));
+    assert!(system.contains("Call find_skills only when the task needs something specific"));
 }
 
 #[tokio::test]
@@ -1437,7 +1437,7 @@ async fn primary_discovers_and_reads_effective_skill_instructions_in_the_same_lo
         task_context("discovery"),
         vec![
             turn(|p| {
-                assert!(mentions(&p.messages, "In your first tool round"));
+                assert!(mentions(&p.messages, "follow them without searching again"));
                 assert!(!mentions(&p.messages, "Typical routes:"));
                 call("find_skills", json!({"query":"do domain task"}))
             }),

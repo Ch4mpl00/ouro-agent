@@ -386,7 +386,7 @@ impl SkillStore for FsSkillStore {
 }
 
 // Skill discovery belongs to the agent. MCP only stores its description index.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct FindSkillsParams {
     pub query: String,
     pub context: Option<String>,
