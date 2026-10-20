@@ -26,7 +26,7 @@ The server and the agent communicate strictly through the MCP protocol;
 neither depends on the other's crate (only tests do: `crates/mcp/tests` drive
 the agent's client and skill loader against the real server). Deployed as
 three native systemd services; Postgres, Codex and tunnel-client stay in
-Docker (`docker-compose.yml`). See README.md, Deploy, for the current layout.
+Docker (`docker-compose.yml`). See `docs/operations.md`, Deploy, for the current layout.
 
 ## The main principle: the agent's freedom and generality
 
@@ -545,7 +545,7 @@ Tests:
 
 ## Production deployment
 
-`README.md` → Deploy is the deployment reference. `scripts/deploy.sh`
+`docs/operations.md` → Deploy is the deployment reference. `scripts/deploy.sh`
 selects runtime changes, cross-compiles affected binaries locally, skips
 unchanged binaries by hash and sends them via rsync. Test/spec/doc-only
 changes do not build, upload or restart. `scripts/test_deploy.py` checks this.
