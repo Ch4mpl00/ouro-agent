@@ -1,7 +1,7 @@
 document: { dsl: '1.0.4', namespace: agent, name: signal, version: '1.0.0' }
 # How one signal is handled: the saved workflow a scheduled task names, the
-# planner for any other scheduled task, else (or when those hand it over) the
-# primary agent loop, with the context gathered for its first turn.
+# primary agent loop for other tasks and sources (or a saved workflow
+# handover), with the context gathered for its first turn.
 # Input: { signal: { id, source, content, env_context, workflow } }.
 do:
   - session:
@@ -13,13 +13,6 @@ do:
       with: { name: '${ $context.signal.workflow }' }
       export: { as: '${ $context + { handover: .handover } }' }
   - after_saved:
-      switch:
-        - done: { when: '${ .done == true }', then: end }
-        - on: { then: planner }
-  - planner:
-      if: '${ $context.signal.source == "scheduler" and $context.signal.workflow == null }'
-      call: run_planner
-  - after_planner:
       switch:
         - done: { when: '${ .done == true }', then: end }
         - on: { then: input }

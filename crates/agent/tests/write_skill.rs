@@ -14,7 +14,6 @@ use agent::{
     skills::FsSkillStore,
     supervisor::{PendingSignal, create_supervisor},
     tracing::NullTracer,
-    workflow::{RunResult, WorkflowRun, WorkflowSignal},
 };
 use async_trait::async_trait;
 use proptest::prelude::*;
@@ -102,21 +101,6 @@ fn live_files(dir: &Path) -> Vec<String> {
     files
 }
 
-struct Exhausted;
-
-#[async_trait]
-impl WorkflowRun for Exhausted {
-    async fn run_signal(
-        &self,
-        _: &WorkflowSignal,
-        _: agent::session::Session,
-        _: agent::tracing::Scope,
-        _: &CancellationToken,
-    ) -> anyhow::Result<RunResult> {
-        Ok(RunResult::ReplanExhausted { passes: 1, attempts: 1 })
-    }
-}
-
 // Loading a skill is not authorization. A model may request dreaming in any
 // signal, but only the supervisor's actual dreaming signal authorizes a worker.
 #[tokio::test]
@@ -160,7 +144,6 @@ async fn delegating_to_dreaming_only_writes_for_an_authorized_signal() {
                 user_email: None,
                 telegram_chat_id: None,
             },
-            Arc::new(Exhausted),
             agent::flows::create_flows(engine.clone()),
         );
         supervisor
@@ -261,7 +244,12 @@ async fn revise(
 
     let authorized = primary || (allow_skill_writes && skills.iter().any(|s| s == "dreaming"));
     let first = offered.lock().unwrap()[0].clone();
-    prop_assert_eq!(first.iter().any(|t| t == "write_skill"), authorized, "write_skill offered to a {} loop", skills[0]);
+    prop_assert_eq!(
+        first.iter().any(|t| t == "write_skill"),
+        authorized,
+        "write_skill offered to a {} loop",
+        skills[0]
+    );
     let live = live_files(&live_dir);
     if !authorized {
         witnessed.lock().unwrap().insert("refused unauthorized worker");
@@ -302,10 +290,13 @@ fn authorized_writers_never_leave_a_skill_the_agent_cant_start_with() {
     let mut runner = TestRunner::new(Config { cases: runs, ..Config::default() });
     let skills = prop::sample::select(vec!["dreaming", "telegram", "worker"]).prop_map(|s| vec![s.to_owned()]);
     runner
-        .run(&(prop::collection::vec(write(), 1..=5), skills, any::<bool>(), any::<bool>()), |(writes, skills, allow, primary)| {
-            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-            runtime.block_on(revise(writes, skills, allow, primary, &witnessed))
-        })
+        .run(
+            &(prop::collection::vec(write(), 1..=5), skills, any::<bool>(), any::<bool>()),
+            |(writes, skills, allow, primary)| {
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                runtime.block_on(revise(writes, skills, allow, primary, &witnessed))
+            },
+        )
         .unwrap();
     assert_eq!(
         witnessed.into_inner().unwrap().into_iter().collect::<Vec<_>>(),

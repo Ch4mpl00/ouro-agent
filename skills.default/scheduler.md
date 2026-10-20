@@ -5,9 +5,10 @@ tools: *
 
 # Scheduler signal handling
 
-You are reacting to a `source=scheduler` signal. MCP fires this when one of
-the cron-scheduled tasks registered via `schedule_task` matches the current
-minute (in the configured timezone).
+You are reacting to a `source=scheduler` signal in the primary agent loop.
+The agent fires this when a task registered via `schedule_task` is due in
+the configured timezone. A task naming a saved workflow runs that workflow
+first; tasks without one come directly to you.
 
 The signal `content` starts with a header block followed by the user's
 own prompt body:
@@ -74,6 +75,11 @@ Recurring: yes | no (one-shot)
 6. **Recurring tasks fire again automatically.** Don't try to
    re-schedule them. One-shot tasks auto-deactivate after this single
    fire — check the `Recurring: …` header.
+
+For recurring deterministic work, delegate to `workflow-author` to draft
+and try a saved workflow, then present its behavior and sample to the user.
+Activate it and update the schedule only after their confirmation, following
+`workflow-author`. Simple reminders can stay as scheduled prompts.
 
 ## Style
 

@@ -27,14 +27,11 @@ flowchart LR
         C[Schedule<br/>cron, 30 s tick] -->|fire| S
         Q -->|get_next_signal<br/>wait_for_signal| S[Supervisor<br/>one signal at a time]
         S -->|scheduler task<br/>naming a workflow| W[Saved workflow<br/>crates/owf]
-        S -->|other scheduler task| PL[Planner<br/>compile → execute]
-        S -->|every other source| L[Agent loop<br/>skills · sub-agents]
+        S -->|all other signals| L[Agent loop<br/>skills · sub-agents]
         W -.->|faulted before any write| L
-        PL -.->|compile failure| L
     end
 
     W --> TOOLS
-    PL --> TOOLS
     L --> TOOLS
 ```
 
@@ -62,7 +59,7 @@ Postgres, the Codex sandbox and the tunnel daemon run in Docker.
 | Crate | Binary | Role |
 | --- | --- | --- |
 | **`crates/mcp`** | `mcp-tools` | A stateless MCP server. It wraps Gmail, Telegram (bot and read-only userbot), Monobank, news, PDF, files and unified memory as primitive tools. It also runs the pollers that turn external events into signals. It knows nothing about the agent. |
-| **`crates/agent`** | `agent-supervisor` | The supervisor and the agent. It takes signals, preselects skills, and runs the ReAct loop, the planner or a saved workflow. It owns the schedule, the activity journal and the trace mirror. It knows MCP only through the protocol. |
+| **`crates/agent`** | `agent-supervisor` | The supervisor and the agent. It takes signals, preselects skills, and runs the agent loop or a saved workflow. It owns the schedule, the activity journal and the trace mirror. It knows MCP only through the protocol. |
 | **`crates/owf`** | (library) | An interpreter for the [Open Workflow Specification](https://serverlessworkflow.io) DSL 1.0, limited to the subset saved workflows use. It covers parsing against the official JSON Schema, validation, jq expressions (via jaq) and durable replay. It knows nothing about MCP or the agent. |
 | **`crates/codex`** | `codex-service` | The sandbox where the agent's `code_agent` tool and the codex judge run `codex exec`. It exposes `POST /run` and `GET /health`. |
 | **`crates/evals`** | `judge`, `judge-worker`, `improve`, … | The tooling that evaluates the agent: a per-node judge, judge-noise calibration, the improver gate and the closed-loop improver, trace replay, and the news-filter golden set. It reads the trace mirror and Langfuse, and is never in the signal path. |
@@ -111,7 +108,7 @@ mcp-tools/
     ├── mcp/                 src/<domain>.rs, src/bin (CLIs), migrations/pg,
     │                        specs/*.feature, tests/ (+ tests/model)
     ├── agent/               supervisor, agent loop, schedule, flows, durable,
-    │                        workflow (planner), skills, activity, tracing;
+    │                        skills, activity, tracing;
     │                        migrations/ (agent.db)
     ├── owf/                 the workflow interpreter + schema/
     ├── codex/               codex-service
@@ -151,17 +148,15 @@ Telegram.
    - A `scheduler` fire whose payload names a saved workflow runs that
      workflow's active version (`flows.rs` over `crates/owf`). No model
      chooses the steps.
-   - Any other `scheduler` fire goes to the planner (`workflow.rs`). The
-     `planner` skill compiles the task into steps, and the executor walks
-     them.
-   - Every other source runs the primary **agent loop** (`agent.rs`).
+   - All other signals run the primary **agent loop** (`agent.rs`). A
+     scheduler fire uses the `scheduler` skill and `base` preset. Recurring
+     deterministic work can become a saved workflow via `workflow-author`.
 
-   Failures are handled by what may already have happened. A compile
-   failure, or a saved workflow that faulted before any write, falls back to
-   the agent loop in the same trace. An execute failure, or a saved workflow
-   that faulted after a write, goes to a bounded `recovery` agent. Recovery
-   reports the failure and never retries, because something may already have
-   been sent.
+   Failures are handled by what may already have happened. A missing saved
+   workflow or one that faulted before any write falls back to the agent loop
+   in the same trace. A saved workflow that faulted after a write goes to a
+   bounded `recovery` agent. Recovery reports the failure and never retries,
+   because something may already have been sent.
 3. **Gather context; take no action.** For the agent loop the supervisor
    builds:
    - a session context block: local time, time zone, watermarks, and the
@@ -210,7 +205,7 @@ version is activated.
 
 The routing and the context gathering above are the OWF workflow `signal`
 too (`crates/agent/workflows/signal.yaml`, its functions in `supervisor.rs` §2b):
-`signal_session`, `run_saved_workflow`, `run_planner`, `signal_input`,
+`signal_session`, `run_saved_workflow`, `signal_input`,
 `recent_activity`, `preselect_skills`, and `primary_loop`, which takes the
 loop's skills, preset and system prompt from the workflow. The agent may
 replace it the same way, under the same kind of breaker; the signal's trace
@@ -233,8 +228,9 @@ provides (`crates/agent/src/synthetic_tools.json`):
 | `save_workflow`, `activate_workflow`, `list_workflows`, `read_workflow` | [Saved workflows](#saved-workflows). Saving is reserved for the `workflow-author` worker. |
 
 The default model presets (`models.rs`) are `base` = `gpt-5.4-mini`,
-`smart` = `gemini-3.7-flash`, `smartest` = `gpt-5.4` and `compiler` =
-`gpt-5.4`. `AGENT_*_MODEL` overrides any of them. The provider follows the
+`smart` = `gemini-3.7-flash` and `smartest` = `gpt-5.4`. The legacy
+`compiler` preset remains as a configuration compatibility field, unused by
+signal routing. `AGENT_*_MODEL` overrides them. The provider follows the
 model name: `openrouter/*` goes to OpenRouter, `gemini-*` to Gemini,
 `deepseek-*` to DeepSeek, and anything else to OpenAI.
 
@@ -303,7 +299,7 @@ export composes the skill the same way, and
 | `worker` | Default skill for a sub-agent with no domain skill |
 | `peer`, `scheduler` | Transport skills, loaded for `peer` signals and scheduler fires |
 | `recovery` | Reports a failed signal to the user or peer |
-| `planner`, `composer` | The scheduler path's compiler prompt and its compose steps |
+| `composer` | The base prompt of saved workflows' `llm_compose` steps |
 | `workflow-author` | Drafts a saved workflow, probes the data, dry-runs it and describes it with a sample (runs on `smart` at least) |
 | `nashdom-bill`, `tech-digest`, `news-query`, `memory`, `dreaming`, `gaia` | Domain skills, found through discovery or named for a worker |
 | `routing` | Legacy delegation guide; no longer loaded by default |

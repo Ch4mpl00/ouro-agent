@@ -42,7 +42,7 @@ pub struct TaskRow {
     pub prompt: String,
     // None → signal source 'scheduler' (user-created).
     pub source: Option<String>,
-    // A saved workflow the fire runs instead of the planner.
+    // A saved workflow the fire runs instead of the primary agent loop.
     pub workflow: Option<String>,
     // Unix seconds of the slot last fired for.
     pub last_run_at: Option<i64>,
@@ -490,7 +490,7 @@ pub async fn run_ticks(
 
 // ── 4. tools ───────────────────────────────────────────────────────────────
 
-// Synthetic tools of the agent loop (and tool steps of planner workflows).
+// Synthetic tools of the agent loop.
 pub const TOOLS: &[&str] = &["schedule_task", "list_scheduled_tasks", "cancel_scheduled_task"];
 
 #[derive(Serialize)]

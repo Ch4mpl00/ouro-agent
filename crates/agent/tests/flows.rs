@@ -6,13 +6,12 @@ mod support;
 use agent::{
     agent::{Engine, EngineDeps, Providers, create_engine},
     db::AgentDb,
-    flows::{FlowResult, FlowRun, MemoryWorkflows, Status, WorkflowStore, check, create_flows},
+    flows::{FlowResult, FlowRun, MemoryWorkflows, Status, WorkflowSignal, WorkflowStore, check, create_flows},
     mcp::Mcp,
     models::{ModelPreset, Presets, ReasoningEffort},
     providers::{ToolDef, assistant},
     trace_model::Observation,
     tracing::{Scope, TraceStart, Tracer},
-    workflow::WorkflowSignal,
 };
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
@@ -860,4 +859,129 @@ async fn a_json_compose_that_answers_text_faults_before_any_write() {
         matches!(result, FlowResult::Faulted { ref error, .. } if error.to_string().contains("`json` must be true or false")),
         "{result:?}"
     );
+}
+
+// ── composition and input helpers (shared with the saved-workflow host) ─────
+
+#[test]
+fn input_xml_keeps_strings_and_pretty_prints_structured_values() {
+    use agent::flows::render_input_xml;
+    assert_eq!(render_input_xml(&Map::new()), "");
+    assert_eq!(render_input_xml(json!({"a":"x","b":"y"}).as_object().unwrap()), "<a>\nx\n</a>\n\n<b>\ny\n</b>");
+    assert_eq!(
+        render_input_xml(json!({"posts":[{"id":1}],"missing":null}).as_object().unwrap()),
+        "<posts>\n[\n  {\n    \"id\": 1\n  }\n]\n</posts>\n\n<missing>\nnull\n</missing>"
+    );
+}
+
+#[test]
+fn tool_result_parsing_keeps_non_json_and_only_parses_objects_and_arrays() {
+    use agent::flows::parse_tool_json;
+    for (raw, parsed) in [
+        (r#"{"ok":true}"#, json!({"ok":true})),
+        ("[1,2]", json!([1, 2])),
+        ("{broken", json!("{broken")),
+        ("pong", json!("pong")),
+        ("42", json!("42")),
+        ("null", json!("null")),
+        (" [1]", json!(" [1]")),
+    ] {
+        assert_eq!(parse_tool_json(raw), parsed, "{raw}");
+    }
+}
+
+#[tokio::test]
+async fn compose_layers_base_skill_and_patch_and_keeps_prompt_only_calls_tool_free() {
+    for (base, skill) in [(true, true), (true, false), (false, true), (false, false)] {
+        let model = Arc::new(Scripted::new(vec![assistant(r#"{"text":"done"}"#)]));
+        let mut skills = Vec::new();
+        if base {
+            skills.push(("composer", "---\ntools: []\n---\nBASE COMPOSE RULES"));
+        }
+        if skill {
+            skills.push(("writer", "---\ntools: []\n---\nWRITER RULES"));
+        }
+        let f = support::fixture(model.clone(), &["search_news"], &skills);
+        std::fs::create_dir(f.root.path().join("skills")).unwrap();
+        std::fs::write(f.root.path().join("skills/writer.patch.md"), "PATCH LESSON").unwrap();
+        let user = "Compose.\n\n<posts>\n[\n  {\n    \"id\": 1\n  }\n]\n</posts>";
+        let result = agent::flows::compose(
+            &f.engine,
+            "smartest",
+            skill.then_some("writer"),
+            user,
+            false,
+            "draft",
+            &agent::tracing::null_scope(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, json!({"text":"done"}));
+        let seen = model.seen.lock().unwrap().clone();
+        assert!(seen[0].tools.is_empty());
+        assert_eq!(seen[0].model, f.engine.deps.presets.smartest.model);
+        assert_eq!(seen[0].messages.last().unwrap()["content"], user);
+        let system = seen[0].messages.iter().find(|m| m["role"] == "system");
+        if base || skill {
+            let system = system.unwrap()["content"].as_str().unwrap();
+            assert_eq!(system.contains("BASE COMPOSE RULES"), base);
+            assert_eq!(system.contains("WRITER RULES"), skill);
+            assert_eq!(system.contains("PATCH LESSON"), skill);
+            if base {
+                assert!(system.starts_with("BASE COMPOSE RULES"));
+            }
+            if skill {
+                assert!(system.ends_with("<!-- improver-patch -->\nPATCH LESSON\n"));
+            }
+        } else {
+            assert!(system.is_none());
+        }
+        f.engine.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn a_compose_with_a_missing_skill_fails_before_generation() {
+    let model = Arc::new(Scripted::new(vec![]));
+    let f = support::fixture(model.clone(), &[], &[]);
+    let error = agent::flows::compose(
+        &f.engine,
+        "base",
+        Some("missing"),
+        "write",
+        false,
+        "draft",
+        &agent::tracing::null_scope(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.to_string(), "skill not found: missing");
+    assert!(model.seen.lock().unwrap().is_empty());
+    f.engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_saved_compose_renders_prompt_before_input_xml() {
+    let w = world(vec!["written"]);
+    w.activate(
+        "draft",
+        r#"
+document: { dsl: '1.0.4', namespace: agent, name: draft, version: '1.0.0' }
+do:
+  - draft:
+      call: llm_compose
+      with: { prompt: 'Write the digest.', input: { posts: [ { id: 1 } ] } }
+"#,
+    );
+    let (result, observations) = w.run("draft").await;
+    assert!(matches!(result, FlowResult::Completed(_)));
+    let generation = named(&observations, "llm_compose:draft");
+    let messages = generation.input.as_array().unwrap();
+    assert_eq!(
+        messages.last().unwrap()["content"],
+        "Write the digest.\n\n<posts>\n[\n  {\n    \"id\": 1\n  }\n]\n</posts>"
+    );
+    assert!(generation.model_parameters.as_ref().unwrap().get("response_format").is_none());
 }

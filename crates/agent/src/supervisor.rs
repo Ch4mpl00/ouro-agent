@@ -4,13 +4,12 @@ use crate::{
     activity::{ACTIVITY_STREAM, tail_utf16},
     agent::{AgentLoop, Engine, EngineDeps, LoopOptions},
     errors::{aborted, check, is_aborted},
-    flows::{FlowResult, FlowRun},
+    flows::{FlowResult, FlowRun, WorkflowSignal},
     mcp::{Mcp, SharedMcp},
     session::{EnvDeps, Format, Session, gather_env_data, render_context, session},
     skills::{FindSkillsParams, append_patch, find_skills, read_skill_index},
     tool_results::is_tool_error,
     tracing::{ContextUpdate, EventStart, Level, Scope, Span, SpanEnd, SpanKind, SpanStart, Trace, TraceStart},
-    workflow::{RunResult, WorkflowRun, WorkflowSignal},
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -342,31 +341,23 @@ fn tail_chars(text: &str, max: usize) -> String {
 pub struct Supervisor {
     pub engine: Arc<Engine>,
     pub env: EnvDeps,
-    pub workflow: Arc<dyn WorkflowRun>,
     pub flows: Arc<dyn FlowRun>,
     cancel: CancellationToken,
     active: Arc<tokio::sync::Semaphore>,
     shutdown: tokio::sync::Mutex<bool>,
 }
-pub fn create_supervisor(
-    engine: Arc<Engine>,
-    env: EnvDeps,
-    workflow: Arc<dyn WorkflowRun>,
-    flows: Arc<dyn FlowRun>,
-) -> Arc<Supervisor> {
-    create_supervisor_with_cancel(engine, env, workflow, flows, CancellationToken::new())
+pub fn create_supervisor(engine: Arc<Engine>, env: EnvDeps, flows: Arc<dyn FlowRun>) -> Arc<Supervisor> {
+    create_supervisor_with_cancel(engine, env, flows, CancellationToken::new())
 }
 pub fn create_supervisor_with_cancel(
     engine: Arc<Engine>,
     env: EnvDeps,
-    workflow: Arc<dyn WorkflowRun>,
     flows: Arc<dyn FlowRun>,
     cancel: CancellationToken,
 ) -> Arc<Supervisor> {
     Arc::new(Supervisor {
         engine,
         env,
-        workflow,
         flows,
         cancel,
         active: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -404,8 +395,7 @@ impl Supervisor {
     async fn run_active(self: &Arc<Self>, signal: &PendingSignal) -> anyhow::Result<String> {
         let id = format!("{}:{}", signal.source, signal.id);
         let saved = signal.saved_workflow();
-        let use_workflow = signal.source == "scheduler" && saved.is_none();
-        let trace=self.engine.deps.tracer.trace(TraceStart{id:id.clone(),name:format!("signal:{}",signal.source),kind:SpanKind::Agent,session_id:Some(id.clone()),tags:Some(vec![signal.source.clone(),if saved.is_some(){"saved-workflow"}else if use_workflow{"planner-mode"}else{"agent-loop"}.into()]),metadata:Some(json!({"signal_id":signal.id,"signal_source":signal.source,"signal_created_at":signal.created_at,"activity":"run"}).as_object().unwrap().clone())});
+        let trace=self.engine.deps.tracer.trace(TraceStart{id:id.clone(),name:format!("signal:{}",signal.source),kind:SpanKind::Agent,session_id:Some(id.clone()),tags:Some(vec![signal.source.clone(),if saved.is_some(){"saved-workflow"}else{"agent-loop"}.into()]),metadata:Some(json!({"signal_id":signal.id,"signal_source":signal.source,"signal_created_at":signal.created_at,"activity":"run"}).as_object().unwrap().clone())});
         trace.update(ContextUpdate::input(signal.content.clone()));
         let state = Arc::new(std::sync::Mutex::new(SignalState::default()));
         let outcome = self.handle(signal, &trace, &state).await;
@@ -551,7 +541,6 @@ pub const SIGNAL_FUNCTIONS: &[(&str, owf::run::Effect)] = {
     &[
         ("signal_session", Read),
         ("run_saved_workflow", Write),
-        ("run_planner", Write),
         ("signal_input", Read),
         ("recent_activity", Read),
         ("preselect_skills", Read),
@@ -672,52 +661,6 @@ impl SignalFunctions {
                         .clone(),
                 ));
                 Ok(json!({"done":false,"handover":handover}))
-            }
-            "run_planner" => {
-                let session = self.session()?;
-                let result =
-                    supervisor.workflow.run_signal(&signal.workflow_signal(), session, scope.clone(), cancel).await?;
-                check(cancel)?;
-                let fallback = match result {
-                    RunResult::Ok { attempts, step_count, .. } => {
-                        let output = json!({"ok":true,"attempts":attempts,"stepCount":step_count});
-                        trace.update(ContextUpdate::output(output.clone()));
-                        return Ok(json!({"done":true,"output":output.to_string()}));
-                    }
-                    RunResult::ExecuteFailed { reason, error, step_index, .. } => {
-                        trace.event(EventStart {
-                            name: "fallback".into(),
-                            level: Some(Level::Error),
-                            metadata: Some(
-                                json!({"stage":"execute","reason":reason,"step_index":step_index})
-                                    .as_object()
-                                    .unwrap()
-                                    .clone(),
-                            ),
-                            ..Default::default()
-                        });
-                        anyhow::bail!("Workflow execution failed at step {step_index} ({reason}): {error}");
-                    }
-                    RunResult::CompileFailed { reason, errors, attempts } => {
-                        json!({"stage":"compile","reason":reason,"errors":errors,"attempts":attempts})
-                    }
-                    RunResult::ReplanExhausted { passes, attempts } => {
-                        json!({"stage":"replan_exhausted","reason":"replan_exhausted","passes":passes,"attempts":attempts})
-                    }
-                };
-                trace.event(EventStart {
-                    name: "fallback".into(),
-                    level: Some(Level::Warning),
-                    metadata: fallback.as_object().cloned(),
-                    ..Default::default()
-                });
-                trace.update(ContextUpdate::metadata(
-                    json!({"fallback":"agent-loop","workflow_failure_stage":fallback["stage"]})
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                ));
-                Ok(json!({"done":false}))
             }
             "signal_input" => Ok(json!(if signal.source == PEER_SOURCE {
                 prepare_peer_input(signal, mcp, &scope, cancel).await?

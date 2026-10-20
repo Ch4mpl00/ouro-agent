@@ -25,4 +25,3 @@ pub mod tracing;
 
 pub mod activity;
 pub mod supervisor;
-pub mod workflow;

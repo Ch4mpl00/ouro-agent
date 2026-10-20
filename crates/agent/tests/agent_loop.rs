@@ -17,7 +17,6 @@ use agent::{
     supervisor::{PendingSignal, create_supervisor},
     trace_model::ObservationType,
     tracing::{NullTracer, Tracer, tee_tracer},
-    workflow::{RunResult, Step, VariableStore, WorkflowRun, WorkflowSignal, create_workflow_runner},
 };
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
@@ -624,52 +623,11 @@ fn signal(source: &str, content: &str) -> PendingSignal {
 
 const SIGNAL_CONTENT: &str = "chatId=42: summarize";
 
-// Routing is by source, not by content: scheduler compiles a workflow,
-// everything else runs the AgentLoop and must never reach the runner.
-struct NeverWorkflow;
-
-#[async_trait]
-impl WorkflowRun for NeverWorkflow {
-    async fn run_signal(
-        &self,
-        _: &WorkflowSignal,
-        _: agent::session::Session,
-        _: agent::tracing::Scope,
-        _: &CancellationToken,
-    ) -> anyhow::Result<RunResult> {
-        panic!("Workflow must not run for this source")
-    }
-}
-
-struct FixedWorkflow {
-    result: Box<dyn Fn() -> RunResult + Send + Sync>,
-    calls: AtomicUsize,
-}
-
-#[async_trait]
-impl WorkflowRun for FixedWorkflow {
-    async fn run_signal(
-        &self,
-        _: &WorkflowSignal,
-        _: agent::session::Session,
-        _: agent::tracing::Scope,
-        _: &CancellationToken,
-    ) -> anyhow::Result<RunResult> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok((self.result)())
-    }
-}
-
-fn fixed(result: impl Fn() -> RunResult + Send + Sync + 'static) -> Arc<FixedWorkflow> {
-    Arc::new(FixedWorkflow { result: Box::new(result), calls: AtomicUsize::new(0) })
-}
-
-fn supervisor(h: &Harness, workflow: Arc<dyn WorkflowRun>) -> Arc<agent::supervisor::Supervisor> {
+fn supervisor(h: &Harness) -> Arc<agent::supervisor::Supervisor> {
     let timezone: Arc<dyn Mcp> = ToolMcp::returning(Vec::new(), "{\"timezone\":\"UTC\"}");
     create_supervisor(
         h.engine.clone(),
         EnvDeps { mcp: timezone, memory: h.persist.clone(), user_email: None, telegram_chat_id: None },
-        workflow,
         agent::flows::create_flows(h.engine.clone()),
     )
 }
@@ -694,8 +652,7 @@ async fn waits_for_cancellation_and_trace_cleanup_on_shutdown_without_starting_r
             "unused",
             probe.clone(),
         );
-        let workflow = create_workflow_runner(h.engine.clone(), vec!["test".into()]).unwrap();
-        let runner = supervisor(&h, workflow);
+        let runner = supervisor(&h);
         let running = {
             let runner = runner.clone();
             let s = signal(source, SIGNAL_CONTENT);
@@ -706,7 +663,7 @@ async fn waits_for_cancellation_and_trace_cleanup_on_shutdown_without_starting_r
         assert!(is_aborted(&running.await.unwrap().unwrap_err()), "{source}");
         runner.shutdown().await;
         let observations = &written.all()[0].observations;
-        assert_eq!(observations.iter().any(|o| o.name == "agent_loop"), source == "telegram", "{source}");
+        assert!(observations.iter().any(|o| o.name == "agent_loop"), "{source}");
         assert!(!observations.iter().any(|o| o.name == "recovery"), "{source}");
         assert_eq!(probe.shutdowns.load(Ordering::SeqCst), 1);
         // The trace was written before the tracer shut down.
@@ -749,7 +706,7 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
         tracer,
     );
     *mcp_calls.lock().unwrap() = Some(h.mcp.clone());
-    let runner = supervisor(&h, Arc::new(NeverWorkflow));
+    let runner = supervisor(&h);
     let content = "Telegram message in chat 42.\nText: \"go ahead\"";
     assert_eq!(runner.run_signal(&signal("telegram", content)).await.unwrap(), "done");
     // History + activity; no worker fetch or extra LLM retrieval turn.
@@ -761,80 +718,6 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
     assert_eq!(fetch.meta("automatic"), Some(&json!(true)));
     assert_eq!(fetch.meta("memory_key"), Some(&json!("telegram.history")));
     assert_eq!(trace.observations.iter().filter(|o| o.kind == ObservationType::Generation).count(), 3);
-}
-
-#[tokio::test]
-async fn compiles_scheduler_signals_into_a_workflow_instead_of_running_the_primary_loop() {
-    let (tracer, written) = recording();
-    let h = Harness::new(task_context("task"), Vec::new(), "unused", tracer);
-    let workflow = fixed(|| RunResult::Ok { attempts: 1, step_count: 3, store: VariableStore::new(Map::new()) });
-    let output = supervisor(&h, workflow.clone()).run_signal(&signal("scheduler", SIGNAL_CONTENT)).await.unwrap();
-    assert_eq!(serde_json::from_str::<Value>(&output).unwrap(), json!({"ok":true,"attempts":1,"stepCount":3}));
-    assert_eq!(workflow.calls.load(Ordering::SeqCst), 1);
-    let trace = &written.all()[0];
-    assert!(!trace.observations.iter().any(|o| o.name == "agent_loop"));
-    // No Telegram preload on this path.
-    assert!(h.mcp.calls.lock().unwrap().is_empty());
-    assert_eq!(trace.tags, ["scheduler", "planner-mode"]);
-    assert_eq!(trace.output.as_ref().unwrap()["ok"], true);
-}
-
-#[tokio::test]
-async fn degrades_to_the_primary_loop_in_the_same_trace_when_a_scheduler_workflow_does_not_compile() {
-    let (tracer, written) = recording();
-    let h = Harness::new(
-        task_context("task"),
-        vec![turn(|p| {
-            // No Telegram preload.
-            assert_eq!(p.messages.last().unwrap()["content"], SIGNAL_CONTENT);
-            answer("done")
-        })],
-        "unused",
-        tracer,
-    );
-    let workflow = fixed(|| RunResult::CompileFailed {
-        reason: "schema_invalid",
-        errors: vec!["step 0: unknown tool".into()],
-        attempts: 3,
-    });
-    assert_eq!(supervisor(&h, workflow).run_signal(&signal("scheduler", SIGNAL_CONTENT)).await.unwrap(), "done");
-    let traces = written.all();
-    assert_eq!(traces.len(), 1);
-    let primary = find(&traces[0].observations, "agent_loop");
-    assert_eq!(primary.meta("preset"), Some(&json!("base")));
-    assert_eq!(primary.meta("skills"), Some(&json!(["scheduler"])));
-    let fallback = find(&traces[0].observations, "fallback");
-    assert_eq!(fallback.kind, ObservationType::Event);
-    assert_eq!(fallback.level, "WARNING");
-    assert_eq!(
-        (fallback.meta("stage"), fallback.meta("reason")),
-        (Some(&json!("compile")), Some(&json!("schema_invalid")))
-    );
-}
-
-#[tokio::test]
-async fn reports_a_scheduler_execution_failure_instead_of_restarting_the_task_agentically() {
-    let (tracer, written) = recording();
-    let h = Harness::new(task_context("task"), vec![turn(|_| answer("recovery report"))], "unused", tracer);
-    let workflow = fixed(|| RunResult::ExecuteFailed {
-        reason: "tool_error",
-        error: anyhow::anyhow!("telegram 400"),
-        step_index: 2,
-        step: Step::Tool { tool: "send_telegram_message".into(), args: Map::new(), bind: None },
-    });
-    let err = supervisor(&h, workflow).run_signal(&signal("scheduler", SIGNAL_CONTENT)).await.unwrap_err();
-    assert!(err.to_string().contains("telegram 400"), "{err}");
-    let observations = &written.all()[0].observations;
-    // Only the recovery loop ran.
-    assert!(!observations.iter().any(|o| o.name == "agent_loop"));
-    assert_eq!(find(observations, "recovery").meta("skills"), Some(&json!(["recovery"])));
-    let fallback = find(observations, "fallback");
-    assert_eq!((fallback.kind, fallback.level.as_str()), (ObservationType::Event, "ERROR"));
-    assert_eq!(
-        (fallback.meta("stage"), fallback.meta("reason"), fallback.meta("step_index")),
-        (Some(&json!("execute")), Some(&json!("tool_error")), Some(&json!(2)))
-    );
-    assert_eq!(find(observations, "recovery").output, json!("recovery report"));
 }
 
 #[tokio::test]
@@ -857,7 +740,7 @@ async fn runs_a_signal_directly_and_records_parent_worker_tool_io_memory_referen
         Arc::new(tee_tracer(primary, mirror)),
     );
     Arc::get_mut(&mut h.engine).unwrap().deps.skills = vec!["orchestrator".into()];
-    let runner = supervisor(&h, Arc::new(NeverWorkflow));
+    let runner = supervisor(&h);
     assert_eq!(runner.run_signal(&signal("telegram", SIGNAL_CONTENT)).await.unwrap(), "finished");
     assert_eq!(primary_written.len(), 1);
     assert_eq!(mirror_written.len(), 1);
@@ -933,7 +816,7 @@ async fn recovers_a_failed_primary_loop_in_the_same_trace_and_releases_both_loop
         "unused",
         tracer,
     );
-    let runner = supervisor(&h, Arc::new(NeverWorkflow));
+    let runner = supervisor(&h);
     let err = runner.run_signal(&signal("telegram", SIGNAL_CONTENT)).await.unwrap_err();
     assert!(err.to_string().contains("primary model offline"), "{err}");
     assert!(h.engine.loop_ids().await.is_empty());
@@ -954,7 +837,7 @@ async fn recovers_a_failed_primary_loop_in_the_same_trace_and_releases_both_loop
 async fn discovers_domain_skills_without_preloading_them_into_the_parent() {
     let (tracer, written) = recording();
     let h = Harness::new(task_context("task"), vec![turn(|_| answer("done"))], "unused", tracer);
-    supervisor(&h, Arc::new(NeverWorkflow)).run_signal(&signal("news-digest", SIGNAL_CONTENT)).await.unwrap();
+    supervisor(&h).run_signal(&signal("news-digest", SIGNAL_CONTENT)).await.unwrap();
     assert_eq!(find(&written.all()[0].observations, "agent_loop").meta("skills"), Some(&json!([])));
     let system = h.model.requests.lock().unwrap()[0][0]["content"].as_str().unwrap().to_owned();
     assert!(system.contains("Call find_skills only when the task needs something specific"));
@@ -1009,7 +892,7 @@ async fn exports_the_primary_loop_and_nested_worker_through_the_langfuse_adapter
         tracer.clone(),
     );
     Arc::get_mut(&mut h.engine).unwrap().deps.skills = vec!["orchestrator".into()];
-    supervisor(&h, Arc::new(NeverWorkflow)).run_signal(&signal("telegram", SIGNAL_CONTENT)).await.unwrap();
+    supervisor(&h).run_signal(&signal("telegram", SIGNAL_CONTENT)).await.unwrap();
     let spans = exported.0.lock().unwrap().clone();
     let by_name = |name: &str| spans.iter().find(|s| s.name == name).unwrap().clone();
     let root = by_name("signal:telegram");

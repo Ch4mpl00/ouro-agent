@@ -1,8 +1,8 @@
 // Saved workflows: Open Workflow Specification definitions (`crates/owf`)
 // that run without a model deciding what to do next. 1. the store (agent.db
 // `workflows`); 2. the function catalog (MCP tools and the model steps);
-// 3. tracing (owf events → spans under the signal's trace, as `workflow.rs`
-// writes them); 4. running one for a scheduler signal.
+// 2b. model composition and signal input; 3. tracing (owf events → spans
+// under the signal's trace); 4. running one for a scheduler signal.
 //
 // A scheduled task naming a workflow (`schedule_task` with `workflow`; its
 // fire's payload is `{ "workflow": "…" }`) runs its active version here.
@@ -11,18 +11,21 @@
 use crate::{
     agent::Engine,
     db::AgentDb,
+    errors::is_aborted,
+    generation::{Observation, generation},
     mcp::{Mcp, model_tools},
-    providers::ToolDef,
-    session::Session,
-    tracing::{EventStart, Level, Scope, Span, SpanEnd, SpanKind, SpanStart},
-    workflow::{WorkflowSignal, compose, parse_tool_json, render_input_xml, signal_input},
+    models::PresetName,
+    providers::{self, CompletionParams, ToolDef},
+    session::{EnvData, Session, iso},
+    skills::append_patch,
+    tracing::{EventStart, GenerationEnd, Level, Scope, Span, SpanEnd, SpanKind, SpanStart},
 };
 use async_trait::async_trait;
 use futures::StreamExt;
 use owf::durable::{CallFailure, Delivery};
 use owf::run::{CallInfo, Effect, Event, Host, Limits, Observer, Status as RunStatus, SystemClock, WorkflowError};
 use rusqlite::{OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -566,6 +569,133 @@ impl owf::run::Functions for Functions {
             }
         }
     }
+}
+
+// ── 2b. model composition and signal input ──────────────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkflowSignal {
+    pub id: i64,
+    pub source: String,
+    pub content: String,
+    #[serde(rename = "envContext")]
+    pub env_context: Option<String>,
+}
+pub fn signal_input(signal: &WorkflowSignal, env: &EnvData) -> Map<String, Value> {
+    let local_now = match env.timezone.parse::<chrono_tz::Tz>() {
+        Ok(zone) => env.now.with_timezone(&zone).to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+        Err(_) => env.now.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+    };
+    json!({"env":{"timezone":env.timezone,"now":iso(env.now),"localNow":local_now,"newsLastReadAt":env.news_last_read_at,"techLastReadAt":env.tech_last_read_at,"userEmail":env.user_email,"telegramChatId":env.telegram_chat_id},"signal":{"source":signal.source,"content":signal.content,"id":signal.id}}).as_object().unwrap().clone()
+}
+
+pub fn render_input_xml(input: &Map<String, Value>) -> String {
+    input
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "<{key}>\n{}\n</{key}>",
+                value.as_str().map(str::to_owned).unwrap_or_else(|| serde_json::to_string_pretty(value).unwrap())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+pub fn parse_tool_json(raw: &str) -> Value {
+    if raw.starts_with(['{', '[']) { serde_json::from_str(raw).unwrap_or_else(|_| json!(raw)) } else { json!(raw) }
+}
+
+/// One `llm_compose` generation: the `composer` base prompt plus `skill`
+/// (with its patch) as the system message, `user` as the only user message.
+/// Traced as `llm_compose:<label>` tagged `judge_node: compose`, which is how
+/// the judge finds compose nodes. A reply that is JSON comes back parsed.
+/// With `json` the provider is held to one JSON object, and a reply that is
+/// not one is an error rather than text a branch would misread.
+#[allow(clippy::too_many_arguments)]
+pub async fn compose(
+    engine: &Engine,
+    preset: &str,
+    skill: Option<&str>,
+    user: &str,
+    json: bool,
+    label: &str,
+    scope: &Scope,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Value> {
+    let preset = engine
+        .deps
+        .presets
+        .get(PresetName::selectable(preset).ok_or_else(|| anyhow::anyhow!("unknown preset"))?)
+        .clone();
+    let provider = engine.resolve_provider(&preset.model)?;
+    let base = engine.deps.skill_store.read_skill("composer").await?.map(|s| s.body);
+    let system = if let Some(skill) = skill {
+        let body = engine
+            .deps
+            .skill_store
+            .read_skill(skill)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("skill not found: {skill}"))?
+            .body;
+        let patch = engine.deps.skill_store.read_patch(skill).await?.unwrap_or_default();
+        let body = append_patch(&body, &patch);
+        if let Some(base) = base.filter(|s| !s.is_empty()) { Some(format!("{base}\n\n{body}")) } else { Some(body) }
+    } else {
+        base
+    };
+    let mut messages = Vec::new();
+    if let Some(system) = system {
+        messages.push(providers::system(&system));
+    }
+    // OpenAI refuses JSON mode unless the messages ask for JSON.
+    if json {
+        messages.push(providers::user(&format!("{user}\n\nReply with one JSON object.")));
+    } else {
+        messages.push(providers::user(user));
+    }
+    let mut model_parameters = json!({"reasoning_effort":preset.reasoning_effort.as_str(),"tools_mode":"none"});
+    if json {
+        model_parameters["response_format"] = json!("json_object");
+    }
+    let mut params = CompletionParams {
+        model: preset.model,
+        messages: &mut messages,
+        reasoning_effort: preset.reasoning_effort,
+        tools: Vec::new(),
+        response_format: json.then(|| json!({"type":"json_object"})),
+        trace: None,
+        cancel: cancel.clone(),
+    };
+    let result = generation(
+        &provider,
+        &mut params,
+        scope,
+        Observation {
+            name: format!("llm_compose:{label}"),
+            model_parameters: model_parameters.as_object().cloned(),
+            metadata: Some(json!({"judge_node":"compose","skill":skill}).as_object().unwrap().clone()),
+        },
+        None,
+        |r| GenerationEnd {
+            output: Some(json!(providers::content(&r.message).unwrap_or_default())),
+            usage: r.usage.clone(),
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|e| if is_aborted(&e) { e } else { anyhow::anyhow!("llm call failed: {e}") })?;
+    crate::errors::check(cancel)?;
+    let reply = providers::content(&result.message).unwrap_or_default();
+    if json {
+        return match serde_json::from_str::<Value>(reply.trim()) {
+            Ok(object @ Value::Object(_)) => Ok(object),
+            _ => Err(anyhow::anyhow!(
+                "llm call failed: the reply is not a JSON object: {}",
+                crate::activity::clip(reply, 200)
+            )),
+        };
+    }
+    Ok(parse_tool_json(reply))
 }
 
 // ── 3. tracing ─────────────────────────────────────────────────────────────

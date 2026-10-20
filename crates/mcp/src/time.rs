@@ -1,7 +1,7 @@
 // Timestamps as the agent sees them. Every date this server hands out has
 // always been a JS `Date#toISOString()` ("2026-10-02T09:00:00.000Z"), and
-// every date it accepts went through `new Date(input)`; skills and the
-// planner depend on both shapes, so they are reproduced here once.
+// every date it accepts went through `new Date(input)`; skills and saved
+// workflows depend on both shapes, so they are reproduced here once.
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc};
 

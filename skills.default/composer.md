@@ -33,8 +33,8 @@ step verbatim.
    result, do not invent a plausible answer and do not stage a fake lookup.
    Return a short, honest statement of what's missing (or, if the prompt
    specifies an output shape, the shape's "insufficient/unknown" form). A
-   truthful "not enough information" is a valid result; the planner can
-   replan on it. A fabricated one is not recoverable.
+   truthful "not enough information" is a valid result; the workflow can
+   branch on it. A fabricated one is not recoverable.
 
 4. **Output exactly the requested form, nothing around it.** If the prompt
    asks for JSON, return only the JSON (no prose, no code fences, no

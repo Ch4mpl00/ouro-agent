@@ -92,19 +92,19 @@ deletion.
    holds the routing and the first turn's context below. Routing is by source: a `scheduler`
    signal whose payload names a saved workflow (`{"workflow": …}`, set by
    `schedule_task(workflow: …)`) runs its active version (`flows.rs` over `crates/owf`, no
-   model deciding the steps); other `scheduler` signals run through the
-   workflow module (`workflow.rs`: compile → execute); every other source
-   runs the primary agent loop. Every agent loop (primary, worker, recovery)
+   model deciding the steps); all other signals run the primary agent loop.
+   Scheduler signals use the `scheduler` skill and `base` preset. Recurring
+   deterministic work can become a saved workflow through `workflow-author`.
+   Every agent loop (primary, worker, recovery)
    is a run of the OWF workflow `agent-loop` (`workflows/agent-loop.yaml`, its host
    functions in `agent.rs` §4): the primary one durable, so a restart resumes
    it from its last round. The agent may activate its own version of
    `agent-loop`; three faults of it in a row fall back to the built-in one
    (`flows.rs` §4b). A worker of the durable primary loop is a durable run of
-   its own, which a resumed parent joins. A compile failure, or a saved
-   workflow that faulted before any write call, degrades to the agent loop in
-   the same trace; an execute failure, or a saved workflow that faulted after
-   a write, goes to `recovery` instead of being retried. Writes are the MCP
-   tools without `readOnlyHint` (plus `set_memory`). The agent-loop path loads:
+   its own, which a resumed parent joins. A missing saved workflow or one that
+   faulted before any write call hands over to the agent loop in the same
+   trace; a saved workflow that faulted after a write goes to `recovery`
+   instead of being retried. Writes are the MCP tools without `readOnlyHint` (plus `set_memory`). The agent-loop path loads:
    - `skills/orchestrator.md` + `skills/routing.md` — always; how to use
      working memory and when to delegate to a domain skill.
    - `skills/<signal.source>.md` (with `skills.default/` fallback) — only for
@@ -156,7 +156,6 @@ mcp-tools/
     ├── agent/
     │   ├── src/main.rs                     composition root (agent-supervisor)
     │   ├── src/supervisor.rs               poll loop, per-signal routing, tg history preload
-    │   ├── src/workflow.rs                 dynamic workflows: DSL, variables, compile, execute
     │   ├── src/flows.rs                    saved workflows: store, function catalog, tracing,
     │   │                                   scheduled runs, the authoring tools
     │   ├── src/durable.rs                  saved workflows' run state: admission, leases, checkpoints
@@ -422,8 +421,7 @@ Three read models, one search projection:
   chunked into it with their subject denormalised into the indexed text, so a
   fragment matches even though the stored document stays clean.
 
-The agent's flow is two-step, the same search→read shape that fixed the
-planner's snippet failures on the GAIA benchmark: `recall` returns **refs**
+The agent's flow is two-step: `recall` returns **refs**
 (`doc:leetcode-graphs/roadmap.md#2`, `fact:88`), then `read_doc` / `get_fact`
 loads the whole thing.
 
@@ -469,7 +467,7 @@ volume — written by the `dreaming` skill when it self-revises).
   `telegram` — primary domain skills, loaded per signal.source.
 - `routing`, `orchestrator`, `worker` — always loaded on the agent-loop path
   (`worker` is the default skill for a sub-agent with no domain skill).
-- `planner` — the workflow compiler's system prompt (scheduler signals).
+- `composer` — the base prompt of saved workflows' `llm_compose` steps.
 - `workflow-author` — a worker skill (on `smart` at least): drafts a saved
   workflow with `save_workflow`, dry-runs it with `try_workflow` (real reads
   and model steps, writes only recorded) and describes it in words with a
@@ -522,7 +520,7 @@ image they are on `PATH`.
   `--dump` writes the materials for the judge-trace skill) — judge a run per
   node. `judge-noise` measures the judge's σ into `noise-baseline.json`;
   `judge-gate` A/Bs a candidate patch; `improve` runs one improver cycle;
-  `judge-replay` replays a planner/compose generation under another model;
+  `judge-replay` replays a compose generation under another model;
   `langfuse-trace` prints a trace; `news-filter-eval` runs the filter golden
   set (`eval-fixtures/news-filter/`).
 

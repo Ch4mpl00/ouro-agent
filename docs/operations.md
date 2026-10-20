@@ -70,7 +70,7 @@ The evaluation binaries run with `cargo run -p evals --bin <name>`:
 - `judge-noise` measures the judge's σ into `noise-baseline.json`.
 - `judge-gate` A/Bs a candidate patch.
 - `improve` runs one improver cycle.
-- `judge-replay` replays a planner or compose generation under another model.
+- `judge-replay` replays a compose generation under another model.
 - `langfuse-trace` prints a trace.
 - `news-filter-eval` runs the filter golden set.
 

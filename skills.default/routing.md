@@ -23,9 +23,8 @@ Typical routes:
 - `dreaming`: the scheduled skill-maintenance task. It may update skills
   as assigned; it should report what changed.
 - `workflow-author`: the user wants something done on a schedule
-  ("присылай каждое утро …"), or a scheduled task should run without
-  re-planning. The worker saves a draft workflow, tries it on today's
-  data and returns, in words, what it does with a sample of what the
+  ("присылай каждое утро …"), or recurring deterministic work should run as a
+  saved workflow. The worker saves a draft workflow, tries it on today's data and returns, in words, what it does with a sample of what the
   user would get; deliver that to the user as it is (never the
   definition, YAML or JSON) and ask them to confirm. A change the user
   asks for goes back to a worker with the workflow's name. Pass the

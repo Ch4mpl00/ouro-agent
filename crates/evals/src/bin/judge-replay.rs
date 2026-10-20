@@ -1,21 +1,8 @@
-// A/B replay over a captured trace. Both tests reduce to ONE pattern: take a
-// generation's recorded input (which already pins everything but the model —
-// the compiler's input holds the signal, the composer's input holds the
-// already-rendered tool results) and replay it under a different model.
+// Replay a compose generation over a captured trace under another model.
+// The recorded input pins the tool results; inspect also reads legacy planner nodes.
 //
-//   Test A (plan):    replay the `planner` generation     -> a Workflow JSON
-//   Test B (compose): replay the `llm_compose` generation -> a digest text
-//
-//   judge-replay <traceId>                            # extract + inspect
-//   judge-replay <traceId> --plan <model> [--thinking [level]] [--planner-file <path>]
-//                [--system-file <path>] [--dump-dir <dir>] [--salvage] [--retries N]
-//   judge-replay <traceId> --compose <model> [--thinking [level]] [--judge]
-//
-// --planner-file swaps the planner-skill body inside the recorded system
-// message for the given on-disk file (the <tools>/<skills> reference block
-// stays as recorded) — an A/B of a planner.md edit over a frozen signal.
-// --thinking takes an optional level (low/medium/high; bare flag = high) —
-// pass `low` to mirror the production compiler preset.
+//   judge-replay <traceId>
+//   judge-replay <traceId> --compose <model> [--thinking [low|medium|high]] [--judge]
 //
 // With --judge, the original (A) and each B sample go to a pairwise judge
 // (gpt-5.4) over the SAME frozen candidates — both in one call (one salience
@@ -26,7 +13,6 @@ use std::sync::Arc;
 
 use agent::providers::{HttpApi, OPENAI_BASE_URL};
 use agent::trace_model::{Observation, ObservationType};
-use agent::workflow::WorkflowSchema;
 use evals::backend::openai_structured;
 use evals::env::load_env;
 use evals::gate::{ChatMessage, as_text, recorded_messages};
@@ -34,7 +20,6 @@ use evals::gate_runtime::{complete, replay_retry, to_param};
 use evals::improver::truncate;
 use evals::langfuse_api::Langfuse;
 use evals::materials::millis;
-use regex::Regex;
 use serde_json::{Value, json};
 
 fn arg_flag(name: &str) -> Option<String> {
@@ -73,53 +58,6 @@ async fn replay_generation(
     complete(model, messages.iter().map(to_param).collect(), json_mode, effort).await
 }
 
-fn print_steps(steps: &[Value], indent: &str) {
-    for s in steps {
-        let Some(step) = s.as_object() else { continue };
-        let mut parts = vec![step.get("kind").map(text_of).unwrap_or_else(|| "?".into())];
-        if let Some(tool) = step.get("tool").filter(|t| truthy(t)) {
-            parts.push(format!("{}({})", text_of(tool), step.get("args").cloned().unwrap_or(json!({}))));
-        }
-        if let Some(skill) = step.get("skill").filter(|t| truthy(t)) {
-            parts.push(format!(
-                "skill={} preset={}",
-                text_of(skill),
-                step.get("preset").map(text_of).unwrap_or("undefined".into())
-            ));
-        }
-        println!("{indent}- {}", parts.join(" "));
-        if let Some(Value::Array(inner)) = step.get("steps") {
-            print_steps(inner, &format!("{indent}  "));
-        }
-    }
-}
-
-fn text_of(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
-}
-
-fn truthy(v: &Value) -> bool {
-    !matches!(v, Value::Null | Value::Bool(false)) && v != "" && v != 0
-}
-
-fn print_workflow(label: &str, model: Option<&str>, json: &str) {
-    println!("\n=== {label} ({}) ===", model.unwrap_or("—"));
-    match serde_json::from_str::<Value>(json) {
-        Err(e) => {
-            println!("(invalid JSON: {e})");
-            println!("{}", truncate(json, 400));
-        }
-        Ok(wf) => {
-            let steps = wf["steps"].as_array().cloned().unwrap_or_default();
-            println!("{} top-level steps:", steps.len());
-            print_steps(&steps, "  ");
-        }
-    }
-}
-
 // ─── modes ───────────────────────────────────────────────────────────
 
 fn inspect(observations: &[Observation]) {
@@ -150,252 +88,8 @@ fn inspect(observations: &[Observation]) {
     }
 }
 
-// Always sample N times — one lucky first shot is a poor metric in a
-// non-deterministic system. Each sample is an INDEPENDENT call on the same
-// input (no retry-feedback between them), so the spread reflects the model's
-// raw reliability at building a workflow, not the retry loop's.
+// Sample independent replies over the same frozen input.
 const SAMPLES: usize = 5;
-
-struct Lite {
-    ok: bool,
-    error: Option<String>,
-    steps: Option<usize>,
-}
-
-// Lite structural validity — JSON-parses + has a steps[] where every step
-// carries a `kind`. Catches the format failures (markdown wrapper, trailing
-// text) without needing the full tool/skill enum schema.
-fn validate_workflow_lite(json: &str) -> Lite {
-    let wf: Value = match serde_json::from_str(json) {
-        Ok(v) => v,
-        Err(e) => return Lite { ok: false, error: Some(format!("JSON: {e}")), steps: None },
-    };
-    let Some(obj) = wf.as_object() else { return Lite { ok: false, error: Some("not an object".into()), steps: None } };
-    let Some(steps) = obj.get("steps").and_then(Value::as_array) else {
-        return Lite { ok: false, error: Some("missing steps[]".into()), steps: None };
-    };
-    if steps.iter().any(|s| !s.as_object().is_some_and(|o| o.contains_key("kind"))) {
-        return Lite { ok: false, error: Some("a step has no kind".into()), steps: None };
-    }
-    Lite { ok: true, error: None, steps: Some(steps.len()) }
-}
-
-// ─── full-schema validation from the recorded prompt ─────────────────
-// The recorded system message carries the exact <tools>/<skills> reference
-// the compiler saw, so we can rebuild the SAME production schema (tool/skill
-// enums included) and validate samples for real — not just "parses and has
-// kinds".
-
-fn extract_block(text: &str, tag: &str) -> Option<String> {
-    let re = Regex::new(&format!(r"<{tag}>\n([\s\S]*?)\n</{tag}>")).ok()?;
-    re.captures(text).map(|c| c[1].to_owned())
-}
-
-fn schema_from_recorded_prompt(messages: &[ChatMessage]) -> Option<WorkflowSchema> {
-    let sys = messages.iter().find(|m| m.role == "system")?;
-    let content = sys.content.as_str()?;
-    let tools = extract_block(content, "tools")?;
-    let skills = extract_block(content, "skills")?;
-    let known_tools: Vec<String> =
-        Regex::new(r"(?m)^- ([a-zA-Z0-9_]+)\(").ok()?.captures_iter(&tools).map(|c| c[1].to_owned()).collect();
-    let known_skills: Vec<String> =
-        Regex::new(r"(?m)^- (\S+)$").ok()?.captures_iter(&skills).map(|c| c[1].to_owned()).collect();
-    WorkflowSchema::new(known_tools, known_skills).ok()
-}
-
-struct SampleVerdict {
-    ok: bool,
-    steps: Option<usize>,
-    errors: Vec<String>,
-}
-
-fn validate_sample(json: &str, schema: Option<&WorkflowSchema>) -> SampleVerdict {
-    let lite = validate_workflow_lite(json);
-    if !lite.ok {
-        return SampleVerdict { ok: false, steps: None, errors: vec![lite.error.unwrap_or_else(|| "invalid".into())] };
-    }
-    let Some(schema) = schema else { return SampleVerdict { ok: true, steps: lite.steps, errors: Vec::new() } };
-    match schema.parse(serde_json::from_str(json).unwrap_or(Value::Null), None) {
-        Ok(_) => SampleVerdict { ok: true, steps: lite.steps, errors: Vec::new() },
-        Err(errors) => SampleVerdict { ok: false, steps: lite.steps, errors },
-    }
-}
-
-// First complete JSON value from a reply with trailing garbage (the
-// gpt-5.4-mini duplicate-object pathology emits `{…}\n{…}`). None when the
-// whole reply parses (nothing to salvage) or no leading value does.
-fn salvage_first_json(text: &str) -> Option<String> {
-    if serde_json::from_str::<Value>(text).is_ok() {
-        return None;
-    }
-    let mut stream = serde_json::Deserializer::from_str(text).into_iter::<Value>();
-    match stream.next() {
-        Some(Ok(_)) => Some(text[..stream.byte_offset()].to_owned()),
-        _ => None,
-    }
-}
-
-// Swap the planner-skill body in the recorded system message for the given
-// on-disk file, keeping the recorded <tools>/<skills> reference intact. The
-// skill loader strips frontmatter before the body reaches the compiler —
-// mirrored here so the swapped prompt matches what production would send.
-fn swap_planner_body(messages: &mut [ChatMessage], planner_path: &str) -> anyhow::Result<()> {
-    let sys = messages.iter_mut().find(|m| m.role == "system");
-    let Some(sys) = sys.filter(|m| m.content.is_string()) else {
-        anyhow::bail!("no system message in recorded input to swap");
-    };
-    let content = sys.content.as_str().unwrap_or_default().to_owned();
-    let idx = content.find("<tools>").ok_or_else(|| anyhow::anyhow!("recorded system message has no <tools> block"))?;
-    let mut body = std::fs::read_to_string(planner_path)?;
-    if body.starts_with("---\n")
-        && let Some(end) = body.find("\n---\n")
-    {
-        body = body[end + 5..].to_owned();
-    }
-    sys.content = Value::String(format!("{}\n\n{}", body.trim(), &content[idx..]));
-    Ok(())
-}
-
-fn system_len(messages: &[ChatMessage]) -> usize {
-    messages
-        .iter()
-        .find(|m| m.role == "system")
-        .and_then(|m| m.content.as_str())
-        .map_or(0, |c| c.encode_utf16().count())
-}
-
-// Test A: replay the planner's input under model B, SAMPLES times. A is the
-// original output (one reference); B is the distribution of fresh samples.
-// With planner_file, B runs on the swapped-in prompt (A stays the recorded
-// run for reference).
-async fn test_plan(
-    observations: &[Observation],
-    model_b: &str,
-    effort: Option<&str>,
-    planner_file: Option<String>,
-    dump_dir: Option<String>,
-    system_file: Option<String>,
-) -> anyhow::Result<()> {
-    let planner =
-        find_generation(observations, "attempt-").ok_or_else(|| anyhow::anyhow!("no planner generation in trace"))?;
-    let mut messages: Vec<ChatMessage> = recorded_messages(&planner.input)
-        .into_iter()
-        .map(|m| ChatMessage { content: Value::String(as_text(&m.content)), ..m })
-        .collect();
-
-    // Full system-message override — for testing prompt + tool-signature
-    // changes that the recorded trace predates (e.g. a new tool parameter).
-    // The schema below is rebuilt AFTER the swap, so the file's
-    // <tools>/<skills> blocks drive validation too.
-    if let Some(path) = &system_file {
-        let sys = messages.iter_mut().find(|m| m.role == "system");
-        let sys = sys.ok_or_else(|| anyhow::anyhow!("no system message in recorded input"))?;
-        sys.content = Value::String(std::fs::read_to_string(path)?);
-        println!("system message replaced from {path}");
-    }
-
-    // Schema enums come from the (possibly swapped) reference block —
-    // swap_planner_body preserves the recorded one.
-    let schema = schema_from_recorded_prompt(&messages);
-    if schema.is_none() {
-        println!("(no <tools>/<skills> block found — falling back to lite validation)");
-    }
-    if let Some(path) = &planner_file {
-        let before = system_len(&messages);
-        swap_planner_body(&mut messages, path)?;
-        println!("planner body swapped in from {path} (system {before} → {} chars)", system_len(&messages));
-    }
-
-    print_workflow("PLAN A — original (recorded prompt)", planner.model.as_deref(), &output_text(planner));
-
-    let think = effort.map(|e| format!(" (thinking={e})")).unwrap_or_default();
-    let prompt = planner_file.as_ref().map_or(", prompt=recorded".into(), |p| format!(", prompt={p}"));
-    println!("\n=== PLAN B — {model_b}{think}{prompt}, {SAMPLES} independent samples ===");
-    let samples =
-        futures::future::try_join_all((0..SAMPLES).map(|_| replay_generation(&messages, model_b, true, effort)))
-            .await?;
-    let with_salvage = has_flag("--salvage");
-    // Simulate the production compile retry loop: on an invalid reply, append
-    // it + the validation errors as feedback (same wording as the compiler's
-    // retry feedback) and re-ask, up to N extra attempts per sample.
-    let retries: usize = arg_flag("--retries").and_then(|r| r.parse().ok()).unwrap_or(0);
-    let (mut valid, mut salvaged, mut attempts_total) = (0, 0, 0);
-
-    for (i, first) in samples.into_iter().enumerate() {
-        let mut out = first;
-        if let Some(dir) = &dump_dir {
-            std::fs::write(format!("{dir}/sample-{}.json", i + 1), &out)?;
-        }
-        let mut convo = messages.clone();
-        let mut v = SampleVerdict { ok: false, steps: None, errors: Vec::new() };
-        let mut was_salvaged = false;
-        let mut attempt = 1;
-        while attempt <= 1 + retries {
-            let mut candidate = out.clone();
-            let mut salvaged_now = false;
-            if with_salvage && let Some(head) = salvage_first_json(&candidate) {
-                candidate = head;
-                salvaged_now = true;
-            }
-            v = validate_sample(&candidate, schema.as_ref());
-            if v.ok {
-                out = candidate;
-                was_salvaged = salvaged_now;
-                break;
-            }
-            if attempt > retries {
-                break;
-            }
-            convo.push(ChatMessage { role: "assistant".into(), content: Value::String(out.clone()) });
-            let mut feedback = vec!["Your previous workflow failed validation. Errors:".to_owned()];
-            feedback.extend(v.errors.iter().map(|e| format!("  - {e}")));
-            feedback.push(String::new());
-            feedback.push("Emit a corrected workflow. Return ONLY the JSON, no markdown wrapper.".into());
-            convo.push(ChatMessage { role: "user".into(), content: Value::String(feedback.join("\n")) });
-            // Sequential by design — a retry depends on the previous reply.
-            out = replay_generation(&convo, model_b, true, effort).await?;
-            attempt += 1;
-        }
-        if was_salvaged {
-            salvaged += 1;
-        }
-        if v.ok {
-            valid += 1;
-        }
-        let used = attempt.min(1 + retries);
-        attempts_total += used;
-        let tags: Vec<String> =
-            [was_salvaged.then(|| "salvaged".to_owned()), (attempt > 1).then(|| format!("attempts={used}"))]
-                .into_iter()
-                .flatten()
-                .collect();
-        let tags = if tags.is_empty() { String::new() } else { format!(" [{}]", tags.join(", ")) };
-        let status = if v.ok {
-            format!("✓ valid ({} steps)", v.steps.unwrap_or(0))
-        } else {
-            format!("✗ invalid{}", v.steps.map(|s| format!(" ({s} steps)")).unwrap_or_default())
-        };
-        println!("\n[sample {}] {status}{tags}", i + 1);
-        for e in v.errors.iter().take(4) {
-            println!("    ! {e}");
-        }
-        if validate_workflow_lite(&out).ok {
-            let wf: Value = serde_json::from_str(&out)?;
-            print_steps(wf["steps"].as_array().map(Vec::as_slice).unwrap_or(&[]), "  ");
-        } else {
-            println!("  {}", truncate(&out, 220).replace('\n', " "));
-        }
-    }
-    let salvage_note = if with_salvage { format!(", {salvaged} salvaged") } else { String::new() };
-    let retry_note = if retries > 0 {
-        format!(", {:.1} avg attempts", attempts_total as f64 / SAMPLES as f64)
-    } else {
-        String::new()
-    };
-    let kind = if schema.is_some() { " (full production schema)" } else { " (lite)" };
-    println!("\nB valid: {valid}/{SAMPLES}{kind}{salvage_note}{retry_note}");
-    Ok(())
-}
 
 // Test B: replay the composer's input under model B, SAMPLES times. The input
 // already holds the frozen tool results (the rendered candidate posts), so this
@@ -640,8 +334,7 @@ async fn judge_compose(compose: &Observation, original: &str, samples: &[String]
     Ok(())
 }
 
-// `--thinking` with an optional level. Bare flag keeps the historical meaning
-// (high); `--thinking low` mirrors the production compiler preset.
+// `--thinking` with an optional level; a bare flag means high.
 fn parse_thinking() -> Option<String> {
     let args: Vec<String> = std::env::args().collect();
     let i = args.iter().position(|a| a == "--thinking")?;
@@ -654,28 +347,20 @@ fn parse_thinking() -> Option<String> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     load_env();
+    anyhow::ensure!(
+        !has_flag("--plan") && !has_flag("--planner-file"),
+        "planner replay is no longer supported; use --compose to replay a compose generation"
+    );
     let trace_id = std::env::args().nth(1).filter(|a| !a.starts_with("--"));
     let Some(trace_id) = trace_id else {
-        eprintln!(
-            "usage: judge-replay <traceId> [--plan <model> | --compose <model>] [--thinking [low|medium|high]] [--planner-file <path>] [--judge]"
-        );
+        eprintln!("usage: judge-replay <traceId> [--compose <model>] [--thinking [low|medium|high]] [--judge]");
         std::process::exit(1);
     };
     let (trace, observations) = Langfuse::from_env()?.trace_by_id(&trace_id).await?;
     println!("trace {trace_id} · {} · tags=[{}]", trace.name, trace.tags.join(","));
     let thinking = parse_thinking();
     let or_default = |m: String| if m.is_empty() { "gpt-5.4-mini".to_owned() } else { m };
-    if let Some(model) = arg_flag("--plan") {
-        test_plan(
-            &observations,
-            &or_default(model),
-            thinking.as_deref(),
-            arg_flag("--planner-file"),
-            arg_flag("--dump-dir"),
-            arg_flag("--system-file"),
-        )
-        .await
-    } else if let Some(model) = arg_flag("--compose") {
+    if let Some(model) = arg_flag("--compose") {
         test_compose(&observations, &or_default(model), thinking.as_deref(), has_flag("--judge")).await
     } else {
         inspect(&observations);

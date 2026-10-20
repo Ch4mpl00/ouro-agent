@@ -4,12 +4,12 @@
 mod support;
 use agent::{
     db::TraceStore,
+    flows::WorkflowSignal,
     mcp::Mcp,
     providers::{ToolDef, assistant},
     session::{EnvDeps, Session},
     supervisor::*,
     tracing::null_scope,
-    workflow::{RunResult, Step, VariableStore, WorkflowRun, WorkflowSignal},
 };
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
@@ -114,60 +114,19 @@ const SKILLS: &[(&str, &str)] = &[
     ("recovery", "---\ntools: []\n---\nRECOVERY"),
     ("dreaming", "---\ntools: []\n---\nDREAMING"),
 ];
-#[derive(Clone, Copy)]
-enum Stage {
-    Success,
-    Compile,
-    Execute,
-    Replan,
-}
-struct FakeWorkflow {
-    stage: Stage,
-    called: AtomicUsize,
-}
-#[async_trait]
-impl WorkflowRun for FakeWorkflow {
-    async fn run_signal(
-        &self,
-        _: &WorkflowSignal,
-        _: Session,
-        _: agent::tracing::Scope,
-        _: &CancellationToken,
-    ) -> anyhow::Result<RunResult> {
-        self.called.fetch_add(1, Ordering::SeqCst);
-        Ok(match self.stage {
-            Stage::Success => RunResult::Ok { attempts: 1, step_count: 2, store: VariableStore::new(Map::new()) },
-            Stage::Compile => {
-                RunResult::CompileFailed { reason: "invalid_json", errors: vec!["broken".into()], attempts: 3 }
-            }
-            Stage::Execute => RunResult::ExecuteFailed {
-                reason: "tool_error",
-                error: anyhow::anyhow!("partial delivery"),
-                step_index: 1,
-                step: Step::Terminal,
-            },
-            Stage::Replan => RunResult::ReplanExhausted { passes: 3, attempts: 1 },
-        })
-    }
-}
-fn setup(
-    model: Arc<dyn agent::providers::ChatProvider>,
-    stage: Stage,
-) -> (Fixture, Arc<ContextMcp>, Arc<FakeWorkflow>, Arc<Supervisor>) {
-    setup_with(model, stage, None)
+fn setup(model: Arc<dyn agent::providers::ChatProvider>) -> (Fixture, Arc<ContextMcp>, Arc<Supervisor>) {
+    setup_with(model, None)
 }
 fn setup_with(
     model: Arc<dyn agent::providers::ChatProvider>,
-    stage: Stage,
     decisions: Option<Arc<agent::decisions::DecisionClient>>,
-) -> (Fixture, Arc<ContextMcp>, Arc<FakeWorkflow>, Arc<Supervisor>) {
+) -> (Fixture, Arc<ContextMcp>, Arc<Supervisor>) {
     let mut f = fixture(model, &[], SKILLS);
     let mcp = Arc::new(ContextMcp::default());
     let deps = &mut Arc::get_mut(&mut f.engine).unwrap().deps;
     deps.mcp = mcp.clone();
     deps.skills = vec!["orchestrator".into(), "routing".into()];
     deps.decisions = decisions;
-    let workflow = Arc::new(FakeWorkflow { stage, called: AtomicUsize::new(0) });
     let supervisor = create_supervisor(
         f.engine.clone(),
         EnvDeps {
@@ -176,48 +135,43 @@ fn setup_with(
             user_email: Some("user@test".into()),
             telegram_chat_id: None,
         },
-        workflow.clone(),
         agent::flows::create_flows(f.engine.clone()),
     );
-    (f, mcp, workflow, supervisor)
+    (f, mcp, supervisor)
 }
 #[tokio::test]
-async fn routing_uses_workflow_only_for_scheduler_and_domain_signals_are_delegation_hints() {
+async fn signals_without_saved_workflows_run_the_primary_loop_with_the_source_context() {
     for source in ["scheduler", "telegram", "dreaming", "new-domain"] {
-        let model = Arc::new(Scripted::new(if source == "scheduler" { vec![] } else { vec![assistant("done")] }));
-        let (f, mcp, workflow, supervisor) = setup(model.clone(), Stage::Success);
-        let output = supervisor.run_signal(&signal(source, 42)).await.unwrap();
-        assert_eq!(workflow.called.load(Ordering::SeqCst), usize::from(source == "scheduler"));
-        if source == "scheduler" {
-            assert_eq!(serde_json::from_str::<Value>(&output).unwrap(), json!({"ok":true,"attempts":1,"stepCount":2}));
-        } else {
-            let seen = model.seen.lock().unwrap().clone();
-            let system = seen[0].messages[0]["content"].as_str().unwrap();
-            assert!(system.contains("Europe/Chisinau"));
-            assert!(system.contains("Default Telegram chat id: 999."));
-            assert!(system.contains("ORCHESTRATOR"));
-            assert_eq!(seen[0].model, "gemini-3.7-flash");
-            assert!(!system.contains("TELEGRAM"), "communication rules are discovered, never autoloaded");
-            assert!(system.contains("Call find_skills only when the task needs something specific"));
-            assert!(!system.contains("Skills selected for this request"), "no decision client, nothing preselected");
-            assert_eq!(system.contains("Delivery: use send_telegram_message"), source == "telegram");
-            assert!(seen[0].tools.iter().any(|t| t.name == "write_skill"));
-        }
+        let model = Arc::new(Scripted::new(vec![assistant("done")]));
+        let (f, mcp, supervisor) = setup(model.clone());
+        assert_eq!(supervisor.run_signal(&signal(source, 42)).await.unwrap(), "done");
+        let seen = model.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one primary turn, with no compiler generation");
+        let system = seen[0].messages[0]["content"].as_str().unwrap();
+        assert!(system.contains("Europe/Chisinau"));
+        assert!(system.contains("Default Telegram chat id: 999."));
+        assert!(system.contains("ORCHESTRATOR"));
+        assert_eq!(system.contains("SCHEDULER"), source == "scheduler");
+        assert_eq!(seen[0].model, if source == "scheduler" { "gpt-5.4-mini" } else { "gemini-3.7-flash" });
+        assert!(!system.contains("TELEGRAM"), "communication rules are discovered, never autoloaded");
+        assert!(system.contains("Call find_skills only when the task needs something specific"));
+        assert!(!system.contains("Skills selected for this request"), "no decision client, nothing preselected");
+        assert_eq!(system.contains("Delivery: use send_telegram_message"), source == "telegram");
+        assert!(seen[0].tools.iter().any(|t| t.name == "write_skill"));
         let (trace, obs) = f.db.get_trace(&format!("{source}:42")).unwrap().unwrap();
         assert_eq!(trace.metadata.as_ref().unwrap()["activity"], "run");
-        if source != "scheduler" {
-            assert!(obs.iter().any(|o| o.meta("activity") == Some(&json!("primary_loop"))));
-        }
+        assert_eq!(trace.tags, [source, "agent-loop"]);
+        assert!(obs.iter().any(|o| o.meta("activity") == Some(&json!("primary_loop"))));
         let calls = mcp.calls.lock().unwrap().clone();
         assert_eq!(calls.iter().any(|(n, _)| n == "get_telegram_chat_history"), source == "telegram");
         supervisor.shutdown().await;
     }
 }
-// A scheduled task naming a saved workflow runs it instead of the planner. A
+// A scheduled task naming a saved workflow runs it without a model. A
 // run that faulted before any write hands the task to the agent loop; one
 // that faulted after a write only recovers, as a failed execution does.
 #[tokio::test]
-async fn a_saved_workflow_runs_without_the_planner_and_faults_hand_over_by_effect() {
+async fn a_saved_workflow_runs_and_faults_hand_over_by_effect() {
     const HEAD: &str = "document: { dsl: '1.0.4', namespace: agent, name: w, version: '1.0.0' }\n";
     let cases = [
         ("completes", "do: [ { a: { set: { done: true } } } ]"),
@@ -230,14 +184,14 @@ async fn a_saved_workflow_runs_without_the_planner_and_faults_hand_over_by_effec
     ];
     for (case, body) in cases {
         let model = Arc::new(Scripted::new(vec![assistant("done")]));
-        let (f, mcp, workflow, supervisor) = setup(model.clone(), Stage::Success);
+        let (f, mcp, supervisor) = setup(model.clone());
         if !body.is_empty() {
             let saved = f.engine.deps.workflows.save("w", &format!("{HEAD}{body}"), None).unwrap();
             f.engine.deps.workflows.activate("w", saved.version).unwrap();
         }
         let scheduled = PendingSignal { payload: Some(json!({"workflow":"w"})), ..signal("scheduler", 42) };
         let result = supervisor.run_signal(&scheduled).await;
-        assert_eq!(workflow.called.load(Ordering::SeqCst), 0, "{case}: the planner never runs");
+
         let seen = model.seen.lock().unwrap().clone();
         let system = seen.first().map(|s| s.messages[0]["content"].as_str().unwrap().to_owned());
         match case {
@@ -256,22 +210,36 @@ async fn a_saved_workflow_runs_without_the_planner_and_faults_hand_over_by_effec
             }
             _ => {
                 assert!(result.unwrap_err().to_string().contains("may have changed something"));
-                assert!(system.unwrap().contains("RECOVERY"), "{case}: only a report");
+                let system = system.unwrap();
+                assert!(system.contains("RECOVERY"), "{case}: only a report");
+                assert!(!system.contains("SCHEDULER") && !system.contains("ROUTING"));
+                assert!(
+                    seen[0].messages[1]["content"].as_str().unwrap().contains("Do not repeat the original actions")
+                );
+                assert!(!seen[0].tools.iter().any(|t| t.name == "invoke_sub_agent"));
                 assert!(mcp.calls.lock().unwrap().iter().any(|(n, _)| n == "t1"));
             }
         }
-        let (_, obs) = f.db.get_trace("scheduler:42").unwrap().unwrap();
+        let (trace, obs) = f.db.get_trace("scheduler:42").unwrap().unwrap();
+        assert_eq!(trace.tags, ["scheduler", "saved-workflow"]);
+        if matches!(case, "faults first" | "is missing") {
+            assert_eq!(trace.metadata.as_ref().unwrap()["fallback"], "agent-loop");
+            let primary = obs.iter().find(|o| o.name == "agent_loop").unwrap();
+            assert_eq!(primary.meta("preset"), Some(&json!("base")));
+            assert!(obs.iter().any(|o| o.name == "fallback" && o.level == "WARNING"));
+        }
+        assert_eq!(obs.iter().any(|o| o.name == "recovery"), case == "faults after a write");
         let ran = obs.iter().any(|o| o.name == "runner" && o.meta("workflow") == Some(&json!("w")));
         assert_eq!(ran, !body.is_empty(), "{case}");
         supervisor.shutdown().await;
     }
     // A payload on another source is not a workflow.
     let model = Arc::new(Scripted::new(vec![assistant("done")]));
-    let (_f, _, workflow, supervisor) = setup(model, Stage::Success);
+    let (_f, _, supervisor) = setup(model);
     let telegram = PendingSignal { payload: Some(json!({"workflow":"w"})), ..signal("telegram", 43) };
     assert_eq!(telegram.saved_workflow(), None);
     supervisor.run_signal(&telegram).await.unwrap();
-    assert_eq!(workflow.called.load(Ordering::SeqCst), 0);
+
     supervisor.shutdown().await;
 }
 // An interrupted saved workflow is still the durable worker's to finish:
@@ -293,7 +261,7 @@ async fn an_interrupted_saved_workflow_is_left_to_durable_recovery() {
         }
     }
     let model = Arc::new(Scripted::new(vec![assistant("done")]));
-    let (f, mcp, workflow, _) = setup(model.clone(), Stage::Success);
+    let (f, mcp, _) = setup(model.clone());
     let supervisor = create_supervisor(
         f.engine.clone(),
         EnvDeps {
@@ -302,7 +270,6 @@ async fn an_interrupted_saved_workflow_is_left_to_durable_recovery() {
             user_email: Some("user@test".into()),
             telegram_chat_id: None,
         },
-        workflow.clone(),
         Arc::new(Interrupting),
     );
     let scheduled = PendingSignal { payload: Some(json!({"workflow":"w"})), ..signal("scheduler", 42) };
@@ -320,7 +287,7 @@ async fn an_interrupted_saved_workflow_is_left_to_durable_recovery() {
 async fn a_scheduled_fire_runs_as_a_signal_with_mcps_note_and_its_workflow() {
     use agent::schedule::{FIRST_FIRE_ID, Fire, FireSink, Fired, SupervisorSink};
     let model = Arc::new(Scripted::new(vec![assistant("done")]));
-    let (f, _, workflow, supervisor) = setup(model.clone(), Stage::Success);
+    let (f, _, supervisor) = setup(model.clone());
     let head = "document: { dsl: '1.0.4', namespace: agent, name: w, version: '1.0.0' }\n";
     let saved = f.engine.deps.workflows.save("w", &format!("{head}do: [ {{ a: {{ set: {{ done: true }} }} }} ]"), None);
     f.engine.deps.workflows.activate("w", saved.unwrap().version).unwrap();
@@ -343,37 +310,12 @@ async fn a_scheduled_fire_runs_as_a_signal_with_mcps_note_and_its_workflow() {
     assert_eq!(sink.fire(fire(2, "scheduler", Some("w"))).await, Fired::Started);
     let (_, obs) = f.db.get_trace(&format!("scheduler:{}", FIRST_FIRE_ID + 2)).unwrap().unwrap();
     assert!(obs.iter().any(|o| o.name == "runner"), "the saved workflow ran");
-    assert_eq!(workflow.called.load(Ordering::SeqCst), 0, "no planner");
+
     assert_eq!(model.seen.lock().unwrap().len(), 1, "no model call for the workflow");
 
     supervisor.shutdown().await;
     assert_eq!(sink.fire(fire(3, "scheduler", None)).await, Fired::NotStarted);
     assert!(f.db.get_trace(&format!("scheduler:{}", FIRST_FIRE_ID + 3)).unwrap().is_none());
-}
-#[tokio::test]
-async fn compile_and_replan_failures_fall_back_but_execute_failure_only_recovers() {
-    for stage in [Stage::Compile, Stage::Replan, Stage::Execute] {
-        let model = Arc::new(Scripted::new(vec![assistant("done")]));
-        let (f, _, _, supervisor) = setup(model.clone(), stage);
-        let result = supervisor.run_signal(&signal("scheduler", 42)).await;
-        assert_eq!(result.is_err(), matches!(stage, Stage::Execute));
-        let seen = model.seen.lock().unwrap().clone();
-        assert_eq!(seen.len(), 1);
-        let system = seen[0].messages[0]["content"].as_str().unwrap();
-        if matches!(stage, Stage::Execute) {
-            assert!(system.contains("RECOVERY"));
-            assert!(!system.contains("SCHEDULER"));
-            assert!(!system.contains("ROUTING"));
-            assert!(seen[0].messages[1]["content"].as_str().unwrap().contains("Do not repeat the original actions"));
-            assert!(!seen[0].tools.iter().any(|t| t.name == "invoke_sub_agent"));
-        } else {
-            assert!(system.contains("SCHEDULER"));
-        }
-        let (trace, obs) = f.db.get_trace("scheduler:42").unwrap().unwrap();
-        assert_eq!(trace.session_id.as_deref(), Some("scheduler:42"));
-        assert_eq!(obs.iter().filter(|o| o.name == "recovery").count(), usize::from(matches!(stage, Stage::Execute)));
-        supervisor.shutdown().await;
-    }
 }
 #[tokio::test]
 async fn history_scopes_chat_topic_and_time_excludes_current_and_keeps_memory() {
@@ -432,7 +374,7 @@ async fn nontelegram_and_spoofed_headers_do_not_fetch_history() {
 #[tokio::test]
 async fn a_peer_signal_loads_its_skill_and_the_earlier_turns_of_its_thread() {
     let model = Arc::new(Scripted::new(vec![assistant("done")]));
-    let (_f, mcp, workflow, supervisor) = setup(model.clone(), Stage::Success);
+    let (_f, mcp, supervisor) = setup(model.clone());
     mcp.thread.lock().unwrap().extend([
         peer_message(1, "in", "What is 2+2?", "2026-09-06 11:59:00"),
         peer_message(2, "out", "4", "2026-09-06 11:59:30"),
@@ -440,7 +382,7 @@ async fn a_peer_signal_loads_its_skill_and_the_earlier_turns_of_its_thread() {
         peer_message(4, "in", "queued later", "2026-09-06 12:00:05"),
     ]);
     supervisor.run_signal(&signal("peer", 42)).await.unwrap();
-    assert_eq!(workflow.called.load(Ordering::SeqCst), 0);
+
     let seen = model.seen.lock().unwrap().clone();
     let system = seen[0].messages[0]["content"].as_str().unwrap();
     assert!(system.contains("PEER"));
@@ -470,7 +412,6 @@ async fn a_signal_with_durable_flows_runs_its_loop_as_an_agent_loop_run() {
     let supervisor = create_supervisor_with_cancel(
         engine.clone(),
         EnvDeps { mcp: mcp.clone(), memory: f.db.clone(), user_email: None, telegram_chat_id: None },
-        Arc::new(FakeWorkflow { stage: Stage::Success, called: AtomicUsize::new(0) }),
         agent::flows::create_durable_flows(engine.clone(), (*f.db).clone()),
         CancellationToken::new(),
     );
@@ -521,7 +462,7 @@ fn jev(broken: bool) -> (Arc<Jev>, Arc<agent::decisions::DecisionClient>) {
 async fn a_signal_starts_with_the_skills_jev_selects_for_it() {
     let model = Arc::new(Scripted::new(vec![assistant("done")]));
     let (api, client) = jev(false);
-    let (f, _mcp, _workflow, supervisor) = setup_with(model.clone(), Stage::Success, Some(client));
+    let (f, _mcp, supervisor) = setup_with(model.clone(), Some(client));
     supervisor.run_signal(&signal("telegram", 42)).await.unwrap();
     let seen = model.seen.lock().unwrap().clone();
     let system = seen[0].messages[0]["content"].as_str().unwrap();
@@ -542,7 +483,7 @@ async fn a_signal_starts_with_the_skills_jev_selects_for_it() {
 async fn a_failed_preselection_leaves_the_search_to_the_model() {
     let model = Arc::new(Scripted::new(vec![assistant("done")]));
     let (_api, client) = jev(true);
-    let (f, _mcp, _workflow, supervisor) = setup_with(model.clone(), Stage::Success, Some(client));
+    let (f, _mcp, supervisor) = setup_with(model.clone(), Some(client));
     assert_eq!(supervisor.run_signal(&signal("telegram", 42)).await.unwrap(), "done");
     let seen = model.seen.lock().unwrap().clone();
     let system = seen[0].messages[0]["content"].as_str().unwrap();
@@ -580,7 +521,7 @@ fn oversized_history_prefers_recent_whole_messages_and_utf8_safe_tail() {
 #[tokio::test]
 async fn recent_activity_is_bounded_oldest_first_and_stays_out_of_user_history() {
     let model = Arc::new(Scripted::new(vec![assistant("done")]));
-    let (f, mcp, _, supervisor) = setup(model.clone(), Stage::Success);
+    let (f, mcp, supervisor) = setup(model.clone());
     mcp.notes.lock().unwrap().extend(["newest".into(), "older".into(), "huge".repeat(4000)]);
     supervisor.run_signal(&signal("telegram", 42)).await.unwrap();
     let seen = model.seen.lock().unwrap().clone();
@@ -614,7 +555,7 @@ impl agent::providers::ChatProvider for PendingProvider {
 #[tokio::test]
 async fn shutdown_cancels_generation_without_recovery_and_closes_trace_before_clients() {
     let model = Arc::new(PendingProvider { started: tokio::sync::Notify::new(), cancel: Mutex::new(None) });
-    let (f, mcp, _, supervisor) = setup(model.clone(), Stage::Success);
+    let (f, mcp, supervisor) = setup(model.clone());
     let s = supervisor.clone();
     let running = tokio::spawn(async move { s.run_signal(&signal("dreaming", 42)).await });
     model.started.notified().await;
@@ -630,7 +571,7 @@ async fn shutdown_cancels_generation_without_recovery_and_closes_trace_before_cl
 #[tokio::test]
 async fn queue_polling_handles_signals_serially_and_survives_bad_polls() {
     let model = Arc::new(Scripted::new(vec![assistant("first"), assistant("second")]));
-    let (f, mcp, workflow, supervisor) = setup(model.clone(), Stage::Success);
+    let (f, mcp, supervisor) = setup(model.clone());
     mcp.queue.lock().unwrap().extend([
         json!({"wrong":"shape"}),
         json!({"signal":signal("dreaming",1),"pendingAfter":1}),
@@ -654,7 +595,7 @@ async fn queue_polling_handles_signals_serially_and_survives_bad_polls() {
     .unwrap();
     stop.cancel();
     task.await.unwrap().unwrap();
-    assert_eq!(workflow.called.load(Ordering::SeqCst), 0);
+
     assert_eq!(model.seen.lock().unwrap().len(), 2);
     assert!(f.db.get_trace("dreaming:1").unwrap().is_some());
     assert!(f.db.get_trace("new-domain:2").unwrap().is_some());
@@ -688,7 +629,7 @@ fn queue_contract_requires_nullable_fields_and_integer_counts() {
 #[tokio::test]
 async fn an_empty_queue_is_waited_on_and_a_new_signal_taken_at_once() {
     let model = Arc::new(Scripted::new(vec![assistant("handled")]));
-    let (f, mcp, _, supervisor) = setup(model.clone(), Stage::Success);
+    let (f, mcp, supervisor) = setup(model.clone());
     mcp.waits.store(true, Ordering::SeqCst);
     let stop = CancellationToken::new();
     let (c, sup, s) = (mcp.clone(), supervisor.clone(), stop.clone());
@@ -725,7 +666,7 @@ async fn an_empty_queue_is_waited_on_and_a_new_signal_taken_at_once() {
 #[tokio::test]
 async fn a_failed_wait_backs_off_instead_of_spinning() {
     let model = Arc::new(Scripted::new(vec![]));
-    let (_f, mcp, _, supervisor) = setup(model, Stage::Success);
+    let (_f, mcp, supervisor) = setup(model);
     mcp.wait_broken.store(true, Ordering::SeqCst);
     let stop = CancellationToken::new();
     let (c, sup, s) = (mcp.clone(), supervisor.clone(), stop.clone());
@@ -744,7 +685,7 @@ async fn a_failed_wait_backs_off_instead_of_spinning() {
 #[tokio::test]
 async fn an_activated_signal_workflow_handles_signals_until_its_breaker_opens() {
     let model = Arc::new(Scripted::new((0..4).map(|_| assistant("done")).collect()));
-    let (f, _mcp, _workflow, supervisor) = setup(model.clone(), Stage::Success);
+    let (f, _mcp, supervisor) = setup(model.clone());
     let tool = |name: &str, args: Value| agent::flows::tool(&f.engine, name, args.as_object().unwrap()).unwrap();
     let activate = |definition: &str| {
         let saved = f.engine.deps.workflows.save("signal", definition, None).unwrap();

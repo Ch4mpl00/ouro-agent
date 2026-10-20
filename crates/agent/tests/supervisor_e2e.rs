@@ -1,13 +1,12 @@
 // Port of test/supervisor.test.ts: the supervisor end to end — the real poll
-// loop, supervisor, engine, workflow runner (compile + execute), skills from
-// skills.default and the sqlite trace mirror — driven over the real MCP
+// loop, supervisor, engine, shipped skills and the sqlite trace mirror —
+// driven over the real MCP
 // client protocol against an in-process MCP server that plays the queue and
 // Telegram, with a scripted LLM at the provider boundary.
 //
 // Each generated signal carries a plan for what "the model" does with it
-// (send messages, some of which the tool rejects; answer; crash; for the
-// scheduler: compile a workflow, or fail to). The rules then say, from the
-// plan alone, what must have reached the chat, which paths ran and what was
+// (send messages, some of which the tool rejects; answer; crash). The rules
+// say, from the plan alone, what must have reached the chat, which paths ran and what was
 // traced — per signal, in queue order.
 mod support;
 use agent::{
@@ -18,10 +17,9 @@ use agent::{
     models::{ModelPreset, Presets, ReasoningEffort},
     providers::{ChatProvider, CompletionParams, CompletionResult, Message, ProviderKind, role},
     session::EnvDeps,
-    skills::{FsSkillStore, SkillStore},
+    skills::FsSkillStore,
     supervisor::{create_supervisor, run_poll_loop},
     tracing::TokenUsage,
-    workflow::create_workflow_runner,
 };
 use async_trait::async_trait;
 use proptest::prelude::*;
@@ -61,19 +59,13 @@ enum Act {
     Crash,
 }
 
-#[derive(Clone, Debug)]
-enum Compile {
-    Valid(Vec<bool>),
-    Invalid(Vec<Act>),
-}
-
 // `disguised`: a non-Telegram signal whose content starts like a Telegram
 // one — it must still be treated as what its source says.
 #[derive(Clone, Debug)]
 enum Plan {
     Telegram(Vec<Act>),
     Domain { source: &'static str, acts: Vec<Act>, disguised: bool },
-    Scheduler(Compile),
+    Scheduler(Vec<Act>),
 }
 
 impl Plan {
@@ -103,13 +95,7 @@ fn plan() -> impl Strategy<Value = Plan> {
         loop_acts().prop_map(Plan::Telegram),
         (prop::sample::select(vec!["nashdom-bill", "dreaming"]), loop_acts(), any::<bool>())
             .prop_map(|(source, acts, disguised)| Plan::Domain { source, acts, disguised }),
-        prop_oneof![
-            // Mostly accepted sends, so a fully successful workflow is common
-            // enough to show up in every run.
-            prop::collection::vec(prop_oneof![3 => Just(true), 1 => Just(false)], 1..=3).prop_map(Compile::Valid),
-            loop_acts().prop_map(Compile::Invalid),
-        ]
-        .prop_map(Plan::Scheduler),
+        loop_acts().prop_map(Plan::Scheduler),
     ]
 }
 
@@ -128,8 +114,6 @@ fn recovery_text(id: i64) -> String {
 struct Expected {
     texts: Vec<String>,
     failed: bool,
-    looped: bool,
-    compiled: bool,
 }
 
 // What must reach the chat for a signal, from its plan alone.
@@ -149,23 +133,11 @@ fn expected(id: i64, p: &Plan) -> Expected {
         }
         (texts, false)
     };
-    match p {
-        Plan::Telegram(acts) | Plan::Domain { acts, .. } | Plan::Scheduler(Compile::Invalid(acts)) => {
-            let (texts, failed) = run_loop(acts);
-            Expected { texts, failed, looped: true, compiled: false }
-        }
-        Plan::Scheduler(Compile::Valid(sends)) => {
-            let mut texts = Vec::new();
-            for (i, ok) in sends.iter().enumerate() {
-                if !ok {
-                    texts.push(recovery_text(id));
-                    return Expected { texts, failed: true, looped: false, compiled: true };
-                }
-                texts.push(send_text(id, i, true));
-            }
-            Expected { texts, failed: false, looped: false, compiled: true }
-        }
-    }
+    let acts = match p {
+        Plan::Telegram(acts) | Plan::Domain { acts, .. } | Plan::Scheduler(acts) => acts,
+    };
+    let (texts, failed) = run_loop(acts);
+    Expected { texts, failed }
 }
 
 fn content_of(id: i64, p: &Plan) -> String {
@@ -327,31 +299,14 @@ impl ChatProvider for ScriptedModel {
         let p = self.plans.get(&id).ok_or_else(|| anyhow::anyhow!("scripted model: no plan for signal {id}"))?;
         let turn = params.messages.iter().filter(|x| role(x) == "assistant").count();
         let recovery = params.messages.iter().any(|x| role(x) == "user" && text(x).starts_with("Original signal ("));
-        let role_name = if params.model == "m-compiler" {
-            "compile"
-        } else if recovery {
-            "recovery"
-        } else {
-            "primary"
-        };
+        let role_name = if recovery { "recovery" } else { "primary" };
         let first_user = params.messages.iter().find(|x| role(x) == "user").map(text).unwrap_or_default();
         self.world.log(Event::Llm { role: role_name, signal: id, first_user });
-        if role_name == "compile" {
-            let Plan::Scheduler(Compile::Valid(sends)) = p else { return Ok(answer("{ this is not a workflow")) };
-            let mut steps: Vec<Value> = sends
-                .iter()
-                .enumerate()
-                .map(|(i, ok)| json!({"kind":"tool","tool":"send_telegram_message","args":{"text":send_text(id, i, *ok),"chatId":CHAT}}))
-                .collect();
-            steps.push(json!({"kind":"terminal"}));
-            return Ok(answer(&json!({"version":1,"steps":steps}).to_string()));
-        }
         if role_name == "recovery" {
             return Ok(if turn == 0 { send(&recovery_text(id), turn) } else { answer("reported") });
         }
         let acts: &[Act] = match p {
-            Plan::Telegram(acts) | Plan::Domain { acts, .. } | Plan::Scheduler(Compile::Invalid(acts)) => acts,
-            Plan::Scheduler(Compile::Valid(_)) => &[],
+            Plan::Telegram(acts) | Plan::Domain { acts, .. } | Plan::Scheduler(acts) => acts,
         };
         match acts.get(turn) {
             None => anyhow::bail!("scripted model: signal {id} has no turn {turn}"),
@@ -423,19 +378,9 @@ async fn run(plans: &[(i64, Plan)]) -> Run {
         workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
         schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
     });
-    let known: Vec<String> = skill_store
-        .list_skills()
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|s| s.name)
-        .filter(|n| !["planner", "orchestrator", "routing", "recovery"].contains(&n.as_str()))
-        .collect();
-    let workflow = create_workflow_runner(engine.clone(), known).unwrap();
     let supervisor = create_supervisor(
         engine.clone(),
         EnvDeps { mcp: mcp.clone(), memory: db.clone(), user_email: None, telegram_chat_id: None },
-        workflow,
         agent::flows::create_flows(engine.clone()),
     );
     run_poll_loop(mcp, supervisor.clone(), world.drained.clone(), std::time::Duration::ZERO).await.unwrap();
@@ -467,18 +412,7 @@ fn check_signal(id: i64, p: &Plan, segment: &[Event], stored: Option<&String>) -
         })
         .collect();
     prop_assert!(llm.iter().all(|(_, s, _)| *s == id), "{}: the model only ever sees this signal", at);
-    prop_assert_eq!(
-        llm.iter().any(|(r, _, _)| *r == "compile"),
-        p.source() == "scheduler",
-        "{}: compiled iff scheduler",
-        at
-    );
-    prop_assert_eq!(
-        llm.iter().any(|(r, _, _)| *r == "primary"),
-        want.looped,
-        "{}: the primary loop runs iff the plan needs it",
-        at
-    );
+    prop_assert_eq!(llm.iter().any(|(r, _, _)| *r == "primary"), true, "{}: every signal runs the primary loop", at);
     prop_assert_eq!(
         llm.iter().any(|(r, _, _)| *r == "recovery"),
         want.failed,
@@ -501,13 +435,6 @@ fn check_signal(id: i64, p: &Plan, segment: &[Event], stored: Option<&String>) -
         && let Some((_, _, first_user)) = llm.iter().find(|(r, _, _)| *r == "primary")
     {
         prop_assert_eq!(*first_user, &content_of(id, p), "{}: a non-Telegram signal reaches the model verbatim", at);
-    }
-    if want.compiled && want.failed {
-        prop_assert!(
-            !llm.iter().any(|(r, _, _)| *r == "primary"),
-            "{}: an execute failure is never retried agentically",
-            at
-        );
     }
     prop_assert_eq!(
         stored,
@@ -543,12 +470,7 @@ fn handles_every_signal_once_in_order_along_the_path_its_plan_calls_for() {
                 let segment = &events[starts[k] + 1..starts[k + 1]];
                 check_signal(*id, p, segment, traced[id].as_ref())?;
                 let want = expected(*id, p);
-                let path = if p.source() == "scheduler" {
-                    if want.compiled { "compiled" } else { "compile failed" }
-                } else {
-                    "loop"
-                };
-                witnessed.lock().unwrap().insert(format!("{path} → {}", if want.failed { "recovery" } else { "ok" }));
+                witnessed.lock().unwrap().insert(format!("loop → {}", if want.failed { "recovery" } else { "ok" }));
                 if segment.iter().any(|e| matches!(e, Event::Rejected(_))) {
                     witnessed.lock().unwrap().insert("a rejected send".to_owned());
                 }
@@ -557,15 +479,7 @@ fn handles_every_signal_once_in_order_along_the_path_its_plan_calls_for() {
             Ok(())
         })
         .unwrap();
-    let mut want = vec![
-        "a rejected send",
-        "compile failed → ok",
-        "compile failed → recovery",
-        "compiled → ok",
-        "compiled → recovery",
-        "loop → ok",
-        "loop → recovery",
-    ];
+    let mut want = vec!["a rejected send", "loop → ok", "loop → recovery"];
     want.sort();
     assert_eq!(witnessed.into_inner().unwrap().into_iter().collect::<Vec<_>>(), want);
 }

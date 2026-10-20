@@ -18,10 +18,9 @@ use agent::{
     },
     schedule::{ScheduleStore, SupervisorSink, run_ticks},
     session::{EnvDeps, parse_telegram_topics, telegram_env_note},
-    skills::{FsSkillStore, SkillStore},
+    skills::FsSkillStore,
     supervisor::{ERROR_BACKOFF, NextSignal, create_supervisor_with_cancel, run_poll_loop},
     tracing::{Tracer, tee_tracer},
-    workflow::create_workflow_runner,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -209,16 +208,6 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
             )),
         });
         let setup = async {
-            let known_skills = skills
-                .list_skills()
-                .await?
-                .into_iter()
-                .map(|s| s.name)
-                .filter(|s| {
-                    !["planner", "orchestrator", "routing", "recovery", "workflow-author"].contains(&s.as_str())
-                })
-                .collect();
-            let workflow = create_workflow_runner(engine.clone(), known_skills)?;
             let flows = create_durable_flows(engine.clone(), (*db).clone());
             let supervisor = create_supervisor_with_cancel(
                 engine.clone(),
@@ -228,7 +217,6 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
                     user_email: std::env::var("USER_EMAIL").ok(),
                     telegram_chat_id: config.telegram_chat_id.clone(),
                 },
-                workflow,
                 flows.clone(),
                 stopping.child_token(),
             );
@@ -246,7 +234,7 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
                 journal = Some(tokio::spawn(async move { worker.run(cancel).await }));
             }
             eprintln!(
-                "[supervisor] entering main loop (scheduler → saved workflow or planner, other sources → agent-loop)"
+                "[supervisor] entering main loop (scheduler → saved workflow when named, otherwise → agent-loop)"
             );
             // The agent owns the schedule: its first start imports the tasks
             // MCP held (or seeds the system ones), and a 30 s tick fires them
