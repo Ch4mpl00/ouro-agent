@@ -64,13 +64,32 @@ pub struct Task {
 
 #[derive(Clone, Debug)]
 pub enum Kind {
-    Call { function: String, with: Option<Value> },
+    Call {
+        function: String,
+        with: Option<Value>,
+    },
     Do(TaskList),
-    For { each: String, at: String, items: Items, condition: Option<String>, tasks: TaskList },
-    Fork { branches: TaskList, compete: bool },
+    /// `concurrency` (`metadata.concurrency`, an extension): iterations run
+    /// at once, at most that many, each on the `for`'s input and a copy of
+    /// the context; the output is their outputs in item order.
+    For {
+        each: String,
+        at: String,
+        items: Items,
+        condition: Option<String>,
+        concurrency: Option<usize>,
+        tasks: TaskList,
+    },
+    Fork {
+        branches: TaskList,
+        compete: bool,
+    },
     Set(Value),
     Switch(Vec<(String, Case)>),
-    Try { tasks: TaskList, catch: Box<Catch> },
+    Try {
+        tasks: TaskList,
+        catch: Box<Catch>,
+    },
     Raise(Raise),
     Wait(DurationSpec),
 }
@@ -515,6 +534,9 @@ impl Parser {
         let export = m.get("export").map(|o| self.output(o, &format!("{at}/export")));
         let timeout = m.get("timeout").and_then(|t| self.timeout(t, &format!("{at}/timeout")));
         let then = m.get("then").and_then(|t| self.flow(t, &format!("{at}/then")));
+        if m.get("metadata").and_then(|m| m.get("concurrency")).is_some() && !m.contains_key("for") {
+            self.fail(&format!("{at}/metadata/concurrency"), "concurrency belongs on a for task");
+        }
         let delivery = match m.get("metadata").and_then(|m| m.get("delivery")) {
             None => crate::durable::Delivery::AtLeastOnce,
             Some(v) => match serde_json::from_value(v.clone()) {
@@ -549,6 +571,20 @@ impl Parser {
         let each = self.string(f, "each", &format!("{at}/for")).unwrap_or_else(|| "item".into());
         let index = self.string(f, "at", &format!("{at}/for")).unwrap_or_else(|| "index".into());
         let condition = self.string(m, "while", at).map(|s| expr::bare(&s).to_string());
+        let concurrency = match m.get("metadata").and_then(|m| m.get("concurrency")) {
+            None => None,
+            Some(n) => match n.as_u64().filter(|n| *n > 0).and_then(|n| usize::try_from(n).ok()) {
+                Some(_) if condition.is_some() => {
+                    self.fail(&format!("{at}/metadata/concurrency"), "a concurrent for has no `while`");
+                    None
+                }
+                Some(n) => Some(n),
+                None => {
+                    self.fail(&format!("{at}/metadata/concurrency"), "expected a positive integer");
+                    None
+                }
+            },
+        };
         let tasks = match m.get("do") {
             Some(d) => self.task_list(d, &format!("{at}/do")),
             None => {
@@ -556,7 +592,7 @@ impl Parser {
                 Vec::new()
             }
         };
-        Some(Kind::For { each, at: index, items, condition, tasks })
+        Some(Kind::For { each, at: index, items, condition, concurrency, tasks })
     }
 
     fn try_task(&mut self, m: &Map<String, Value>, at: &str) -> Option<Kind> {
@@ -1045,7 +1081,7 @@ impl Validator<'_> {
                 }
             }
             Kind::Do(tasks) => self.list(tasks, &format!("{at}/do"), args),
-            Kind::For { each, at: index, items, condition, tasks } => {
+            Kind::For { each, at: index, items, condition, tasks, .. } => {
                 let inner = args.clone().with(each, Value::Null).with(index, Value::Null);
                 if let Items::Expr(e) = items {
                     self.expr(e, &format!("{at}/for/in"), args);

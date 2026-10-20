@@ -79,7 +79,10 @@
 //!     response stream is distinct from issuing a new call.
 //! 14. Unknown is not successful completion and has no fabricated output.
 //!     Surface it explicitly for error handling/reconciliation; dependent steps
-//!     requiring the missing result cannot proceed. Cancellation, a timeout or
+//!     requiring the missing result cannot proceed. A host may instead name an
+//!     explicit marker for it (`Functions::unknown_outcome`), saved as the
+//!     call's result for a reader that reconciles it (a model told the call
+//!     may have run); the call is still never sent again. Cancellation, a timeout or
 //!     dropping a losing fork branch does not prove an in-flight effect stopped.
 //!
 //! ## Waiting and completion

@@ -15,7 +15,7 @@ use crate::model::{
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures::future::{BoxFuture, try_join_all};
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::{self, FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -52,6 +52,22 @@ pub trait Functions: Send + Sync {
         self.call(name, args, info).await.map_err(CallFailure::Unknown)
     }
     async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError>;
+    /// This invocation's effect: a function that dispatches by an argument
+    /// (a tool by name) may differ per call. The function's by default.
+    fn effect_of(&self, name: &str, _args: &Value) -> Option<Effect> {
+        self.effect(name)
+    }
+    /// Whether this invocation is at most once whatever its task says.
+    fn at_most_once(&self, _name: &str, _args: &Value) -> bool {
+        false
+    }
+    /// What an at-most-once invocation whose outcome is unknown returns
+    /// instead of faulting the run (the default, `None`). The value is the
+    /// host's explicit marker, saved as the call's result; the call is still
+    /// never sent again.
+    fn unknown_outcome(&self, _name: &str, _args: &Value) -> Option<Value> {
+        None
+    }
 }
 
 /// One step of a run, keyed by task reference.
@@ -941,7 +957,7 @@ impl Run<'_> {
             Kind::Do(tasks) => Ok(ended(
                 self.list(tasks, format!("{reference}/do"), Some(reference), input.clone(), ctx, scope).await?,
             )),
-            Kind::For { each, at, items, condition, tasks } => {
+            Kind::For { each, at, items, condition, concurrency, tasks } => {
                 let items = match items {
                     Items::Inline(items) => items.clone(),
                     Items::Expr(code) => match expr::eval(code, input, &args(ctx)).map_err(expression)? {
@@ -955,6 +971,9 @@ impl Run<'_> {
                         }
                     },
                 };
+                if let Some(limit) = concurrency {
+                    return self.concurrent(tasks, items, each, at, *limit, reference, input, ctx, scope).await;
+                }
                 // Each pass gets the previous pass's output; the first gets the task's input.
                 let mut data = input.clone();
                 for (i, item) in items.into_iter().enumerate() {
@@ -1031,6 +1050,7 @@ impl Run<'_> {
                 .await?;
             return Ok(out);
         }
+        let delivery = if self.host.functions.at_most_once(name, &args) { Delivery::AtMostOnce } else { delivery };
         let key = format!("{reference}#call");
         let logical = self.logical(reference);
         let prior = self.record(&key);
@@ -1048,7 +1068,9 @@ impl Run<'_> {
             }
             match state {
                 CallState::Done(result) => return result.clone().map_err(Fault::Error),
-                CallState::Pending if delivery == Delivery::AtMostOnce => return Err(self.unknown(reference)),
+                CallState::Pending if delivery == Delivery::AtMostOnce => {
+                    return self.unknown_call(&key, logical, name, args, reference);
+                }
                 _ => {}
             }
         } else if prior.is_some() {
@@ -1057,7 +1079,7 @@ impl Run<'_> {
         let effect = self
             .host
             .functions
-            .effect(name)
+            .effect_of(name, &args)
             .ok_or_else(|| Fault::Fatal(WorkflowError::runtime(format!("unknown function `{name}`"))))?;
         if let Some(Record::Call { effect: original, .. }) = &prior
             && *original != effect
@@ -1105,7 +1127,7 @@ impl Run<'_> {
             Err(CallFailure::NotExecuted(error)) => (CallState::NotExecuted(error.clone()), Err(Fault::Error(error))),
             Err(CallFailure::Unknown(error)) => {
                 if delivery == Delivery::AtMostOnce {
-                    return Err(self.unknown(reference));
+                    return self.unknown_call(&key, logical, name, args, reference);
                 }
                 // A transient transport failure remains retryable, including after restart.
                 return Err(Fault::Error(error));
@@ -1113,6 +1135,88 @@ impl Run<'_> {
         };
         self.save(&key, Record::Call { logical, function: name.into(), arguments: args, effect, delivery, state })?;
         result
+    }
+
+    /// A concurrent `for`: every iteration runs on the input and a copy of
+    /// the context (its exports stay in it), at most `limit` at once. All of
+    /// them run to their end, so none is dropped mid-call; then the first
+    /// fault in item order wins, else the earliest wait, else the outputs in
+    /// item order (with `end` when an iteration ended the workflow).
+    #[allow(clippy::too_many_arguments)]
+    async fn concurrent(
+        &self,
+        tasks: &TaskList,
+        items: Vec<Value>,
+        each: &str,
+        at: &str,
+        limit: usize,
+        reference: &str,
+        input: &Value,
+        ctx: &Value,
+        scope: &Scope,
+    ) -> Result<(Value, Option<Flow>), Fault> {
+        let runs = items.into_iter().enumerate().map(|(i, item)| {
+            let mut inner = scope.clone();
+            inner.push((each.to_owned(), item));
+            inner.push((at.to_owned(), json!(i)));
+            let mut ctx = ctx.clone();
+            let input = input.clone();
+            async move {
+                let next =
+                    self.list(tasks, format!("{reference}[{i}]/do"), Some(reference), input, &mut ctx, &inner).await;
+                (i, next)
+            }
+        });
+        let mut done: Vec<_> = stream::iter(runs).buffer_unordered(limit).collect().await;
+        done.sort_by_key(|(i, _)| *i);
+        let mut output = Vec::with_capacity(done.len());
+        let mut wake: Option<i64> = None;
+        let mut end = None;
+        for (_, next) in done {
+            match next {
+                Ok(Next::Done(v)) => output.push(v),
+                Ok(Next::End(v)) => {
+                    output.push(v);
+                    end = Some(Flow::End);
+                }
+                Err(Fault::Waiting(deadline)) => wake = Some(wake.map_or(deadline, |old| old.min(deadline))),
+                Err(stop) => return Err(stop),
+            }
+        }
+        match wake {
+            Some(deadline) => Err(Fault::Waiting(deadline)),
+            None => Ok((Value::Array(output), end)),
+        }
+    }
+
+    /// An at-most-once call that may have run: the host's marker for it,
+    /// saved as its result, or a fatal fault when the host has none.
+    fn unknown_call(
+        &self,
+        key: &str,
+        logical: String,
+        name: &str,
+        args: Value,
+        reference: &str,
+    ) -> Result<Value, Fault> {
+        let Some(marker) = self.host.functions.unknown_outcome(name, &args) else {
+            return Err(self.unknown(reference));
+        };
+        let Some(Record::Call { effect, .. }) = self.record(key) else {
+            return Err(Fault::Storage(WorkflowError::runtime("missing call record")));
+        };
+        self.save(
+            key,
+            Record::Call {
+                logical,
+                function: name.into(),
+                arguments: args,
+                effect,
+                delivery: Delivery::AtMostOnce,
+                state: CallState::Done(Ok(marker.clone())),
+            },
+        )?;
+        Ok(marker)
     }
 
     /// Branches run concurrently, each on the fork's input and a copy of the

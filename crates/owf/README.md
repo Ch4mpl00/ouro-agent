@@ -42,6 +42,23 @@ Host adapters implement `Functions::invoke`, classifying failures as
 ambiguous dispatches. The agent's MCP adapter uses `call_tool_once` for
 durable calls. Third-party tools require no changes.
 
+A host may classify one invocation by its arguments
+(`Functions::effect_of`, `Functions::at_most_once`): the agent's `tool`
+function is a write, sent at most once, when the tool it names is one. It
+may also name a marker for an unknown outcome (`Functions::unknown_outcome`):
+the marker is saved as the call's result instead of faulting the run, and the
+call is still never sent again. The agent loop uses it to tell the model a
+write may have run before a restart.
+
+## Concurrent `for`
+
+`metadata: { concurrency: n }` on a `for` (an extension; `metadata` is free
+in the specification) runs up to `n` iterations at once, each on the `for`'s
+input and a copy of the context, whose exports stay inside it. Every
+iteration runs to its end; then the first fault in item order wins, else the
+earliest wait, else the output is the iterations' outputs in item order. A
+concurrent `for` takes no `while`.
+
 ## Retries and idempotency
 
 A `try` retry attempt does not make a protected call (a `Write`, or any

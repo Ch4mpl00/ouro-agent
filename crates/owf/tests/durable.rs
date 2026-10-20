@@ -910,3 +910,130 @@ async fn retried_writes_survive_a_crash_at_every_checkpoint() {
         }
     }
 }
+
+// A host that dispatches by an argument: `tool { name }` is a write (and at
+// most once) for `send`, a read otherwise, and a `send` that may have run
+// comes back as a marker instead of faulting the run.
+#[derive(Default)]
+struct Dispatch(Mutex<Vec<(String, String)>>);
+#[async_trait]
+impl Functions for Dispatch {
+    fn effect(&self, name: &str) -> Option<Effect> {
+        (name == "tool").then_some(Effect::Read)
+    }
+    fn effect_of(&self, name: &str, args: &Value) -> Option<Effect> {
+        self.effect(name).map(|read| if args["name"] == "send" { Effect::Write } else { read })
+    }
+    fn at_most_once(&self, _: &str, args: &Value) -> bool {
+        args["name"] == "send"
+    }
+    fn unknown_outcome(&self, _: &str, args: &Value) -> Option<Value> {
+        Some(json!({"unknown": args["name"]}))
+    }
+    async fn call(&self, _: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError> {
+        self.0.lock().unwrap().push((args["name"].as_str().unwrap_or_default().into(), info.reference.into()));
+        Ok(json!({"did": args["name"]}))
+    }
+}
+
+fn dispatch_host(functions: Arc<Dispatch>, time: Arc<Time>) -> Host {
+    Host {
+        functions,
+        clock: time,
+        observer: Arc::new(Silent),
+        limits: Limits::default(),
+        runtime: json!({"name":"test"}),
+    }
+}
+
+const ROUND: &str = r#"do:
+  - round:
+      for: { each: call, in: [ read, send, read ] }
+      metadata: { concurrency: 3 }
+      do:
+        - one: { call: tool, with: { name: '${ $call }' } }
+"#;
+
+#[tokio::test]
+async fn a_write_classified_per_call_is_never_sent_twice_and_an_unknown_one_is_a_marker() {
+    let wf = workflow(ROUND);
+    let mut markers = 0;
+    for after_commit in [false, true] {
+        for fail_at in 1..=20 {
+            let store = Store { fail_at: AtomicUsize::new(fail_at), after_commit, ..Default::default() };
+            let calls = Arc::new(Dispatch::default());
+            let time = Arc::new(Time(AtomicI64::new(1_000)));
+            let result = drive(&dispatch_host(calls.clone(), time.clone()), &time, &wf, &store).await;
+            let Status::Completed(Value::Array(out)) = result else { panic!("crash {fail_at}: {result:?}") };
+            assert_eq!(out.len(), 3, "crash {fail_at}");
+            assert!(out[1] == json!({"did":"send"}) || out[1] == json!({"unknown":"send"}), "{out:?}");
+            markers += usize::from(out[1] == json!({"unknown":"send"}));
+            let sends = calls.0.lock().unwrap().iter().filter(|(name, _)| name == "send").count();
+            assert!(sends <= 1, "crash {fail_at}, after={after_commit}: sent {sends} times");
+            // The marker is the call's saved result: a later replay keeps it.
+            assert_eq!(
+                drive(&dispatch_host(calls, time.clone()), &time, &wf, &store).await,
+                Status::Completed(json!(out))
+            );
+        }
+    }
+    assert!(markers > 0, "some crash leaves the send's outcome unknown");
+}
+
+#[tokio::test]
+async fn a_concurrent_for_runs_its_iterations_at_once_on_its_input() {
+    struct Slow(AtomicUsize, AtomicUsize);
+    #[async_trait]
+    impl Functions for Slow {
+        fn effect(&self, _: &str) -> Option<Effect> {
+            Some(Effect::Read)
+        }
+        async fn call(&self, _: &str, args: Value, _: &CallInfo<'_>) -> Result<Value, WorkflowError> {
+            let now = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+            self.1.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            self.0.fetch_sub(1, Ordering::SeqCst);
+            Ok(args)
+        }
+    }
+    let wf = workflow(
+        r#"do:
+  - init: { set: { base: 10 }, export: { as: '${ . }' } }
+  - round:
+      for: { each: n, in: [ 3, 1, 2 ] }
+      metadata: { concurrency: 2 }
+      do:
+        - echo: { call: slow, with: { v: '${ $n + .base }' }, export: { as: '${ { leaked: true } }' } }
+  - after: { set: { round: '${ . }', context: '${ $context }' } }
+"#,
+    );
+    let slow = Arc::new(Slow(AtomicUsize::new(0), AtomicUsize::new(0)));
+    let time = Arc::new(Time(AtomicI64::new(1_000)));
+    let h = Host {
+        functions: slow.clone(),
+        clock: time.clone(),
+        observer: Arc::new(Silent),
+        limits: Limits::default(),
+        runtime: json!({"name":"test"}),
+    };
+    assert_eq!(
+        drive(&h, &time, &wf, &Store::default()).await,
+        Status::Completed(json!({"round": [{"v":13}, {"v":11}, {"v":12}], "context": {"base":10}})),
+        "outputs in item order, each iteration on the for's input, exports kept inside"
+    );
+    assert_eq!(slow.1.load(Ordering::SeqCst), 2, "at most `concurrency` at once, and more than one");
+}
+
+#[test]
+fn concurrency_is_validated_as_for_metadata() {
+    let parse = |task: &str| {
+        model::parse_yaml(&format!(
+            "document: {{ dsl: '1.0.4', namespace: t, name: w, version: '0.1.0' }}\ndo: [ {{ t: {task} }} ]"
+        ))
+    };
+    let each = "for: { in: [1] }, do: [ { e: { call: echo } } ]";
+    assert!(parse(&format!("{{ {each}, metadata: {{ concurrency: 4 }} }}")).is_ok());
+    assert!(parse(&format!("{{ {each}, metadata: {{ concurrency: 0 }} }}")).is_err());
+    assert!(parse(&format!("{{ {each}, while: '.go', metadata: {{ concurrency: 2 }} }}")).is_err());
+    assert!(parse("{ call: echo, metadata: { concurrency: 2 } }").is_err());
+}
