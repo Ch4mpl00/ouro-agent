@@ -91,7 +91,12 @@ deletion.
    `schedule_task(workflow: …)`) runs its active version (`flows.rs` over `crates/owf`, no
    model deciding the steps); other `scheduler` signals run through the
    workflow module (`workflow.rs`: compile → execute); every other source
-   runs the primary agent loop (`agent.rs`). A compile failure, or a saved
+   runs the primary agent loop. Every agent loop (primary, worker, recovery)
+   is a run of the OWF workflow `agent-loop` (`agent_loop.yaml`, its host
+   functions in `agent.rs` §4): the primary one durable, so a restart resumes
+   it from its last round. The agent may activate its own version of
+   `agent-loop`; three faults of it in a row fall back to the built-in one
+   (`flows.rs` §4b). A compile failure, or a saved
    workflow that faulted before any write call, degrades to the agent loop in
    the same trace; an execute failure, or a saved workflow that faulted after
    a write, goes to `recovery` instead of being retried. Writes are the MCP
@@ -153,7 +158,8 @@ mcp-tools/
     │   ├── src/durable.rs                  saved workflows' run state: admission, leases, checkpoints
     │   ├── src/schedule.rs                 scheduled tasks: cron rows, the 30 s tick, the schedule
     │   │                                   tools, the first start's import
-    │   ├── src/agent.rs                    the engine and the ReAct agent loop
+    │   ├── src/agent.rs                    the engine, the loop's turn/tool/settle, synthetic tools
+    │   ├── src/agent_loop.yaml             the built-in `agent-loop` workflow every loop runs
     │   ├── src/activity.rs                 traces → ouro/activity journal notes (background
     │   │                                   task inside the supervisor)
     │   ├── src/providers.rs                ChatProviders: openai, gemini, deepseek, openrouter

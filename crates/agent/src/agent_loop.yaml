@@ -15,7 +15,8 @@ do:
         - act: { then: round }
   - round:
       for: { each: call, in: '${ $context.calls }' }
-      metadata: { concurrency: 4 }
+      # The loop's own limit (max_concurrent_tools) applies inside `tool`.
+      metadata: { concurrency: 16 }
       do:
         - one:
             call: tool

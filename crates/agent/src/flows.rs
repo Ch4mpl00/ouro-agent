@@ -270,6 +270,9 @@ fn mcp_tool(mcp: &dyn Mcp, name: &str) -> Option<ToolDef> {
 // What `name` does, or None when a workflow cannot call it. An MCP tool not
 // marked read-only counts as a write.
 pub fn effect(mcp: &dyn Mcp, name: &str) -> Option<Effect> {
+    if LOOP_FUNCTIONS.contains(&name) {
+        return Some(Effect::Read);
+    }
     if let Some((_, effect, _, _)) = MODEL_FUNCTIONS.iter().find(|f| f.0 == name) {
         return Some(*effect);
     }
@@ -343,9 +346,9 @@ fn failed(e: anyhow::Error) -> WorkflowError {
     WorkflowError::runtime(e.to_string())
 }
 
-// The built-in agent loop's functions (`agent::AGENT_LOOP`). Only that
-// definition runs them: saved workflows are checked against `effect`, which
-// does not know them.
+// The agent loop's functions (`agent::AGENT_LOOP`): a turn, one tool call
+// by name, a round's settlement. They take the loop from the run's context,
+// so they belong to an `agent-loop` definition.
 const LOOP_FUNCTIONS: &[&str] = &["agent_turn", "tool", "agent_settle"];
 
 fn loop_tool_name(args: &Value) -> &str {
@@ -355,9 +358,6 @@ fn loop_tool_name(args: &Value) -> &str {
 #[async_trait]
 impl owf::run::Functions for Functions {
     fn effect(&self, name: &str) -> Option<Effect> {
-        if LOOP_FUNCTIONS.contains(&name) {
-            return Some(Effect::Read);
-        }
         effect(&*self.engine.deps.mcp, name)
     }
 
@@ -374,6 +374,12 @@ impl owf::run::Functions for Functions {
 
     fn unknown_outcome(&self, name: &str, args: &Value) -> Option<Value> {
         (name == "tool").then(|| crate::agent::unknown_tool_outcome(loop_tool_name(args)))
+    }
+
+    // A loop's turn and calls stop on its cancellation and end their spans
+    // and child loops first.
+    fn cooperative(&self, name: &str) -> bool {
+        LOOP_FUNCTIONS.contains(&name)
     }
 
     async fn invoke(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
@@ -717,14 +723,7 @@ impl Flows {
         let status = match owf::model::parse_yaml(&saved.definition) {
             Err(error) => (RunStatus::Interrupted(WorkflowError::validation(error.to_string())), true),
             Ok(wf) => {
-                let spans = Arc::new(Spans { root: root.clone(), open: Mutex::default() });
-                let host = Host {
-                    functions: Arc::new(Functions { engine: self.engine.clone(), spans: spans.clone() }),
-                    observer: spans,
-                    clock: Arc::new(SystemClock),
-                    limits: Limits::default(),
-                    runtime: json!({"name":"agent-supervisor","version":env!("CARGO_PKG_VERSION")}),
-                };
+                let host = host(&self.engine, &root, saved.name == crate::agent::AGENT_LOOP_NAME);
                 // Shutdown releases work for recovery; only explicit run
                 // cancellation is allowed to create a terminal Cancelled state.
                 let execution_cancel = CancellationToken::new();
@@ -827,8 +826,10 @@ impl Flows {
         let driven = (saved.name == crate::agent::AGENT_LOOP_NAME)
             .then(|| saved.input["loop"]["id"].as_str().map(str::to_owned))
             .flatten();
+        let version = saved.input.get(OVERRIDE).and_then(Value::as_i64);
         let result = self.execute_saved(saved, lease, &scope, cancel).await;
         if let Some(id) = driven {
+            loop_outcome(&self.engine, version, &result);
             self.engine.end_loop(&id).await;
         }
         trace.end();
@@ -982,36 +983,11 @@ impl FlowRun for Flows {
     }
 
     async fn run_loop(&self, id: &str, input: Value, scope: &Scope, cancel: &CancellationToken) -> FlowResult {
-        let name = crate::agent::AGENT_LOOP_NAME;
-        let definition = crate::agent::AGENT_LOOP;
-        let Some(runs) = &self.runs else {
-            let root = scope.span(
-                SpanStart::new("runner", SpanKind::Chain).metadata(metadata(json!({"workflow":name,"engine":"owf"}))),
-            );
-            let wf = match owf::model::parse_yaml(definition) {
-                Ok(wf) => wf,
-                Err(error) => {
-                    return FlowResult::Faulted {
-                        error: WorkflowError::validation(error.to_string()),
-                        effects_started: false,
-                    };
-                }
-            };
-            let spans = Arc::new(Spans { root: root.clone(), open: Mutex::default() });
-            let host = Host {
-                functions: Arc::new(Functions { engine: self.engine.clone(), spans: spans.clone() }),
-                observer: spans,
-                clock: Arc::new(SystemClock),
-                limits: Limits::default(),
-                runtime: json!({"name":"agent-supervisor","version":env!("CARGO_PKG_VERSION")}),
-            };
-            let outcome = owf::run::run(&host, &wf, id, input, cancel).await;
-            let result = flow_result(outcome.status, outcome.effects_started);
-            root.end(SpanEnd::default());
-            return result;
-        };
+        let Some(runs) = &self.runs else { return run_loop_here(&self.engine, id, input, scope, cancel).await };
+        let (definition, version) = loop_definition(&self.engine);
+        let input = with_override(input, version);
         let claimed = (|| -> anyhow::Result<Option<(crate::durable::SavedRun, crate::durable::Lease)>> {
-            let lease = match runs.start(id, name, definition, &input)? {
+            let lease = match runs.start(id, crate::agent::AGENT_LOOP_NAME, &definition, &input)? {
                 Some(lease) => lease,
                 None => match runs.claim(id)? {
                     Some(lease) => lease,
@@ -1023,7 +999,12 @@ impl FlowRun for Flows {
         })();
         match claimed {
             Err(error) => FlowResult::Interrupted { error: WorkflowError::runtime(error.to_string()) },
-            Ok(Some((saved, lease))) => self.execute_saved(saved, lease, scope, cancel).await,
+            Ok(Some((saved, lease))) => {
+                let version = saved.input.get(OVERRIDE).and_then(Value::as_i64);
+                let result = self.execute_saved(saved, lease, scope, cancel).await;
+                loop_outcome(&self.engine, version, &result);
+                result
+            }
             Ok(None) => match runs.get(id) {
                 Ok(Some(crate::durable::SavedRun { outcome: Some(status), .. })) => flow_result(status, true),
                 Ok(_) => FlowResult::Waiting { wake_at_ms: chrono::Utc::now().timestamp_millis() },
@@ -1031,6 +1012,125 @@ impl FlowRun for Flows {
             },
         }
     }
+}
+
+// ── 4b. the agent loop's definition ─────────────────────────────────────────
+// Every agent loop runs `agent-loop`: the version the agent saved and
+// activated under that name, or the built-in one in git (`agent_loop.yaml`).
+// A circuit breaker guards the agent's version: LOOP_BREAKER faults in a row
+// and loops go back to the built-in one until another version is activated.
+
+const LOOP_BREAKER: u32 = 3;
+const BREAKER_KEY: &str = "agent_loop.breaker";
+// Where a run's input names the saved version it runs (null: the built-in).
+const OVERRIDE: &str = "override_version";
+
+fn host(engine: &Arc<Engine>, root: &Arc<dyn Span>, agent_loop: bool) -> Host {
+    let spans = Arc::new(Spans { root: root.clone(), open: Mutex::default() });
+    // A loop's generations and tool calls trace themselves; spans for its
+    // turn/round/settle tasks would only repeat them.
+    let observer: Arc<dyn owf::run::Observer> = if agent_loop { Arc::new(owf::run::Silent) } else { spans.clone() };
+    Host {
+        functions: Arc::new(Functions { engine: engine.clone(), spans }),
+        observer,
+        clock: Arc::new(SystemClock),
+        limits: Limits::default(),
+        runtime: json!({"name":"agent-supervisor","version":env!("CARGO_PKG_VERSION")}),
+    }
+}
+
+// The breaker's state: the saved version it counts, its faults in a row,
+// and whether they reached LOOP_BREAKER.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Breaker {
+    version: i64,
+    faults: u32,
+    open: bool,
+}
+
+fn breaker(engine: &Engine) -> Breaker {
+    engine.deps.memory.get(BREAKER_KEY).ok().flatten().and_then(|b| serde_json::from_str(&b).ok()).unwrap_or_default()
+}
+
+/// The definition a new loop runs, with the saved version it comes from
+/// (None: the built-in). A saved version that no longer validates, or whose
+/// breaker is open, gives way to the built-in one.
+pub fn loop_definition(engine: &Engine) -> (String, Option<i64>) {
+    let builtin = (crate::agent::AGENT_LOOP.to_owned(), None);
+    let Ok(Some(saved)) = engine.deps.workflows.active(crate::agent::AGENT_LOOP_NAME) else { return builtin };
+    let state = breaker(engine);
+    if (state.open && state.version == saved.version) || check(&*engine.deps.mcp, &saved.definition).is_err() {
+        return builtin;
+    }
+    (saved.definition, Some(saved.version))
+}
+
+fn with_override(mut input: Value, version: Option<i64>) -> Value {
+    if let Value::Object(fields) = &mut input {
+        fields.insert(OVERRIDE.into(), json!(version));
+    }
+    input
+}
+
+// Counts a saved version's run: a fault adds one (LOOP_BREAKER in a row open
+// the breaker), a completed run starts the count again. Cancellation and an
+// interruption say nothing about the definition.
+fn loop_outcome(engine: &Engine, version: Option<i64>, result: &FlowResult) {
+    let Some(version) = version else { return };
+    let mut state = breaker(engine);
+    if state.version != version {
+        state = Breaker { version, ..Breaker::default() };
+    }
+    match result {
+        FlowResult::Completed(_) => state.faults = 0,
+        FlowResult::Faulted { error, .. } => {
+            state.faults += 1;
+            if state.faults >= LOOP_BREAKER && !state.open {
+                state.open = true;
+                eprintln!(
+                    "[agent-loop] version {version} faulted {} times in a row; back to the built-in loop: {error}",
+                    state.faults
+                );
+            }
+        }
+        _ => return,
+    }
+    if let Err(error) =
+        serde_json::to_string(&state).map_err(anyhow::Error::from).and_then(|s| engine.deps.memory.set(BREAKER_KEY, &s))
+    {
+        eprintln!("[agent-loop] breaker: {error:#}");
+    }
+}
+
+/// Runs a loop in this process, without checkpoints: a worker's, a
+/// recovery's. `input` is `AgentLoop::workflow_input`'s.
+pub async fn run_loop_here(
+    engine: &Arc<Engine>,
+    id: &str,
+    input: Value,
+    scope: &Scope,
+    cancel: &CancellationToken,
+) -> FlowResult {
+    let (definition, version) = loop_definition(engine);
+    let root = scope.span(SpanStart::new("runner", SpanKind::Chain).metadata(metadata(
+        json!({"workflow":crate::agent::AGENT_LOOP_NAME,"workflow_version":version,"engine":"owf"}),
+    )));
+    let result = match owf::model::parse_yaml(&definition) {
+        Err(error) => {
+            FlowResult::Faulted { error: WorkflowError::validation(error.to_string()), effects_started: false }
+        }
+        Ok(wf) => {
+            let outcome =
+                owf::run::run(&host(engine, &root, true), &wf, id, with_override(input, version), cancel).await;
+            flow_result(outcome.status, outcome.effects_started)
+        }
+    };
+    loop_outcome(engine, version, &result);
+    root.end(match &result {
+        FlowResult::Faulted { error, .. } => SpanEnd::error(error.to_string()),
+        _ => SpanEnd::default(),
+    });
+    result
 }
 
 // ── 5. authoring tools ─────────────────────────────────────────────────────
@@ -1211,6 +1311,16 @@ pub fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::R
                 .ok_or_else(|| anyhow::anyhow!("no version {version} of workflow `{name}`"))?;
             // Tools may have changed since it was saved.
             check(mcp, &saved.definition).map_err(anyhow::Error::msg)?;
+            if name == crate::agent::AGENT_LOOP_NAME {
+                // A loop is tried by running: the breaker takes it back after
+                // a few faults in a row.
+                store.activate(name, version)?;
+                return Ok(json!({
+                    "ok": true, "name": name, "version": version,
+                    "next": "Every agent loop started from now runs this version; three faults in a row put the built-in loop back.",
+                })
+                .to_string());
+            }
             anyhow::ensure!(
                 saved.tried,
                 "version {version} of `{name}` has not completed a dry run; the workflow-author worker tries it (try_workflow) before it is shown to the user"
@@ -1236,6 +1346,10 @@ pub fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::R
         "read_workflow" => {
             let name = text("name")?;
             Ok(match store.get(name, version()?)? {
+                // The loop the agent runs until it saves its own version.
+                None if name == crate::agent::AGENT_LOOP_NAME => {
+                    json!({"name":name,"found":true,"version":null,"status":"built-in","definition":crate::agent::AGENT_LOOP})
+                }
                 None => json!({"name": name, "found": false}),
                 Some(w) => json!({"name":w.name,"found":true,"version":w.version,"status":w.status,"note":w.note,"definition":w.definition}),
             }

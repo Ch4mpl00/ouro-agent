@@ -181,6 +181,18 @@ composed again inside the `try`), the run fails with a conflict and sends
 nothing, so keep each `try` narrow, around the call it retries, with the
 `llm_compose` before it. Reads and model steps run again on every attempt.
 
+## The agent loop is a workflow too
+
+Every agent loop, the parent's and each worker's, runs the workflow
+`agent-loop`. `read_workflow("agent-loop")` shows the version in force (the
+built-in one until another is saved). Its context carries `loop`,
+`messages`, `memory` and the turn count `i`; `agent_turn`, `tool` (one call
+by name, a write sent at most once) and `agent_settle` (`finish`, the
+replies, the memory) are its functions. To change how loops work, save a
+new version under that name and activate it when the user agrees; it needs
+no dry run. Loops started after that run it, and three faults of it in a
+row put the built-in loop back.
+
 ## The language
 
 A subset of the Open Workflow Specification 1.0, in YAML. Anything not

@@ -188,6 +188,22 @@ Telegram.
 
 ### The agent loop
 
+Every agent loop is a run of the OWF workflow `agent-loop`
+(`crates/agent/src/agent_loop.yaml`): a turn (`agent_turn`), the round's
+calls in parallel (`tool`, one call by name; a write is sent at most once),
+then the settlement (`agent_settle`: `finish`, the replies, the working
+memory). The transcript and the working memory travel in the run's context,
+so each task record is a checkpoint. A signal's primary loop is durable: a
+deploy or a crash in the middle of it resumes from the last round, a read in
+flight runs again, and a write in flight comes back to the model as "outcome
+unknown" instead of being sent twice. Workers and recovery run the same
+workflow in process.
+
+The agent can read the loop (`read_workflow("agent-loop")`), save its own
+version and activate it. A circuit breaker counts that version's faults;
+three in a row and loops go back to the built-in definition until another
+version is activated.
+
 The primary loop runs on the `smart` preset (the base preset for scheduler
 fires). It uses the MCP tools plus a set of **synthetic tools** the runtime
 provides (`crates/agent/src/synthetic_tools.json`):

@@ -15,7 +15,7 @@ use crate::{
     tool_results::{WORKING_MEMORY_INSTRUCTIONS, is_tool_error, store_tool_result},
     tracing::{ContextUpdate, Metadata, Scope, Span, SpanEnd, SpanKind, SpanStart, Trace, TraceStart, Tracer},
 };
-use futures::{FutureExt, StreamExt, future::BoxFuture, stream};
+use futures::{FutureExt, future::BoxFuture};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
@@ -219,6 +219,8 @@ pub struct AgentLoop {
     // False for a loop rebuilt after a restart until a host function has
     // put its working memory back from the run's context.
     memory_restored: AtomicBool,
+    // The round's calls running at once: at most max_concurrent_tools.
+    slots: tokio::sync::Semaphore,
 }
 fn create_loop(
     engine: &Arc<Engine>,
@@ -231,6 +233,7 @@ fn create_loop(
     }
     opts.session_id = Some(opts.session_id.clone().unwrap_or_else(|| opts.session.id.clone()));
     let preset = engine.deps.presets.get(opts.preset).clone();
+    let opts_slots = opts.max_concurrent_tools;
     let skill_names: Vec<_> = resolved.keys().cloned().collect();
     let mut parts = Vec::new();
     if let Some(prompt) = opts.system_prompt.as_ref().filter(|s| !s.is_empty()) {
@@ -280,6 +283,7 @@ fn create_loop(
         sub_counter: AtomicUsize::new(0),
         observation_meta,
         memory_restored: AtomicBool::new(true),
+        slots: tokio::sync::Semaphore::new(opts_slots),
     }))
 }
 impl AgentLoop {
@@ -312,10 +316,7 @@ impl AgentLoop {
             let _running =
                 loop_.gate.try_lock().map_err(|_| anyhow::anyhow!("session {} is already running", loop_.opts.id))?;
             check(&loop_.cancel)?;
-            if let Some(text) = text {
-                loop_.messages.lock().await.push(providers::user(&text));
-            }
-            let outcome = loop_.run_until_settled().await;
+            let outcome = loop_.drive(text).await;
             if let Err(error) = &outcome {
                 loop_.scope.update(ContextUpdate {
                     output: Some(json!({"error": error.to_string()})),
@@ -328,47 +329,28 @@ impl AgentLoop {
         }
         .boxed()
     }
-    async fn run_until_settled(self: &Arc<Self>) -> anyhow::Result<String> {
+    // Runs this loop's `agent-loop` workflow here, from its transcript plus
+    // `text`, to its answer.
+    async fn drive(self: &Arc<Self>, text: Option<String>) -> anyhow::Result<String> {
         let engine = self.engine.upgrade().ok_or_else(aborted)?;
-        let mut messages = self.messages.lock().await;
-        if let Some(message) = messages.iter().find(|m| providers::role(m) == "user") {
-            self.scope.update(ContextUpdate::input(message.get("content").cloned().unwrap_or(Value::Null)));
+        let input = {
+            let mut messages = self.messages.lock().await;
+            if let Some(text) = text {
+                messages.push(providers::user(&text));
+            }
+            json!({"loop": self.spec(), "messages": *messages, "memory": self.opts.session.memory.snapshot()})
+        };
+        let result = crate::flows::run_loop_here(&engine, &self.opts.id, input, &self.scope, &self.cancel).await;
+        check(&self.cancel)?;
+        match result {
+            crate::flows::FlowResult::Completed(Value::String(output)) => Ok(output),
+            crate::flows::FlowResult::Completed(output) => Ok(output.to_string()),
+            crate::flows::FlowResult::Cancelled => Err(aborted()),
+            crate::flows::FlowResult::Faulted { error, .. } => {
+                Err(anyhow::anyhow!(error.detail.clone().unwrap_or_else(|| error.to_string())))
+            }
+            other => anyhow::bail!("session {} did not end: {other:?}", self.opts.id),
         }
-        for iteration in 0..self.opts.max_iterations {
-            let message = self.generate(&engine, &mut messages, iteration).await?;
-            let calls = providers::tool_calls(&message);
-            let content = providers::content(&message).unwrap_or_default().to_owned();
-            messages.push(message);
-            if calls.is_empty() {
-                self.scope.update(ContextUpdate::output(content.clone()));
-                return Ok(content);
-            }
-            // A finished call frees its slot at once (`buffered` would hold it
-            // until every earlier call finished); replies go back in call
-            // order. Cancellation is shared by all tools, and every dispatch
-            // runs to its end, so no worker is dropped before its trace /
-            // child-loop finalizers run.
-            let mut results: Vec<_> = stream::iter(
-                calls.into_iter().enumerate().map(|(i, call)| self.dispatch(engine.clone(), call).map(move |r| (i, r))),
-            )
-            .buffer_unordered(self.opts.max_concurrent_tools)
-            .collect()
-            .await;
-            results.sort_by_key(|(i, _)| *i);
-            let mut round = Vec::with_capacity(results.len());
-            for (_, result) in results {
-                round.push(result?);
-            }
-            let finished = settle_round(&mut round);
-            for (call, presented, _, _) in round {
-                messages.push(providers::tool_reply(&call.id, &presented));
-            }
-            if let Some(output) = finished {
-                self.finished(&output);
-                return Ok(output);
-            }
-        }
-        anyhow::bail!("session {} exceeded maxIterations={}", self.opts.id, self.opts.max_iterations)
     }
     // The model's next message after `messages`, traced as `iter-{iteration}`.
     async fn generate(
@@ -419,20 +401,6 @@ impl AgentLoop {
             _ => true,
         }
     }
-    // The call, its reply as the model sees it, whether the call failed, and
-    // the `result` a valid `finish` carries.
-    async fn dispatch(
-        self: &Arc<Self>,
-        engine: Arc<Engine>,
-        call: providers::ToolCall,
-    ) -> anyhow::Result<(providers::ToolCall, String, bool, String)> {
-        let (span, raw) = self.start_call(&engine, &call).await?;
-        let presented = self.present(&call.name, &raw, Some(&span));
-        let failed = is_tool_error(&raw);
-        span.end(if failed { SpanEnd::error(raw.clone()).with_output(raw) } else { SpanEnd::output(raw) });
-        let finish = finish_result(&call);
-        Ok((call, presented, failed, finish))
-    }
     // One call under its span, left open for the caller: the tool's raw reply.
     async fn start_call(
         self: &Arc<Self>,
@@ -466,15 +434,14 @@ impl AgentLoop {
     // memory tools and a dry run's bounded report (storing those would only
     // cost a turn to read them back), else the reply stored in working
     // memory with its content or a preview.
-    fn present(&self, name: &str, raw: &str, span: Option<&Arc<dyn Span>>) -> String {
+    // Also the entry it stored, `[key, value, format]`.
+    fn present(&self, name: &str, raw: &str, span: &Arc<dyn Span>) -> (String, Option<Value>) {
         if name.starts_with("working_memory_") || name == "try_workflow" {
-            return raw.to_owned();
+            return (raw.to_owned(), None);
         }
         let stored = store_tool_result(&self.opts.session.memory, raw);
-        if let Some(span) = span {
-            span.update(ContextUpdate::metadata(json!({"memory_key": stored.memory_key, "result_size_bytes": stored.size_bytes, "result_truncated": stored.truncated}).as_object().cloned().unwrap_or_default()));
-        }
-        stored.to_json().to_string()
+        span.update(ContextUpdate::metadata(json!({"memory_key": stored.memory_key, "result_size_bytes": stored.size_bytes, "result_truncated": stored.truncated}).as_object().cloned().unwrap_or_default()));
+        (stored.to_json().to_string(), Some(json!([stored.memory_key, raw, stored.format])))
     }
     async fn invoke(
         self: &Arc<Self>,
@@ -861,7 +828,7 @@ impl AgentLoop {
         if let Some(memory) = memory.filter(|m| !m.is_null())
             && !self.memory_restored.swap(true, Ordering::SeqCst)
         {
-            self.opts.session.memory.restore(memory)?;
+            self.opts.session.memory.merge(memory)?;
         }
         Ok(())
     }
@@ -927,6 +894,9 @@ pub async fn loop_turn(
         loop_.scope.update(ContextUpdate::input(message.get("content").cloned().unwrap_or(Value::Null)));
     }
     let message = loop_.generate(engine, &mut messages, i).await?;
+    // The live transcript follows the run's (a recovery report reads it).
+    messages.push(message.clone());
+    *loop_.messages.lock().await = messages;
     let calls: Vec<Value> = providers::tool_calls(&message)
         .into_iter()
         .map(|c| json!({"id": c.id, "name": c.name, "arguments": c.arguments}))
@@ -947,9 +917,10 @@ fn tool_call(value: &Value) -> anyhow::Result<providers::ToolCall> {
     })
 }
 
-/// `tool { loop, call, memory? }`: one call of the round, `{ raw, failed }`,
-/// plus the working-memory change it made (`op`), which `agent_settle`
-/// applies again, since a call that completed before a restart is not rerun.
+/// `tool { loop, call, memory? }`: one call of the round: its reply as the
+/// model sees it (`presented`), whether it `failed`, and the working-memory
+/// entries it made (`stored`, `op`), which `agent_settle` applies again: a
+/// call that completed before a restart is not run again.
 pub async fn loop_tool(
     engine: &Arc<Engine>,
     args: &Value,
@@ -959,10 +930,12 @@ pub async fn loop_tool(
     let loop_ = engine.loop_for(&loop_spec(args)?, scope, cancel).await?;
     loop_.restore_memory(args.get("memory"))?;
     let call = tool_call(args.get("call").unwrap_or(&Value::Null))?;
+    let _slot = loop_.slots.acquire().await?;
     let (span, raw) = loop_.start_call(engine, &call).await?;
     let failed = is_tool_error(&raw);
+    let (presented, stored) = loop_.present(&call.name, &raw, &span);
     span.end(if failed { SpanEnd::error(raw.clone()).with_output(raw.clone()) } else { SpanEnd::output(raw.clone()) });
-    let mut out = json!({"raw": raw, "failed": failed});
+    let mut out = json!({"presented": presented, "failed": failed, "stored": stored});
     if !failed {
         let parsed: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
         match call.name.as_str() {
@@ -979,7 +952,7 @@ pub async fn loop_tool(
 
 /// What a write that may have run before a restart answers the model.
 pub fn unknown_tool_outcome(name: &str) -> Value {
-    json!({"raw": format!("[tool error] outcome unknown: {name} was sent before a restart and its reply was lost, so it may or may not have run. Check its effect before repeating it."), "failed": true})
+    json!({"presented": format!("[tool error] outcome unknown: {name} was sent before a restart and its reply was lost, so it may or may not have run. Check its effect before repeating it."), "failed": true})
 }
 
 /// `agent_settle { loop, calls, results, memory }`: the round's replies as
@@ -992,10 +965,10 @@ pub async fn loop_settle(
     cancel: &CancellationToken,
 ) -> anyhow::Result<Value> {
     let loop_ = engine.loop_for(&loop_spec(args)?, scope, cancel).await?;
-    // The round starts from the memory before it: what its calls changed is
-    // applied again from their results, then their replies are stored.
+    // The memory before the round, then what its calls stored and changed,
+    // applied again from their results: after a restart they are not rerun.
     let memory = &loop_.opts.session.memory;
-    memory.restore(args.get("memory").unwrap_or(&json!([])))?;
+    memory.merge(args.get("memory").unwrap_or(&json!([])))?;
     loop_.memory_restored.store(true, Ordering::SeqCst);
     let calls = args.get("calls").and_then(Value::as_array).cloned().unwrap_or_default();
     let results = args.get("results").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -1013,15 +986,19 @@ pub async fn loop_settle(
             }
             _ => {}
         }
-        let raw = result.get("raw").and_then(Value::as_str).unwrap_or_default();
+        if let Some([key, value, format]) = result.get("stored").and_then(Value::as_array).map(Vec::as_slice) {
+            let format = if format == "json" { Format::Json } else { Format::Text };
+            let _ = memory.put(key.as_str().unwrap_or_default(), value.as_str().unwrap_or_default(), format);
+        }
+        let presented = result.get("presented").and_then(Value::as_str).unwrap_or_default().to_owned();
         let failed = result.get("failed").and_then(Value::as_bool).unwrap_or(true);
-        let presented = loop_.present(&call.name, raw, None);
         let finish = finish_result(&call);
         round.push((call, presented, failed, finish));
     }
     let finished = settle_round(&mut round);
     let replies: Vec<Message> =
         round.iter().map(|(call, presented, _, _)| providers::tool_reply(&call.id, presented)).collect();
+    loop_.messages.lock().await.extend(replies.iter().cloned());
     if let Some(output) = &finished {
         loop_.finished(output);
     }

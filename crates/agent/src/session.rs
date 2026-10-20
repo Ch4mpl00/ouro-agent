@@ -141,10 +141,11 @@ impl WorkingMemory {
         Value::Array(entries.iter().map(|(k, v, f)| serde_json::json!([k, v, f])).collect())
     }
 
-    // Replaces every entry with a snapshot's.
-    pub fn restore(&self, snapshot: &Value) -> anyhow::Result<()> {
-        let restored = serde_json::from_value::<Vec<(String, String, Format)>>(snapshot.clone())?;
-        *self.entries.lock().unwrap_or_else(|e| e.into_inner()) = restored;
+    // Adds a snapshot's entries this memory lacks; the ones it has stay.
+    pub fn merge(&self, snapshot: &Value) -> anyhow::Result<()> {
+        for (key, value, format) in serde_json::from_value::<Vec<(String, String, Format)>>(snapshot.clone())? {
+            let _ = self.put(&key, &value, format);
+        }
         Ok(())
     }
 }

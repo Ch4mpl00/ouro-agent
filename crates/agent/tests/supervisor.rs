@@ -261,7 +261,8 @@ async fn a_saved_workflow_runs_without_the_planner_and_faults_hand_over_by_effec
             }
         }
         let (_, obs) = f.db.get_trace("scheduler:42").unwrap().unwrap();
-        assert_eq!(obs.iter().any(|o| o.name == "runner"), !body.is_empty(), "{case}");
+        let ran = obs.iter().any(|o| o.name == "runner" && o.meta("workflow") == Some(&json!("w")));
+        assert_eq!(ran, !body.is_empty(), "{case}");
         supervisor.shutdown().await;
     }
     // A payload on another source is not a workflow.
@@ -454,11 +455,11 @@ async fn a_peer_signal_loads_its_skill_and_the_earlier_turns_of_its_thread() {
     assert!(!calls.iter().any(|(n, _)| n == "get_telegram_chat_history"));
     supervisor.shutdown().await;
 }
-// With durable loops on for `peer`, the same signal runs as an `agent-loop`
-// run: the same answer, the same trace for the judge and the journal, and a
+// With durable flows, a signal's primary loop runs as an `agent-loop` run:
+// the same answer, the same trace for the judge and the journal, and a
 // completed run in agent.db.
 #[tokio::test]
-async fn a_peer_signal_with_durable_loops_runs_as_an_agent_loop_run() {
+async fn a_signal_with_durable_flows_runs_its_loop_as_an_agent_loop_run() {
     let model = Arc::new(Scripted::new(vec![assistant("done")]));
     let mut f = fixture(model.clone(), &[], SKILLS);
     let mcp = Arc::new(ContextMcp::default());
@@ -472,7 +473,6 @@ async fn a_peer_signal_with_durable_loops_runs_as_an_agent_loop_run() {
         Arc::new(FakeWorkflow { stage: Stage::Success, called: AtomicUsize::new(0) }),
         agent::flows::create_durable_flows(engine.clone(), (*f.db).clone()),
         CancellationToken::new(),
-        vec!["peer".into()],
     );
     assert_eq!(supervisor.run_signal(&signal("peer", 42)).await.unwrap(), "done");
     let run = agent::durable::RunStore::new((*f.db).clone()).get("peer:42/loop").unwrap().unwrap();

@@ -231,12 +231,6 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
                 workflow,
                 flows.clone(),
                 stopping.child_token(),
-                std::env::var("AGENT_DURABLE_LOOPS")
-                    .unwrap_or_default()
-                    .split(',')
-                    .map(|s| s.trim().to_owned())
-                    .filter(|s| !s.is_empty())
-                    .collect(),
             );
             let journal_cancel = CancellationToken::new();
             let mut journal = None;

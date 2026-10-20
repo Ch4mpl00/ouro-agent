@@ -347,9 +347,6 @@ pub struct Supervisor {
     cancel: CancellationToken,
     active: Arc<tokio::sync::Semaphore>,
     shutdown: tokio::sync::Mutex<bool>,
-    // Sources whose primary loop runs as a durable `agent-loop` run (`all`
-    // for every source): a restart resumes it instead of losing it.
-    durable_loops: Vec<String>,
 }
 pub fn create_supervisor(
     engine: Arc<Engine>,
@@ -357,7 +354,7 @@ pub fn create_supervisor(
     workflow: Arc<dyn WorkflowRun>,
     flows: Arc<dyn FlowRun>,
 ) -> Arc<Supervisor> {
-    create_supervisor_with_cancel(engine, env, workflow, flows, CancellationToken::new(), Vec::new())
+    create_supervisor_with_cancel(engine, env, workflow, flows, CancellationToken::new())
 }
 pub fn create_supervisor_with_cancel(
     engine: Arc<Engine>,
@@ -365,7 +362,6 @@ pub fn create_supervisor_with_cancel(
     workflow: Arc<dyn WorkflowRun>,
     flows: Arc<dyn FlowRun>,
     cancel: CancellationToken,
-    durable_loops: Vec<String>,
 ) -> Arc<Supervisor> {
     Arc::new(Supervisor {
         engine,
@@ -375,7 +371,6 @@ pub fn create_supervisor_with_cancel(
         cancel,
         active: Arc::new(tokio::sync::Semaphore::new(1)),
         shutdown: Default::default(),
-        durable_loops,
     })
 }
 impl Supervisor {
@@ -479,8 +474,8 @@ impl Supervisor {
         check(&self.cancel)?;
         outcome
     }
-    // Runs the primary loop: as a durable `agent-loop` run for the sources
-    // configured so, else in this process.
+    // Runs the primary loop as a durable `agent-loop` run: a restart resumes
+    // it instead of losing the signal.
     async fn drive(
         &self,
         agent: &Arc<AgentLoop>,
@@ -488,10 +483,6 @@ impl Supervisor {
         input: String,
         primary: &Arc<dyn Span>,
     ) -> anyhow::Result<String> {
-        let source = id.split(':').next().unwrap_or_default();
-        if !self.durable_loops.iter().any(|s| s == source || s == "all") {
-            return agent.send(input).await;
-        }
         let scope: Scope = primary.clone();
         let run = agent.workflow_input(&input).await;
         match self.flows.run_loop(&format!("{id}/loop"), run, &scope, &self.cancel).await {
@@ -500,7 +491,9 @@ impl Supervisor {
             }
             FlowResult::Missing => agent.send(input).await,
             FlowResult::Cancelled => Err(aborted()),
-            FlowResult::Faulted { error, .. } => Err(anyhow::anyhow!("{error}")),
+            FlowResult::Faulted { error, .. } => {
+                Err(anyhow::anyhow!(error.detail.clone().unwrap_or_else(|| error.to_string())))
+            }
             // Released on shutdown or held elsewhere: the recovery worker resumes it.
             FlowResult::Waiting { .. } | FlowResult::Interrupted { .. } => {
                 check(&self.cancel)?;

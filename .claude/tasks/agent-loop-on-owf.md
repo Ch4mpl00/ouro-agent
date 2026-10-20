@@ -39,9 +39,22 @@ skill procedures (`skill-procedures.md`) a loop to embed.
   3. `for` with `metadata: { concurrency: n }` runs its iterations at once,
      each on the `for`'s input and a copy of the context, and outputs their
      results in order (a round's calls run in parallel).
-- **Supervisor**: the primary loop of a signal is admitted as a run of the
-  built-in `agent-loop` definition (behind a flag first: `peer`), so a
-  restart resumes it instead of losing it.
+- **Supervisor**: the primary loop of a signal is admitted as a durable run
+  of `agent-loop`, so a restart resumes it instead of losing it. Workers and
+  recovery run the same definition in process (`flows::run_loop_here`). The
+  in-process ReAct loop is gone (2026-10-20).
+- **Override + breaker**: the version the agent activates under
+  `agent-loop` drives every loop (no dry run needed); three faults in a row
+  of that version put the built-in one back (`agent_loop.breaker` in the
+  memory KV).
+
+## Still open
+
+- Workers are not durable inside: a restart during `invoke_sub_agent` gives
+  the parent "outcome unknown" for it. Next: the worker as a child run.
+- A provider outage (429) faults the run into recovery; it should back off
+  as an interruption.
+- A resumed run that faults is only logged; it should get a recovery report.
 
 ## Cleanup of finished runs
 

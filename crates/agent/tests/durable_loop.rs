@@ -50,6 +50,10 @@ impl Mcp for World {
 }
 
 fn engine(llm: Arc<Scripted>, mcp: Arc<World>) -> Arc<Engine> {
+    engine_with(llm, mcp, Arc::new(PersistLog::default()))
+}
+
+fn engine_with(llm: Arc<Scripted>, mcp: Arc<World>, memory: Arc<dyn agent::db::MemoryStore>) -> Arc<Engine> {
     let p = |model: &str| ModelPreset { model: model.into(), reasoning_effort: ReasoningEffort::Disabled };
     let (tracer, _) = recording();
     create_engine(EngineDeps {
@@ -63,7 +67,7 @@ fn engine(llm: Arc<Scripted>, mcp: Arc<World>) -> Arc<Engine> {
         },
         skills: Vec::new(),
         skill_store: Arc::new(AnySkill),
-        memory: Arc::new(PersistLog::default()),
+        memory,
         tracer,
         codex: Arc::new(NoCodex),
         decisions: None,
@@ -151,4 +155,48 @@ async fn a_round_cut_by_a_restart_resumes_without_regenerating_or_resending() {
     let seen = serde_json::to_string(&second.seen.lock().unwrap()[0].messages).unwrap();
     assert!(seen.contains("outcome unknown: send"), "the model hears the write may have run: {seen}");
     assert!(seen.contains("search ok"), "the read has its reply: {seen}");
+}
+
+// The agent may replace the loop: the version it activates under
+// `agent-loop` drives every loop started after, with no dry run needed.
+// LOOP_BREAKER faults in a row of that version put the built-in loop back.
+#[tokio::test]
+async fn an_activated_agent_loop_runs_and_three_faults_in_a_row_put_the_built_in_one_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(AgentDb::open(dir.path().join("agent.db")).unwrap());
+    let replies = (0..6).map(|_| assistant("hello")).collect();
+    let llm = Arc::new(Scripted::new(replies));
+    let engine = engine_with(llm, Arc::new(World { calls: Mutex::default(), stop: None }), db);
+    let activate = |definition: &str| {
+        let saved = engine.deps.workflows.save("agent-loop", definition, None).unwrap();
+        let args = json!({"name": "agent-loop", "version": saved.version});
+        agent::flows::tool(&engine, "activate_workflow", args.as_object().unwrap()).unwrap()
+    };
+    let run = |n: usize| {
+        let engine = engine.clone();
+        async move {
+            let id = format!("peer:{n}");
+            let input = input(&engine, &id).await;
+            let result =
+                create_flows(engine.clone()).run_loop(&id, input, &scope(&engine), &CancellationToken::new()).await;
+            engine.end_loop(&id).await;
+            result
+        }
+    };
+
+    let louder = agent::agent::AGENT_LOOP.replace("output: .content", r#"output: ("v2 " + .content)"#);
+    assert_ne!(louder, agent::agent::AGENT_LOOP);
+    activate(&louder);
+    assert!(matches!(run(1).await, FlowResult::Completed(ref v) if v == "v2 hello"));
+
+    let broken = "document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '9.0.0' }\n\
+        do: [ { boom: { raise: { error: { type: 'https://example.com/boom', status: 500 } } } } ]\n";
+    activate(broken);
+    for n in 2..5 {
+        assert!(matches!(run(n).await, FlowResult::Faulted { .. }), "fault {}", n - 1);
+    }
+    assert!(matches!(run(5).await, FlowResult::Completed(ref v) if v == "hello"), "the built-in loop is back");
+    // Activating a version again closes the breaker for it.
+    activate(&louder);
+    assert!(matches!(run(6).await, FlowResult::Completed(ref v) if v == "v2 hello"));
 }
