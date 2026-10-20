@@ -434,7 +434,7 @@ completed is never sent again. Calls marked
 
 The ouro supervisor, Claude Code sessions and ChatGPT (through the tunnel)
 all share one memory. It lives in `crates/mcp/src/memory.rs` and is stored in
-Postgres with pgvector. The design is in `.claude/tasks/unified-memory.md`.
+Postgres with pgvector. The design is in `.claude/tasks/done/unified-memory.md`.
 
 | Read model | What it holds | Tools |
 | --- | --- | --- |
@@ -538,14 +538,14 @@ sequenceDiagram
 The two MCP instances are separate processes on one database. Inserts into
 `signals` and `peer_messages` send a Postgres `NOTIFY`, and each instance
 `LISTEN`s, so waiters wake immediately. In v1 ouro never opens a thread
-itself. The design and decisions are in `.claude/tasks/peer-messaging.md`,
+itself. The design and decisions are in `.claude/tasks/done/peer-messaging.md`,
 and the behaviour is specified in `crates/mcp/specs/peer_messages.feature`.
 
 **From Claude Code:** `.mcp.json` points at `http://127.0.0.1:3001/mcp`.
 Open the tunnel before the session starts:
 
 ```bash
-ssh -N -L 3001:127.0.0.1:3001 root@165.22.199.65
+ssh -N -L 3001:127.0.0.1:3001 ouro
 ```
 
 That gives the session memory, news, skills, `send_telegram_message` and

@@ -1,6 +1,6 @@
 // Unified memory: one memory every agent shares — the droplet supervisor,
 // Claude Code sessions, ChatGPT through the tunnel. Design and rationale in
-// .claude/tasks/unified-memory.md (the D-numbers below refer to it).
+// .claude/tasks/done/unified-memory.md (the D-numbers below refer to it).
 //
 // Two read models behind one search projection (D8): projects made of
 // markdown documents, and flat facts. Both feed `memory_index`, the only
@@ -284,6 +284,7 @@ fn doc_name_re() -> regex::Regex {
 // streams reads as one ("digest/news", "digest/tech"). The separator is a
 // naming convention only — every name is its own stream.
 pub const JOURNAL_STREAM_RE: &str = r"^[a-z0-9][a-z0-9-]*(/[a-z0-9][a-z0-9-]*)*$";
+
 pub const JOURNAL_STREAM_MAX_LENGTH: usize = 100;
 
 pub fn is_journal_stream(name: &str) -> bool {
@@ -1447,8 +1448,11 @@ pub struct WriteDoc<'a> {
 // The journal's bounds. Capacity is per stream (stored with it); these are
 // the defaults and the limits a caller may set within.
 pub const JOURNAL_DEFAULT_CAPACITY: i32 = 100;
+
 pub const JOURNAL_MAX_CAPACITY: i64 = 1000;
+
 pub const JOURNAL_TAIL_DEFAULT: i64 = 5;
+
 pub const JOURNAL_TAIL_MAX: i64 = 100;
 // A digest is ~5k characters; the cap keeps one runaway write from making
 // every later tail expensive.

@@ -59,8 +59,8 @@ choice.
 Their tests were ported one to one before that; a test or comment that says
 "a port of …test.ts" names where it came from. The databases, migrations,
 trace shapes and Langfuse attributes are still the ones the TS code wrote, so
-nothing on the volumes was converted. History: `.claude/tasks/rust-rewrite.md`,
-`.claude/tasks/rust-agent.md`. Rolling back to TS means an old image
+nothing on the volumes was converted. History: `.claude/tasks/done/rust-rewrite.md`,
+`.claude/tasks/done/rust-agent.md`. Rolling back to TS means an old image
 (`mcp-tools-image:ts-backup-ad4ffbe` on the droplet) or a commit before the
 deletion.
 
@@ -372,7 +372,7 @@ also see them when running `claude` locally with `.mcp.json` registered.
   ouro answers with `reply_to_peer` / reads `get_peer_thread` (`peer-reply`,
   default surface). A peer is trusted as the user; instances wake each
   other's waiters through Postgres `LISTEN/NOTIFY` (`db.rs`, wake-ups).
-  Decisions: `.claude/tasks/peer-messaging.md`.
+  Decisions: `.claude/tasks/done/peer-messaging.md`.
 - **Scheduler** — `list_scheduled_tasks` (supervisor only: the tasks MCP
   held, read by the agent's first start). `schedule_task`,
   `list_scheduled_tasks` and `cancel_scheduled_task` as a model sees them
@@ -382,7 +382,7 @@ also see them when running `claude` locally with `.mcp.json` registered.
   `gateway.rs` makes own-MCP an MCP *client* to them too and re-exposes
   their tools namespaced as `${prefix}__${tool}` (e.g. `tavily__tavily_search`).
   The agent still sees one merged endpoint. Onboarding (config + secret + skill
-  frontmatter, no code) is in `.claude/tasks/mcp-gateway.md`.
+  frontmatter, no code) is in `.claude/tasks/done/mcp-gateway.md`.
 
 ### Tool scoping (`MCP_TOOLSETS`)
 
@@ -410,7 +410,7 @@ auth design: `.claude/tasks/mcp-auth-and-tool-scoping.md`.
 One memory every agent shares — the droplet supervisor, Claude Code sessions,
 anything on the far side of the ChatGPT tunnel. Lives in
 `crates/mcp/src/memory.rs`; design and rationale in
-`.claude/tasks/unified-memory.md`.
+`.claude/tasks/done/unified-memory.md`.
 
 Three read models, one search projection:
 
@@ -504,7 +504,7 @@ image they are on `PATH`.
 - `mcp-tools` — the MCP server. **Do not run locally if the droplet is also
   running it** — Telegram getUpdates is exclusive and the second poller
   causes 409 Conflict. `.mcp.json` points Claude Code at the droplet's
-  restricted endpoint instead: `ssh -N -L 3001:127.0.0.1:3001 root@165.22.199.65`
+  restricted endpoint instead: `ssh -N -L 3001:127.0.0.1:3001 ouro`
   before the session starts (memory, news, skills, `ask_ouro`).
 - `agent-supervisor` — the supervisor (long-running loop);
   `agent-supervisor --check-config` validates env and exits.

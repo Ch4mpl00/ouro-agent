@@ -1,7 +1,7 @@
 // The agent's runtime library. Clients and stores are injected into the
 // engine; the eval tooling (crates/evals) reads the same agent.db and
 // canonical Langfuse trace shapes. agent-supervisor composes the runtime;
-// history lives in .claude/tasks/rust-agent.md.
+// history lives in .claude/tasks/done/rust-agent.md.
 
 pub mod agent;
 pub mod codex;

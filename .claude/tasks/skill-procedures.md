@@ -1,6 +1,6 @@
 # Skills with procedures: a skill as a graph the agent drives
 
-**Status:** pending
+**Status:** pending (the general bricks `finish` and `choose` are shipped; the procedure itself is not started)
 **Priority:** P2
 **Area:** agent / skills, flows (OWF)
 **Created:** 2026-10-19
@@ -13,13 +13,12 @@ each of those costs a model turn (typing alone took a round in 35 of 39
 Telegram runs), and the hard rules ("always reply", "one reply") hold only
 as far as the model follows them.
 
-Discussed 2026-10-19 (engineer/critic rounds; material in the session's
-`design/` notes, summary below). Rejected along the way:
+Discussed 2026-10-19 (engineer/critic rounds). Rejected along the way:
 
 - **A graph in front of the agent** (Jev or a fixed route picks "simple
   answer → llm_compose → send" vs "agent"): decides for the agent whether it
   needs tools; misroutes are silent (a "remember X" sent to a tool-less
-  compose answers "Запомнил ✅" and saves nothing); `start_typing` and `send`
+  compose answers "Remembered ✅" and saves nothing); `start_typing` and `send`
   are Writes, so a fault after them goes to recovery, not the agent; and
   with `finish` the agent already answers a simple message in one call.
 - **Jev choosing every step** (B): a classifier cannot write arguments, and
@@ -53,7 +52,7 @@ with the agent; `done` keeps it free to deliver however it wants.
 
 1. **`agent` step in OWF with declared exits** — a child loop as a workflow
    function; it ends by choosing an exit with arguments; a Write (needs
-   `at_most_once` for model adapters, which `flows.rs` lacks) and a dry-run
+   `at_most_once` for model adapters, which `crates/agent/src/flows.rs` lacks) and a dry-run
    wrapper for its MCP calls.
 2. **Skill ↔ procedure binding** — e.g. `procedure: <workflow>` in skill
    frontmatter; when preselection picks a skill with one, the procedure

@@ -391,7 +391,7 @@ def apply(payload, repository):
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("services", nargs="*", metavar="SERVICE")
-    parser.add_argument("--host", default=os.environ.get("DEPLOY_HOST", "root@165.22.199.65"))
+    parser.add_argument("--host", default=os.environ.get("DEPLOY_HOST", "ouro"))
     parser.add_argument("--repository", default=os.environ.get("DEPLOY_DIR", "/root/agent-helper"))
     parser.add_argument("--runtime-image", action="store_true")
     parser.add_argument("--apply", type=Path, help=argparse.SUPPRESS)

@@ -2,7 +2,7 @@
 // world. Two transports: Streamable HTTP (MCP_TRANSPORT=http, MCP_URL; the
 // containers) and stdio (a child process; local dev).
 //
-// Connection lifecycle (.claude/tasks/mcp-connection-lifecycle.md):
+// Connection lifecycle (.claude/tasks/done/mcp-connection-lifecycle.md):
 //   - startup retries inside the process, with capped backoff, instead of
 //     exiting and letting Docker restart it (the crash-loops of 2026-06-15
 //     and 2026-08-23);
@@ -259,6 +259,7 @@ struct Connection {
     peer: rmcp::Peer<RoleClient>,
     service: tokio::sync::Mutex<Option<Client>>,
 }
+
 impl Connection {
     fn new(client: Client) -> Arc<Self> {
         Arc::new(Self { peer: client.peer().clone(), service: tokio::sync::Mutex::new(Some(client)) })

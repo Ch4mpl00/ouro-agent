@@ -1,6 +1,6 @@
 # Peer messaging: other agents talk to ouro over MCP
 
-**Status:** in-progress
+**Status:** done (implemented in `crates/mcp/src/peer.rs`, `skills.default/peer.md`, `crates/mcp/specs/peer_messages.feature`; live on the tunnel endpoint)
 **Priority:** P2
 **Area:** mcp / peer, agent / supervisor
 **Created:** 2026-10-19
@@ -18,7 +18,7 @@ table as the transport.
 - **P1 — trust: a peer is the user.** Ouro runs a peer's request with the
   same tools and authority as a Telegram message from the user. Safe only
   because both endpoints are loopback-only (SSH / the tunnel daemon). Real
-  per-token identity (`mcp-auth-and-tool-scoping.md` A1/A2) is a precondition
+  per-token identity (`../mcp-auth-and-tool-scoping.md` A1/A2) is a precondition
   for any public exposure.
 - **P2 — sender.** The trusted identity is the instance's actor
   (`MCP_MEMORY_ACTOR`: `chatgpt` on the tunnel). The peer's own `from` is a

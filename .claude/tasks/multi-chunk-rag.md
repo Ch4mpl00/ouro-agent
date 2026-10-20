@@ -1,43 +1,37 @@
-# Multi-chunk RAG (sliding window)
+# Multi-chunk embeddings for long news items (sliding window)
 
-**Status:** pending
+**Status:** pending (deliberately deferred until measured)
 **Priority:** P3
 **Area:** news / embeddings
-**Created:** 2026-06-01
+**Created:** 2026-06-01 (rewritten for the Rust code 2026-10-20)
 
 ## Context
 
-Today's `truncateChunker` returns one chunk per news_items row — head
-of the text, capped at ~8000 chars. For long HN threads or long Habr
-articles that means we silently drop the tail. Retrieval quality
-suffers when the relevant point sits past the cutoff.
+`news_items` holds exactly one embedding per row, computed from the head of the
+text (`crates/mcp/src/embeddings.rs`; roughly 8000 characters, about 4 chars per
+token). For long HN threads or Habr articles the tail is silently dropped, and
+retrieval suffers when the relevant point sits past the cutoff. Memory documents
+are already chunked, in their own domain (`memory.rs`, `memory_index`); news is
+not.
 
-`Chunker` interface already supports multi-chunk (returns `string[]`),
-but the EmbeddingService throws if a chunker produces more than one
-chunk — by design, because `news_items` has exactly one embedding
-column.
-
-To unlock multi-chunk we need a sibling table that owns the (item_id,
-chunk_idx, chunk_text, embedding) tuples and search has to switch to
-joining against it.
+Multi-chunk needs a sibling table that owns `(item, chunk_idx, body,
+embedding)` and a search that joins against it.
 
 ## Acceptance
 
-- Schema migration adds `news_item_chunks (id, news_item_id FK,
-  chunk_idx, body, embedding vector(1536))`.
-- `EmbeddingRepository.saveEmbeddings(itemId, chunks)` replaces the
-  per-row `saveEmbedding`.
-- `EmbeddingService` lifts the single-chunk guard.
-- `performSearch` joins chunks → items, returns the top-k items by
-  best-chunk distance (or aggregates per item).
-- `slidingWindowChunker(size, overlap)` impl in
-  `embeddings/chunker.ts`.
+- Migration adds `news_item_chunks (id, news_item_id FK, chunk_idx, body,
+  embedding vector(1536))` (a new file in `crates/mcp/migrations/pg/` plus its
+  entry in `pg.rs` `MIGRATIONS`; applied files never change).
+- The news repository saves the chunks of an item instead of one vector; the
+  embedder interface handles several chunks per item (it assumes one today).
+- `search_news` joins chunks to items and returns the top-k items by best-chunk
+  distance (or aggregated per item), keeping the dedup step.
+- A sliding-window chunker (`size`, `overlap`) in the embeddings module.
+- `embed-backfill` and the re-embed-on-text-change path handle chunks.
 
 ## Notes
 
-Only do this when retrieval quality demonstrably suffers — measure
-first (find a real query where the relevant chunk lives past 8000
-chars), then chunk. Don't pre-emptively complicate the schema.
-
-This is the canonical "multi-chunk strategy" mentioned in the
-`truncateChunker` doc.
+Only do this when retrieval quality demonstrably suffers: find a real query
+whose relevant chunk lives past the cutoff (the long-form queries q-020..q-034
+in `crates/mcp/eval/fixtures/queries.jsonl` are the test bed; run `eval-rag`
+before and after). Do not complicate the schema pre-emptively.

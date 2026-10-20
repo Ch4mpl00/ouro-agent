@@ -1,7 +1,7 @@
 // Third-party MCP upstreams, re-exposed through this server: the agent sees
 // one merged tool list, upstream tools namespaced as `${prefix}__${tool}`
 // (`tavily__tavily_search`). Onboarding is config + secret + skill
-// frontmatter, no code (.claude/tasks/mcp-gateway.md).
+// frontmatter, no code (.claude/tasks/done/mcp-gateway.md).
 //
 // Sections:
 //   1. config  — gateway.config.json, ${VAR} secrets resolved from the env
