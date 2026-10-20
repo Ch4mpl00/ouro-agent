@@ -41,6 +41,7 @@ pub struct RunStore {
 pub struct SavedRun {
     pub id: String,
     pub name: String,
+    pub state: String,
     pub definition: String,
     pub input: Value,
     pub outcome: Option<Status>,
@@ -55,25 +56,43 @@ impl RunStore {
         let row = self
             .db
             .conn()
-            .query_row("SELECT name, definition, input, outcome FROM workflow_runs WHERE id = ?1", [id], |r| {
+            .query_row("SELECT name, definition, input, outcome, state FROM workflow_runs WHERE id = ?1", [id], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(4)?,
                 ))
             })
             .optional()?;
-        row.map(|(name, definition, input, outcome)| {
+        row.map(|(name, definition, input, outcome, state)| {
             Ok(SavedRun {
                 id: id.into(),
                 name,
+                state,
                 definition,
                 input: serde_json::from_str(&input)?,
                 outcome: outcome.map(|s| serde_json::from_str(&s)).transpose()?,
             })
         })
         .transpose()
+    }
+
+    /// Read evidence without claiming or renewing a run, including finished runs.
+    pub fn records(&self, id: &str) -> anyhow::Result<Vec<Record>> {
+        let conn = self.db.conn();
+        let mut statement = conn.prepare("SELECT record FROM workflow_records WHERE run_id = ?1 ORDER BY key")?;
+        let rows = statement.query_map([id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter().map(|row| Ok(serde_json::from_str(&row)?)).collect()
+    }
+
+    /// A literal prefix, not a LIKE pattern: ids can contain `_` and `%`.
+    pub fn list_prefix(&self, name: &str, prefix: &str) -> anyhow::Result<Vec<String>> {
+        let conn = self.db.conn();
+        let mut statement = conn
+            .prepare("SELECT id FROM workflow_runs WHERE name = ?1 AND substr(id, 1, length(?2)) = ?2 ORDER BY id")?;
+        Ok(statement.query_map(params![name, prefix], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn admit(&self, id: &str, name: &str, definition: &str, input: &Value) -> anyhow::Result<()> {

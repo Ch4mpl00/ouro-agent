@@ -224,6 +224,7 @@ provides (`crates/agent/src/synthetic_tools.json`):
 | --- | --- |
 | `find_skills`, `read_skill`, `list_skills`, `write_skill` | Discover, read and (for the primary loop or an authorized `dreaming` worker) write skills |
 | `invoke_sub_agent` | Delegate a focused subtask to a worker. The worker gets the named skills (or `worker`), a fresh conversation and the same session memory. Only the primary loop can spawn workers. |
+| `read_run` | Read durable `agent-loop` history: list this loop’s workers, or inspect a run by id with state, outcome and a bounded transcript. `offset`/`limit` page over turns (workers when listing), with `entry_offset` continuation for oversized turns; no history for in-process runs, and swept records are reported explicitly. |
 | `working_memory_put` / `get` / `list` / `delete` | The session's temporary KV. Every tool result is stored under a fresh key. Results up to 8,000 bytes come back whole; larger ones come back as a key plus a 512-byte preview. `input_refs` hands values to a worker without copying them through the parent. |
 | `set_memory` | Persistent agent-side KV in agent.db, used for watermarks such as `news_digest.last_read_at` |
 | `finish` | Ends the session in the same round as the final delivery, instead of spending another turn on a closing message. If any call in that round fails, the session continues with the errors. |

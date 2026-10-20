@@ -537,5 +537,39 @@
         "additionalProperties": false
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_run",
+      "description": "Read durable agent-loop history. Without id, list this loop\u2019s workers with their tasks and outcomes. With id (for example peer:739__sub1.0/loop), show its state, outcome and transcript, skipping system messages. offset/limit page over assistant turns (or worker runs when listing); defaults 0/10, maximum limit 100. Text, arguments and replies are clipped; the whole view is bounded to 8000 characters. Follow next offset for more; an oversized turn also gives entry_offset to continue its remaining calls/replies. In-process runs have no history; finished runs may have had their records swept.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 0
+          },
+          "entry_offset": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 0,
+            "description": "Within-turn continuation from an oversized page; otherwise leave at 0."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 10
+          }
+        },
+        "additionalProperties": false
+      }
+    }
   }
 ]

@@ -89,6 +89,16 @@ runs that ended more than `RECORDS_KEPT_MS` (7 days) ago, hourly, and keeps
 the row with its outcome, so a swept run still reports it and is never
 resumed.
 
+## Run history (done 2026-10-20)
+
+`read_run` lets every loop inspect durable `agent-loop` evidence on demand:
+without an id it lists its workers with tasks and outcomes; with an id it
+shows a bounded transcript, paged over assistant turns, including calls,
+arguments and replies. The store exposes generic lease-free record and
+prefix reads. Missing in-process runs and swept transcripts are explicit;
+other workflow names are refused. Worker reporting rules live in the
+orchestrator skill, and delegation still returns only the worker’s answer.
+
 ## Acceptance
 
 - A peer message survives a restart in the middle of a round: no repeated

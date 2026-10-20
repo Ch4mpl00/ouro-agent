@@ -1,7 +1,7 @@
 // Agent runtime: engine wiring, synthetic tools, and the ReAct loop. Shared
 // clients are injected once; each loop owns its conversation and cancellation.
 // Sections: 1. engine / skill scoping; 2. loop lifecycle; 3. dispatch / workers;
-// 4. the loop as a workflow.
+// 4. the loop as a workflow; 5. run history.
 use crate::{
     codex::{SharedCodex, code_agent},
     db::MemoryStore,
@@ -407,6 +407,7 @@ impl AgentLoop {
         engine: &Arc<Engine>,
         call: &providers::ToolCall,
         child: Option<ChildRun<'_>>,
+        runs: Option<&crate::durable::RunStore>,
     ) -> anyhow::Result<(Arc<dyn Span>, String)> {
         let mut metadata = self.observation_meta.clone();
         metadata.insert("tool".into(), call.name.clone().into());
@@ -419,7 +420,7 @@ impl AgentLoop {
         let raw = match serde_json::from_str::<Value>(if call.arguments.is_empty() { "{}" } else { &call.arguments }) {
             Ok(Value::Object(args)) => {
                 span.update(ContextUpdate::input(Value::Object(args.clone())));
-                self.invoke(engine, &call.name, args, span.clone(), child).await
+                self.invoke(engine, &call.name, args, span.clone(), child, runs).await
             }
             _ => Ok("[tool error] arguments must be a JSON object".to_owned()),
         };
@@ -432,12 +433,12 @@ impl AgentLoop {
         }
     }
     // What the model sees of a reply: the reply itself for the working
-    // memory tools and a dry run's bounded report (storing those would only
+    // memory tools and bounded reports (storing those would only
     // cost a turn to read them back), else the reply stored in working
     // memory with its content or a preview.
     // Also the entry it stored, `[key, value, format]`.
     fn present(&self, name: &str, raw: &str, span: &Arc<dyn Span>) -> (String, Option<Value>) {
-        if name.starts_with("working_memory_") || name == "try_workflow" {
+        if name.starts_with("working_memory_") || matches!(name, "try_workflow" | "read_run") {
             return (raw.to_owned(), None);
         }
         let stored = store_tool_result(&self.opts.session.memory, raw);
@@ -451,6 +452,7 @@ impl AgentLoop {
         args: Map<String, Value>,
         span: Arc<dyn Span>,
         child: Option<ChildRun<'_>>,
+        runs: Option<&crate::durable::RunStore>,
     ) -> anyhow::Result<String> {
         check(&self.cancel)?;
         let synthetic = synthetic_definitions().iter().any(|t| t.name == name);
@@ -458,7 +460,7 @@ impl AgentLoop {
             return Ok(format!("[tool error] {name} is unavailable in this loop"));
         }
         let outcome = if synthetic {
-            self.synthetic(engine, name, &args, span, child).await
+            self.synthetic(engine, name, &args, span, child, runs).await
         } else if !crate::mcp::model_tools(&*engine.deps.mcp).iter().any(|t| t.name == name)
             || !self.allowed.as_ref().is_none_or(|s| s.contains(name))
         {
@@ -476,8 +478,10 @@ impl AgentLoop {
         args: &Map<String, Value>,
         span: Arc<dyn Span>,
         child: Option<ChildRun<'_>>,
+        runs: Option<&crate::durable::RunStore>,
     ) -> anyhow::Result<String> {
         match name {
+            "read_run" => read_run(runs, &self.opts.id, args),
             "find_skills" => {
                 let params: crate::skills::FindSkillsParams = serde_json::from_value(json!(args))?;
                 params.validate()?;
@@ -999,7 +1003,7 @@ pub async fn loop_tool(
     let call = tool_call(args.get("call").unwrap_or(&Value::Null))?;
     let child = runs.zip(child_key(args)).map(|(runs, key)| ChildRun { runs, key });
     let _slot = loop_.slots.acquire().await?;
-    let (span, raw) = loop_.start_call(engine, &call, child).await?;
+    let (span, raw) = loop_.start_call(engine, &call, child, runs).await?;
     let failed = is_tool_error(&raw);
     let (presented, stored) = loop_.present(&call.name, &raw, &span);
     span.end(if failed { SpanEnd::error(raw.clone()).with_output(raw.clone()) } else { SpanEnd::output(raw.clone()) });
@@ -1076,4 +1080,207 @@ pub async fn loop_settle(
         "finished": finished.is_some(),
         "output": finished.unwrap_or_default(),
     }))
+}
+
+// ── 5. run history ──────────────────────────────────────────────────────────
+// History is evidence on demand, not a second summary attached to delegation.
+// The store only reads generic records; transcript interpretation stays here.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadRunArgs {
+    id: Option<String>,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default)]
+    entry_offset: usize,
+    limit: Option<usize>,
+}
+
+fn history_cut(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        text.to_owned()
+    } else {
+        format!("{}… [cut]", text.chars().take(limit.saturating_sub(7)).collect::<String>())
+    }
+}
+
+fn history_messages(records: &[owf::durable::Record]) -> &[Value] {
+    records
+        .iter()
+        .filter_map(|record| match record {
+            owf::durable::Record::Task { result: Some(result), .. } => result.context.get("messages")?.as_array(),
+            _ => None,
+        })
+        .max_by_key(|messages| messages.len())
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+fn history_text(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        value => value.to_string(),
+    }
+}
+
+fn history_task(messages: &[Value]) -> String {
+    messages
+        .iter()
+        .find(|message| message["role"] == "user")
+        .map(|message| history_cut(&history_text(&message["content"]), 500))
+        .unwrap_or_default()
+}
+
+fn history_turn(messages: &[Value]) -> Vec<String> {
+    let mut entries = Vec::new();
+    for message in messages {
+        let role = message["role"].as_str().unwrap_or_default();
+        let content = history_text(&message["content"]);
+        match role {
+            "assistant" => {
+                entries.push(format!("assistant: {}\n", history_cut(&content, 500)));
+                if let Some(calls) = message["tool_calls"].as_array() {
+                    for call in calls {
+                        entries.push(format!(
+                            "call {} {}: {}\n",
+                            history_cut(call["id"].as_str().unwrap_or_default(), 100),
+                            history_cut(call["function"]["name"].as_str().unwrap_or_default(), 100),
+                            history_cut(&history_text(&call["function"]["arguments"]), 500),
+                        ));
+                    }
+                }
+            }
+            "tool" => {
+                // Ordinary replies are working-memory envelopes. Show their
+                // content (or the explicitly incomplete preview), not the key.
+                let stored = serde_json::from_str::<Value>(&content).ok();
+                let reply = stored.as_ref().filter(|v| v.get("memory_key").is_some());
+                let preview = reply.and_then(|v| v["preview"].as_str());
+                let body = reply.and_then(|v| v["content"].as_str()).or(preview).unwrap_or(&content);
+                let failed = is_tool_error(body);
+                entries.push(format!(
+                    "reply {}{}{}: {}\n",
+                    history_cut(message["tool_call_id"].as_str().unwrap_or_default(), 100),
+                    if failed { " [FAILED]" } else { "" },
+                    if preview.is_some() { " [stored preview]" } else { "" },
+                    history_cut(body, 500),
+                ));
+            }
+            "user" => entries.push(format!("user: {}\n", history_cut(&content, 500))),
+            _ => {}
+        }
+    }
+    entries
+}
+
+fn read_run(
+    runs: Option<&crate::durable::RunStore>,
+    loop_id: &str,
+    args: &Map<String, Value>,
+) -> anyhow::Result<String> {
+    let Some(runs) = runs else {
+        return Ok("No run history is available in an in-process loop; its workers have no durable runs.".into());
+    };
+    let args: ReadRunArgs = serde_json::from_value(json!(args))?;
+    let limit = args.limit.unwrap_or(10);
+    anyhow::ensure!((1..=100).contains(&limit), "limit must be between 1 and 100");
+    let (mut output, entries, total) = if let Some(id) = &args.id {
+        anyhow::ensure!(!id.is_empty(), "id must not be empty");
+        let Some(run) = runs.get(id)? else {
+            return Ok("No durable run found for this id. In-process workers have no run history.".into());
+        };
+        anyhow::ensure!(run.name == AGENT_LOOP_NAME, "read_run only reads agent-loop runs; this run is {}", run.name);
+        let records = runs.records(id)?;
+        let messages = history_messages(&records);
+        let header = format!(
+            "Run: {}\nState: {}\nOutcome: {}\nTask: {}\n",
+            history_cut(id, 500),
+            run.state,
+            history_cut(&serde_json::to_string(&run.outcome)?, 500),
+            history_task(messages),
+        );
+        if messages.is_empty() {
+            return Ok(format!(
+                "{header}No transcript records are available: they may have been swept, or no transcript was checkpointed yet."
+            ));
+        }
+        let turns: Vec<_> =
+            messages.iter().enumerate().filter(|(_, m)| m["role"] == "assistant").map(|(i, _)| i).collect();
+        let entries: Vec<_> = turns
+            .iter()
+            .enumerate()
+            .skip(args.offset)
+            .take(limit)
+            .map(|(index, &start)| {
+                let end = turns.get(index + 1).copied().unwrap_or(messages.len());
+                history_turn(&messages[start..end])
+            })
+            .collect();
+        (header, entries, turns.len())
+    } else {
+        anyhow::ensure!(args.entry_offset == 0, "entry_offset requires a run id");
+        let prefix = format!("{loop_id}__sub");
+        let ids: Vec<_> = runs
+            .list_prefix(AGENT_LOOP_NAME, &prefix)?
+            .into_iter()
+            .filter(|id| {
+                id.strip_prefix(&prefix)
+                    .and_then(|tail| tail.strip_suffix("/loop"))
+                    .is_some_and(|key| !key.contains("__sub") && !key.contains('/'))
+            })
+            .collect();
+        let mut entries = Vec::new();
+        for id in ids.iter().skip(args.offset).take(limit) {
+            let Some(run) = runs.get(id)? else { continue };
+            let records = runs.records(id)?;
+            let messages = history_messages(&records);
+            // Admission retains the original user task even after sweeping.
+            let initial = run.input.get("messages").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+            entries.push(vec![format!(
+                "Run: {}\nState: {}\nTask: {}\nOutcome: {}\n{}\n",
+                history_cut(id, 500),
+                run.state,
+                history_task(if messages.is_empty() { initial } else { messages }),
+                history_cut(&serde_json::to_string(&run.outcome)?, 500),
+                if messages.is_empty() {
+                    "No transcript records available (swept or not yet checkpointed)."
+                } else {
+                    ""
+                },
+            )]);
+        }
+        (format!("Worker runs: {}\n", ids.len()), entries, ids.len())
+    };
+    let mut next = args.offset.min(total);
+    for entry in entries {
+        let start = if next == args.offset { args.entry_offset } else { 0 };
+        anyhow::ensure!(start <= entry.len(), "entry_offset exceeds this turn's entries");
+        let heading = if args.id.is_some() { format!("Turn {next}\n") } else { String::new() };
+        let size: usize = entry.iter().skip(start).map(|line| line.chars().count()).sum();
+        // Keep ordinary turns together. Only a turn larger than a page is
+        // continued within the turn, so even a huge parallel round is readable.
+        if next != args.offset && output.chars().count() + heading.chars().count() + size > 7700 {
+            break;
+        }
+        output.push_str(&heading);
+        for (index, line) in entry.into_iter().enumerate().skip(start) {
+            if output.chars().count() + line.chars().count() > 7700 {
+                output.push_str(&format!(
+                    "More in this turn: call read_run with the same id, offset={next}, entry_offset={index}, limit={limit}.\n"
+                ));
+                return Ok(output);
+            }
+            output.push_str(&line);
+        }
+        next += 1;
+    }
+    if next < total {
+        output.push_str(&format!(
+            "More: call read_run with the same id (or no id for workers), offset={next}, limit={limit} (entry_offset=0).\n"
+        ));
+    } else {
+        output.push_str("End of available history.\n");
+    }
+    Ok(output)
 }

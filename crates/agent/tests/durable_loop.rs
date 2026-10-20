@@ -251,3 +251,243 @@ async fn an_activated_agent_loop_runs_and_three_faults_in_a_row_put_the_built_in
     activate(&louder);
     assert!(matches!(run(6).await, FlowResult::Completed(ref v) if v == "v2 hello"));
 }
+
+#[tokio::test]
+async fn a_parent_reads_what_its_durable_worker_did() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
+    let child = "peer:history__sub1.0/loop";
+    let llm = Arc::new(Scripted::new(vec![
+        calls(&[("invoke_sub_agent", json!({"prompt": "check the violet telescope"}))]),
+        calls(&[("search", json!({"q": "violet telescope", "after": "2026-10-19", "sources": ["Habr"]}))]),
+        assistant("worker found three telescopes"),
+        calls(&[("read_run", json!({}))]),
+        calls(&[("read_run", json!({"id": child}))]),
+        assistant("checked the worker's evidence"),
+    ]));
+    let world = Arc::new(World { calls: Mutex::default(), stop: None });
+    let engine = engine(llm.clone(), world.clone());
+    let input = input(&engine, "peer:history").await;
+    let result = create_durable_flows(engine.clone(), db)
+        .run_loop("peer:history/loop", input, &scope(&engine), &CancellationToken::new())
+        .await;
+    assert!(matches!(result, FlowResult::Completed(_)), "{result:?}");
+    assert_eq!(*world.calls.lock().unwrap(), ["search"], "read_run never goes to MCP");
+    assert_eq!(agent::agent::tool_effect(&engine, "read_run"), owf::run::Effect::Read);
+    let seen = llm.seen.lock().unwrap();
+    assert!(seen[1].tools.iter().any(|tool| tool.name == "read_run"), "workers can read history too");
+    let listing = seen[4].messages.last().unwrap()["content"].as_str().unwrap();
+    for expected in [child, "completed", "check the violet telescope", "worker found three telescopes"] {
+        assert!(listing.contains(expected), "{listing}");
+    }
+    let transcript = seen[5].messages.last().unwrap()["content"].as_str().unwrap();
+    for expected in
+        [child, "search", "violet telescope", "2026-10-19", "Habr", "search ok", "worker found three telescopes"]
+    {
+        assert!(transcript.contains(expected), "{transcript}");
+    }
+    assert!(!transcript.contains("You are a focused worker"), "system messages stay hidden");
+}
+
+async fn read_history(engine: &Arc<Engine>, input: &Value, runs: Option<&RunStore>, args: Value) -> Value {
+    agent::agent::loop_tool(
+        engine,
+        &json!({
+            "loop": input["loop"],
+            "call": {"id": "history", "name": "read_run", "arguments": args.to_string()},
+        }),
+        &scope(engine),
+        &CancellationToken::new(),
+        runs,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn read_run_refuses_other_workflows_and_explains_absent_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let runs = RunStore::new(AgentDb::open(dir.path().join("agent.db")).unwrap());
+    runs.admit("other", "digest", "unused", &json!({})).unwrap();
+    runs.admit("empty", "agent-loop", "unused", &json!({})).unwrap();
+    let engine = engine(Arc::new(Scripted::new(vec![])), Arc::new(World { calls: Mutex::default(), stop: None }));
+    let input = input(&engine, "reader").await;
+    let refused = read_history(&engine, &input, Some(&runs), json!({"id": "other"})).await;
+    assert_eq!(refused["failed"], true);
+    assert!(refused["presented"].as_str().unwrap().contains("only reads agent-loop"));
+    let missing = read_history(&engine, &input, Some(&runs), json!({"id": "absent"})).await;
+    assert!(missing["presented"].as_str().unwrap().contains("In-process workers have no run history"));
+    let empty = read_history(&engine, &input, Some(&runs), json!({"id": "empty"})).await;
+    assert!(empty["presented"].as_str().unwrap().contains("No transcript records"));
+    for args in [json!({"limit": 0}), json!({"offset": -1}), json!({"limit": 101}), json!({"id": ""})] {
+        assert_eq!(read_history(&engine, &input, Some(&runs), args).await["failed"], true);
+    }
+}
+
+#[tokio::test]
+async fn an_in_process_loop_reports_no_run_history() {
+    let llm = Arc::new(Scripted::new(vec![calls(&[("read_run", json!({}))]), assistant("done")]));
+    let engine = engine(llm.clone(), Arc::new(World { calls: Mutex::default(), stop: None }));
+    let input = input(&engine, "in-process").await;
+    let result = create_flows(engine.clone())
+        .run_loop("in-process/loop", input, &scope(&engine), &CancellationToken::new())
+        .await;
+    assert!(matches!(result, FlowResult::Completed(_)), "{result:?}");
+    let seen = llm.seen.lock().unwrap();
+    assert!(seen[1].messages.last().unwrap()["content"].as_str().unwrap().contains("No run history is available"));
+}
+
+#[tokio::test]
+async fn read_run_pages_the_longest_checkpoint_and_bounds_text_and_failed_replies() {
+    use owf::durable::{Journal, Record, StepOutcome, TaskResult};
+    let dir = tempfile::tempdir().unwrap();
+    let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
+    let runs = RunStore::new(db);
+    let engine = engine(Arc::new(Scripted::new(vec![])), Arc::new(World { calls: Mutex::default(), stop: None }));
+    let input = input(&engine, "reader_%").await;
+    let id = "reader_%__sub1.0/loop";
+    let mut messages = vec![
+        json!({"role": "system", "content": "hidden instructions"}),
+        json!({"role": "user", "content": "original task"}),
+    ];
+    let lease = runs.start(id, "agent-loop", "unused", &json!({"messages": messages})).unwrap().unwrap();
+    let checkpoint = |messages: Vec<Value>| Record::Task {
+        started_ms: 0,
+        result: Some(TaskResult {
+            context: json!({"messages": messages}),
+            outcome: StepOutcome::Completed { output: Value::Null, flow: owf::model::Flow::Continue },
+        }),
+    };
+    for index in 0..20 {
+        let mut turn = calls(&[("search", json!({"q": "界".repeat(900), "tail": "argument tail"}))]);
+        turn.insert("content".into(), json!(format!("assistant-{index} {} assistant tail", "я".repeat(900))));
+        messages.push(json!(turn));
+        messages.push(json!({"role": "tool", "tool_call_id": "call-0", "content": json!({
+            "memory_key": "tool.example", "content": format!("[tool error] reply-{index} {} reply tail", "🎯".repeat(900)),
+        }).to_string()}));
+    }
+    lease.save("a-longest", &checkpoint(messages.clone())).unwrap();
+    lease.save("z-shorter", &checkpoint(messages[..4].to_vec())).unwrap();
+    lease.finish(&Status::Completed(json!("complete answer"))).unwrap();
+    let page = read_history(&engine, &input, Some(&runs), json!({"id": id, "offset": 1, "limit": 1})).await;
+    let text = page["presented"].as_str().unwrap();
+    for expected in ["Turn 1", "assistant-1", "reply-1", "[FAILED]", "[cut]", "offset=2", "complete answer"] {
+        assert!(text.contains(expected), "{text}");
+    }
+    for absent in ["hidden instructions", "Turn 0", "Turn 2", "argument tail", "assistant tail", "reply tail"] {
+        assert!(!text.contains(absent), "{absent} leaked: {text}");
+    }
+    let mut offset = 0;
+    while offset < 20 {
+        let page = read_history(&engine, &input, Some(&runs), json!({"id": id, "offset": offset, "limit": 100})).await;
+        let text = page["presented"].as_str().unwrap();
+        assert!(text.chars().count() <= 8000, "{} characters", text.chars().count());
+        assert!(page["stored"].is_null(), "bounded replies bypass working-memory previews");
+        let count = text.lines().filter(|line| line.starts_with("Turn ")).count();
+        assert!(count > 0);
+        for index in offset..offset + count {
+            assert!(text.contains(&format!("Turn {index}\n")));
+        }
+        offset += count;
+        if offset < 20 {
+            assert!(text.contains(&format!("offset={offset},")));
+        }
+    }
+    let beyond = read_history(&engine, &input, Some(&runs), json!({"id": id, "offset": 200})).await;
+    assert!(!beyond["presented"].as_str().unwrap().contains("Turn "));
+
+    // Literal prefixes and workflow names keep unrelated runs out of the list.
+    for (other, name) in [
+        ("readerXX__sub2.0/loop", "agent-loop"),
+        ("reader_%__sub3.0/loop", "digest"),
+        ("reader_%__sub1.0__sub1.0/loop", "agent-loop"),
+    ] {
+        runs.admit(other, name, "unused", &json!({})).unwrap();
+    }
+    let list = read_history(&engine, &input, Some(&runs), json!({})).await;
+    assert!(list["presented"].as_str().unwrap().contains("Worker runs: 1"));
+    assert!(list["presented"].as_str().unwrap().contains("original task"));
+    assert_eq!(runs.sweep(0).unwrap(), 2);
+    let swept = read_history(&engine, &input, Some(&runs), json!({"id": id})).await;
+    let text = swept["presented"].as_str().unwrap();
+    assert!(text.contains("complete answer") && text.contains("swept"), "{text}");
+    let list = read_history(&engine, &input, Some(&runs), json!({})).await;
+    assert!(list["presented"].as_str().unwrap().contains("original task"));
+}
+
+#[tokio::test]
+async fn read_run_bounds_worker_lists_and_an_oversized_parallel_turn() {
+    use owf::durable::{Journal, Record, StepOutcome, TaskResult};
+    let dir = tempfile::tempdir().unwrap();
+    let runs = RunStore::new(AgentDb::open(dir.path().join("agent.db")).unwrap());
+    let engine = engine(Arc::new(Scripted::new(vec![])), Arc::new(World { calls: Mutex::default(), stop: None }));
+    let input = input(&engine, "reader").await;
+    let long = "🌱".repeat(1000);
+    let tool_calls: Vec<_> = (0..20).map(|i| ("search", json!({"q": long, "index": i}))).collect();
+    let messages = json!([
+        {"role": "user", "content": long},
+        calls(&[("search", json!({"q": "first"}))]),
+        {"role": "tool", "tool_call_id": "call-0", "content": json!({
+            "memory_key": "tool.long-error", "truncated": true, "preview": "[tool error] a long failure",
+        }).to_string()},
+        calls(&tool_calls),
+        assistant("last turn"),
+    ]);
+    for i in 0..20 {
+        let id = format!("reader__sub1.{i:02}/loop");
+        let lease = runs.start(&id, "agent-loop", "unused", &json!({"messages": messages})).unwrap().unwrap();
+        lease
+            .save(
+                "checkpoint",
+                &Record::Task {
+                    started_ms: 0,
+                    result: Some(TaskResult {
+                        context: json!({"messages": messages}),
+                        outcome: StepOutcome::Completed { output: Value::Null, flow: owf::model::Flow::Continue },
+                    }),
+                },
+            )
+            .unwrap();
+        lease.finish(&Status::Completed(json!(long))).unwrap();
+    }
+    let list = read_history(&engine, &input, Some(&runs), json!({"limit": 100})).await;
+    let text = list["presented"].as_str().unwrap();
+    assert!(text.chars().count() <= 8000);
+    let count = text.lines().filter(|line| line.starts_with("Run: ")).count();
+    assert!(count > 0 && count < 20);
+    assert!(text.contains(&format!("offset={count},")), "{text}");
+    let next = read_history(&engine, &input, Some(&runs), json!({"offset": count, "limit": 1})).await;
+    assert!(next["presented"].as_str().unwrap().contains(&format!("reader__sub1.{count:02}/loop")));
+    let id = "reader__sub1.00/loop";
+    let first = read_history(&engine, &input, Some(&runs), json!({"id": id, "limit": 1})).await;
+    assert!(first["presented"].as_str().unwrap().contains("[FAILED] [stored preview]: [tool error] a long failure"));
+    let mut entry_offset = 0;
+    let mut viewed = String::new();
+    loop {
+        let huge = read_history(
+            &engine,
+            &input,
+            Some(&runs),
+            json!({
+                "id": id, "offset": 1, "entry_offset": entry_offset, "limit": 1,
+            }),
+        )
+        .await;
+        let text = huge["presented"].as_str().unwrap();
+        assert!(text.chars().count() <= 8000);
+        viewed.push_str(text);
+        if !text.contains("More in this turn:") {
+            assert!(text.contains("offset=2,"), "{text}");
+            break;
+        }
+        let next: usize = text.split("entry_offset=").nth(1).unwrap().split(',').next().unwrap().parse().unwrap();
+        assert!(next > entry_offset, "continuations always progress");
+        entry_offset = next;
+    }
+    assert!(entry_offset > 0, "the parallel turn needed more than one page");
+    for index in 0..20 {
+        assert_eq!(viewed.matches(&format!("call call-{index} search:")).count(), 1, "no calls lost or repeated");
+    }
+    let last = read_history(&engine, &input, Some(&runs), json!({"id": id, "offset": 2})).await;
+    assert!(last["presented"].as_str().unwrap().contains("last turn"));
+}

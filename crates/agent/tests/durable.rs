@@ -423,3 +423,27 @@ fn a_swept_run_keeps_its_outcome_and_is_never_resumed() {
     assert!(store.start("old", "w", "x", &json!({})).unwrap().is_none());
     assert!(store.cancel("recent").is_ok_and(|changed| !changed));
 }
+
+#[test]
+fn history_reads_do_not_claim_or_modify_runs_and_prefixes_are_literal() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
+    let runs = RunStore::new(db.clone());
+    let lease = runs.start("a_%/child", "w", "unused", &json!({})).unwrap().unwrap();
+    let record = Record::Timer { deadline_ms: 123 };
+    lease.save("timer", &record).unwrap();
+    for (id, name) in [("aXX/child", "w"), ("a_%/other", "other"), ("a_%/ready", "w")] {
+        runs.admit(id, name, "unused", &json!({})).unwrap();
+    }
+    assert_eq!(runs.list_prefix("w", "a_%/").unwrap(), ["a_%/child", "a_%/ready"]);
+    assert_eq!(runs.records("a_%/child").unwrap().as_slice(), std::slice::from_ref(&record));
+    assert_eq!(runs.get("a_%/child").unwrap().unwrap().state, "running");
+    assert_eq!(runs.get("a_%/ready").unwrap().unwrap().state, "ready");
+    assert_eq!(runs.due().unwrap(), ["aXX/child", "a_%/other", "a_%/ready"]);
+    assert!(runs.records("missing").unwrap().is_empty());
+    lease.finish(&Status::Completed(json!("done"))).unwrap();
+    assert_eq!(runs.records("a_%/child").unwrap(), [record]);
+    assert_eq!(runs.get("a_%/child").unwrap().unwrap().state, "completed");
+    db.conn().execute("UPDATE workflow_records SET record = 'broken'", []).unwrap();
+    assert!(runs.records("a_%/child").is_err(), "corrupt evidence is an error, not an empty history");
+}
