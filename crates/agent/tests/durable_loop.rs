@@ -263,6 +263,7 @@ async fn a_parent_reads_what_its_durable_worker_did() {
         assistant("worker found three telescopes"),
         calls(&[("read_run", json!({}))]),
         calls(&[("read_run", json!({"id": child}))]),
+        calls(&[("read_run", json!({"id": "peer:14__sub1/loop"}))]),
         assistant("checked the worker's evidence"),
     ]));
     let world = Arc::new(World { calls: Mutex::default(), stop: None });
@@ -287,6 +288,8 @@ async fn a_parent_reads_what_its_durable_worker_did() {
         assert!(transcript.contains(expected), "{transcript}");
     }
     assert!(!transcript.contains("You are a focused worker"), "system messages stay hidden");
+    let guessed = seen[6].messages.last().unwrap()["content"].as_str().unwrap();
+    assert!(guessed.contains(child), "a guessed id is answered with the real ones: {guessed}");
 }
 
 async fn read_history(engine: &Arc<Engine>, input: &Value, runs: Option<&RunStore>, args: Value) -> Value {

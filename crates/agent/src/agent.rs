@@ -1174,6 +1174,20 @@ fn history_turn(messages: &[Value]) -> Vec<String> {
     entries
 }
 
+// The durable runs of `loop_id`'s own workers (not their workers' workers).
+fn worker_runs(runs: &crate::durable::RunStore, loop_id: &str) -> anyhow::Result<Vec<String>> {
+    let prefix = format!("{loop_id}__sub");
+    Ok(runs
+        .list_prefix(AGENT_LOOP_NAME, &prefix)?
+        .into_iter()
+        .filter(|id| {
+            id.strip_prefix(&prefix)
+                .and_then(|tail| tail.strip_suffix("/loop"))
+                .is_some_and(|key| !key.contains("__sub") && !key.contains('/'))
+        })
+        .collect())
+}
+
 fn read_run(
     runs: Option<&crate::durable::RunStore>,
     loop_id: &str,
@@ -1188,7 +1202,17 @@ fn read_run(
     let (mut output, entries, total) = if let Some(id) = &args.id {
         anyhow::ensure!(!id.is_empty(), "id must not be empty");
         let Some(run) = runs.get(id)? else {
-            return Ok("No durable run found for this id. In-process workers have no run history.".into());
+            // A guessed id is the usual cause: name the ones that exist.
+            let workers = worker_runs(runs, loop_id)?;
+            return Ok(if workers.is_empty() {
+                "No durable run has this id, and this loop has no worker runs. In-process workers have no run history."
+                    .into()
+            } else {
+                format!(
+                    "No durable run has this id. This loop's worker runs: {}. Use one of these ids; never build one.",
+                    workers.join(", ")
+                )
+            });
         };
         anyhow::ensure!(run.name == AGENT_LOOP_NAME, "read_run only reads agent-loop runs; this run is {}", run.name);
         let records = runs.records(id)?;
@@ -1220,16 +1244,7 @@ fn read_run(
         (header, entries, turns.len())
     } else {
         anyhow::ensure!(args.entry_offset == 0, "entry_offset requires a run id");
-        let prefix = format!("{loop_id}__sub");
-        let ids: Vec<_> = runs
-            .list_prefix(AGENT_LOOP_NAME, &prefix)?
-            .into_iter()
-            .filter(|id| {
-                id.strip_prefix(&prefix)
-                    .and_then(|tail| tail.strip_suffix("/loop"))
-                    .is_some_and(|key| !key.contains("__sub") && !key.contains('/'))
-            })
-            .collect();
+        let ids = worker_runs(runs, loop_id)?;
         let mut entries = Vec::new();
         for id in ids.iter().skip(args.offset).take(limit) {
             let Some(run) = runs.get(id)? else { continue };

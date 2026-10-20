@@ -542,7 +542,7 @@
     "type": "function",
     "function": {
       "name": "read_run",
-      "description": "Read durable agent-loop history. Without id, list this loop's workers with their tasks and outcomes. With id (for example peer:739__sub1.0/loop), show its state, outcome and transcript, skipping system messages. offset/limit page over assistant turns (or worker runs when listing); defaults 0/10, maximum limit 100. Text, arguments and replies are clipped; the whole view is bounded to 8000 characters. Follow next offset for more; an oversized turn also gives entry_offset to continue its remaining calls/replies. In-process runs have no history; finished runs may have had their records swept.",
+      "description": "Read durable agent-loop history. Without id, list this loop's workers with their run ids, tasks and outcomes: take a worker's id from that list, never build one. With id (for example peer:739__sub1.0/loop), show its state, outcome and transcript, skipping system messages. offset/limit page over assistant turns (or worker runs when listing); defaults 0/10, maximum limit 100. Text, arguments and replies are clipped; the whole view is bounded to 8000 characters. Follow next offset for more; an oversized turn also gives entry_offset to continue its remaining calls/replies. In-process runs have no history; finished runs may have had their records swept.",
       "parameters": {
         "type": "object",
         "properties": {
