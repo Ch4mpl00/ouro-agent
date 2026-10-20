@@ -71,11 +71,14 @@ on the next start rather than after the lease expires.
 
 `Supervisor::run_active`'s body is the built-in workflow `signal`
 (`workflows/signal.yaml`): routing, context gathering and the primary loop's options
-are YAML over seven host functions (`supervisor.rs` §2b) that act on the
+are YAML over the signal host functions (`supervisor.rs` §2b) that act on the
 signal the run serves and trace as before. The run is in process and
 untraced itself (the primary loop inside it is the durable part). The
 override + breaker of `agent-loop` is now general (`flows::built_in`,
 `definition`, `record_outcome`; `signal.breaker` in the memory KV).
+The failure report is now its `try`/`catch` too: YAML owns the prompt and
+loop options; `signal_transcript` and `recovery_loop` provide the mechanisms,
+with cancellation/abort/session guards and the original failure preserved.
 Open: the signal workflow can call only its own functions; letting it call
 the general catalog (a model step to classify, an MCP read) needs task spans
 that don't change the signal trace's shape.

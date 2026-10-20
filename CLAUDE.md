@@ -110,6 +110,14 @@ deletion.
    - `skills/<signal.source>.md` (with `skills.default/` fallback) — only for
      transport sources (`telegram`, `peer`, `scheduler`); domain work is delegated to
      a sub-agent with that source's skill.
+
+   The built-in `signal` workflow's `try`/`catch` requests a recovery report
+   through `recovery_loop`, then raises the signal failure again. Its prompt,
+   skills, preset, iteration limit and system context live in YAML;
+   `signal_transcript` reads the primary loop's bounded transcript tail.
+   Rust guards cancellation, aborts and missing sessions, traces the report
+   under `recovery`, and cleans up its loop. Reporting errors cannot replace
+   the signal error. A `signal` override without a catch chooses no report.
 4. Plus a session-context block (local time, tz, watermarks) and the signal's
    `envContext` (per-source env addendum, e.g. default Telegram chat id).
    For `telegram` signals the supervisor also preloads recent chat/topic
@@ -472,7 +480,8 @@ volume — written by the `dreaming` skill when it self-revises).
   workflow with `save_workflow`, dry-runs it with `try_workflow` (real reads
   and model steps, writes only recorded) and describes it in words with a
   sample; the parent activates it once the user confirms.
-- `recovery` — spawned on a failed signal to phrase the failure to the user.
+- `recovery` — requested by the built-in `signal` catch to phrase a failed
+  signal to the user; an activated workflow controls the report policy.
 
 The improver (`crates/evals`) writes an append-only overlay at
 `skills/<name>.patch.md`; the runtime glues it onto the end of the body with

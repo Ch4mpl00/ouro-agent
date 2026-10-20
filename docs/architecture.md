@@ -154,9 +154,10 @@ Telegram.
 
    Failures are handled by what may already have happened. A missing saved
    workflow or one that faulted before any write falls back to the agent loop
-   in the same trace. A saved workflow that faulted after a write goes to a
-   bounded `recovery` agent. Recovery reports the failure and never retries,
-   because something may already have been sent.
+   in the same trace. A saved workflow that faulted after a write, or any
+   other failure, goes to a bounded `recovery` agent. Recovery is requested
+   by the built-in `signal` catch, whose prompt tells it to report without
+   repeating actions because something may already have been sent.
 3. **Gather context; take no action.** For the agent loop the supervisor
    builds:
    - a session context block: local time, time zone, watermarks, and the
@@ -207,9 +208,17 @@ The routing and the context gathering above are the OWF workflow `signal`
 too (`crates/agent/workflows/signal.yaml`, its functions in `supervisor.rs` §2b):
 `signal_session`, `run_saved_workflow`, `signal_input`,
 `recent_activity`, `preselect_skills`, and `primary_loop`, which takes the
-loop's skills, preset and system prompt from the workflow. The agent may
-replace it the same way, under the same kind of breaker; the signal's trace
-keeps its shape either way.
+loop's skills, preset and system prompt from the workflow. The built-in
+`try`/`catch` reads the primary loop's transcript tail through
+`signal_transcript` and calls `recovery_loop` with a YAML-assembled prompt,
+skills (`recovery`), preset (`base`), iteration limit (5) and system context.
+The host skips reporting on cancellation, abort or a missing session. It
+ends the report's `<session id>__recovery` loop and records any reporting
+failure without replacing the signal error. The catch then raises the
+signal failure again, so trace output and the breaker still see a failure.
+The agent may replace `signal` the same way, under the same kind of breaker;
+an override without a catch gets no recovery report. Report spans remain
+children of the signal trace named `recovery`.
 
 The primary loop runs on the `smart` preset (the base preset for scheduler
 fires). It uses the MCP tools plus a set of **synthetic tools** the runtime

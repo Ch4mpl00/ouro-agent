@@ -391,7 +391,7 @@ impl Supervisor {
         Some(self.run_active(signal).await)
     }
     // Runs the workflow `signal` for `signal` (§2b) under the signal's trace;
-    // a failure that is not a cancellation gets a recovery report.
+    // its catch handler decides whether to request a recovery report.
     async fn run_active(self: &Arc<Self>, signal: &PendingSignal) -> anyhow::Result<String> {
         let id = format!("{}:{}", signal.source, signal.id);
         let saved = signal.saved_workflow();
@@ -399,8 +399,7 @@ impl Supervisor {
         trace.update(ContextUpdate::input(signal.content.clone()));
         let state = Arc::new(std::sync::Mutex::new(SignalState::default()));
         let outcome = self.handle(signal, &trace, &state).await;
-        let SignalState { session: context, primary: loop_, span } =
-            std::mem::take(&mut *state.lock().unwrap_or_else(|e| e.into_inner()));
+        let SignalState { primary, span, .. } = std::mem::take(&mut *state.lock().unwrap_or_else(|e| e.into_inner()));
         if let Err(error) = &outcome {
             if let Some(span) = &span {
                 span.end(SpanEnd::error(error.to_string()).with_output(json!({"error":error.to_string()})));
@@ -410,14 +409,8 @@ impl Supervisor {
                 metadata: Some(json!({"error":true}).as_object().unwrap().clone()),
                 ..Default::default()
             });
-            if let Some(context) = context
-                && !self.cancel.is_cancelled()
-                && !is_aborted(error)
-            {
-                self.recover(signal, context, error, loop_.as_ref(), &trace).await;
-            }
         }
-        if span.is_some() {
+        if primary.is_some() || span.is_some() {
             self.engine.end_loop(&id).await;
         }
         trace.end();
@@ -496,41 +489,13 @@ impl Supervisor {
             }
         }
     }
-    async fn recover(
-        &self,
-        signal: &PendingSignal,
-        context: Session,
-        error: &anyhow::Error,
-        original: Option<&Arc<AgentLoop>>,
-        trace: &Arc<dyn Trace>,
-    ) {
-        let span = trace.span(
-            SpanStart::new("recovery", SpanKind::Agent)
-                .metadata(json!({"skill":"recovery"}).as_object().unwrap().clone()),
-        );
-        let id = format!("{}__recovery", context.id);
-        let result=async{
-            let mut opts=LoopOptions::new(&id,context.clone());opts.cancel=self.cancel.clone();opts.parent_id=Some(context.id.clone());opts.skills=vec!["recovery".into()];opts.include_engine_skills=false;opts.preset=crate::models::PresetName::Base;opts.max_iterations=5;opts.trace_scope=Some(span.clone());
-            let mut system=vec![render_context(&context.env)?];if let Some(env)=signal.env_context.as_ref().filter(|s|!s.is_empty()){system.push(env.clone());}opts.system_prompt=Some(system.join("\n\n"));
-            let recovery=self.engine.start_loop(opts).await?;let transcript=if let Some(original)=original{crate::generation::messages_json(&original.messages.lock().await).to_string()}else{"[]".into()};
-            recovery.send(format!("Original signal ({}):\n{}\n\nError: {error}\n\nRecent transcript (may be truncated):\n{}\n\nReport the failure only. Do not repeat the original actions; some may already have succeeded.",signal.source,signal.content,tail_utf16(&transcript,20000))).await
-        }.await;
-        match result {
-            Ok(output) => span.end(SpanEnd::output(output)),
-            Err(error) => {
-                span.end(SpanEnd::error(error.to_string()).with_output(json!({"error":error.to_string()})));
-                eprintln!("[{}] recovery failed: {error}", context.id);
-            }
-        }
-        self.engine.end_loop(&id).await;
-    }
 }
 
 // ── 2b. the signal workflow ──────────────────────────────────────────────
 // How a signal is handled is the OWF workflow `signal` (`workflows/signal.yaml`, or
 // the version the agent activates under that name, guarded by a breaker:
 // flows.rs §4b): the routing, the context the first turn gets, the primary
-// loop's skills and prompt. Its functions here act on the one signal its run
+// loop's skills and prompt, and the failure report. Its functions here act on the one signal its run
 // serves and trace under that signal's trace, as the code before them did.
 
 pub const SIGNAL: &str = include_str!("../workflows/signal.yaml");
@@ -545,11 +510,13 @@ pub const SIGNAL_FUNCTIONS: &[(&str, owf::run::Effect)] = {
         ("recent_activity", Read),
         ("preselect_skills", Read),
         ("primary_loop", Write),
+        ("signal_transcript", Read),
+        ("recovery_loop", Write),
     ]
 };
 
-// What the run made that the supervisor needs after it: the session (for a
-// recovery report), the primary loop and its span.
+// State shared by the workflow functions: the session, the primary loop
+// (for its transcript) and its span (also closed on workflow failure).
 #[derive(Default)]
 struct SignalState {
     session: Option<Session>,
@@ -674,6 +641,68 @@ impl SignalFunctions {
                 let found =
                     preselect_skills(&engine.deps, &text("request"), &text("context"), &loaded, &scope, cancel).await?;
                 Ok(found.map_or(Value::Null, |(names, block)| json!({"names": names, "block": block})))
+            }
+            "signal_transcript" => {
+                let original = self.state().primary.clone();
+                let transcript = if let Some(original) = original {
+                    crate::generation::messages_json(&original.messages.lock().await).to_string()
+                } else {
+                    "[]".into()
+                };
+                Ok(json!(tail_utf16(&transcript, 20000)))
+            }
+            "recovery_loop" => {
+                // These lifecycle guards also apply to an override's catch handler.
+                let context = self.state().session.clone();
+                let aborted = self.errors.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(is_aborted);
+                let Some(context) = context.filter(|_| !cancel.is_cancelled() && !aborted) else {
+                    return Ok(Value::Null);
+                };
+                let error = args["error"]["detail"].as_str().unwrap_or("signal failed");
+                if let Some(primary) = self.state().span.take() {
+                    primary.end(SpanEnd::error(error).with_output(json!({"error": error})));
+                }
+                let span = trace.span(
+                    SpanStart::new("recovery", SpanKind::Agent)
+                        .metadata(json!({"skill":"recovery"}).as_object().unwrap().clone()),
+                );
+                let id = format!("{}__recovery", context.id);
+                // A reporting failure is an observation, never the signal's error.
+                let result = async {
+                    let prompt = args["prompt"].as_str().ok_or_else(|| anyhow::anyhow!("prompt: Required"))?;
+                    let preset = args["preset"].as_str().unwrap_or("base");
+                    let preset = crate::models::PresetName::selectable(preset)
+                        .ok_or_else(|| anyhow::anyhow!("preset: unknown preset {preset}"))?;
+                    let iterations = args["max_iterations"]
+                        .as_u64()
+                        .filter(|n| *n > 0)
+                        .and_then(|n| usize::try_from(n).ok())
+                        .ok_or_else(|| anyhow::anyhow!("max_iterations: Expected positive integer"))?;
+                    let mut opts = LoopOptions::new(&id, context.clone());
+                    opts.cancel = cancel.clone();
+                    opts.parent_id = Some(context.id.clone());
+                    opts.skills = strings(args, "skills");
+                    opts.include_engine_skills = false;
+                    opts.preset = preset;
+                    opts.max_iterations = iterations;
+                    opts.trace_scope = Some(span.clone());
+                    opts.system_prompt = Some(strings(args, "system").join("\n\n"));
+                    engine.start_loop(opts).await?.send(prompt.to_owned()).await
+                }
+                .await;
+                let output = match result {
+                    Ok(output) => {
+                        span.end(SpanEnd::output(output.clone()));
+                        json!({"output": output})
+                    }
+                    Err(error) => {
+                        span.end(SpanEnd::error(error.to_string()).with_output(json!({"error":error.to_string()})));
+                        eprintln!("[{}] recovery failed: {error}", context.id);
+                        json!({"error": error.to_string()})
+                    }
+                };
+                engine.end_loop(&id).await;
+                Ok(output)
             }
             "primary_loop" => {
                 let input = args["input"].as_str().ok_or_else(|| anyhow::anyhow!("input: Required"))?;

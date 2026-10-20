@@ -1,57 +1,87 @@
 document: { dsl: '1.0.4', namespace: agent, name: signal, version: '1.0.0' }
-# How one signal is handled: the saved workflow a scheduled task names, the
-# primary agent loop for other tasks and sources (or a saved workflow
-# handover), with the context gathered for its first turn.
+# How one signal is handled: the saved workflow a scheduled task names, else
+# (or when it hands over) the primary agent loop, with the context gathered
+# for its first turn. Its catch
+# requests a failure report; reporting never retries the original actions.
 # Input: { signal: { id, source, content, env_context, workflow } }.
 do:
-  - session:
-      call: signal_session
-      export: { as: '${ $context + . }' }
-  - saved:
-      if: '${ $context.signal.workflow != null }'
-      call: run_saved_workflow
-      with: { name: '${ $context.signal.workflow }' }
-      export: { as: '${ $context + { handover: .handover } }' }
-  - after_saved:
-      switch:
-        - done: { when: '${ .done == true }', then: end }
-        - on: { then: input }
-  - input:
-      call: signal_input
-      export: { as: '${ $context + { input: . } }' }
-  - activity:
-      if: '${ $context.signal.source == "telegram" or $context.signal.source == "peer" }'
-      call: recent_activity
-      export: { as: '${ $context + { activity: . } }' }
-  - own_skills:
-      # A transport source has a skill of its own; domain work is delegated.
-      set: '${ if $context.signal.source == "peer" or $context.signal.source == "scheduler" then [ $context.signal.source ] else [] end }'
-      export: { as: '${ $context + { own: . } }' }
-  - preselect:
-      call: preselect_skills
-      with:
-        request: '${ $context.signal.content }'
-        context: '${ "Signal source: " + $context.signal.source + "\n\n" + $context.input }'
-        loaded: '${ $context.own + $context.engine_skills }'
-      export: { as: '${ $context + { preselected: . } }' }
-  - primary:
-      call: primary_loop
-      with:
-        input: '${ $context.input }'
-        skills: '${ $context.own }'
-        loaded: '${ $context.own + $context.engine_skills + ($context.preselected.names // []) }'
-        preset: '${ if $context.signal.source == "scheduler" then "base" else "smart" end }'
-        allow_skill_writes: '${ $context.signal.source == "dreaming" }'
-        system: >-
-          ${ [
-            $context.context,
-            $context.activity,
-            ("Signal source: " + $context.signal.source),
-            "Call find_skills only when the task needs something specific that the skills already in your instructions don't cover; the source is only a hint. You own delivery.",
-            $context.preselected.block,
-            (if $context.signal.source == "telegram" then "Delivery: use send_telegram_message for the current signal's chatId and optional messageThreadId. A final assistant message alone is not delivered to Telegram." else null end),
-            $context.signal.env_context,
-            $context.handover
-          ] | map(select(. != null and . != "")) }
+  - handle:
+      try:
+        - session:
+            call: signal_session
+            export: { as: '${ $context + . }' }
+        - saved:
+            if: '${ $context.signal.workflow != null }'
+            call: run_saved_workflow
+            with: { name: '${ $context.signal.workflow }' }
+            export: { as: '${ $context + { handover: .handover } }' }
+        - after_saved:
+            switch:
+              - done: { when: '${ .done == true }', then: end }
+              - on: { then: input }
+        - input:
+            call: signal_input
+            export: { as: '${ $context + { input: . } }' }
+        - activity:
+            if: '${ $context.signal.source == "telegram" or $context.signal.source == "peer" }'
+            call: recent_activity
+            export: { as: '${ $context + { activity: . } }' }
+        - own_skills:
+            # A transport source has a skill of its own; domain work is delegated.
+            set: '${ if $context.signal.source == "peer" or $context.signal.source == "scheduler" then [ $context.signal.source ] else [] end }'
+            export: { as: '${ $context + { own: . } }' }
+        - preselect:
+            call: preselect_skills
+            with:
+              request: '${ $context.signal.content }'
+              context: '${ "Signal source: " + $context.signal.source + "\n\n" + $context.input }'
+              loaded: '${ $context.own + $context.engine_skills }'
+            export: { as: '${ $context + { preselected: . } }' }
+        - primary:
+            call: primary_loop
+            with:
+              input: '${ $context.input }'
+              skills: '${ $context.own }'
+              loaded: '${ $context.own + $context.engine_skills + ($context.preselected.names // []) }'
+              preset: '${ if $context.signal.source == "scheduler" then "base" else "smart" end }'
+              allow_skill_writes: '${ $context.signal.source == "dreaming" }'
+              system: >-
+                ${ [
+                  $context.context,
+                  $context.activity,
+                  ("Signal source: " + $context.signal.source),
+                  "Call find_skills only when the task needs something specific that the skills already in your instructions don't cover; the source is only a hint. You own delivery.",
+                  $context.preselected.block,
+                  (if $context.signal.source == "telegram" then "Delivery: use send_telegram_message for the current signal's chatId and optional messageThreadId. A final assistant message alone is not delivered to Telegram." else null end),
+                  $context.signal.env_context,
+                  $context.handover
+                ] | map(select(. != null and . != "")) }
+      catch:
+        as: failure
+        do:
+          - transcript:
+              call: signal_transcript
+              export: { as: '${ $context + { transcript: . } }' }
+          - report:
+              call: recovery_loop
+              with:
+                error: '${ $failure }'
+                skills: [recovery]
+                preset: base
+                max_iterations: 5
+                system: '${ [ $context.context, $context.signal.env_context ] | map(select(. != null and . != "")) }'
+                prompt: >-
+                  ${ "Original signal (" + $context.signal.source + "):\n" + $context.signal.content
+                    + "\n\nError: " + ($failure.detail // $failure.title // "signal failed")
+                    + "\n\nRecent transcript (may be truncated):\n" + $context.transcript
+                    + "\n\nReport the failure only. Do not repeat the original actions; some may already have succeeded." }
+          - fail:
+              # Keep the original detail; the host retains a function's typed error.
+              raise:
+                error:
+                  type: https://open-workflow-specification.org/spec/1.0.0/errors/runtime
+                  status: 500
+                  title: '${ $failure.title // "Signal failed" }'
+                  detail: '${ $failure.detail // $failure.title // "signal failed" }'
 output:
   as: '${ .output }'

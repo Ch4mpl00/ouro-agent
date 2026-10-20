@@ -716,3 +716,147 @@ async fn an_activated_signal_workflow_handles_signals_until_its_breaker_opens() 
     assert_eq!(model.seen.lock().unwrap().len(), 2);
     supervisor.shutdown().await;
 }
+
+// Recovery policy belongs to the activated signal definition, even though
+// the host keeps the same report span and loop lifecycle.
+#[tokio::test]
+async fn an_activated_signal_override_changes_the_recovery_prompt() {
+    let model = Arc::new(Scripted::new(vec![assistant("reported")]));
+    let (f, _, supervisor) = setup(model.clone());
+    let definition = SIGNAL.replace("Report the failure only.", "Explain this failure in one sentence.");
+    let saved = f.engine.deps.workflows.save("signal", &definition, None).unwrap();
+    agent::flows::tool(
+        &f.engine,
+        "activate_workflow",
+        json!({"name": "signal", "version": saved.version}).as_object().unwrap(),
+    )
+    .unwrap();
+    let saved = f
+        .engine
+        .deps
+        .workflows
+        .save(
+            "broken",
+            r#"
+document: { dsl: '1.0.4', namespace: agent, name: broken, version: '1.0.0' }
+do:
+  - write: { call: t1 }
+  - fail: { raise: { error: { type: 'https://example.com/failure', status: 500, detail: 'original failure' } } }
+"#,
+            None,
+        )
+        .unwrap();
+    f.engine.deps.workflows.activate("broken", saved.version).unwrap();
+    let pending = PendingSignal { payload: Some(json!({"workflow":"broken"})), ..signal("scheduler", 42) };
+    let error = supervisor.run_signal(&pending).await.unwrap_err().to_string();
+    assert!(error.contains("original failure"), "{error}");
+    let seen = model.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    let prompt = seen[0].messages[1]["content"].as_str().unwrap();
+    assert!(prompt.contains("Explain this failure in one sentence."), "{prompt}");
+    assert!(!prompt.contains("Report the failure only."));
+    assert!(prompt.contains("original failure"));
+    assert!(prompt.contains("Recent transcript (may be truncated):\n[]"));
+    let (trace, obs) = f.db.get_trace("scheduler:42").unwrap().unwrap();
+    let recovery = obs.iter().find(|o| o.name == "recovery").unwrap();
+    let root = obs.iter().find(|o| o.parent_observation_id.is_none()).unwrap();
+    assert_eq!(recovery.parent_observation_id.as_deref(), Some(root.id.as_str()));
+    assert_eq!(trace.output["error"], error);
+    let loop_span = obs.iter().find(|o| o.meta("agent_id") == Some(&json!("scheduler:42__recovery"))).unwrap();
+    assert_eq!(loop_span.meta("max_iterations"), Some(&json!(5)));
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn recovery_failure_keeps_the_primary_error_and_transcript() {
+    for invalid_preset in [false, true] {
+        let model = Arc::new(Scripted::new(vec![calls(&[("t1", json!({"marker":"primary transcript marker"}))])]));
+        let (f, _, supervisor) = setup(model.clone());
+        if invalid_preset {
+            let definition = SIGNAL.replace("preset: base", "preset: unknown");
+            let saved = f.engine.deps.workflows.save("signal", &definition, None).unwrap();
+            f.engine.deps.workflows.activate("signal", saved.version).unwrap();
+        }
+        // After one tool round, both the primary and the recovery provider
+        // fail. An invalid recovery preset also exercises setup failure.
+        let error = supervisor.run_signal(&signal("peer", 42)).await.unwrap_err().to_string();
+        assert!(error.contains("script exhausted"), "{error}");
+        let seen = model.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), if invalid_preset { 2 } else { 3 });
+        if !invalid_preset {
+            let prompt = seen.last().unwrap().messages[1]["content"].as_str().unwrap();
+            assert!(prompt.contains("primary transcript marker"), "{prompt}");
+            assert!(prompt.contains("script exhausted"));
+        }
+        let (trace, obs) = f.db.get_trace("peer:42").unwrap().unwrap();
+        assert_eq!(trace.output["error"], error);
+        let recovery = obs.iter().find(|o| o.name == "recovery").unwrap();
+        assert_eq!(recovery.level, "ERROR");
+        if invalid_preset {
+            assert!(recovery.status_message.as_deref().unwrap().contains("unknown preset unknown"));
+        }
+        supervisor.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn a_signal_override_without_a_catch_gets_no_automatic_recovery() {
+    let model = Arc::new(Scripted::new(vec![]));
+    let (f, _, supervisor) = setup(model.clone());
+    let definition = SIGNAL.split("      catch:").next().unwrap().replace("      try:", "      do:");
+    let saved = f.engine.deps.workflows.save("signal", &definition, None).unwrap();
+    f.engine.deps.workflows.activate("signal", saved.version).unwrap();
+    assert!(supervisor.run_signal(&signal("peer", 42)).await.is_err());
+    assert_eq!(model.seen.lock().unwrap().len(), 1);
+    let (_, obs) = f.db.get_trace("peer:42").unwrap().unwrap();
+    assert!(!obs.iter().any(|o| o.name == "recovery"));
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_catch_before_signal_session_cannot_start_recovery() {
+    let model = Arc::new(Scripted::new(vec![]));
+    let (f, _, supervisor) = setup(model.clone());
+    let definition = SIGNAL.replace("call: signal_session", "call: primary_loop");
+    let saved = f.engine.deps.workflows.save("signal", &definition, None).unwrap();
+    f.engine.deps.workflows.activate("signal", saved.version).unwrap();
+    let error = supervisor.run_signal(&signal("peer", 42)).await.unwrap_err().to_string();
+    assert!(error.contains("input: Required"), "{error}");
+    assert!(model.seen.lock().unwrap().is_empty());
+    let (_, obs) = f.db.get_trace("peer:42").unwrap().unwrap();
+    assert!(!obs.iter().any(|o| o.name == "recovery"));
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_abort_without_supervisor_shutdown_gets_no_recovery() {
+    struct Aborting;
+    #[async_trait]
+    impl agent::flows::FlowRun for Aborting {
+        async fn run(
+            &self,
+            _: &str,
+            _: &WorkflowSignal,
+            _: &Session,
+            _: &agent::tracing::Scope,
+            _: &CancellationToken,
+        ) -> agent::flows::FlowResult {
+            agent::flows::FlowResult::Cancelled
+        }
+    }
+    let model = Arc::new(Scripted::new(vec![]));
+    let (f, mcp, _) = setup(model.clone());
+    let supervisor = create_supervisor(
+        f.engine.clone(),
+        EnvDeps { mcp, memory: f.db.clone(), user_email: Some("user@test".into()), telegram_chat_id: None },
+        Arc::new(Aborting),
+    );
+    let pending = PendingSignal { payload: Some(json!({"workflow":"w"})), ..signal("scheduler", 42) };
+    let error = supervisor.run_signal(&pending).await.unwrap_err();
+    assert!(agent::errors::is_aborted(&error), "{error}");
+    assert!(model.seen.lock().unwrap().is_empty());
+    let (_, obs) = f.db.get_trace("scheduler:42").unwrap().unwrap();
+    assert!(!obs.iter().any(|o| o.name == "recovery"));
+    assert!(f.engine.loop_ids().await.is_empty());
+    supervisor.shutdown().await;
+}

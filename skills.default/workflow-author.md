@@ -199,9 +199,19 @@ How a signal is handled is the workflow `signal` the same way: which path
 runs (a scheduled task's saved workflow or the primary loop), the
 context gathered first, the primary loop's skills, preset and system prompt.
 Its functions are `signal_session`, `run_saved_workflow`,
-`signal_input`, `recent_activity`, `preselect_skills` and `primary_loop`;
-`read_workflow("signal")` shows each one's use. It is replaced, activated and
-guarded the same way as `agent-loop`.
+`signal_input`, `recent_activity`, `preselect_skills`, `primary_loop`,
+`signal_transcript` (the primary loop's bounded transcript tail) and
+`recovery_loop`; `read_workflow("signal")` shows each one's use. It is
+replaced, activated and guarded the same way as `agent-loop`.
+
+The built-in `signal` wraps its body in `try`/`catch` and passes the caught
+error and a prompt assembled in YAML to `recovery_loop`, along with skills,
+preset, `max_iterations` and system prompt parts. You can change the report
+policy there. The host skips reporting on cancellation, abort or before
+`signal_session` has run, and a reporting failure does not replace the
+original error. Keep the final `raise` so a reported failure stays a failed
+signal for tracing and the breaker. An override without a catch deliberately
+gets no recovery report; Rust does not add one afterwards.
 
 ## The language
 
