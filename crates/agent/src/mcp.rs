@@ -43,6 +43,10 @@ pub trait Mcp: Send + Sync {
     fn read_only(&self, _name: &str) -> bool {
         false
     }
+    // MCP defaults openWorldHint to true; only an explicit false is closed.
+    fn open_world(&self, _name: &str) -> bool {
+        true
+    }
     async fn call_tool(
         &self,
         name: &str,
@@ -269,6 +273,7 @@ impl Connection {
 pub struct McpClient {
     tools: Vec<ToolDef>,
     read_only: HashSet<String>,
+    closed_world: HashSet<String>,
     open: Open,
     sleep: Sleep,
     // The current session. A replaced one is dropped when the last call
@@ -320,8 +325,14 @@ impl McpClient {
             .filter(|t| t.annotations.as_ref().and_then(|a| a.read_only_hint) == Some(true))
             .map(|t| t.name.to_string())
             .collect();
+        let closed_world = tools
+            .iter()
+            .filter(|t| t.annotations.as_ref().and_then(|a| a.open_world_hint) == Some(false))
+            .map(|t| t.name.to_string())
+            .collect();
         Ok(McpClient {
             read_only,
+            closed_world,
             tools: tool_defs(tools),
             open,
             sleep: options.sleep,
@@ -424,6 +435,10 @@ impl Mcp for McpClient {
 
     fn read_only(&self, name: &str) -> bool {
         self.read_only.contains(name)
+    }
+
+    fn open_world(&self, name: &str) -> bool {
+        !self.closed_world.contains(name)
     }
 
     async fn call_tool(

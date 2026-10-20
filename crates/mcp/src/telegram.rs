@@ -1013,6 +1013,7 @@ struct SendParams {
 impl McpTools {
     #[tool(
         name = "send_telegram_message",
+        annotations(open_world_hint = true),
         title = "Send Telegram message",
         description = "Send a Telegram message via the assistant bot. If chatId is omitted, \
             TELEGRAM_DEFAULT_CHAT_ID env is used. Pass messageThreadId to send into \
@@ -1155,6 +1156,7 @@ struct HistoryParams {
 impl McpTools {
     #[tool(
         name = "edit_telegram_message",
+        annotations(open_world_hint = true),
         title = "Edit Telegram message",
         description = "Edit a previously-sent Telegram message in place. Use to update a bill \
             notification when status changes (e.g. mark as PAID). messageId is the value \
@@ -1189,6 +1191,7 @@ impl McpTools {
 
     #[tool(
         name = "telegram_send_status",
+        annotations(open_world_hint = true),
         title = "Send / update / clear a live status message",
         description = "Show live progress in a SINGLE Telegram message edited in place, \
             instead of posting a new message per step. Call with the same `id` \
@@ -1217,6 +1220,7 @@ impl McpTools {
 
     #[tool(
         name = "start_typing",
+        annotations(open_world_hint = true),
         title = "Start typing indicator (auto-refresh until reply)",
         description = "Show a chat action indicator (typing by default) in a Telegram chat \
             and keep it alive. MCP re-sends the action every ~4s in the \
@@ -1236,6 +1240,7 @@ impl McpTools {
     // before posting an image); start_typing is the self-refreshing one.
     #[tool(
         name = "send_telegram_chat_action",
+        annotations(open_world_hint = true),
         title = "Send a one-shot Telegram chat action (no auto-refresh)",
         description = "Send a single chat action ping (~5s lifespan, no keep-alive). \
             Prefer `start_typing` for the common 'show typing while I work' \
@@ -1256,7 +1261,7 @@ impl McpTools {
 
     #[tool(
         name = "get_telegram_chat_history",
-        annotations(read_only_hint = true),
+        annotations(read_only_hint = true, open_world_hint = false),
         title = "Get Telegram chat history",
         description = "Read the last N messages of a Telegram chat from the local log, in \
             chronological order. Pass threadId to scope to a single forum topic \

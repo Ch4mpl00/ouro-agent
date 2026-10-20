@@ -876,6 +876,15 @@ pub fn tool_effect(engine: &Engine, name: &str) -> owf::run::Effect {
     }
 }
 
+/// Network-capable synthetic adapters are reviewed even when replay-safe.
+/// MCP tools use annotations, never tool-name lists.
+pub fn tool_open_world(engine: &Engine, name: &str) -> bool {
+    if synthetic_definitions().iter().any(|t| t.name == name) {
+        return matches!(name, "code_agent" | "probe_function" | "try_workflow");
+    }
+    engine.deps.mcp.open_world(name)
+}
+
 /// A durable loop's sub-agent: the run store its run goes in, and the key
 /// of the call that starts it (`<turn>.<place in the round>`).
 pub struct ChildRun<'a> {

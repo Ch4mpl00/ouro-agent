@@ -397,10 +397,15 @@ impl owf::run::Functions for Functions {
     }
 
     async fn invoke(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
-        if self.loop_only && !LOOP_FUNCTIONS.contains(&name) && self.effect(name) != Some(Effect::Read) {
+        if self.loop_only
+            && !LOOP_FUNCTIONS.contains(&name)
+            && (self.effect(name) != Some(Effect::Read)
+                || (self.engine.deps.mcp.tools().iter().any(|t| t.name == name)
+                    && self.engine.deps.mcp.open_world(name)))
+        {
             return Err(CallFailure::NotExecuted(invalid(
                 name,
-                "agent-loop writes must use tool so the host guard reviews them",
+                "agent-loop guarded calls must use tool so the host guard reviews them",
             )));
         }
         if crate::supervisor::SIGNAL_FUNCTIONS.iter().any(|f| f.0 == name) {
@@ -444,8 +449,13 @@ impl owf::run::Functions for Functions {
     }
 
     async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError> {
-        if self.loop_only && !LOOP_FUNCTIONS.contains(&name) && self.effect(name) != Some(Effect::Read) {
-            return Err(invalid(name, "agent-loop writes must use tool so the host guard reviews them"));
+        if self.loop_only
+            && !LOOP_FUNCTIONS.contains(&name)
+            && (self.effect(name) != Some(Effect::Read)
+                || (self.engine.deps.mcp.tools().iter().any(|t| t.name == name)
+                    && self.engine.deps.mcp.open_world(name)))
+        {
+            return Err(invalid(name, "agent-loop guarded calls must use tool so the host guard reviews them"));
         }
         let span = self.spans.scope(info.reference);
         let label = info.reference.rsplit('/').next().unwrap_or(name);
@@ -1423,7 +1433,7 @@ pub async fn run_loop_here(
 fn require_loop_guard(name: &str, wf: &owf::model::Workflow) -> anyhow::Result<()> {
     anyhow::ensure!(
         name != crate::agent::AGENT_LOOP_NAME || owf::model::call_sites(wf).iter().any(|s| s.function == "guard"),
-        "agent-loop requires a `call: guard` task before its tool round so every write is reviewed; the host enforces this even for older overrides"
+        "agent-loop requires a `call: guard` task before its tool round so every write and open-world read is reviewed; the host enforces this even for older overrides"
     );
     Ok(())
 }

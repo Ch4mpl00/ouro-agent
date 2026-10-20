@@ -241,6 +241,7 @@ struct NextSignalResult {
 impl McpTools {
     #[tool(
         name = "get_next_signal",
+        annotations(open_world_hint = false),
         title = "Get the next pending signal",
         description = "Atomically pop the oldest pending signal from the MCP queue. \
             Returns `{ signal, pendingAfter }`. The signal carries `content` \
@@ -265,7 +266,7 @@ impl McpTools {
 
     #[tool(
         name = "wait_for_signal",
-        annotations(read_only_hint = true),
+        annotations(read_only_hint = true, open_world_hint = false),
         title = "Wait for a signal",
         description = "Supervisor plumbing: blocks until the queue holds at least \
             one pending signal, or `timeoutMs` passes (default 25000, max \
@@ -326,7 +327,7 @@ struct ListSignalsResult {
 impl McpTools {
     #[tool(
         name = "list_signals",
-        annotations(read_only_hint = true),
+        annotations(read_only_hint = true, open_world_hint = false),
         title = "List past signals",
         description = "Read-only view of past signals (does not pop or mutate the queue). \
             Optional filters: `since` (ISO timestamp, returns signals created \

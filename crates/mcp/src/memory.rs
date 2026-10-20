@@ -2284,7 +2284,8 @@ impl McpTools {
     // defeated archive as a discovery boundary.
     #[tool(
         name = "recall",
-        annotations(read_only_hint = true),
+        // The query is sent to the external embedding provider.
+        annotations(read_only_hint = true, open_world_hint = true),
         title = "Search everything the agents remember",
         description = "Semantic search across ALL shared memory — project documents and \
             standalone facts alike. Use it whenever the user refers to something \
@@ -2311,6 +2312,7 @@ impl McpTools {
 
     #[tool(
         name = "remember",
+        annotations(open_world_hint = true),
         title = "Store a standalone fact",
         description = "Persist a freeform fact the user asked you to remember (\"remember that …\"). \
             For anything with ongoing progress use a project document instead — a \
@@ -2329,7 +2331,7 @@ impl McpTools {
 
     #[tool(
         name = "get_fact",
-        annotations(read_only_hint = true),
+        annotations(read_only_hint = true, open_world_hint = false),
         title = "Read one fact in full",
         description = "Load a fact by id — the read half of a `fact:<id>` ref returned by recall."
     )]
@@ -2343,6 +2345,7 @@ impl McpTools {
 
     #[tool(
         name = "update_fact",
+        annotations(open_world_hint = true),
         title = "Correct a fact or retire it",
         description = "Change a fact's text, tags or lifecycle state. Nothing is ever deleted: \
             mark a finished or obsolete item `done` / `archived` and it drops out of \
@@ -2361,7 +2364,7 @@ impl McpTools {
 
     #[tool(
         name = "list_memory",
-        annotations(read_only_hint = true),
+        annotations(read_only_hint = true, open_world_hint = false),
         title = "List projects, or the documents in one",
         description = "Without `project`: every project, plus every journal stream with its \
             capacity and size. With it: that project's documents, \
@@ -2385,6 +2388,7 @@ impl McpTools {
 
     #[tool(
         name = "create_project",
+        annotations(open_world_hint = false),
         title = "Start a new project",
         description = "Create an empty project — a folder of markdown documents with progress, \
             e.g. preparing for an interview on a topic. Check list_memory first; \
@@ -2400,7 +2404,7 @@ impl McpTools {
 
     #[tool(
         name = "read_doc",
-        annotations(read_only_hint = true),
+        annotations(read_only_hint = true, open_world_hint = false),
         title = "Read a project document",
         description = "Return a document's full markdown plus its `version`. You need that \
             version to patch it, and the text has to be fresh or your quoted \
@@ -2413,6 +2417,7 @@ impl McpTools {
 
     #[tool(
         name = "append_doc",
+        annotations(open_world_hint = true),
         title = "Add text to the end of a document (safe default)",
         description = "Append to a document, or to one section of it. THE PREFERRED WRITE: it \
             cannot destroy existing text and needs no prior read or version.\n\n\
@@ -2433,6 +2438,7 @@ impl McpTools {
 
     #[tool(
         name = "patch_doc",
+        annotations(open_world_hint = true),
         title = "Change existing text in a document",
         description = "Apply search/replace edits. Each `old` must appear EXACTLY ONCE — copy \
             it verbatim from a fresh read_doc, including punctuation, dashes and \
@@ -2452,6 +2458,7 @@ impl McpTools {
 
     #[tool(
         name = "write_doc",
+        annotations(open_world_hint = true),
         title = "Create a document, or replace one wholesale",
         description = "Create a new document, or overwrite an existing one entirely. THE ONLY \
             OP THAT CAN LOSE CONTENT — prefer append_doc for additions and \
@@ -2482,7 +2489,7 @@ impl McpTools {
 
     #[tool(
         name = "doc_history",
-        annotations(read_only_hint = true),
+        annotations(read_only_hint = true, open_world_hint = false),
         title = "Who changed a document, when and why",
         description = "List a document's patches, newest first: patch id, kind, actor, the \
             rationale recorded at the time, and the versions it moved between. \
@@ -2501,6 +2508,7 @@ impl McpTools {
 
     #[tool(
         name = "revert_patch",
+        annotations(open_world_hint = true),
         title = "Undo a recorded change",
         description = "Undo one patch from doc_history. The newest patch always reverts \
             exactly. An older one is undone in place when later patches left its \
@@ -2521,6 +2529,7 @@ impl McpTools {
 
     #[tool(
         name = "journal_append",
+        annotations(open_world_hint = false),
         title = "Add a record to a journal stream",
         description = "Append one immutable entry to a journal stream — operational records \
             read back by recency, like the last digests sent or a run log. Not \
@@ -2554,7 +2563,7 @@ impl McpTools {
 
     #[tool(
         name = "journal_tail",
-        annotations(read_only_hint = true),
+        annotations(read_only_hint = true, open_world_hint = false),
         title = "Read the newest records of a journal stream",
         description = "Return the last `n` entries of a stream, newest first. A stream nobody \
             has written to reads as an empty list, not an error."

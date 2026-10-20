@@ -94,6 +94,34 @@ fn all_shipped_skills_pass_the_agents_startup_validation_against_prods_mcp_surfa
                 "wait_for_signal",
             ]
         );
+        let mut open_world: Vec<&str> = own.iter().map(String::as_str).filter(|t| mcp.open_world(t)).collect();
+        open_world.sort();
+        assert_eq!(
+            open_world,
+            [
+                "add_note",
+                "append_doc",
+                "download_gmail_attachment",
+                "edit_telegram_message",
+                "fetch_article",
+                "fetch_url",
+                "find_notes",
+                "list_monobank_transactions",
+                "list_nashdom_mails",
+                "list_userbot_dialogs",
+                "patch_doc",
+                "recall",
+                "remember",
+                "revert_patch",
+                "search_news",
+                "send_telegram_chat_action",
+                "send_telegram_message",
+                "start_typing",
+                "telegram_send_status",
+                "update_fact",
+                "write_doc",
+            ]
+        );
         let gateway: Value =
             serde_json::from_str(&std::fs::read_to_string(repo.join("crates/mcp/gateway.config.json")).unwrap())
                 .unwrap();

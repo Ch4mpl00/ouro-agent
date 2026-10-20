@@ -243,6 +243,7 @@ struct RepliesResult {
 impl McpTools {
     #[tool(
         name = "ask_ouro",
+        annotations(open_world_hint = false),
         title = "Send a message to ouro",
         description = "Send a message to ouro, the user's personal agent, which acts \
             on it with the user's tools and answers in the thread. Omit `threadId` \
@@ -258,7 +259,7 @@ impl McpTools {
 
     #[tool(
         name = "read_replies",
-        annotations(read_only_hint = true),
+        annotations(read_only_hint = true, open_world_hint = false),
         title = "Read ouro's replies",
         description = "Ouro's replies in a thread after `afterId`, oldest first, as \
             `{ threadId, replies: [{ id, text, created_at }] }`. Waits up to \
@@ -310,6 +311,7 @@ struct ThreadResult {
 impl McpTools {
     #[tool(
         name = "reply_to_peer",
+        annotations(open_world_hint = false),
         title = "Reply to a peer agent",
         description = "Answer another agent in its thread — the `threadId` a `peer` \
             signal names. The peer reads it with read_replies. Returns `{ ok, \
@@ -324,7 +326,7 @@ impl McpTools {
 
     #[tool(
         name = "get_peer_thread",
-        annotations(read_only_hint = true),
+        annotations(read_only_hint = true, open_world_hint = false),
         title = "Read a peer thread",
         description = "The whole conversation in a peer thread, oldest first: \
             `{ threadId, messages: [{ id, direction ('in' from the peer, 'out' \

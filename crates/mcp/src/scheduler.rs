@@ -212,7 +212,7 @@ fn upcoming_count(recurring: bool) -> usize {
 impl McpTools {
     #[tool(
         name = "list_scheduled_tasks",
-        annotations(read_only_hint = true),
+        annotations(read_only_hint = true, open_world_hint = false),
         title = "List scheduled tasks",
         description = "Show every task that may still fire — recurring tasks (always) and \
             one-shots that haven't been triggered yet. Each row includes the \
@@ -248,7 +248,7 @@ impl McpTools {
 
     #[tool(
         name = "get_timezone",
-        annotations(read_only_hint = true),
+        annotations(read_only_hint = true, open_world_hint = false),
         title = "Get configured timezone",
         description = "Return the IANA timezone driving cron evaluation and digest \
             schedule decisions. Defaults to UTC when unset."
@@ -260,6 +260,7 @@ impl McpTools {
 
     #[tool(
         name = "set_timezone",
+        annotations(open_world_hint = false),
         title = "Set the configured timezone",
         description = "Update the IANA timezone (e.g. 'Europe/Kiev', 'America/New_York', \
             'UTC'). Takes effect immediately — the agent's next scheduler tick, \

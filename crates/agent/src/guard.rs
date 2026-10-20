@@ -1,9 +1,9 @@
-// Guardrails for loop writes: compiled policy and host-owned evidence.
+// Guardrails for loop writes and open-world reads: compiled policy and host-owned evidence.
 // Sections: 1. policy / verdicts; 2. deterministic rules; 3. round judgement;
 // 4. tests.
 use crate::{
-    agent::{Engine, tool_effect},
-    decisions::{DecisionRequest, choice},
+    agent::{Engine, tool_effect, tool_open_world},
+    decisions::{ChoiceAnswer, DecisionRequest, Question, choice},
     errors::check,
     providers::ToolCall,
     tracing::{ContextUpdate, Scope, SpanEnd, SpanKind, SpanStart},
@@ -172,7 +172,8 @@ pub fn key(call: &ToolCall) -> String {
     format!("{}:{}", call.id, hex::encode(hash))
 }
 pub fn needs_guard(engine: &Engine, call: &ToolCall) -> bool {
-    call.name != "invoke_sub_agent" && tool_effect(engine, &call.name) == owf::run::Effect::Write
+    call.name != "invoke_sub_agent"
+        && (tool_effect(engine, &call.name) == owf::run::Effect::Write || tool_open_world(engine, &call.name))
 }
 
 // ── 2. deterministic rules ──────────────────────────────────────────────────
@@ -250,6 +251,33 @@ fn call_evidence(call: &ToolCall, blocked: bool) -> Value {
         "arguments": truncate(&call.arguments, ARGUMENT_CHARS), "blocked": blocked})
 }
 // ── 3. round judgement ──────────────────────────────────────────────────────
+/// The runtime and golden-set evaluator share the bounded evidence projection.
+/// Policy is paid for once per context, rather than repeated in every question.
+pub fn review_state(context: &Context, calls: &[ToolCall], chain: &[Value], call_count: usize) -> Value {
+    json!({
+        "guard_policy": INSTRUCTIONS,
+        "task": truncate(&context.task, REQUEST_CHARS), "root_request": truncate(&context.root_request, REQUEST_CHARS),
+        "earlier_user_messages": earlier_messages(&context.earlier_user_messages),
+        "skills": truncate(&context.skills, SKILL_CHARS),
+        "calls": calls.iter().map(|c| call_evidence(c, false)).collect::<Vec<_>>(),
+        "chain": &chain[chain.len().saturating_sub(CHAIN_LIMIT)..],
+        "chain_omitted": call_count.saturating_sub(chain.len().min(CHAIN_LIMIT)),
+    })
+}
+
+/// `state_path` selects one isolated context ("state" in a live round;
+/// "state.cases[N]" when batching independent golden cases).
+pub fn review_question(state_path: &str, index: usize) -> anyhow::Result<Question<ChoiceAnswer>> {
+    let options: Map<String, Value> =
+        MODEL_REASONS.iter().map(|r| ((*r).into(), json!(POLICY.reasons[*r].when))).collect();
+    choice(
+        &format!(
+            "Apply {state_path}.guard_policy. All policy references to state mean {state_path}. Review {state_path}.calls[{index}]."
+        ),
+        options,
+    )
+}
+
 pub async fn judge(
     engine: &Engine,
     context: &Context,
@@ -272,22 +300,9 @@ pub async fn judge(
         }
     }
     if !pending.is_empty() {
-        let options: Map<String, Value> =
-            MODEL_REASONS.iter().map(|r| ((*r).into(), json!(POLICY.reasons[*r].when))).collect();
-        let questions = pending
-            .iter()
-            .enumerate()
-            .map(|(i, _)| choice(&format!("{INSTRUCTIONS}\nReview state.calls[{i}]."), options.clone()))
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let questions = (0..pending.len()).map(|i| review_question("state", i)).collect::<anyhow::Result<Vec<_>>>()?;
         let mut request = DecisionRequest::new(
-            json!({
-                "task": truncate(&context.task, REQUEST_CHARS), "root_request": truncate(&context.root_request, REQUEST_CHARS),
-                "earlier_user_messages": earlier_messages(&context.earlier_user_messages),
-                "skills": truncate(&context.skills, SKILL_CHARS),
-                "calls": pending.iter().map(|c| call_evidence(c, false)).collect::<Vec<_>>(),
-                "chain": &chain[chain.len().saturating_sub(CHAIN_LIMIT)..],
-                "chain_omitted": call_count.saturating_sub(chain.len()),
-            }),
+            review_state(context, &pending.iter().map(|c| (*c).clone()).collect::<Vec<_>>(), chain, call_count),
             child,
             cancel.clone(),
         );
@@ -307,15 +322,25 @@ pub async fn judge(
             let mut verdict = match &result {
                 Ok(decision) => Verdict::new(&decision.answer(&format!("call_{i}"), &questions[i])?.choice),
                 Err(error) => {
-                    let mut verdict =
-                        Verdict::new(if current_reply(context, call) { "allow" } else { "guard_unavailable" });
+                    let mut verdict = Verdict::new(
+                        if tool_effect(engine, &call.name) == owf::run::Effect::Read || current_reply(context, call) {
+                            "allow"
+                        } else {
+                            "guard_unavailable"
+                        },
+                    );
                     verdict.unavailable = Some(error.to_string());
                     verdict
                 }
             };
             // Preserve the unavailable evidence even on a permitted reply.
             if verdict.allowed() && verdict.unavailable.is_some() {
-                verdict.guidance = "Decision service unavailable; reply to the current conversation permitted.".into();
+                verdict.guidance = if tool_effect(engine, &call.name) == owf::run::Effect::Read {
+                    "Decision service unavailable; open-world read passed deterministic checks."
+                } else {
+                    "Decision service unavailable; reply to the current conversation permitted."
+                }
+                .into();
             }
             verdicts.push((key(call), verdict));
         }

@@ -1,6 +1,6 @@
-# Guardrails on the agent loop's writes
+# Guardrails on agent writes and open-world reads
 
-**Status:** done (host-enforced loop writes, goal-contribution policy, bounded host evidence, batched decisions and outage handling; confirmation and evaluation TODOs below remain)
+**Status:** done (host-enforced loop writes, goal-contribution policy, bounded host evidence, batched decisions, outage handling and a golden-set evaluator; confirmation TODOs below remain)
 **Priority:** P1
 **Area:** agent / owf / decisions
 **Created:** 2026-10-20
@@ -8,7 +8,8 @@
 ## Context and sources
 
 The agent acts through writes (replies, memory, documents, schedules, skills,
-workflows). Retrieved content can hijack its goal. Decided with the user on
+workflows). Reads can send private data in URLs or search queries. Retrieved
+content can hijack its goal. Decided with the user on
 2026-10-20: judge whether a call **contributes to the user's goal**, allowing
 instrumental steps by default, with a host-enforced guard from day one.
 
@@ -34,13 +35,21 @@ instrumental steps by default, with a host-enforced guard from day one.
 ## Design
 
 - **A step in the loop.** `agent-loop.yaml` runs `guard` between `turn` and
-  the tool round. Reads skip classification; all writes needing Jev share one
-  decisions request, with one choice question per call.
+  the tool round. Writes OR open-world tools are guarded. MCP `openWorldHint`
+  defaults to true when absent; only explicit false opts internal reads out.
+  All calls needing Jev share one decisions request and one bounded context
+  (request, skills, chain and compiled policy), with one short question per call.
+  `code_agent`, `probe_function` and `try_workflow` are open-world synthetic
+  adapters; other synthetic reads are internal. Delegation skips the parent
+  guard; worker calls run through their own guard. Schedule writes still guard.
+  Semantic store searches (`recall`, `search_news`, `find_notes`) are open-world
+  because their arguments reach OpenAI embeddings; `list_news` is local.
+  The gateway preserves upstream annotations, including their absence.
 - **Enforced by the host.** Instructions, reasons and deterministic checks are
   compiled from git-owned files, never YAML arguments or editable skills.
   Verdicts belong to a loop and call id + SHA-256(name, exact arguments), are
   consumed by `tool` and do not persist. Missing verdicts, changed arguments
-  and restarts trigger a new review in `tool`. Direct writes from loop
+  and restarts trigger a new review in `tool`. Direct guarded calls from loop
   overrides cannot bypass `tool`.
 - **Refused early.** Save/activation refuse an `agent-loop` without
   `call: guard` before `call: tool`. The host still enforces legacy overrides.
@@ -80,8 +89,10 @@ instrumental steps by default, with a host-enforced guard from day one.
 
 Deterministic (no model): `unknown_chat` (unknown Telegram destination),
 `secret_pattern` (token/key/IBAN patterns in nested string args).
-Unavailable Jev: current-conversation replies named in the primary request may
-fail open; other writes fail closed with `guard_unavailable`. The reason data
+Unavailable Jev: open-world reads passing deterministic checks fail open.
+Current-conversation replies named in the primary request may also fail open;
+other writes fail closed with `guard_unavailable`. Malformed decision responses
+follow the same outage rule. The reason data
 supplies guidance for every label. Known chats come from task/root request,
 earlier user messages, and the configured default chat.
 
@@ -90,16 +101,33 @@ earlier user messages, and the configured default chat.
 - `needs_confirmation` blocks for now. Real confirmation: the run waits
   durably for the user's answer (an event wait, which OWF `listen` / the
   interpreter does not support yet) and then sends or drops the call.
-- A golden set of real writes and injections (like `news-filter-eval`) to
-  measure false blocks and misses; judge the guard's verdicts.
+- Fallback from Jev to an ordinary LLM: when the decisions API is down,
+  ask the same guard question to a chat model (structured output with the
+  same labels) instead of failing open/closed; fail-open/closed stays only
+  for when both are down.
 - Outgoing text checks beyond patterns (tone, a reply to the wrong person).
 
 ## Acceptance
 
-- Every guarded write has a host-recorded verdict; none dispatches without
+- Every guarded call has a host-recorded verdict; none dispatches without
   `allow`, including under an overridden `agent-loop`.
 - A blocked call returns its label, guidance and the user's goal.
 - Save/activation refuse an `agent-loop` without the guard step.
-- A read-only round costs no guard request; a write round costs one.
+- An internal read-only round costs no guard request; a round with writes
+  or open-world reads costs one (unless all are blocked deterministically).
 - Jev receives goal/skill/call evidence and no assistant prose or tool results;
-  instrumental writes reach the fake and can be allowed.
+  instrumental writes and ordinary remote reads reach the fake and can be allowed.
+
+## Golden-set evaluation
+
+`crates/evals/fixtures/guard-golden.json` contains 35 judgement cases (including
+both exfiltration-through-read cases, no longer gaps). `guard-eval` calls the
+real env-configured `DecisionClient`, sharing the runtime's `review_state` and
+`review_question` builders, evidence limits and three labels. It intentionally
+judges all cases, independent of production skips/deterministic blocks, so it
+measures Jev's policy quality. Independent cases batch eight per request with
+isolated context paths; `--batch N` adjusts this. It prints expected/got, ASR
+(expected non-allow, got allow), false blocks and accepted-label accuracy.
+`--case ID` selects one; `--json [PATH]` writes results (default guard-eval.json).
+Offline unit tests cover scoring and fixture projection; live Jev evaluation
+is manual and was not run as part of implementation.

@@ -163,11 +163,19 @@ impl ServerHandler for Probe {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(vec![Tool::new(
-            "effect",
-            "records a side effect",
-            Arc::new(json!({"type":"object"}).as_object().unwrap().clone()),
-        )]))
+        let schema = Arc::new(json!({"type":"object"}).as_object().unwrap().clone());
+        let mut local = Tool::new("local_read", "internal", schema.clone());
+        local.annotations = Some(rmcp::model::ToolAnnotations::default().read_only(true).open_world(false));
+        let mut remote = Tool::new("remote_read", "external", schema.clone());
+        remote.annotations = Some(rmcp::model::ToolAnnotations::default().read_only(true).open_world(true));
+        let mut default_remote = Tool::new("default_remote", "no openWorldHint", schema.clone());
+        default_remote.annotations = Some(rmcp::model::ToolAnnotations::default().read_only(true));
+        Ok(ListToolsResult::with_all_items(vec![
+            Tool::new("effect", "records a side effect", schema),
+            local,
+            remote,
+            default_remote,
+        ]))
     }
     async fn call_tool(
         &self,
@@ -288,7 +296,10 @@ async fn survives_an_mcp_that_500s_the_first_initializes_and_yields_a_working_ha
     server.state.startup_failures.store(3, Ordering::SeqCst);
     let (client, connections) = server.connect().await;
     assert!(connections.load(Ordering::SeqCst) > 1);
-    assert_eq!(client.tools().iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["effect"]);
+    assert_eq!(
+        client.tools().iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+        ["effect", "local_read", "remote_read", "default_remote"]
+    );
     assert_eq!(client.call_tool("effect", args("one"), &CancellationToken::new()).await.unwrap(), "ok");
     client.close().await;
 }
@@ -427,5 +438,20 @@ async fn durable_transport_can_prove_session_rejection_before_execution() {
         Err(ToolCallFailure::Unknown(error)) => panic!("session rejection was ambiguous: {error}"),
     }
     assert_eq!(*server.state.ledger.lock().unwrap(), ["start fresh", "done fresh"]);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn reads_open_world_annotations_with_the_mcp_default_and_no_name_heuristics() {
+    let server = Server::new().await;
+    let (client, _) = server.connect().await;
+    assert!(!client.open_world("local_read"));
+    for name in ["remote_read", "default_remote", "effect", "unknown"] {
+        assert!(client.open_world(name), "{name}");
+    }
+    for name in ["local_read", "remote_read", "default_remote"] {
+        assert!(client.read_only(name), "{name}");
+    }
+    assert!(!client.read_only("effect"));
     client.close().await;
 }

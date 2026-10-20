@@ -185,7 +185,7 @@ Telegram.
 ### The agent loop
 
 Every agent loop is a run of the OWF workflow `agent-loop`
-(`crates/agent/workflows/agent-loop.yaml`): a turn (`agent_turn`), a write review (`guard`), the round's
+(`crates/agent/workflows/agent-loop.yaml`): a turn (`agent_turn`), an action review (`guard`), the round's
 calls in parallel (`tool`, one call by name; a write is sent at most once),
 then the settlement (`agent_settle`: `finish`, the replies, the working
 memory). The transcript and the working memory travel in the run's context,
@@ -198,12 +198,16 @@ joins it rather than starting another. Recovery runs the same workflow in
 process. The records of runs that ended more than 7 days ago are swept.
 
 The host guard (`guard.rs`, compiled policy in `crates/agent/guard/`) reviews
-all writes of a round in one Jev decisions request, after deterministic
-chat and secret checks. Reads, working memory, `finish` and delegation skip
-review; workers guard their own writes. A verdict belongs to the loop, call
+all writes and open-world reads of a round in one Jev decisions request, after
+deterministic chat and secret checks. MCP `openWorldHint` defaults to true when
+absent; internal reads explicitly declare false. `code_agent`, `probe_function`
+and `try_workflow` can reach the network and are reviewed. Other synthetic
+reads, working memory, `finish` and delegation skip review; workers guard
+their own calls. The request shares one bounded context and compiled policy
+across short per-call questions. A verdict belongs to the loop, call
 id and SHA-256 of the exact tool name and argument bytes. `tool` requires an
 allow verdict and reviews again when one is missing, including after restart
-or when an override changes arguments. Overrides cannot call writes directly
+or when an override changes arguments. Overrides cannot call guarded MCP tools directly
 to bypass `tool`. A block returns `[guard] blocked: <label> — <guidance>. The user's goal: <request>` as
 a failed tool result; `finish` in that round cannot end the loop.
 
@@ -230,9 +234,16 @@ are deterministic labels; an outage uses `guard_unavailable`.
 Known Telegram targets come from those requests, earlier user messages and
 the session's configured default chat (`TELEGRAM_DEFAULT_CHAT_ID`); `TELEGRAM_TOPICS_JSON` lists threads
 within that chat, not additional chats. Jev outages permit replies only to a
-conversation named in the primary request; other writes fail closed. These
+conversation named in the primary request; open-world reads passing deterministic
+checks also fail open. Other writes fail closed. Malformed responses use the
+same outage rules. These
 checks cover agent loops; user-approved saved workflows retain their own
-write semantics. Confirmation reasons currently block and ask the model to
+write semantics. `guard-eval` batches the 35 checked-in golden cases through the
+same policy/evidence builders and the real env-configured decisions client,
+reporting ASR, false blocks and accepted-label accuracy; live evaluation is manual.
+Semantic store searches (`recall`, `search_news`, `find_notes`) reach OpenAI
+embeddings and are marked open-world; `list_news` only reads stored rows. The
+gateway preserves upstream annotations unchanged. Confirmation reasons currently block and ask the model to
 consult the user; durable confirmation waits remain future work.
 
 The agent can read the loop (`read_workflow("agent-loop")`), save its own
