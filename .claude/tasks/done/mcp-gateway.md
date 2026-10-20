@@ -89,6 +89,6 @@ Steady state: three small edits (config, secret, skill) and a deploy.
 - OAuth upstreams need a persisted auth flow; out of scope.
 - An upstream down at MCP boot is skipped until MCP restarts, and a skill that
   names its tools then fails the agent's boot validation
-  (`../open-findings-from-tests.md`).
+  (#42).
 - Tavily is enabled only in the `gaia` skill, which serves a dropped benchmark;
   pick the skill(s) that should search the web deliberately.

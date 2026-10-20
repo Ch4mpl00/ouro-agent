@@ -1,6 +1,6 @@
 # Guardrails on agent writes and open-world reads
 
-**Status:** done (host-enforced loop writes, goal-contribution policy, bounded host evidence, batched decisions, outage handling and a golden-set evaluator; confirmation TODOs below remain)
+**Status:** done (host-enforced loop writes, goal-contribution policy, bounded host evidence, batched decisions, outage handling and a golden-set evaluator; open work in issues #47–#50)
 **Priority:** P1
 **Area:** agent / owf / decisions
 **Created:** 2026-10-20
@@ -98,16 +98,10 @@ follow the same outage rule. The reason data
 supplies guidance for every label. Known chats come from task/root request,
 earlier user messages, and the configured default chat.
 
-## TODO
+## Open work
 
-- `needs_confirmation` blocks for now. Real confirmation: the run waits
-  durably for the user's answer (an event wait, which OWF `listen` / the
-  interpreter does not support yet) and then sends or drops the call.
-- Fallback from Jev to an ordinary LLM: when the decisions API is down,
-  ask the same guard question to a chat model (structured output with the
-  same labels) instead of failing open/closed; fail-open/closed stays only
-  for when both are down.
-- Outgoing text checks beyond patterns (tone, a reply to the wrong person).
+#47 durable user confirmation, #48 a chat-model fallback when Jev is down,
+#49 a peer thread's earlier user messages, #50 checks on outgoing text.
 
 ## Acceptance
 

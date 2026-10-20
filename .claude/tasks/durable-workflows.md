@@ -1,6 +1,7 @@
 # Durable workflows: run state, waits and user input
 
 **Status:** in-progress. The durable core is built and used by saved workflows
+**Open work:** #44
 and the agent loop (see "Done"). Open: external events and user replies as
 waits, a durable inbox with MCP lease/ack, atomic admission of scheduler fires,
 and a user-facing inspect/cancel/resolve-unknown API.
@@ -172,5 +173,5 @@ rejected. This chooses retry semantics, it is not universal idempotency.
 - Telegram reply correlation, reliable signal delivery and MCP-write
   idempotency need our integration even with an off-the-shelf runtime.
 
-First application scenarios: `data-sources.md`, `watch-tasks.md`,
-`agent-jit-workflows.md`.
+First application scenarios: #36, #33,
+#37.

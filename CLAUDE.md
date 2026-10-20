@@ -330,15 +330,17 @@ locators, no `static` handles in business code.
 
 ## Task tracking
 
-Planned work and tech debt live under `.claude/tasks/` — one markdown
-file per task with frontmatter-style fields (`Status`, `Priority`,
-`Area`, `Created`). Format is documented in `.claude/tasks/README.md`.
+Planned work and tech debt are GitHub issues in `Ch4mpl00/ouro`
+(`gh issue list`, `gh issue view N`), labelled `area:agent|mcp|owf|evals`,
+`P0`–`P3` and `tech-debt` / `feature` / `idea`. Scan the open issues before
+picking work. New tech debt agreed in a design discussion gets an issue
+before moving on, so the decision doesn't evaporate. A PR that does the work
+says `Closes #N`. The repository and its issues are public: no server
+addresses, chat ids, emails, personal amounts or secrets in an issue.
 
-When picking work, scan that directory first — there's usually a
-written-up task with context, rather than starting fresh from a half-
-remembered Slack thread. When agreeing on new tech debt during a
-design discussion, add a file there before moving on, so the decision
-doesn't evaporate.
+Decisions and their "why" go into code comments next to the code they
+constrain. Older design records stay in `.claude/tasks/` (README there) until
+they move into comments.
 
 ## MCP tools (signal-emitting + agent-callable)
 

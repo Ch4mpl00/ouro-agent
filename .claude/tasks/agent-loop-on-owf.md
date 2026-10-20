@@ -1,6 +1,7 @@
 # The agent loop as an OWF workflow
 
 **Status:** in-progress. The loop, the `signal` workflow, durable sub-agents,
+**Open work:** #43
 cleanup and `read_run` are done (2026-10-20); two fault-handling gaps remain
 (see "Still open").
 **Priority:** P1
@@ -19,7 +20,7 @@ backoff, intent/result call records, durable waits.
 Decided 2026-10-20: the loop itself becomes an OWF workflow on that machinery,
 not a second durability layer in Rust. It also makes the loop data the agent
 can later rewrite (Harness^2, arXiv:2610.14224) and gives skill procedures
-(`skill-procedures.md`) a loop to embed.
+(#34) a loop to embed.
 
 ## Design (as built)
 

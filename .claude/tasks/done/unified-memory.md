@@ -3,7 +3,7 @@
 **Status:** done. v1 implemented 2026-08-23 in TypeScript and ported to Rust
 (`crates/mcp/src/memory.rs`; the D-numbers below are cited from that file).
 Not built: the phase-2 memory agent (Q10) and the removal of the legacy
-`add_note` / `find_notes` toolset (`../open-findings-from-tests.md`).
+`add_note` / `find_notes` toolset (#42).
 **Priority:** P1
 **Area:** mcp / memory
 **Created:** 2026-08-21
@@ -407,4 +407,4 @@ agent pass `states: ["archived"]` defeated archive as a discovery boundary.
 ## Notes
 
 - Related: `mcp-connection-lifecycle.md` (superseded in part by D1),
-  `../multi-chunk-rag.md` (chunking quality feeds D8).
+  #39 (chunking quality feeds D8).

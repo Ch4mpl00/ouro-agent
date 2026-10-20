@@ -1,6 +1,7 @@
 # Jev (TypeSafe System One): typed decisions where we spend an LLM turn
 
 **Status:** in-progress. The client (`decisions.rs`), the `filter_relevant` and
+**Open work:** #46
 `choose` workflow functions and the news-filter golden set are shipped (the
 digest filter moved to Jev 2026-10-12). Open: the other candidate uses, the
 dedup/`covered` measurement, calibration on Russian/Ukrainian text.
@@ -35,7 +36,7 @@ with typed values and calibrated probabilities. It generates no strings.
    cheap axes and flag which nodes deserve the expensive judge. Measurable today:
    a judged corpus and the sigma baseline exist.
 5. **Plan-cache validity** ("does this signal match saved workflow X?" in
-   ~100 ms), see `agent-jit-workflows.md`.
+   ~100 ms), see #37.
 
 Not a candidate wherever text is produced: digest composition, recovery
 messages.

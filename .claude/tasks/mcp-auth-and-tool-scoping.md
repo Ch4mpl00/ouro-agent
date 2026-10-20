@@ -1,6 +1,7 @@
 # MCP auth and per-client tool scoping
 
 **Status:** in-progress. Scoping per *instance* (A2 mechanism) and the Secure
+**Open work:** #45
 MCP Tunnel (A6) are shipped; token auth (A1/A3), the `mcp_tokens` store and
 per-token roles are not started.
 **Priority:** P2 (nothing is public: both MCP endpoints are loopback-only; this
