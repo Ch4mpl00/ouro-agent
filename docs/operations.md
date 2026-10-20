@@ -106,7 +106,9 @@ spec to make a run pass.
 
 ## Deploy
 
-Production is one droplet (1 vCPU / 2 GB, `root@165.22.199.65`). It never
+Production is one droplet (1 vCPU / 2 GB), reached as the SSH alias `ouro`:
+its address lives only in each machine's `~/.ssh/config` (`Host ouro`,
+`HostName <droplet ip>`, `User root`), never in the repo. It never
 compiles Rust. The laptop cross-compiles only the affected Linux binaries in
 a cached Docker builder and sends the changed files with rsync.
 
@@ -119,7 +121,7 @@ python3 scripts/test_deploy.py       # deployment regression checks, no Docker/S
 ```
 
 `DEPLOY_HOST` (or `--host`) and `DEPLOY_DIR` (or `--repository`) override the
-SSH host and the server checkout. They default to `root@165.22.199.65` and
+SSH host and the server checkout. They default to `ouro` and
 `/root/agent-helper`. The commit must be **clean and pushed**, because the
 server checks out exactly that commit.
 
@@ -214,7 +216,7 @@ live skills through the state symlink.
   ships only the three service binaries). Run them with a `DATABASE_URL`
   that reaches production Postgres, which listens on loopback only. One way
   is from the laptop through an SSH forward:
-  `ssh -N -L 15432:127.0.0.1:5432 root@165.22.199.65`, then
+  `ssh -N -L 15432:127.0.0.1:5432 ouro`, then
   `DATABASE_URL=postgres://<user>:<password>@127.0.0.1:15432/<db> cargo run -p mcp-tools --bin gmail-auth`.
   The credentials are the ones in `/etc/ouro/mcp.env`.
 - **Codex** keeps its login in the `codex-home` volume. Bootstrap it once

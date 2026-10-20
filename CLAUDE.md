@@ -502,7 +502,7 @@ image they are on `PATH`.
 - `mcp-tools` — the MCP server. **Do not run locally if the droplet is also
   running it** — Telegram getUpdates is exclusive and the second poller
   causes 409 Conflict. `.mcp.json` points Claude Code at the droplet's
-  restricted endpoint instead: `ssh -N -L 3001:127.0.0.1:3001 root@165.22.199.65`
+  restricted endpoint instead: `ssh -N -L 3001:127.0.0.1:3001 ouro`
   before the session starts (memory, news, skills, `ask_ouro`).
 - `agent-supervisor` — the supervisor (long-running loop);
   `agent-supervisor --check-config` validates env and exits.

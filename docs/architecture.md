@@ -494,7 +494,7 @@ and the behaviour is specified in `crates/mcp/specs/peer_messages.feature`.
 Open the tunnel before the session starts:
 
 ```bash
-ssh -N -L 3001:127.0.0.1:3001 root@165.22.199.65
+ssh -N -L 3001:127.0.0.1:3001 ouro
 ```
 
 That gives the session memory, news, skills, `send_telegram_message` and
