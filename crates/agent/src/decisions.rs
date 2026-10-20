@@ -186,13 +186,18 @@ pub struct DecisionClient {
     pub model: String,
     api: Arc<dyn JsonApi>,
     retry: RetryOpts,
+    endpoint: String,
 }
 pub fn decision_client(model: String, api: Arc<dyn JsonApi>) -> Arc<DecisionClient> {
-    Arc::new(DecisionClient { model, api, retry: RetryOpts::default() })
+    Arc::new(DecisionClient::with_retry(model, api, RetryOpts::default()))
 }
 impl DecisionClient {
     pub fn with_retry(model: String, api: Arc<dyn JsonApi>, retry: RetryOpts) -> Self {
-        Self { model, api, retry }
+        Self { model, api, retry, endpoint: OPENROUTER_DECISIONS_URL.into() }
+    }
+    pub fn with_endpoint(mut self, endpoint: String) -> Self {
+        self.endpoint = endpoint;
+        self
     }
     pub async fn decide(&self, request: DecisionRequest) -> anyhow::Result<Decision> {
         let wire: Map<_, _> = request.questions.iter().map(|(key, q)| (key.clone(), q.wire.clone())).collect();
@@ -217,7 +222,7 @@ impl DecisionClient {
                         log_retry(&format!("decisions/{}", self.model), info);
                         request.scope.event(retry_event("openrouter", &self.model, info));
                     },
-                    || self.api.post(OPENROUTER_DECISIONS_URL, body.clone(), &cancel),
+                    || self.api.post(&self.endpoint, body.clone(), &cancel),
                 )
                 .await?;
                 let model = raw["model"]

@@ -25,6 +25,7 @@ struct State {
     polls: AtomicUsize,
     sends: AtomicUsize,
     requests: Mutex<Vec<Value>>,
+    decisions: Mutex<Vec<Value>>,
     exports: Mutex<Vec<Value>>,
     journal_entries: Mutex<Vec<Value>>,
     model_started: tokio::sync::Notify,
@@ -64,7 +65,7 @@ impl ServerHandler for Server {
         let result = match p.name.as_ref() {
             "get_next_signal" => {
                 if self.0.polls.fetch_add(1, Ordering::SeqCst) == 0 {
-                    json!({"signal":{"id":42,"source":self.0.source,"content":if self.0.source=="telegram"{"Telegram message in chat 42.\nText: \"hello\""}else{"scheduled task"},"envContext":"Send to chat 42","created_at":"2026-10-01T12:00:00Z"},"pendingAfter":0})
+                    json!({"signal":{"id":42,"source":self.0.source,"content":if self.0.source=="telegram"{"Telegram message in chat 42.\nText: \"hello\""}else{"Task: reply in Telegram chat 42."},"envContext":"Send to chat 42","created_at":"2026-10-01T12:00:00Z"},"pendingAfter":0})
                 } else {
                     json!({"signal":null,"pendingAfter":0})
                 }
@@ -137,10 +138,24 @@ impl Fixture {
             StreamableHttpService::new(move || Ok(server.clone()), Arc::new(LocalSessionManager::default()), config);
         let llm_state = state.clone();
         let export_state = state.clone();
+        let decision_state = state.clone();
         let app=axum::Router::new().nest_service("/mcp",mcp).route("/chat/completions",axum::routing::post(move|headers:axum::http::HeaderMap,axum::Json(body):axum::Json<Value>|{let state=llm_state.clone();async move{
    assert_eq!(headers["authorization"],"Bearer fixture-key");state.requests.lock().unwrap().push(body.clone());state.model_started.notify_one();if state.wait_model{std::future::pending::<()>().await;}
    let system=body["messages"][0]["content"].as_str().unwrap_or_default();let message=if system.starts_with("You write one entry of the activity journal"){json!({"role":"assistant","content":"Request received.\nSent a message to Telegram."})}else if system.contains("RECOVERY")||body["messages"].as_array().unwrap().iter().any(|m|m["role"]=="tool"){json!({"role":"assistant","content":"done"})}else{json!({"role":"assistant","content":null,"tool_calls":[{"id":"send","type":"function","function":{"name":"send_telegram_message","arguments":"{\"chatId\":\"42\",\"text\":\"agent\"}"}}]})};axum::Json(json!({"model":"gpt-fixture","choices":[{"message":message,"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}))
-  }})).route("/api/public/otel/v1/traces",axum::routing::post(move|headers:axum::http::HeaderMap,axum::Json(body):axum::Json<Value>|{let state=export_state.clone();async move{assert_eq!(headers["authorization"],"Basic cHVibGljOnNlY3JldA==");state.exports.lock().unwrap().push(body);axum::http::StatusCode::OK}}));
+  }})).route("/decisions", axum::routing::post(move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+            let state = decision_state.clone();
+            async move {
+                assert_eq!(headers["authorization"], "Bearer fixture-key");
+                state.decisions.lock().unwrap().push(body.clone());
+                let answers: serde_json::Map<String, Value> = body["questions"].as_object().unwrap().iter().map(|(key, q)| {
+                    let answer = if q["type"] == "choice" {
+                        json!({"type":"choice","choice":"allow","confidence":1.0,"probabilities":{"allow":1.0}})
+                    } else { json!({"type":"noul","noul":0.0}) };
+                    (key.clone(), answer)
+                }).collect();
+                axum::Json(json!({"model":"guard-fixture","answers":answers}))
+            }
+        })).route("/api/public/otel/v1/traces",axum::routing::post(move|headers:axum::http::HeaderMap,axum::Json(body):axum::Json<Value>|{let state=export_state.clone();async move{assert_eq!(headers["authorization"],"Basic cHVibGljOnNlY3JldA==");state.exports.lock().unwrap().push(body);axum::http::StatusCode::OK}}));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -162,6 +177,8 @@ impl Fixture {
         cmd.env("MCP_TRANSPORT", "http")
             .env("MCP_URL", format!("{}/mcp", self.url))
             .env("OPENAI_BASE_URL", &self.url)
+            .env("TELEGRAM_DEFAULT_CHAT_ID", "42")
+            .env("OPENROUTER_DECISIONS_URL", format!("{}/decisions", self.url))
             .env("ACTIVITY_JOURNAL", "off")
             .env("LANGFUSE_BASE_URL", &self.url)
             .env("LANGFUSE_PUBLIC_KEY", "public")
@@ -189,6 +206,9 @@ async fn binary_runs_scheduler_and_agent_sources_and_flushes_matching_otel_ids()
         let output = tokio::time::timeout(Duration::from_secs(10), f.child(true).output()).await.unwrap().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         assert_eq!(f.state.sends.load(Ordering::SeqCst), 1);
+        assert!(
+            f.state.decisions.lock().unwrap().iter().any(|r| r["state"]["calls"][0]["name"] == "send_telegram_message")
+        );
         let (trace, observations) = f.trace();
         assert_eq!(trace.metadata.as_ref().unwrap()["activity"], "run");
         assert!(observations.iter().any(|o| o.meta("tool") == Some(&json!("send_telegram_message"))));

@@ -209,7 +209,7 @@ async fn memory_boundary_accepts_only_explicit_missing_or_valid_index_and_surfac
 
 #[tokio::test]
 async fn missing_decision_client_is_an_explicit_agent_tool_error_without_an_mcp_search_call() {
-    let h = Harness::new(
+    let mut h = Harness::new(
         task_context("unavailable"),
         vec![
             turn(|p| {
@@ -224,6 +224,7 @@ async fn missing_decision_client_is_an_explicit_agent_tool_error_without_an_mcp_
         "unused",
         Arc::new(NullTracer),
     );
+    Arc::get_mut(&mut h.engine).unwrap().deps.decisions = None;
     assert_eq!(h.start().await.send("task".into()).await.unwrap(), "fallback");
     assert!(h.mcp.calls.lock().unwrap().is_empty());
     h.engine.shutdown().await;

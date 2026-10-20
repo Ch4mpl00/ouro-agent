@@ -170,6 +170,8 @@ mcp-tools/
     │   ├── src/schedule.rs                 scheduled tasks: cron rows, the 30 s tick, the schedule
     │   │                                   tools, the first start's import
     │   ├── src/agent.rs                    the engine, the loop's turn/tool/settle, synthetic tools
+    │   ├── src/guard.rs                    loop write policy, deterministic rules, batched verdicts
+    │   ├── guard/                          compiled guard instructions and reason data (git-owned)
     │   ├── workflows/                      the built-in OWF workflows in git: agent-loop.yaml
     │   │                                   (every loop), signal.yaml (every signal)
     │   ├── src/activity.rs                 traces → ouro/activity journal notes (background

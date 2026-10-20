@@ -53,3 +53,6 @@ the delivery, instead of spending another turn on a closing message. It is
 safe: if the delivery or any other call of the round fails, the session
 does not end and you get the error to act on. Never pair it with a call
 whose answer decides what you do next, such as a worker, a search or a read.
+
+A `[guard] blocked` tool reply names the reason and guidance. Do not retry
+the same call; follow that guidance, asking the user when it calls for confirmation.

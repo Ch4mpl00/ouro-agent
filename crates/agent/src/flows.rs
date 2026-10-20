@@ -312,6 +312,8 @@ struct Functions {
     // The store of the durable run these functions serve: a loop's
     // sub-agents become durable runs of their own in it.
     runs: Option<crate::durable::RunStore>,
+    loop_only: bool,
+    loop_input: Option<Value>,
 }
 
 fn invalid(name: &str, detail: impl std::fmt::Display) -> WorkflowError {
@@ -358,7 +360,7 @@ fn failed(e: anyhow::Error) -> WorkflowError {
 // The agent loop's functions (`agent::AGENT_LOOP`): a turn, one tool call
 // by name, a round's settlement. They take the loop from the run's context,
 // so they belong to an `agent-loop` definition.
-const LOOP_FUNCTIONS: &[&str] = &["agent_turn", "tool", "agent_settle"];
+const LOOP_FUNCTIONS: &[&str] = &["agent_turn", "guard", "tool", "agent_settle"];
 
 fn loop_tool_name(args: &Value) -> &str {
     args.get("call").and_then(|c| c.get("name")).and_then(Value::as_str).unwrap_or_default()
@@ -395,6 +397,12 @@ impl owf::run::Functions for Functions {
     }
 
     async fn invoke(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
+        if self.loop_only && !LOOP_FUNCTIONS.contains(&name) && self.effect(name) != Some(Effect::Read) {
+            return Err(CallFailure::NotExecuted(invalid(
+                name,
+                "agent-loop writes must use tool so the host guard reviews them",
+            )));
+        }
         if crate::supervisor::SIGNAL_FUNCTIONS.iter().any(|f| f.0 == name) {
             return Err(CallFailure::NotExecuted(invalid(name, "only the signal workflow calls it")));
         }
@@ -436,15 +444,36 @@ impl owf::run::Functions for Functions {
     }
 
     async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError> {
+        if self.loop_only && !LOOP_FUNCTIONS.contains(&name) && self.effect(name) != Some(Effect::Read) {
+            return Err(invalid(name, "agent-loop writes must use tool so the host guard reviews them"));
+        }
         let span = self.spans.scope(info.reference);
         let label = info.reference.rsplit('/').next().unwrap_or(name);
         match name {
-            "agent_turn" | "tool" | "agent_settle" => {
+            "agent_turn" | "guard" | "tool" | "agent_settle" => {
                 // A loop rebuilt after a restart is traced under the runner.
                 let root: Scope = self.spans.root.clone();
                 let engine = &self.engine;
+                // The run id is supplied by the interpreter, not by YAML.
+                // Rebuild from the admitted input, never a rewritten loop spec.
+                let admitted = match &self.runs {
+                    Some(runs) => runs
+                        .get(info.run_id)
+                        .map_err(failed)?
+                        .filter(|r| r.name == crate::agent::AGENT_LOOP_NAME)
+                        .map(|r| r.input),
+                    None => self.loop_input.clone(),
+                }
+                .ok_or_else(|| invalid(name, "requires the host's admitted agent-loop input"))?;
+                let spec: crate::agent::LoopSpec =
+                    serde_json::from_value(admitted["loop"].clone()).map_err(|e| invalid(name, e))?;
+                let live = engine.loop_for(&spec, &root, info.cancel).await.map_err(failed)?;
+                live.admit_guard(&admitted).await.map_err(failed)?;
+                let mut args = args;
+                args["loop"] = admitted["loop"].clone();
                 match name {
                     "agent_turn" => crate::agent::loop_turn(engine, &args, &root, info.cancel).await,
+                    "guard" => crate::agent::loop_guard(engine, &args, &root, info.cancel).await,
                     "tool" => crate::agent::loop_tool(engine, &args, &root, info.cancel, self.runs.as_ref()).await,
                     _ => crate::agent::loop_settle(engine, &args, &root, info.cancel).await,
                 }
@@ -869,7 +898,7 @@ async fn execute_saved(
     let status = match owf::model::parse_yaml(&saved.definition) {
         Err(error) => (RunStatus::Interrupted(WorkflowError::validation(error.to_string())), true),
         Ok(wf) => {
-            let host = host(engine, &root, saved.name == crate::agent::AGENT_LOOP_NAME, Some(runs.clone()));
+            let host = host(engine, &root, saved.name == crate::agent::AGENT_LOOP_NAME, Some(runs.clone()), None);
             // Shutdown releases work for recovery; only explicit run
             // cancellation is allowed to create a terminal Cancelled state.
             let execution_cancel = CancellationToken::new();
@@ -1120,7 +1149,13 @@ impl FlowRun for Flows {
             Ok(wf) => {
                 let spans = Arc::new(Spans { root: root.clone(), open: Mutex::default() });
                 let host = Host {
-                    functions: Arc::new(Functions { engine: self.engine.clone(), spans: spans.clone(), runs: None }),
+                    functions: Arc::new(Functions {
+                        engine: self.engine.clone(),
+                        spans: spans.clone(),
+                        runs: None,
+                        loop_only: false,
+                        loop_input: None,
+                    }),
                     observer: spans,
                     clock: Arc::new(SystemClock),
                     limits: Limits::default(),
@@ -1229,17 +1264,23 @@ const OVERRIDE: &str = "override_version";
 
 /// The host an `agent-loop` run executes on, traced under `root`: for a
 /// caller that owns the run's journal itself (a test injecting crashes).
-pub fn loop_host(engine: &Arc<Engine>, root: &Arc<dyn Span>) -> Host {
-    host(engine, root, true, None)
+pub fn loop_host(engine: &Arc<Engine>, root: &Arc<dyn Span>, input: Value) -> Host {
+    host(engine, root, true, None, Some(input))
 }
 
-fn host(engine: &Arc<Engine>, root: &Arc<dyn Span>, agent_loop: bool, runs: Option<crate::durable::RunStore>) -> Host {
+fn host(
+    engine: &Arc<Engine>,
+    root: &Arc<dyn Span>,
+    agent_loop: bool,
+    runs: Option<crate::durable::RunStore>,
+    loop_input: Option<Value>,
+) -> Host {
     let spans = Arc::new(Spans { root: root.clone(), open: Mutex::default() });
     // A loop's generations and tool calls trace themselves; spans for its
     // turn/round/settle tasks would only repeat them.
     let observer: Arc<dyn owf::run::Observer> = if agent_loop { Arc::new(owf::run::Silent) } else { spans.clone() };
     Host {
-        functions: Arc::new(Functions { engine: engine.clone(), spans, runs }),
+        functions: Arc::new(Functions { engine: engine.clone(), spans, runs, loop_only: agent_loop, loop_input }),
         observer,
         clock: Arc::new(SystemClock),
         limits: Limits::default(),
@@ -1352,8 +1393,14 @@ pub async fn run_loop_here(
             FlowResult::Faulted { error: WorkflowError::validation(error.to_string()), effects_started: false }
         }
         Ok(wf) => {
-            let outcome =
-                owf::run::run(&host(engine, &root, true, None), &wf, id, with_override(input, version), cancel).await;
+            let outcome = owf::run::run(
+                &host(engine, &root, true, None, Some(input.clone())),
+                &wf,
+                id,
+                with_override(input, version),
+                cancel,
+            )
+            .await;
             flow_result(outcome.status, outcome.effects_started)
         }
     };
@@ -1370,6 +1417,14 @@ pub async fn run_loop_here(
 // Synthetic tools of the agent loop for writing saved workflows. Saving
 // validates and stores a draft; only activation (after the user agreed in
 // the chat) lets a schedule run it.
+fn require_loop_guard(name: &str, wf: &owf::model::Workflow) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        name != crate::agent::AGENT_LOOP_NAME || owf::model::call_sites(wf).iter().any(|s| s.function == "guard"),
+        "agent-loop requires a `call: guard` task before its tool round so every write is reviewed; the host enforces this even for older overrides"
+    );
+    Ok(())
+}
+
 pub const TOOLS: &[&str] = &["save_workflow", "activate_workflow", "list_workflows", "read_workflow"];
 
 // The workflow-author worker's own tools (`workflow-author` skill, which
@@ -1520,6 +1575,7 @@ pub fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::R
                 "document.name is `{}` but the workflow is saved as `{name}`; make them the same",
                 wf.document.name
             );
+            require_loop_guard(name, &wf)?;
             let saved = store.save(name, definition, args.get("note").and_then(Value::as_str))?;
             let calls: Vec<Value> = owf::model::call_sites(&wf)
                 .into_iter()
@@ -1542,7 +1598,8 @@ pub fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::R
                 .get(name, Some(version))?
                 .ok_or_else(|| anyhow::anyhow!("no version {version} of workflow `{name}`"))?;
             // Tools may have changed since it was saved.
-            check(mcp, &saved.definition).map_err(anyhow::Error::msg)?;
+            let wf = check(mcp, &saved.definition).map_err(anyhow::Error::msg)?;
+            require_loop_guard(name, &wf)?;
             if built_in(name).is_some() {
                 // The runtime's own workflow is tried by running: the breaker
                 // takes it back after a few faults in a row.
@@ -1865,7 +1922,13 @@ pub async fn try_draft(
     );
     let spans = Arc::new(Spans { root: root.clone(), open: Mutex::default() });
     let functions = Arc::new(DryRun {
-        functions: Functions { engine: engine.clone(), spans: spans.clone(), runs: None },
+        functions: Functions {
+            engine: engine.clone(),
+            spans: spans.clone(),
+            runs: None,
+            loop_only: false,
+            loop_input: None,
+        },
         writes: Mutex::default(),
     });
     let steps = Arc::new(DrySteps { spans, report: Mutex::default() });

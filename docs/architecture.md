@@ -185,7 +185,7 @@ Telegram.
 ### The agent loop
 
 Every agent loop is a run of the OWF workflow `agent-loop`
-(`crates/agent/workflows/agent-loop.yaml`): a turn (`agent_turn`), the round's
+(`crates/agent/workflows/agent-loop.yaml`): a turn (`agent_turn`), a write review (`guard`), the round's
 calls in parallel (`tool`, one call by name; a write is sent at most once),
 then the settlement (`agent_settle`: `finish`, the replies, the working
 memory). The transcript and the working memory travel in the run's context,
@@ -196,6 +196,27 @@ unknown" instead of being sent twice. A worker of a durable loop is a
 durable run of its own, keyed by the call that started it: a resumed parent
 joins it rather than starting another. Recovery runs the same workflow in
 process. The records of runs that ended more than 7 days ago are swept.
+
+The host guard (`guard.rs`, compiled policy in `crates/agent/guard/`) reviews
+all writes of a round in one Jev decisions request, after deterministic tool,
+chat and secret checks. Reads, working memory, `finish` and delegation skip
+review; workers guard their own writes. A verdict belongs to the loop, call
+id and SHA-256 of the exact tool name and argument bytes. `tool` requires an
+allow verdict and reviews again when one is missing, including after restart
+or when an override changes arguments. Overrides cannot call writes directly
+to bypass `tool`. A block returns `[guard] blocked: <reason> — <guidance>` as
+a failed tool result; `finish` in that round cannot end the loop.
+
+Guard authority comes from the live loop's first admitted user message or
+its durable run's original input, never workflow task arguments. Workers
+also retain the primary request in their admitted loop spec across restarts.
+Known Telegram targets come from those requests and the session's configured
+default chat (`TELEGRAM_DEFAULT_CHAT_ID`); `TELEGRAM_TOPICS_JSON` lists threads
+within that chat, not additional chats. Jev outages permit replies only to a
+conversation named in the primary request; other writes fail closed. These
+checks cover agent loops; user-approved saved workflows retain their own
+write semantics. Confirmation reasons currently block and ask the model to
+consult the user; durable confirmation waits remain future work.
 
 The agent can read the loop (`read_workflow("agent-loop")`), save its own
 version and activate it. A circuit breaker counts that version's faults;

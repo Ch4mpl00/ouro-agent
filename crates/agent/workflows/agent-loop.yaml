@@ -12,7 +12,10 @@ do:
   - route:
       switch:
         - answered: { when: '${ .calls == [] }', then: answer }
-        - act: { then: round }
+        - act: { then: guard }
+  - guard:
+      call: guard
+      with: { loop: '${ $context.loop }', calls: '${ $context.calls }' }
   - round:
       for: { each: call, in: '${ $context.calls }' }
       # The loop's own limit (max_concurrent_tools) applies inside `tool`.

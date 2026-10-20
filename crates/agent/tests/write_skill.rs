@@ -87,7 +87,7 @@ fn engine(model: Model, tools: &[&str], store: Arc<FsSkillStore>) -> Arc<agent::
         memory: Arc::new(PersistLog::default()),
         tracer: Arc::new(NullTracer),
         codex: Arc::new(NoCodex),
-        decisions: None,
+        decisions: Some(support::allow_guard()),
         workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
         schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
     })

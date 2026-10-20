@@ -1,6 +1,6 @@
 # Guardrails on the agent loop's writes
 
-**Status:** planned
+**Status:** done (host-enforced loop writes, compiled policy, batched decisions and outage handling; confirmation and evaluation TODOs below remain)
 **Priority:** P1
 **Area:** agent / owf / decisions
 **Created:** 2026-10-20

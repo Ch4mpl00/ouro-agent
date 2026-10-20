@@ -172,6 +172,7 @@ pub struct LoopOptions {
     pub preset: PresetName,
     pub max_iterations: usize,
     pub parent_id: Option<String>,
+    pub root_request: Option<String>,
     pub session_id: Option<String>,
     pub tags: Option<Vec<String>>,
     pub metadata: Metadata,
@@ -193,6 +194,7 @@ impl LoopOptions {
             preset: PresetName::Base,
             max_iterations: 100,
             parent_id: None,
+            root_request: None,
             session_id: None,
             tags: None,
             metadata: Map::new(),
@@ -219,6 +221,7 @@ pub struct AgentLoop {
     // False for a loop rebuilt after a restart until a host function has
     // put its working memory back from the run's context.
     memory_restored: AtomicBool,
+    guard: tokio::sync::Mutex<crate::guard::State>,
     // The round's calls running at once: at most max_concurrent_tools.
     slots: tokio::sync::Semaphore,
 }
@@ -284,6 +287,7 @@ fn create_loop(
         observation_meta,
         memory_restored: AtomicBool::new(true),
         slots: tokio::sync::Semaphore::new(opts_slots),
+        guard: Default::default(),
     }))
 }
 impl AgentLoop {
@@ -340,6 +344,7 @@ impl AgentLoop {
             }
             json!({"loop": self.spec(), "messages": *messages, "memory": self.opts.session.memory.snapshot()})
         };
+        self.admit_guard(&input).await?;
         let result = crate::flows::run_loop_here(&engine, &self.opts.id, input, &self.scope, &self.cancel).await;
         check(&self.cancel)?;
         match result {
@@ -408,6 +413,7 @@ impl AgentLoop {
         call: &providers::ToolCall,
         child: Option<ChildRun<'_>>,
         runs: Option<&crate::durable::RunStore>,
+        verdict: Option<&crate::guard::Verdict>,
     ) -> anyhow::Result<(Arc<dyn Span>, String)> {
         let mut metadata = self.observation_meta.clone();
         metadata.insert("tool".into(), call.name.clone().into());
@@ -417,6 +423,12 @@ impl AgentLoop {
                 .input(json!({"raw_arguments": call.arguments}))
                 .metadata(metadata),
         );
+        if let Some(verdict) = verdict {
+            span.update(ContextUpdate::metadata(json!({"guard": verdict}).as_object().unwrap().clone()));
+            if !verdict.allowed() {
+                return Ok((span, verdict.reply()));
+            }
+        }
         let raw = match serde_json::from_str::<Value>(if call.arguments.is_empty() { "{}" } else { &call.arguments }) {
             Ok(Value::Object(args)) => {
                 span.update(ContextUpdate::input(Value::Object(args.clone())));
@@ -438,7 +450,10 @@ impl AgentLoop {
     // memory with its content or a preview.
     // Also the entry it stored, `[key, value, format]`.
     fn present(&self, name: &str, raw: &str, span: &Arc<dyn Span>) -> (String, Option<Value>) {
-        if name.starts_with("working_memory_") || matches!(name, "try_workflow" | "read_run") {
+        if raw.starts_with("[guard] blocked:")
+            || name.starts_with("working_memory_")
+            || matches!(name, "try_workflow" | "read_run")
+        {
             return (raw.to_owned(), None);
         }
         let stored = store_tool_result(&self.opts.session.memory, raw);
@@ -659,6 +674,13 @@ impl AgentLoop {
         };
         opts.max_iterations = iterations;
         opts.parent_id = Some(self.opts.id.clone());
+        opts.root_request = self
+            .guard
+            .lock()
+            .await
+            .context
+            .as_ref()
+            .map(|c| if c.root_request.is_empty() { c.task.clone() } else { c.root_request.clone() });
         opts.session_id = self.opts.session_id.clone();
         opts.trace_scope = Some(span.clone());
         if let Some(child) = child {
@@ -866,6 +888,8 @@ pub struct LoopSpec {
     pub max_concurrent_tools: usize,
     pub parent_id: Option<String>,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub root_request: Option<String>,
 }
 
 impl AgentLoop {
@@ -888,6 +912,7 @@ impl AgentLoop {
             max_concurrent_tools: opts.max_concurrent_tools,
             parent_id: opts.parent_id.clone(),
             session_id: opts.session_id.clone(),
+            root_request: opts.root_request.clone(),
         }
     }
 
@@ -896,7 +921,62 @@ impl AgentLoop {
     pub async fn workflow_input(&self, text: &str) -> Value {
         let mut messages = self.messages.lock().await.clone();
         messages.push(providers::user(text));
-        json!({"loop": self.spec(), "messages": messages, "memory": self.opts.session.memory.snapshot()})
+        let input = json!({"loop": self.spec(), "messages": messages, "memory": self.opts.session.memory.snapshot()});
+        self.admit_guard(&input).await.expect("host loop input");
+        input
+    }
+
+    // Only callers holding host admission data may initialize this evidence.
+    pub(crate) async fn admit_guard(&self, input: &Value) -> anyhow::Result<()> {
+        let mut state = self.guard.lock().await;
+        if state.context.is_none() {
+            let messages: Vec<Message> = serde_json::from_value(input["messages"].clone())?;
+            let task = messages
+                .iter()
+                .find(|m| providers::role(m) == "user")
+                .and_then(providers::content)
+                .unwrap_or_default()
+                .to_owned();
+            state.context = Some(crate::guard::Context {
+                task,
+                root_request: self.opts.root_request.clone().unwrap_or_default(),
+                default_chat: self.opts.session.env.telegram_chat_id.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn guard_calls(&self, engine: &Engine, calls: &[providers::ToolCall]) -> anyhow::Result<Value> {
+        let context = self
+            .guard
+            .lock()
+            .await
+            .context
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("guard requires the host's admitted loop input"))?;
+        let messages = self.messages.lock().await.clone();
+        // Pair within each assistant round: providers may reuse call ids in
+        // later rounds, so a global id-to-reply map would invent prior writes.
+        let mut pending = HashMap::new();
+        let mut writes = Vec::new();
+        for message in &messages {
+            if providers::role(message) == "assistant" {
+                pending = providers::tool_calls(message).into_iter().map(|c| (c.id.clone(), c)).collect();
+            } else if providers::role(message) == "tool"
+                && let Some(id) = message.get("tool_call_id").and_then(Value::as_str)
+                && let Some(call) = pending.remove(id)
+                && crate::guard::needs_guard(engine, &call)
+            {
+                let reply = providers::content(message).unwrap_or_default();
+                if !reply.starts_with("[guard] blocked:") {
+                    writes.push(json!({"id":call.id,"name":call.name,"arguments":call.arguments,"reply":reply}));
+                }
+            }
+        }
+        let verdicts = crate::guard::judge(engine, &context, calls, &writes, &self.scope, &self.cancel).await?;
+        let output = json!(verdicts);
+        self.guard.lock().await.verdicts.extend(verdicts);
+        Ok(output)
     }
 
     fn restore_memory(&self, memory: Option<&Value>) -> anyhow::Result<()> {
@@ -935,6 +1015,7 @@ impl Engine {
         opts.max_iterations = spec.max_iterations;
         opts.max_concurrent_tools = spec.max_concurrent_tools;
         opts.parent_id = spec.parent_id.clone();
+        opts.root_request = spec.root_request.clone();
         opts.session_id = spec.session_id.clone();
         opts.trace_scope = Some(scope.clone());
         let rebuilt = self.start_loop(opts).await?;
@@ -983,6 +1064,24 @@ pub async fn loop_turn(
     Ok(json!({"message": message, "calls": calls, "content": content}))
 }
 
+/// `guard { loop, calls }`: review a round using only host-owned evidence.
+pub async fn loop_guard(
+    engine: &Arc<Engine>,
+    args: &Value,
+    scope: &Scope,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Value> {
+    let loop_ = engine.loop_for(&loop_spec(args)?, scope, cancel).await?;
+    let calls = args
+        .get("calls")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("guard needs calls"))?
+        .iter()
+        .map(tool_call)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    loop_.guard_calls(engine, &calls).await
+}
+
 fn tool_call(value: &Value) -> anyhow::Result<providers::ToolCall> {
     let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
     Ok(providers::ToolCall {
@@ -1009,8 +1108,27 @@ pub async fn loop_tool(
     let child = runs.zip(child_key(args)).map(|(runs, key)| ChildRun { runs, key });
     let worker_run = child.as_ref().map(|c| format!("{}/loop", child_loop_id(&loop_.opts.id, &c.key)));
     let _slot = loop_.slots.acquire().await?;
-    let (span, raw) = loop_.start_call(engine, &call, child, runs).await?;
-    let failed = is_tool_error(&raw);
+    let verdict = if crate::guard::needs_guard(engine, &call) {
+        let key = crate::guard::key(&call);
+        let recorded = loop_.guard.lock().await.verdicts.remove(&key);
+        Some(match recorded {
+            Some(verdict) => verdict,
+            None => {
+                loop_.guard_calls(engine, std::slice::from_ref(&call)).await?;
+                loop_
+                    .guard
+                    .lock()
+                    .await
+                    .verdicts
+                    .remove(&key)
+                    .ok_or_else(|| anyhow::anyhow!("guard did not record a verdict"))?
+            }
+        })
+    } else {
+        None
+    };
+    let (span, raw) = loop_.start_call(engine, &call, child, runs, verdict.as_ref()).await?;
+    let failed = raw.starts_with("[guard] blocked:") || is_tool_error(&raw);
     let (mut presented, stored) = loop_.present(&call.name, &raw, &span);
     // A durable worker's run, for read_run: beside its answer, not in it,
     // so the answer can still be passed on as it is.

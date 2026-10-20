@@ -691,6 +691,7 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
                     [
                         ("get_telegram_chat_history".to_owned(), obj(json!({"chatId":"42","limit":20}))),
                         ("journal_tail".to_owned(), obj(json!({"stream":"ouro/activity","n":10}))),
+                        ("read_doc".to_owned(), obj(json!({"project":"agent-system","doc":"skill-index.md"}))),
                     ]
                 );
                 assert!(mentions(&p.messages, "Put together a weekly summary?"));
@@ -709,8 +710,8 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
     let runner = supervisor(&h);
     let content = "Telegram message in chat 42.\nText: \"go ahead\"";
     assert_eq!(runner.run_signal(&signal("telegram", content)).await.unwrap(), "done");
-    // History + activity; no worker fetch or extra LLM retrieval turn.
-    assert_eq!(h.mcp.calls.lock().unwrap().len(), 2);
+    // History, activity and skill-index lookup; no worker fetch or extra LLM retrieval turn.
+    assert_eq!(h.mcp.calls.lock().unwrap().len(), 3);
     let trace = &written.all()[0];
     assert_eq!(trace.input, Some(json!(content)));
     let fetch = find(&trace.observations, "get_telegram_chat_history");
@@ -754,7 +755,11 @@ async fn runs_a_signal_directly_and_records_parent_worker_tool_io_memory_referen
     assert_eq!(agent.meta("skills"), Some(&json!(["orchestrator"])));
     let worker = find(&trace.observations, "invoke_sub_agent");
     let search = find(&trace.observations, "search_news");
-    let generations: Vec<_> = trace.observations.iter().filter(|o| o.kind == ObservationType::Generation).collect();
+    let generations: Vec<_> = trace
+        .observations
+        .iter()
+        .filter(|o| o.kind == ObservationType::Generation && o.name.starts_with("iter-"))
+        .collect();
     assert_eq!(worker.kind, ObservationType::Agent);
     assert_eq!(worker.parent_observation_id.as_ref(), Some(&agent.id));
     assert_eq!(worker.output, json!("short summary"));
@@ -765,6 +770,13 @@ async fn runs_a_signal_directly_and_records_parent_worker_tool_io_memory_referen
     assert_eq!(search.meta("result_truncated"), Some(&json!(true)));
     assert_eq!(search.meta("result_size_bytes"), Some(&json!(payload.len())));
     assert!(search.meta("memory_key").is_some_and(Value::is_string));
+    assert_eq!(search.meta("guard").unwrap()["label"], "allow");
+    assert!(
+        trace
+            .observations
+            .iter()
+            .any(|o| o.name == "guard" && o.meta("verdicts").and_then(Value::as_array).is_some_and(|v| !v.is_empty()))
+    );
     assert_eq!(generations.len(), 4);
     assert_eq!(generations.iter().filter(|o| o.parent_observation_id.as_ref() == Some(&worker.id)).count(), 1);
     for generation in &generations {
@@ -907,8 +919,10 @@ async fn exports_the_primary_loop_and_nested_worker_through_the_langfuse_adapter
     assert_eq!(attr(&tool, "langfuse.observation.type"), Some("tool"));
     assert!(attr(&tool, "langfuse.observation.metadata.memory_key").is_some());
     assert!(attr(&tool, "langfuse.observation.output").unwrap().contains("large result"));
-    let generations: Vec<_> =
-        spans.iter().filter(|s| attr(s, "langfuse.observation.type") == Some("generation")).collect();
+    let generations: Vec<_> = spans
+        .iter()
+        .filter(|s| attr(s, "langfuse.observation.type") == Some("generation") && s.name.starts_with("iter-"))
+        .collect();
     assert_eq!(generations.len(), 4);
     assert!(generations.iter().any(|s| s.parent_span_id.as_ref() == Some(&worker.span_id)));
     let usage: Value =

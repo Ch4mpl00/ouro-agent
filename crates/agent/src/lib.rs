@@ -11,6 +11,7 @@ pub mod durable;
 pub mod errors;
 pub mod flows;
 pub mod generation;
+pub mod guard;
 pub mod langfuse;
 pub mod local_recorder;
 pub mod mcp;

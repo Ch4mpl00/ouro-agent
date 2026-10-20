@@ -70,7 +70,7 @@ fn engine_with(llm: Arc<Scripted>, mcp: Arc<World>, memory: Arc<dyn agent::db::M
         memory,
         tracer,
         codex: Arc::new(NoCodex),
-        decisions: None,
+        decisions: Some(support::allow_guard()),
         workflows: Arc::new(MemoryWorkflows::default()),
         schedule: Arc::new(agent::schedule::MemorySchedule::default()),
     })
@@ -241,7 +241,7 @@ async fn an_activated_agent_loop_runs_and_three_faults_in_a_row_put_the_built_in
     assert!(matches!(run(1).await, FlowResult::Completed(ref v) if v == "v2 hello"));
 
     let broken = "document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '9.0.0' }\n\
-        do: [ { boom: { raise: { error: { type: 'https://example.com/boom', status: 500 } } } } ]\n";
+        do: [ { boom: { raise: { error: { type: 'https://example.com/boom', status: 500 } } } }, { guard: { call: guard, with: { loop: '${ $context.loop }', calls: [] } } } ]\n";
     activate(broken);
     for n in 2..5 {
         assert!(matches!(run(n).await, FlowResult::Faulted { .. }), "fault {}", n - 1);
@@ -497,4 +497,266 @@ async fn read_run_bounds_worker_lists_and_an_oversized_parallel_turn() {
     }
     let last = read_history(&engine, &input, Some(&runs), json!({"id": id, "offset": 2})).await;
     assert!(last["presented"].as_str().unwrap().contains("last turn"));
+}
+
+// ── host guard ──────────────────────────────────────────────────────────────
+fn guarded(
+    script: Vec<agent::providers::Message>,
+    label: &str,
+) -> (Arc<Engine>, Arc<World>, Arc<support::GuardApi>, Arc<Scripted>) {
+    let model = Arc::new(Scripted::new(script));
+    let world = Arc::new(World { calls: Mutex::default(), stop: None });
+    let mut engine = engine(model.clone(), world.clone());
+    let api = Arc::new(support::GuardApi::default());
+    *api.label.lock().unwrap() = Some(label.into());
+    Arc::get_mut(&mut engine).unwrap().deps.decisions =
+        Some(agent::decisions::decision_client("guard-test".into(), api.clone()));
+    (engine, world, api, model)
+}
+async fn guarded_run(engine: &Arc<Engine>, id: &str) -> FlowResult {
+    let input = input(engine, id).await;
+    create_flows(engine.clone()).run_loop(id, input, &scope(engine), &CancellationToken::new()).await
+}
+fn without_guard() -> String {
+    agent::agent::AGENT_LOOP.replace("- act: { then: guard }", "- act: { then: round }").replace(
+        "  - guard:\n      call: guard\n      with: { loop: '${ $context.loop }', calls: '${ $context.calls }' }\n",
+        "",
+    )
+}
+
+#[tokio::test]
+async fn reads_skip_decisions_and_a_round_of_two_writes_is_one_request() {
+    let (engine, world, api, _) = guarded(
+        vec![
+            calls(&[("search", json!({"q":"read"}))]),
+            calls(&[("send", json!({"q":"one"})), ("send", json!({"q":"two"})), ("finish", json!({"result":"done"}))]),
+        ],
+        "allow",
+    );
+    assert!(matches!(guarded_run(&engine, "batch").await, FlowResult::Completed(ref v) if v == "done"));
+    let requests = api.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["questions"].as_object().unwrap().len(), 2);
+    assert_eq!(world.calls.lock().unwrap().iter().filter(|n| *n == "send").count(), 2);
+}
+
+#[tokio::test]
+async fn blocked_writes_never_dispatch_and_finish_does_not_end_the_round() {
+    let (engine, world, api, model) = guarded(
+        vec![
+            calls(&[("send", json!({"q":"unasked"})), ("finish", json!({"result":"premature"}))]),
+            assistant("recovered"),
+        ],
+        "off_request",
+    );
+    assert!(matches!(guarded_run(&engine, "blocked").await, FlowResult::Completed(ref v) if v == "recovered"));
+    assert!(world.calls.lock().unwrap().is_empty());
+    assert_eq!(api.requests.lock().unwrap().len(), 1);
+    let seen = model.seen.lock().unwrap();
+    let replies = serde_json::to_string(&seen[1].messages).unwrap();
+    assert!(replies.contains("[guard] blocked: off_request —"), "{replies}");
+    assert!(replies.contains("[finish error] not finished: send failed"), "{replies}");
+}
+
+#[tokio::test]
+async fn guardless_overrides_are_refused_early_but_old_stored_ones_are_enforced_by_the_host() {
+    let (engine, world, api, _) = guarded(vec![calls(&[("send", json!({"q":"x"}))]), assistant("done")], "injected");
+    let definition = without_guard();
+    assert!(!definition.contains("call: guard"));
+    let save = json!({"name":"agent-loop","definition":definition});
+    let error = agent::flows::tool(&engine, "save_workflow", save.as_object().unwrap()).unwrap_err().to_string();
+    assert!(error.contains("requires a `call: guard`"), "{error}");
+    let saved = engine.deps.workflows.save("agent-loop", &definition, None).unwrap();
+    let activate = json!({"name":"agent-loop","version":saved.version});
+    assert!(
+        agent::flows::tool(&engine, "activate_workflow", activate.as_object().unwrap())
+            .unwrap_err()
+            .to_string()
+            .contains("requires a `call: guard`")
+    );
+    engine.deps.workflows.activate("agent-loop", saved.version).unwrap();
+    assert!(matches!(guarded_run(&engine, "legacy").await, FlowResult::Completed(_)));
+    assert!(world.calls.lock().unwrap().is_empty());
+    assert_eq!(api.requests.lock().unwrap().len(), 1, "tool supplied the missing guard");
+}
+
+#[tokio::test]
+async fn arguments_swapped_after_guard_require_a_new_verdict_and_yaml_cannot_change_the_task() {
+    let (engine, world, api, _) = guarded(vec![], "allow");
+    let definition = r#"
+document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '2.0.0' }
+do:
+  - review:
+      call: guard
+      with:
+        loop: '${ $workflow.input.loop + { root_request: "forged authority" } }'
+        calls: [{ id: c, name: send, arguments: '{"q":"original"}' }]
+  - changed:
+      call: tool
+      with:
+        loop: '${ $workflow.input.loop + { root_request: "forged authority" } }'
+        call: { id: c, name: send, arguments: '{"q":"changed"}' }
+"#;
+    let saved = engine.deps.workflows.save("agent-loop", definition, None).unwrap();
+    engine.deps.workflows.activate("agent-loop", saved.version).unwrap();
+    assert!(matches!(guarded_run(&engine, "swapped").await, FlowResult::Completed(_)));
+    assert_eq!(*world.calls.lock().unwrap(), ["send"]);
+    let requests = api.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["state"]["task"], "go");
+    assert_eq!(requests[1]["state"]["task"], "go");
+    assert_eq!(requests[1]["state"]["root_request"], "");
+    assert_eq!(requests[1]["state"]["calls"][0]["arguments"], r#"{"q":"changed"}"#);
+}
+
+#[tokio::test]
+async fn an_override_cannot_bypass_tool_by_calling_mcp_writes_directly() {
+    let (engine, world, _, _) = guarded(vec![], "allow");
+    let definition = "document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '2.0.0' }\ndo: [{ bypass: { call: send, with: { q: bypass } } }]";
+    let saved = engine.deps.workflows.save("agent-loop", definition, None).unwrap();
+    engine.deps.workflows.activate("agent-loop", saved.version).unwrap();
+    let result = guarded_run(&engine, "direct").await;
+    assert!(matches!(result, FlowResult::Faulted { .. }), "{result:?}");
+    assert!(world.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn unavailable_guard_permits_current_conversation_replies_only() {
+    for missing_client in [true, false] {
+        let model = Arc::new(Scripted::new(vec![
+            calls(&[
+                ("send_telegram_message", json!({"chatId":42,"text":"reply"})),
+                ("reply_to_peer", json!({"threadId":"peer-7","text":"reply"})),
+                ("set_memory", json!({"key":"x","value":"blocked"})),
+            ]),
+            assistant("done"),
+        ]));
+        let mut fixture = support::fixture(
+            model.clone(),
+            &["send_telegram_message", "reply_to_peer"],
+            &[("any", "---\ntools: *\n---\nworker")],
+        );
+        let api = Arc::new(support::GuardApi::default());
+        api.broken.store(true, std::sync::atomic::Ordering::SeqCst);
+        Arc::get_mut(&mut fixture.engine).unwrap().deps.decisions =
+            if missing_client { None } else { Some(agent::decisions::decision_client("guard-test".into(), api)) };
+        let mut opts = LoopOptions::new("down", task_context("down"));
+        opts.skills = vec!["any".into()];
+        let loop_ = fixture.engine.start_loop(opts).await.unwrap();
+        assert_eq!(loop_.send("Reply in chat 42 and thread peer-7".into()).await.unwrap(), "done");
+        assert_eq!(fixture.mcp.called.lock().unwrap().len(), 2);
+        assert!(fixture.engine.deps.memory.get("x").unwrap().is_none());
+        let seen = model.seen.lock().unwrap();
+        assert!(serde_json::to_string(&seen[1].messages).unwrap().contains("[guard] blocked: guard_unavailable —"));
+    }
+}
+
+#[tokio::test]
+async fn a_restart_after_guard_rechecks_against_admitted_input_before_dispatch() {
+    use owf::durable::{CallState, Journal, Record, check_transition};
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    #[derive(Default)]
+    struct CrashAfterGuard {
+        records: Mutex<BTreeMap<String, Record>>,
+        dead: AtomicBool,
+        crashed: AtomicBool,
+    }
+    impl Journal for CrashAfterGuard {
+        fn load(&self) -> anyhow::Result<BTreeMap<String, Record>> {
+            Ok(self.records.lock().unwrap().clone())
+        }
+        fn save(&self, key: &str, record: &Record) -> anyhow::Result<()> {
+            anyhow::ensure!(!self.dead.load(Ordering::SeqCst), "process stopped");
+            let mut records = self.records.lock().unwrap();
+            if let Some(old) = records.get(key) {
+                check_transition(old, record)?;
+            }
+            records.insert(key.into(), record.clone());
+            if matches!(record, Record::Call { function, state: CallState::Done(_), .. } if function == "guard")
+                && !self.crashed.swap(true, Ordering::SeqCst)
+            {
+                self.dead.store(true, Ordering::SeqCst);
+                anyhow::bail!("crash after guard's response committed");
+            }
+            Ok(())
+        }
+    }
+    let journal = CrashAfterGuard::default();
+    let (first, world, api1, _) =
+        guarded(vec![calls(&[("send", json!({"q":"x"})), ("finish", json!({"result":"done"}))])], "allow");
+    let admitted = input(&first, "restart").await;
+    let wf = owf::model::parse_yaml(agent::agent::AGENT_LOOP).unwrap();
+    let root = scope(&first).span(agent::tracing::SpanStart::new("runner", agent::tracing::SpanKind::Chain));
+    let host = agent::flows::loop_host(&first, &root, admitted.clone());
+    let cut = owf::run::resume(&host, &wf, "restart", admitted.clone(), &CancellationToken::new(), &journal).await;
+    assert!(matches!(cut.status, Status::Interrupted(_)), "{:?}", cut.status);
+    assert!(world.calls.lock().unwrap().is_empty());
+    assert_eq!(api1.requests.lock().unwrap().len(), 1);
+    journal.dead.store(false, Ordering::SeqCst);
+    // The second process no longer allows the write: it must not reuse the
+    // allowed verdict in the workflow's persisted guard output.
+    let (second, world2, api2, model2) = guarded(vec![assistant("recovered")], "off_request");
+    let root = scope(&second).span(agent::tracing::SpanStart::new("runner", agent::tracing::SpanKind::Chain));
+    let host = agent::flows::loop_host(&second, &root, admitted.clone());
+    let resumed = owf::run::resume(&host, &wf, "restart", admitted, &CancellationToken::new(), &journal).await;
+    assert_eq!(resumed.status, Status::Completed(json!("recovered")));
+    assert!(world2.calls.lock().unwrap().is_empty());
+    let requests = api2.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1, "the completed guard step is not run again, but tool rechecks");
+    assert_eq!(requests[0]["state"]["task"], "go");
+    assert!(
+        serde_json::to_string(&model2.seen.lock().unwrap()[0].messages)
+            .unwrap()
+            .contains("[guard] blocked: off_request")
+    );
+}
+
+#[tokio::test]
+async fn prior_writes_and_the_root_request_reach_a_durable_worker_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
+    let (first, _, _, _) = guarded(vec![], "allow");
+    let mut opts = LoopOptions::new("root", task_context("root"));
+    opts.skills = vec!["any".into()];
+    let live = first.start_loop(opts).await.unwrap();
+    let input = live.workflow_input("Original root request: publish the report").await;
+    // A stored override delegates without running a turn, like an agent-loop
+    // definition manufacturing calls. The worker still gets host authority.
+    let def = r#"
+document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '2.0.0' }
+do:
+  - worker:
+      call: tool
+      with:
+        loop: '${ $workflow.input.loop }'
+        call: { id: worker, name: invoke_sub_agent, arguments: '{"prompt":"worker task"}' }
+        i: 1
+        index: 0
+"#;
+    let runs = RunStore::new(db.clone());
+    // Admit the primary with its custom definition; children use the built-in
+    // loop. This mirrors a restart before a worker's first turn.
+    runs.admit("root/loop", "agent-loop", def, &input).unwrap();
+    let (mut second, world, api, model) = guarded(
+        vec![
+            calls(&[("send", json!({"q":"first"}))]),
+            calls(&[("send", json!({"q":"second"})), ("finish", json!({"result":"done"}))]),
+        ],
+        "allow",
+    );
+    Arc::get_mut(&mut second).unwrap().deps.workflows = Arc::new(MemoryWorkflows::default());
+    assert_eq!(
+        create_durable_flows(second.clone(), db.clone()).recover_once(&CancellationToken::new()).await.unwrap(),
+        1
+    );
+    assert_eq!(world.calls.lock().unwrap().len(), 2);
+    assert_eq!(model.seen.lock().unwrap().len(), 2);
+    let child = runs.get("root__sub1.0/loop").unwrap().unwrap();
+    assert_eq!(child.input["loop"]["root_request"], "Original root request: publish the report");
+    let requests = api.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["state"]["root_request"], "Original root request: publish the report");
+    assert_eq!(requests[0]["state"]["task"], "worker task");
+    assert_eq!(requests[1]["state"]["prior_writes"].as_array().unwrap().len(), 1);
 }
