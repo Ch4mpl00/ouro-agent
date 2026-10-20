@@ -268,7 +268,10 @@ pub struct Headline {
 }
 
 // The shared article mapping. Keys whose value is absent are omitted, as
-// JSON.stringify dropped `undefined`; the headline's author wins.
+// JSON.stringify dropped `undefined`; the headline's author wins. So does its
+// time (HN's `time`, the feed's date): a page's own date is often wrong
+// (a misread "26/09/26" became the year 2609) and is only a fallback, never
+// one in the future, which would pass every "since" filter forever.
 pub fn article_item(source: &str, headline: &Headline, article: Option<Article>) -> Option<NewsItem> {
     let article = article.filter(|a| !a.text.trim().is_empty())?;
     let mut metadata = headline.extra.clone();
@@ -285,7 +288,9 @@ pub fn article_item(source: &str, headline: &Headline, article: Option<Article>)
         url: Some(headline.url.clone()),
         body: article.text,
         metadata,
-        posted_at: article.published_at.or(headline.posted_at),
+        posted_at: headline
+            .posted_at
+            .or(article.published_at.filter(|at| *at <= Utc::now() + chrono::Duration::days(1))),
     })
 }
 
@@ -1414,12 +1419,21 @@ mod tests {
             item.metadata,
             json!({ "hn_id": 1, "author": "alice", "site": "example.com" }).as_object().unwrap().clone()
         );
-        assert_eq!(item.posted_at, parse_js_date("2026-01-02T00:00:00Z"));
+        assert_eq!(item.posted_at, parse_js_date("2026-01-01T00:00:00Z"), "the listing's time wins");
         // Empty extracted title falls back to the headline's.
         assert_eq!(
             article_item("habr", &headline(Map::new()), Some(article("", "b"))).unwrap().title.as_deref(),
             Some("Headline title")
         );
+    }
+
+    #[test]
+    fn a_page_date_is_only_a_fallback_and_never_in_the_future() {
+        let undated = Headline { posted_at: None, ..headline(Map::new()) };
+        let item = article_item("hackernews", &undated, Some(article("t", "b"))).unwrap();
+        assert_eq!(item.posted_at, parse_js_date("2026-01-02T00:00:00Z"));
+        let future = Article { published_at: parse_js_date("2609-09-26T00:00:00Z"), ..article("t", "b") };
+        assert_eq!(article_item("hackernews", &undated, Some(future)).unwrap().posted_at, None);
     }
 
     #[test]
