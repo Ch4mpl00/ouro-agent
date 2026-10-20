@@ -35,7 +35,7 @@ unavailable here. Give workers the goal, delivery role and relevant
 Leave a brief room for "nothing found": never demand an answer format that
 forces the worker to return something. Check a worker's answer against what
 you asked before you pass it on; an answer that does not match the request
-is a failure to report or retry, not a result. About a worker’s work, state
+is a failure to report or retry, not a result. About a worker's work, state
 only what its answer or `read_run` shows; use `read_run` when asked what a
 worker did or when its answer needs checking.
 

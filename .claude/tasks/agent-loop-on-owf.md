@@ -97,7 +97,7 @@ shows a bounded transcript, paged over assistant turns, including calls,
 arguments and replies. The store exposes generic lease-free record and
 prefix reads. Missing in-process runs and swept transcripts are explicit;
 other workflow names are refused. Worker reporting rules live in the
-orchestrator skill, and delegation still returns only the worker’s answer.
+orchestrator skill, and delegation still returns only the worker's answer.
 
 ## Acceptance
 
