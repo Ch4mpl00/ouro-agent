@@ -87,7 +87,7 @@ deletion.
    wait never takes a signal: a wait abandoned by a dead supervisor can't
    lose one. `wait_for_signal` is supervisor-only — never offered to a model
    (`agent::mcp::SUPERVISOR_ONLY_TOOLS`). Each signal runs the OWF workflow
-   `signal` (`signal.yaml`, its functions in `supervisor.rs` §2b; the agent
+   `signal` (`workflows/signal.yaml`, its functions in `supervisor.rs` §2b; the agent
    may activate its own version, with the same breaker as `agent-loop`), which
    holds the routing and the first turn's context below. Routing is by source: a `scheduler`
    signal whose payload names a saved workflow (`{"workflow": …}`, set by
@@ -95,7 +95,7 @@ deletion.
    model deciding the steps); other `scheduler` signals run through the
    workflow module (`workflow.rs`: compile → execute); every other source
    runs the primary agent loop. Every agent loop (primary, worker, recovery)
-   is a run of the OWF workflow `agent-loop` (`agent_loop.yaml`, its host
+   is a run of the OWF workflow `agent-loop` (`workflows/agent-loop.yaml`, its host
    functions in `agent.rs` §4): the primary one durable, so a restart resumes
    it from its last round. The agent may activate its own version of
    `agent-loop`; three faults of it in a row fall back to the built-in one
@@ -163,8 +163,8 @@ mcp-tools/
     │   ├── src/schedule.rs                 scheduled tasks: cron rows, the 30 s tick, the schedule
     │   │                                   tools, the first start's import
     │   ├── src/agent.rs                    the engine, the loop's turn/tool/settle, synthetic tools
-    │   ├── src/agent_loop.yaml             the built-in `agent-loop` workflow every loop runs
-    │   ├── src/signal.yaml                 the built-in `signal` workflow every signal runs
+    │   ├── workflows/                      the built-in OWF workflows in git: agent-loop.yaml
+    │   │                                   (every loop), signal.yaml (every signal)
     │   ├── src/activity.rs                 traces → ouro/activity journal notes (background
     │   │                                   task inside the supervisor)
     │   ├── src/providers.rs                ChatProviders: openai, gemini, deepseek, openrouter

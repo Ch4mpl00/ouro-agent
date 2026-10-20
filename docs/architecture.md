@@ -189,7 +189,7 @@ Telegram.
 ### The agent loop
 
 Every agent loop is a run of the OWF workflow `agent-loop`
-(`crates/agent/src/agent_loop.yaml`): a turn (`agent_turn`), the round's
+(`crates/agent/workflows/agent-loop.yaml`): a turn (`agent_turn`), the round's
 calls in parallel (`tool`, one call by name; a write is sent at most once),
 then the settlement (`agent_settle`: `finish`, the replies, the working
 memory). The transcript and the working memory travel in the run's context,
@@ -209,7 +209,7 @@ version is activated.
 ### The signal workflow
 
 The routing and the context gathering above are the OWF workflow `signal`
-too (`crates/agent/src/signal.yaml`, its functions in `supervisor.rs` §2b):
+too (`crates/agent/workflows/signal.yaml`, its functions in `supervisor.rs` §2b):
 `signal_session`, `run_saved_workflow`, `run_planner`, `signal_input`,
 `recent_activity`, `preselect_skills`, and `primary_loop`, which takes the
 loop's skills, preset and system prompt from the workflow. The agent may

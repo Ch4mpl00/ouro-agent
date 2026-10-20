@@ -798,7 +798,7 @@ fn string_array(args: &Map<String, Value>, name: &str) -> anyhow::Result<Option<
 // functions (flows.rs): `agent_turn`, `tool` and `agent_settle`. The transcript
 // and the working memory travel in the run's context, so the interpreter's
 // task records are the loop's checkpoints and a restart resumes it.
-pub const AGENT_LOOP: &str = include_str!("agent_loop.yaml");
+pub const AGENT_LOOP: &str = include_str!("../workflows/agent-loop.yaml");
 pub const AGENT_LOOP_NAME: &str = "agent-loop";
 
 // Synthetic tools that change something outside the run. Every other

@@ -537,13 +537,13 @@ impl Supervisor {
 }
 
 // ── 2b. the signal workflow ──────────────────────────────────────────────
-// How a signal is handled is the OWF workflow `signal` (`signal.yaml`, or
+// How a signal is handled is the OWF workflow `signal` (`workflows/signal.yaml`, or
 // the version the agent activates under that name, guarded by a breaker:
 // flows.rs §4b): the routing, the context the first turn gets, the primary
 // loop's skills and prompt. Its functions here act on the one signal its run
 // serves and trace under that signal's trace, as the code before them did.
 
-pub const SIGNAL: &str = include_str!("signal.yaml");
+pub const SIGNAL: &str = include_str!("../workflows/signal.yaml");
 pub const SIGNAL_NAME: &str = "signal";
 /// The signal workflow's functions and their effects.
 pub const SIGNAL_FUNCTIONS: &[(&str, owf::run::Effect)] = {

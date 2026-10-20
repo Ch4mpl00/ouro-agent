@@ -1086,7 +1086,7 @@ pub async fn run_child(
 
 // ── 4b. the agent loop's definition ─────────────────────────────────────────
 // Every agent loop runs `agent-loop`: the version the agent saved and
-// activated under that name, or the built-in one in git (`agent_loop.yaml`).
+// activated under that name, or the built-in one in git (`workflows/agent-loop.yaml`).
 // A circuit breaker guards the agent's version: LOOP_BREAKER faults in a row
 // and loops go back to the built-in one until another version is activated.
 

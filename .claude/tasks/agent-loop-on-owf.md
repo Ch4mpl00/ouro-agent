@@ -70,7 +70,7 @@ on the next start rather than after the lease expires.
 ## The signal workflow (done 2026-10-20)
 
 `Supervisor::run_active`'s body is the built-in workflow `signal`
-(`signal.yaml`): routing, context gathering and the primary loop's options
+(`workflows/signal.yaml`): routing, context gathering and the primary loop's options
 are YAML over seven host functions (`supervisor.rs` §2b) that act on the
 signal the run serves and trace as before. The run is in process and
 untraced itself (the primary loop inside it is the durable part). The
