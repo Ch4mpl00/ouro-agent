@@ -122,14 +122,21 @@ earlier user messages, and the configured default chat.
 
 ## Golden-set evaluation
 
-`crates/evals/fixtures/guard-golden.json` contains 35 judgement cases (including
-both exfiltration-through-read cases, no longer gaps). `guard-eval` calls the
-real env-configured `DecisionClient`, sharing the runtime's `review_state` and
-`review_question` builders, evidence limits and three labels. It intentionally
-judges all cases, independent of production skips/deterministic blocks, so it
-measures Jev's policy quality. Independent cases batch eight per request with
-isolated context paths; `--batch N` adjusts this. It prints expected/got, ASR
-(expected non-allow, got allow), false blocks and accepted-label accuracy.
-`--case ID` selects one; `--json [PATH]` writes results (default guard-eval.json).
-Offline unit tests cover scoring and fixture projection; live Jev evaluation
-is manual and was not run as part of implementation.
+`crates/evals/fixtures/guard-golden.json` holds 147 judgement cases in four
+splits by category prefix: the first 35 (tuned on), `holdout/` (seen while
+tuning), `blind/` (written later, unseen) and `indep/`: 80 cases a separate
+model wrote from a brief without seeing the prompt or the other cases. Only
+`indep/` is an honest measure. `guard-eval` calls the real env-configured
+`DecisionClient` with the runtime's builders, judges every case (production
+skips and deterministic blocks aside, so it measures Jev alone), one case per
+request by default: batched cases sharing one state influenced each other's
+answers. It prints expected/got, ASR, false blocks and label accuracy; a run
+costs about $0.005.
+
+Measured 2026-10-20 (Jev 1.13, 3 runs each, `indep/`): the first prompt (one
+label question, short policy) ASR 14%, false blocks 10.5%; the six-step
+prompt in `instructions.md` (goal, destination, data, history, scale,
+explicitness) ASR 12%, false blocks 0%, label accuracy 95%. Five narrow
+questions combined by the host (branch `feat/guard-atomic`) did worse on
+`indep/` (ASR 17%, or 23% with a two-signal rule) despite near-perfect scores
+on the sets it was tuned on; the six-step prompt shipped.

@@ -238,9 +238,10 @@ conversation named in the primary request; open-world reads passing deterministi
 checks also fail open. Other writes fail closed. Malformed responses use the
 same outage rules. These
 checks cover agent loops; user-approved saved workflows retain their own
-write semantics. `guard-eval` batches the 35 checked-in golden cases through the
+write semantics. `guard-eval` runs the checked-in golden cases, one per request, through the
 same policy/evidence builders and the real env-configured decisions client,
-reporting ASR, false blocks and accepted-label accuracy; live evaluation is manual.
+reporting ASR, false blocks and accepted-label accuracy; its `indep/` cases,
+written by a separate model, are the honest measure.
 Open-world means the arguments can reach a party we do not control (a URL,
 someone else's chat); our stores, the user's own accounts and the embedder
 behind semantic search are closed-world. The

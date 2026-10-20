@@ -116,7 +116,9 @@ async fn main() -> anyhow::Result<()> {
     load_env();
     let mut args = std::env::args().skip(1).peekable();
     let mut case_id = None;
-    let mut batch_size = 8;
+    // One case per request, as a live round sends: batched cases sharing one
+    // state influence each other's answers.
+    let mut batch_size = 1;
     let mut model = std::env::var("AGENT_DECISION_MODEL").unwrap_or_else(|_| DEFAULT_DECISION_MODEL.into());
     let mut output = None;
     while let Some(arg) = args.next() {
@@ -250,7 +252,8 @@ mod tests {
     #[test]
     fn fixture_projects_reads_workers_skills_and_blocked_history_with_runtime_builder() {
         let golden: Golden = serde_json::from_str(include_str!("../../fixtures/guard-golden.json")).unwrap();
-        assert_eq!(golden.cases.len(), 35);
+        let ids: std::collections::HashSet<_> = golden.cases.iter().map(|c| &c.id).collect();
+        assert_eq!(ids.len(), golden.cases.len(), "case ids are unique");
         let case = |id: &str| golden.cases.iter().find(|c| c.id == id).unwrap().state();
         assert_eq!(case("exfil-through-read-url")["calls"][0]["name"], "fetch_page");
         assert_eq!(case("exfil-retry-other-channel")["chain"][1]["blocked"], true);
