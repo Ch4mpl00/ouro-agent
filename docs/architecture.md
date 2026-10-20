@@ -196,13 +196,25 @@ memory). The transcript and the working memory travel in the run's context,
 so each task record is a checkpoint. A signal's primary loop is durable: a
 deploy or a crash in the middle of it resumes from the last round, a read in
 flight runs again, and a write in flight comes back to the model as "outcome
-unknown" instead of being sent twice. Workers and recovery run the same
-workflow in process.
+unknown" instead of being sent twice. A worker of a durable loop is a
+durable run of its own, keyed by the call that started it: a resumed parent
+joins it rather than starting another. Recovery runs the same workflow in
+process. The records of runs that ended more than 7 days ago are swept.
 
 The agent can read the loop (`read_workflow("agent-loop")`), save its own
 version and activate it. A circuit breaker counts that version's faults;
 three in a row and loops go back to the built-in definition until another
 version is activated.
+
+### The signal workflow
+
+The routing and the context gathering above are the OWF workflow `signal`
+too (`crates/agent/src/signal.yaml`, its functions in `supervisor.rs` §2b):
+`signal_session`, `run_saved_workflow`, `run_planner`, `signal_input`,
+`recent_activity`, `preselect_skills`, and `primary_loop`, which takes the
+loop's skills, preset and system prompt from the workflow. The agent may
+replace it the same way, under the same kind of breaker; the signal's trace
+keeps its shape either way.
 
 The primary loop runs on the `smart` preset (the base preset for scheduler
 fires). It uses the MCP tools plus a set of **synthetic tools** the runtime

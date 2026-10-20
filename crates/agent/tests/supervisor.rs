@@ -737,3 +737,41 @@ async fn a_failed_wait_backs_off_instead_of_spinning() {
     tokio::time::timeout(std::time::Duration::from_secs(2), task).await.unwrap().unwrap().unwrap();
     supervisor.shutdown().await;
 }
+
+// The agent may replace how signals are handled: the version it activates
+// under `signal` handles every signal after it, with no dry run, and three
+// faults of it in a row put the built-in one back.
+#[tokio::test]
+async fn an_activated_signal_workflow_handles_signals_until_its_breaker_opens() {
+    let model = Arc::new(Scripted::new((0..4).map(|_| assistant("done")).collect()));
+    let (f, _mcp, _workflow, supervisor) = setup(model.clone(), Stage::Success);
+    let tool = |name: &str, args: Value| agent::flows::tool(&f.engine, name, args.as_object().unwrap()).unwrap();
+    let activate = |definition: &str| {
+        let saved = f.engine.deps.workflows.save("signal", definition, None).unwrap();
+        tool("activate_workflow", json!({"name": "signal", "version": saved.version}))
+    };
+    let read: Value = serde_json::from_str(&tool("read_workflow", json!({"name": "signal"}))).unwrap();
+    assert_eq!(
+        (read["status"].as_str(), read["definition"].as_str()),
+        (Some("built-in"), Some(agent::supervisor::SIGNAL))
+    );
+    let last_system = || model.seen.lock().unwrap().last().unwrap().messages[0]["content"].as_str().unwrap().to_owned();
+
+    let terse = agent::supervisor::SIGNAL
+        .replace(r#""Call find_skills only when"#, r#""Answer tersely.", "Call find_skills only when"#);
+    assert_ne!(terse, agent::supervisor::SIGNAL);
+    activate(&terse);
+    supervisor.run_signal(&signal("telegram", 1)).await.unwrap();
+    assert!(last_system().contains("Answer tersely."), "{}", last_system());
+
+    let broken = "document: { dsl: '1.0.4', namespace: agent, name: signal, version: '9.0.0' }\n\
+        do: [ { boom: { raise: { error: { type: 'https://example.com/boom', status: 500 } } } } ]\n";
+    activate(broken);
+    for n in 2..5 {
+        assert!(supervisor.run_signal(&signal("telegram", n)).await.is_err(), "fault {}", n - 1);
+    }
+    supervisor.run_signal(&signal("telegram", 5)).await.unwrap();
+    assert!(!last_system().contains("Answer tersely."), "the built-in signal workflow is back");
+    assert_eq!(model.seen.lock().unwrap().len(), 2);
+    supervisor.shutdown().await;
+}

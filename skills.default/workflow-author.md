@@ -195,6 +195,14 @@ new version under that name and activate it when the user agrees; it needs
 no dry run. Loops started after that run it, and three faults of it in a
 row put the built-in loop back.
 
+How a signal is handled is the workflow `signal` the same way: which path
+runs (a scheduled task's saved workflow, the planner, the primary loop), the
+context gathered first, the primary loop's skills, preset and system prompt.
+Its functions are `signal_session`, `run_saved_workflow`, `run_planner`,
+`signal_input`, `recent_activity`, `preselect_skills` and `primary_loop`;
+`read_workflow("signal")` shows each one's use. It is replaced, activated and
+guarded the same way as `agent-loop`.
+
 ## The language
 
 A subset of the Open Workflow Specification 1.0, in YAML. Anything not

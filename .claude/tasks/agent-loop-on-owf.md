@@ -67,6 +67,19 @@ worker may resume the child first; the parent then waits for its outcome
 stopping with its worker in flight) is released at once, so the child is due
 on the next start rather than after the lease expires.
 
+## The signal workflow (done 2026-10-20)
+
+`Supervisor::run_active`'s body is the built-in workflow `signal`
+(`signal.yaml`): routing, context gathering and the primary loop's options
+are YAML over seven host functions (`supervisor.rs` §2b) that act on the
+signal the run serves and trace as before. The run is in process and
+untraced itself (the primary loop inside it is the durable part). The
+override + breaker of `agent-loop` is now general (`flows::built_in`,
+`definition`, `record_outcome`; `signal.breaker` in the memory KV).
+Open: the signal workflow can call only its own functions; letting it call
+the general catalog (a model step to classify, an MCP read) needs task spans
+that don't change the signal trace's shape.
+
 ## Cleanup of finished runs (done 2026-10-20)
 
 `workflow_records` of a terminal run are only evidence once it has ended,

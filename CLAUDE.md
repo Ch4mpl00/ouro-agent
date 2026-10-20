@@ -86,7 +86,10 @@ deletion.
    (25 s rounds), so a signal starts at once instead of on the next poll. The
    wait never takes a signal: a wait abandoned by a dead supervisor can't
    lose one. `wait_for_signal` is supervisor-only — never offered to a model
-   (`agent::mcp::SUPERVISOR_ONLY_TOOLS`). Routing is by source: a `scheduler`
+   (`agent::mcp::SUPERVISOR_ONLY_TOOLS`). Each signal runs the OWF workflow
+   `signal` (`signal.yaml`, its functions in `supervisor.rs` §2b; the agent
+   may activate its own version, with the same breaker as `agent-loop`), which
+   holds the routing and the first turn's context below. Routing is by source: a `scheduler`
    signal whose payload names a saved workflow (`{"workflow": …}`, set by
    `schedule_task(workflow: …)`) runs its active version (`flows.rs` over `crates/owf`, no
    model deciding the steps); other `scheduler` signals run through the
@@ -96,7 +99,8 @@ deletion.
    functions in `agent.rs` §4): the primary one durable, so a restart resumes
    it from its last round. The agent may activate its own version of
    `agent-loop`; three faults of it in a row fall back to the built-in one
-   (`flows.rs` §4b). A compile failure, or a saved
+   (`flows.rs` §4b). A worker of the durable primary loop is a durable run of
+   its own, which a resumed parent joins. A compile failure, or a saved
    workflow that faulted before any write call, degrades to the agent loop in
    the same trace; an execute failure, or a saved workflow that faulted after
    a write, goes to `recovery` instead of being retried. Writes are the MCP
@@ -160,6 +164,7 @@ mcp-tools/
     │   │                                   tools, the first start's import
     │   ├── src/agent.rs                    the engine, the loop's turn/tool/settle, synthetic tools
     │   ├── src/agent_loop.yaml             the built-in `agent-loop` workflow every loop runs
+    │   ├── src/signal.yaml                 the built-in `signal` workflow every signal runs
     │   ├── src/activity.rs                 traces → ouro/activity journal notes (background
     │   │                                   task inside the supervisor)
     │   ├── src/providers.rs                ChatProviders: openai, gemini, deepseek, openrouter

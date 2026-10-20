@@ -273,6 +273,9 @@ pub fn effect(mcp: &dyn Mcp, name: &str) -> Option<Effect> {
     if LOOP_FUNCTIONS.contains(&name) {
         return Some(Effect::Read);
     }
+    if let Some((_, effect)) = crate::supervisor::SIGNAL_FUNCTIONS.iter().find(|f| f.0 == name) {
+        return Some(*effect);
+    }
     if let Some((_, effect, _, _)) = MODEL_FUNCTIONS.iter().find(|f| f.0 == name) {
         return Some(*effect);
     }
@@ -389,6 +392,9 @@ impl owf::run::Functions for Functions {
     }
 
     async fn invoke(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
+        if crate::supervisor::SIGNAL_FUNCTIONS.iter().any(|f| f.0 == name) {
+            return Err(CallFailure::NotExecuted(invalid(name, "only the signal workflow calls it")));
+        }
         if LOOP_FUNCTIONS.contains(&name) {
             // A tool reports its own failures in its reply; an error here
             // (cancellation, a lost loop) leaves a write's outcome unknown.
@@ -705,7 +711,7 @@ pub fn create_durable_flows(engine: Arc<Engine>, db: AgentDb) -> Arc<Flows> {
     Arc::new(Flows { engine, runs: Some(crate::durable::RunStore::new(db)) })
 }
 
-fn flow_result(status: RunStatus, effects_started: bool) -> FlowResult {
+pub fn flow_result(status: RunStatus, effects_started: bool) -> FlowResult {
     match status {
         RunStatus::Completed(output) => FlowResult::Completed(output),
         RunStatus::Faulted(error) => {
@@ -1084,8 +1090,10 @@ pub async fn run_child(
 // A circuit breaker guards the agent's version: LOOP_BREAKER faults in a row
 // and loops go back to the built-in one until another version is activated.
 
+// The same goes for every workflow the runtime itself runs (`built_in`):
+// `signal` too (`supervisor.rs`), each with its own breaker.
+
 const LOOP_BREAKER: u32 = 3;
-const BREAKER_KEY: &str = "agent_loop.breaker";
 // Where a run's input names the saved version it runs (null: the built-in).
 const OVERRIDE: &str = "override_version";
 
@@ -1118,21 +1126,41 @@ struct Breaker {
     open: bool,
 }
 
-fn breaker(engine: &Engine) -> Breaker {
-    engine.deps.memory.get(BREAKER_KEY).ok().flatten().and_then(|b| serde_json::from_str(&b).ok()).unwrap_or_default()
+/// The definition in git of a workflow the runtime itself runs.
+pub fn built_in(name: &str) -> Option<&'static str> {
+    match name {
+        crate::agent::AGENT_LOOP_NAME => Some(crate::agent::AGENT_LOOP),
+        crate::supervisor::SIGNAL_NAME => Some(crate::supervisor::SIGNAL),
+        _ => None,
+    }
 }
 
-/// The definition a new loop runs, with the saved version it comes from
-/// (None: the built-in). A saved version that no longer validates, or whose
-/// breaker is open, gives way to the built-in one.
-pub fn loop_definition(engine: &Engine) -> (String, Option<i64>) {
-    let builtin = (crate::agent::AGENT_LOOP.to_owned(), None);
-    let Ok(Some(saved)) = engine.deps.workflows.active(crate::agent::AGENT_LOOP_NAME) else { return builtin };
-    let state = breaker(engine);
+// `agent_loop.breaker`, `signal.breaker` in the memory KV.
+fn breaker_key(name: &str) -> String {
+    format!("{}.breaker", name.replace('-', "_"))
+}
+
+fn breaker(engine: &Engine, name: &str) -> Breaker {
+    let stored = engine.deps.memory.get(&breaker_key(name)).ok().flatten();
+    stored.and_then(|b| serde_json::from_str(&b).ok()).unwrap_or_default()
+}
+
+/// The definition a new run of the built-in workflow `name` runs, with the
+/// saved version it comes from (None: the built-in). A saved version that no
+/// longer validates, or whose breaker is open, gives way to the built-in one.
+pub fn definition(engine: &Engine, name: &str) -> (String, Option<i64>) {
+    let builtin = (built_in(name).unwrap_or_default().to_owned(), None);
+    let Ok(Some(saved)) = engine.deps.workflows.active(name) else { return builtin };
+    let state = breaker(engine, name);
     if (state.open && state.version == saved.version) || check(&*engine.deps.mcp, &saved.definition).is_err() {
         return builtin;
     }
     (saved.definition, Some(saved.version))
+}
+
+/// The definition a new loop runs (`definition` of `agent-loop`).
+pub fn loop_definition(engine: &Engine) -> (String, Option<i64>) {
+    definition(engine, crate::agent::AGENT_LOOP_NAME)
 }
 
 fn with_override(mut input: Value, version: Option<i64>) -> Value {
@@ -1142,12 +1170,17 @@ fn with_override(mut input: Value, version: Option<i64>) -> Value {
     input
 }
 
-// Counts a saved version's run: a fault adds one (LOOP_BREAKER in a row open
-// the breaker), a completed run starts the count again. Cancellation and an
-// interruption say nothing about the definition.
 fn loop_outcome(engine: &Engine, version: Option<i64>, result: &FlowResult) {
+    record_outcome(engine, crate::agent::AGENT_LOOP_NAME, version, result)
+}
+
+/// Counts a run of the saved version `version` of the built-in workflow
+/// `name`: a fault adds one (LOOP_BREAKER in a row open the breaker), a
+/// completed run starts the count again. Cancellation and an interruption
+/// say nothing about the definition.
+pub fn record_outcome(engine: &Engine, name: &str, version: Option<i64>, result: &FlowResult) {
     let Some(version) = version else { return };
-    let mut state = breaker(engine);
+    let mut state = breaker(engine, name);
     if state.version != version {
         state = Breaker { version, ..Breaker::default() };
     }
@@ -1158,17 +1191,16 @@ fn loop_outcome(engine: &Engine, version: Option<i64>, result: &FlowResult) {
             if state.faults >= LOOP_BREAKER && !state.open {
                 state.open = true;
                 eprintln!(
-                    "[agent-loop] version {version} faulted {} times in a row; back to the built-in loop: {error}",
+                    "[{name}] version {version} faulted {} times in a row; back to the built-in one: {error}",
                     state.faults
                 );
             }
         }
         _ => return,
     }
-    if let Err(error) =
-        serde_json::to_string(&state).map_err(anyhow::Error::from).and_then(|s| engine.deps.memory.set(BREAKER_KEY, &s))
-    {
-        eprintln!("[agent-loop] breaker: {error:#}");
+    let saved = serde_json::to_string(&state).map_err(anyhow::Error::from);
+    if let Err(error) = saved.and_then(|s| engine.deps.memory.set(&breaker_key(name), &s)) {
+        eprintln!("[{name}] breaker: {error:#}");
     }
 }
 
@@ -1381,13 +1413,14 @@ pub fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::R
                 .ok_or_else(|| anyhow::anyhow!("no version {version} of workflow `{name}`"))?;
             // Tools may have changed since it was saved.
             check(mcp, &saved.definition).map_err(anyhow::Error::msg)?;
-            if name == crate::agent::AGENT_LOOP_NAME {
-                // A loop is tried by running: the breaker takes it back after
-                // a few faults in a row.
+            if built_in(name).is_some() {
+                // The runtime's own workflow is tried by running: the breaker
+                // takes it back after a few faults in a row.
                 store.activate(name, version)?;
+                let runs = if name == crate::agent::AGENT_LOOP_NAME { "Every agent loop" } else { "Every signal" };
                 return Ok(json!({
                     "ok": true, "name": name, "version": version,
-                    "next": "Every agent loop started from now runs this version; three faults in a row put the built-in loop back.",
+                    "next": format!("{runs} started from now runs this version; three faults in a row put the built-in one back."),
                 })
                 .to_string());
             }
@@ -1416,9 +1449,9 @@ pub fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::R
         "read_workflow" => {
             let name = text("name")?;
             Ok(match store.get(name, version()?)? {
-                // The loop the agent runs until it saves its own version.
-                None if name == crate::agent::AGENT_LOOP_NAME => {
-                    json!({"name":name,"found":true,"version":null,"status":"built-in","definition":crate::agent::AGENT_LOOP})
+                // What the runtime runs until the agent saves its own version.
+                None if built_in(name).is_some() => {
+                    json!({"name":name,"found":true,"version":null,"status":"built-in","definition":built_in(name)})
                 }
                 None => json!({"name": name, "found": false}),
                 Some(w) => json!({"name":w.name,"found":true,"version":w.version,"status":w.status,"note":w.note,"definition":w.definition}),
