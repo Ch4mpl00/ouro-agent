@@ -1025,6 +1025,12 @@ const BREAKER_KEY: &str = "agent_loop.breaker";
 // Where a run's input names the saved version it runs (null: the built-in).
 const OVERRIDE: &str = "override_version";
 
+/// The host an `agent-loop` run executes on, traced under `root`: for a
+/// caller that owns the run's journal itself (a test injecting crashes).
+pub fn loop_host(engine: &Arc<Engine>, root: &Arc<dyn Span>) -> Host {
+    host(engine, root, true)
+}
+
 fn host(engine: &Arc<Engine>, root: &Arc<dyn Span>, agent_loop: bool) -> Host {
     let spans = Arc::new(Spans { root: root.clone(), open: Mutex::default() });
     // A loop's generations and tool calls trace themselves; spans for its
