@@ -151,6 +151,10 @@ impl Mcp for World {
     fn read_only(&self, name: &str) -> bool {
         name != "send"
     }
+
+    fn open_world(&self, _name: &str) -> bool {
+        false
+    }
     async fn call_tool(&self, name: &str, args: Map<String, Value>, _: &CancellationToken) -> anyhow::Result<String> {
         let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(now, Ordering::SeqCst);
@@ -178,7 +182,7 @@ fn engine(model: Arc<Model>, world: Arc<World>) -> Arc<Engine> {
         memory: Arc::new(PersistLog::default()),
         tracer: Arc::new(agent::tracing::NullTracer),
         codex: Arc::new(NoCodex),
-        decisions: None,
+        decisions: Some(support::allow_guard()),
         workflows: Arc::new(MemoryWorkflows::default()),
         schedule: Arc::new(agent::schedule::MemorySchedule::default()),
     })
@@ -200,7 +204,7 @@ static AGENT_LOOP: LazyLock<owf::model::Workflow> =
 // One process's attempt at the run on `journal` (None: no checkpoints).
 async fn attempt(engine: &Arc<Engine>, input: &Value, journal: Option<&dyn Journal>) -> Status {
     let root = null_scope().span(SpanStart::new("runner", agent::tracing::SpanKind::Chain));
-    let host = agent::flows::loop_host(engine, &root);
+    let host = agent::flows::loop_host(engine, &root, input.clone());
     let cancel = CancellationToken::new();
     let outcome = match journal {
         None => owf::run::run(&host, &AGENT_LOOP, ID, input.clone(), &cancel).await,

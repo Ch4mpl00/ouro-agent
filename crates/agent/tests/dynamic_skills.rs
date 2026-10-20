@@ -13,6 +13,9 @@ struct Scorer;
 #[async_trait]
 impl JsonApi for Scorer {
     async fn post(&self, _: &str, body: Value, _: &CancellationToken) -> anyhow::Result<Value> {
+        if body["state"]["calls"].is_array() {
+            return agent_support::GuardApi::default().post("guard", body, &CancellationToken::new()).await;
+        }
         assert_eq!(body["state"]["current_request"], "What's new?");
         assert!(body["state"]["context"].as_str().unwrap().contains("telegram"));
         let skills = body["state"]["skills"].as_array().unwrap();

@@ -5,7 +5,7 @@ use agent::{
     agent::{EngineDeps, Providers, create_engine},
     codex::codex_client,
     db::{AgentDb, DEFAULT_DB_PATH},
-    decisions::decision_client,
+    decisions::{DecisionClient, OPENROUTER_DECISIONS_URL},
     errors::{is_aborted, or_cancel},
     flows::create_durable_flows,
     langfuse::LangfuseTracer,
@@ -202,9 +202,15 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
             schedule: db.clone(),
             tracer,
             codex: codex_client(&std::env::var("CODEX_URL").unwrap_or_else(|_| "http://localhost:3010".into())),
-            decisions: Some(decision_client(
-                std::env::var("AGENT_DECISION_MODEL").unwrap_or_else(|_| DEFAULT_DECISION_MODEL.into()),
-                router,
+            decisions: Some(Arc::new(
+                DecisionClient::with_retry(
+                    std::env::var("AGENT_DECISION_MODEL").unwrap_or_else(|_| DEFAULT_DECISION_MODEL.into()),
+                    router,
+                    RetryOpts::default(),
+                )
+                .with_endpoint(
+                    std::env::var("OPENROUTER_DECISIONS_URL").unwrap_or_else(|_| OPENROUTER_DECISIONS_URL.into()),
+                ),
             )),
         });
         let setup = async {

@@ -175,8 +175,19 @@ fn only_the_full_instance_reaches_the_paid_upstream_and_out_of_scope_tools_stay_
             let (url, child) = boot(env, toolsets.as_deref()).await;
             let at = format!("MCP_TOOLSETS={toolsets:?}");
             let client = connect(&url).await;
-            let names: Vec<String> =
-                client.list_all_tools().await.unwrap().into_iter().map(|t| t.name.to_string()).collect();
+            let tools = client.list_all_tools().await.unwrap();
+            for tool in &tools {
+                if tool.name.starts_with("paid__") {
+                    assert!(tool.annotations.is_none(), "gateway retains absent upstream annotations");
+                } else {
+                    assert!(
+                        tool.annotations.as_ref().and_then(|a| a.open_world_hint).is_some(),
+                        "{} must explicitly decide openWorldHint",
+                        tool.name
+                    );
+                }
+            }
+            let names: Vec<String> = tools.into_iter().map(|t| t.name.to_string()).collect();
             let charge = call(&client, "paid__charge", json!({ "q": "x" })).await;
             if restricted {
                 witnessed.lock().unwrap().insert("restricted");

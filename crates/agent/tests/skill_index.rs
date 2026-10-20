@@ -27,6 +27,10 @@ impl Mcp for MarkedMemory {
     fn read_only(&self, name: &str) -> bool {
         name == "read_doc"
     }
+
+    fn open_world(&self, _name: &str) -> bool {
+        false
+    }
     async fn call_tool(
         &self,
         name: &str,

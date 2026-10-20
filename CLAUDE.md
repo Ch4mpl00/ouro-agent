@@ -170,6 +170,8 @@ mcp-tools/
     │   ├── src/schedule.rs                 scheduled tasks: cron rows, the 30 s tick, the schedule
     │   │                                   tools, the first start's import
     │   ├── src/agent.rs                    the engine, the loop's turn/tool/settle, synthetic tools
+    │   ├── src/guard.rs                    loop write/open-world policy, deterministic rules, batched verdicts
+    │   ├── guard/                          compiled guard instructions and reason data (git-owned)
     │   ├── workflows/                      the built-in OWF workflows in git: agent-loop.yaml
     │   │                                   (every loop), signal.yaml (every signal)
     │   ├── src/activity.rs                 traces → ouro/activity journal notes (background
@@ -531,7 +533,11 @@ image they are on `PATH`.
   `judge-gate` A/Bs a candidate patch; `improve` runs one improver cycle;
   `judge-replay` replays a compose generation under another model;
   `langfuse-trace` prints a trace; `news-filter-eval` runs the filter golden
-  set (`eval-fixtures/news-filter/`).
+  set (`eval-fixtures/news-filter/`); `guard-eval [--case ID] [--batch N]
+  [--json [PATH]]` runs the guard golden set (`crates/evals/fixtures/guard-golden.json`)
+  through the runtime prompt builder and real Jev client. Reads `.env` /
+  `.env.agent`, `OPEN_ROUTER_API_KEY`, `AGENT_DECISION_MODEL` and optional
+  `OPENROUTER_DECISIONS_URL`; JSON defaults to `guard-eval.json`.
 
 Tests:
 

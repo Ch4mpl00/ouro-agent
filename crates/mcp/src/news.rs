@@ -1203,7 +1203,8 @@ async fn fetch_article_response(news: &NewsRepository, fetcher: &ArticleFetcher,
 impl McpTools {
     #[tool(
         name = "search_news",
-        annotations(read_only_hint = true),
+        // Closed world: the embedder is our processor, not a destination the arguments choose.
+        annotations(read_only_hint = true, open_world_hint = false),
         title = "Semantic search over the news store",
         description = "Vector search across every news item the pollers have ingested \
             (Hacker News, Habr, harvested Telegram channels). Returns the \
@@ -1236,8 +1237,8 @@ impl McpTools {
 
     #[tool(
         name = "list_news",
-        // Writes only a cache of what it reads: repeating it changes nothing.
-        annotations(read_only_hint = true),
+        // Only queries ingested rows; no fetch or embedding request.
+        annotations(read_only_hint = true, open_world_hint = false),
         title = "List news items chronologically",
         description = "Read items from the news store ordered by posted_at. Use when \
             you need everything in a time window (e.g. a 24h channel digest) \
@@ -1254,7 +1255,7 @@ impl McpTools {
     #[tool(
         name = "fetch_article",
         // Writes only a cache of what it reads: repeating it changes nothing.
-        annotations(read_only_hint = true),
+        annotations(read_only_hint = true, open_world_hint = true),
         title = "Fetch and store an arbitrary article URL",
         description = "Download a web article (Mozilla Readability) and save it to the \
             news store so it becomes searchable. Manual override — the HN \

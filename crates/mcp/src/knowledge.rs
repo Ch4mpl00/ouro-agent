@@ -195,6 +195,7 @@ struct FindNotesParams {
 impl McpTools {
     #[tool(
         name = "add_note",
+        annotations(open_world_hint = false),
         title = "Save a note to the personal knowledge base",
         description = "Persist a freeform fact the user asked you to remember (\"remember \
             that …\", \"write down …\", \"note: …\"). The note becomes semantically \
@@ -217,7 +218,8 @@ impl McpTools {
 
     #[tool(
         name = "find_notes",
-        annotations(read_only_hint = true),
+        // Closed world: the embedder is our processor, not a destination the arguments choose.
+        annotations(read_only_hint = true, open_world_hint = false),
         title = "Semantic search over the personal knowledge base",
         description = "Recall notes saved with add_note by meaning, not exact wording \
             (\"what do you remember about the router?\", \"when does Lyosha pay for the internet?\", \

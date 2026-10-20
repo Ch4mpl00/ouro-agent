@@ -374,13 +374,13 @@ async fn run(plans: &[(i64, Plan)]) -> Run {
         memory: db.clone(),
         tracer: Arc::new(local_recorder_tracer(db.clone())),
         codex: Arc::new(NoCodex),
-        decisions: None,
+        decisions: Some(support::allow_guard()),
         workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
         schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
     });
     let supervisor = create_supervisor(
         engine.clone(),
-        EnvDeps { mcp: mcp.clone(), memory: db.clone(), user_email: None, telegram_chat_id: None },
+        EnvDeps { mcp: mcp.clone(), memory: db.clone(), user_email: None, telegram_chat_id: Some(CHAT.to_string()) },
         agent::flows::create_flows(engine.clone()),
     );
     run_poll_loop(mcp, supervisor.clone(), world.drained.clone(), std::time::Duration::ZERO).await.unwrap();

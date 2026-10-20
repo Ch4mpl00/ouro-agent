@@ -93,7 +93,7 @@ struct ReadFileParams {
 impl McpTools {
     #[tool(
         name = "read_file",
-        annotations(read_only_hint = true),
+        annotations(read_only_hint = true, open_world_hint = false),
         title = "Read a text file",
         description = "Read a UTF-8 text file (markdown, txt, etc) and return its contents. \
             Use this to load skill instructions like `skills/telegram.md` when \

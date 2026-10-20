@@ -521,6 +521,8 @@ pub const SIGNAL_FUNCTIONS: &[(&str, owf::run::Effect)] = {
 struct SignalState {
     session: Option<Session>,
     primary: Option<Arc<AgentLoop>>,
+    earlier_user_messages: Vec<String>,
+    selected_skill_text: String,
     span: Option<Arc<dyn Span>>,
 }
 
@@ -629,17 +631,40 @@ impl SignalFunctions {
                 ));
                 Ok(json!({"done":false,"handover":handover}))
             }
-            "signal_input" => Ok(json!(if signal.source == PEER_SOURCE {
-                prepare_peer_input(signal, mcp, &scope, cancel).await?
-            } else {
-                prepare_telegram_input(signal, &self.session()?, mcp, &scope, cancel).await?
-            })),
+            "signal_input" => {
+                let session = self.session()?;
+                let input = if signal.source == PEER_SOURCE {
+                    // Peer history currently survives only as rendered text.
+                    prepare_peer_input(signal, mcp, &scope, cancel).await?
+                } else {
+                    prepare_telegram_input(signal, &session, mcp, &scope, cancel).await?
+                };
+                // Capture structured Telegram user messages immediately after host
+                // preload, before any loop can change the working-memory copy.
+                if signal.source == "telegram" {
+                    let history = session
+                        .memory
+                        .get(TELEGRAM_HISTORY_KEY)
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                        .unwrap_or(Value::Null);
+                    self.state().earlier_user_messages = history["messages"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|m| m["role"] == "user")
+                        .filter_map(|m| m["text"].as_str().map(str::to_owned))
+                        .collect();
+                }
+                Ok(json!(input))
+            }
             "recent_activity" => Ok(json!(load_recent_activity(mcp, &scope, cancel).await?)),
             "preselect_skills" => {
                 let text = |key: &str| args[key].as_str().unwrap_or_default().to_owned();
                 let loaded = strings(args, "loaded");
                 let found =
                     preselect_skills(&engine.deps, &text("request"), &text("context"), &loaded, &scope, cancel).await?;
+                self.state().selected_skill_text = found.as_ref().map(|(_, block)| block.clone()).unwrap_or_default();
                 Ok(found.map_or(Value::Null, |(names, block)| json!({"names": names, "block": block})))
             }
             "signal_transcript" => {
@@ -681,6 +706,7 @@ impl SignalFunctions {
                     let mut opts = LoopOptions::new(&id, context.clone());
                     opts.cancel = cancel.clone();
                     opts.parent_id = Some(context.id.clone());
+                    opts.guard_request = Some(signal.content.clone());
                     opts.skills = strings(args, "skills");
                     opts.include_engine_skills = false;
                     opts.preset = preset;
@@ -716,6 +742,12 @@ impl SignalFunctions {
                 self.state().span = Some(primary.clone());
                 let mut opts = LoopOptions::new(&id, self.session()?);
                 opts.cancel = cancel.clone();
+                opts.guard_request = Some(signal.content.clone());
+                opts.earlier_user_messages = self.state().earlier_user_messages.clone();
+                let selected = self.state().selected_skill_text.clone();
+                if strings(args, "system").iter().any(|part| part.contains(&selected)) {
+                    opts.loaded_skill_text = selected;
+                }
                 opts.skills = strings(args, "skills");
                 opts.allow_skill_writes = args["allow_skill_writes"].as_bool().unwrap_or(false);
                 opts.system_prompt = Some(strings(args, "system").join("\n\n"));

@@ -95,6 +95,10 @@ impl Mcp for Marked {
     fn read_only(&self, name: &str) -> bool {
         READ_ONLY.contains(&name)
     }
+
+    fn open_world(&self, _name: &str) -> bool {
+        false
+    }
     async fn call_tool(
         &self,
         name: &str,

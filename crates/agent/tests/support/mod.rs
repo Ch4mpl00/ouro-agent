@@ -145,7 +145,7 @@ pub fn fixture(provider: Arc<dyn ChatProvider>, definitions: &[&str], skills: &[
         memory: db.clone(),
         tracer: Arc::new(local_recorder_tracer(db.clone())),
         codex: Arc::new(NoCodex),
-        decisions: None,
+        decisions: Some(allow_guard()),
         workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
         schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
     });
@@ -451,7 +451,7 @@ impl Harness {
             memory: persist.clone(),
             tracer,
             codex: Arc::new(NoCodex),
-            decisions: None,
+            decisions: Some(allow_guard()),
             workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
             schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
         });
@@ -491,4 +491,38 @@ impl Tracer for ShutdownProbe {
         self.written_at_shutdown.lock().unwrap().push(self.written.len());
         self.inner.shutdown().await;
     }
+}
+
+// Most loop fixtures test dispatch/durability rather than policy. Their
+// decision service explicitly allows writes; guard tests override its label.
+#[derive(Default)]
+pub struct GuardApi {
+    pub requests: Mutex<Vec<Value>>,
+    pub label: Mutex<Option<String>>,
+    pub broken: std::sync::atomic::AtomicBool,
+}
+#[async_trait]
+impl agent::providers::JsonApi for GuardApi {
+    async fn post(&self, _: &str, body: Value, _: &CancellationToken) -> anyhow::Result<Value> {
+        self.requests.lock().unwrap().push(body.clone());
+        if self.broken.load(Ordering::SeqCst) {
+            anyhow::bail!("guard test service unavailable");
+        }
+        let label = self.label.lock().unwrap().clone().unwrap_or_else(|| "allow".into());
+        let answers: Map<String, Value> = body["questions"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|key| {
+                (
+                    key.clone(),
+                    json!({"type":"choice","choice":label,"confidence":1.0,"probabilities":{label.clone():1.0}}),
+                )
+            })
+            .collect();
+        Ok(json!({"model":"guard-test","answers":answers}))
+    }
+}
+pub fn allow_guard() -> Arc<agent::decisions::DecisionClient> {
+    agent::decisions::decision_client("guard-test".into(), Arc::new(GuardApi::default()))
 }

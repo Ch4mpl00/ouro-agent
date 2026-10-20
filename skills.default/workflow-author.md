@@ -184,7 +184,9 @@ nothing, so keep each `try` narrow, around the call it retries, with the
 ## The agent loop is a workflow too
 
 Every agent loop, the parent's and each worker's, runs the workflow
-`agent-loop`. `read_workflow("agent-loop")` shows the version in force (the
+`agent-loop`. A `call: guard` step before the tool round is required; it reviews
+the round's writes, and the host checks every write even if an override skips it.
+`read_workflow("agent-loop")` shows the version in force (the
 built-in one until another is saved). Its context carries `loop`,
 `messages`, `memory` and the turn count `i`; `agent_turn`, `tool` (one call
 by name, a write sent at most once) and `agent_settle` (`finish`, the

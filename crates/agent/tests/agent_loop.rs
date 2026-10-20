@@ -691,6 +691,7 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
                     [
                         ("get_telegram_chat_history".to_owned(), obj(json!({"chatId":"42","limit":20}))),
                         ("journal_tail".to_owned(), obj(json!({"stream":"ouro/activity","n":10}))),
+                        ("read_doc".to_owned(), obj(json!({"project":"agent-system","doc":"skill-index.md"}))),
                     ]
                 );
                 assert!(mentions(&p.messages, "Put together a weekly summary?"));
@@ -709,8 +710,8 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
     let runner = supervisor(&h);
     let content = "Telegram message in chat 42.\nText: \"go ahead\"";
     assert_eq!(runner.run_signal(&signal("telegram", content)).await.unwrap(), "done");
-    // History + activity; no worker fetch or extra LLM retrieval turn.
-    assert_eq!(h.mcp.calls.lock().unwrap().len(), 2);
+    // History, activity and skill-index lookup; no worker fetch or extra LLM retrieval turn.
+    assert_eq!(h.mcp.calls.lock().unwrap().len(), 3);
     let trace = &written.all()[0];
     assert_eq!(trace.input, Some(json!(content)));
     let fetch = find(&trace.observations, "get_telegram_chat_history");
@@ -718,6 +719,44 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
     assert_eq!(fetch.meta("automatic"), Some(&json!(true)));
     assert_eq!(fetch.meta("memory_key"), Some(&json!("telegram.history")));
     assert_eq!(trace.observations.iter().filter(|o| o.kind == ObservationType::Generation).count(), 3);
+}
+
+#[tokio::test]
+async fn guard_gets_only_preloaded_user_messages_and_raw_signal_for_parent_and_worker() {
+    let history = json!({"messages":[
+        {"id":1,"chat_id":42,"thread_id":null,"role":"user","text":"Yesterday: keep a weekly summary","created_at":"2026-09-06 11:58:00"},
+        {"id":2,"chat_id":42,"thread_id":null,"role":"assistant","text":"BOT_HISTORY_MUST_STAY_OUT","created_at":"2026-09-06 11:59:00"},
+    ]});
+    let mut h = Harness::new(
+        task_context("task"),
+        vec![
+            turn(|_| call("invoke_sub_agent", json!({"prompt":"prepare notes","input_refs":["telegram.history"]}))),
+            turn(|_| call("set_memory", json!({"key":"worker_notes","value":"summary"}))),
+            turn(|_| answer("notes ready")),
+            turn(|_| call("set_memory", json!({"key":"parent_notes","value":"summary"}))),
+            turn(|_| answer("done")),
+        ],
+        &history.to_string(),
+        null(),
+    );
+    let api = Arc::new(GuardApi::default());
+    Arc::get_mut(&mut h.engine).unwrap().deps.decisions =
+        Some(agent::decisions::decision_client("guard-test".into(), api.clone()));
+    let content = "Telegram message in chat 42.\nText: \"do what I asked yesterday\"";
+    assert_eq!(supervisor(&h).run_signal(&signal("telegram", content)).await.unwrap(), "done");
+    let requests = api.requests.lock().unwrap();
+    let guards: Vec<_> = requests.iter().filter(|r| r["questions"].get("call_0").is_some()).collect();
+    assert_eq!(guards.len(), 2);
+    assert_eq!(guards[0]["state"]["task"], "prepare notes");
+    assert_eq!(guards[0]["state"]["root_request"], content);
+    assert_eq!(guards[1]["state"]["task"], content);
+    for request in guards {
+        assert!(
+            request["state"]["earlier_user_messages"].as_str().unwrap().contains("Yesterday: keep a weekly summary")
+        );
+        assert!(!request.to_string().contains("BOT_HISTORY_MUST_STAY_OUT"));
+        assert!(!request.to_string().contains("Working-memory inputs"));
+    }
 }
 
 #[tokio::test]
@@ -754,7 +793,11 @@ async fn runs_a_signal_directly_and_records_parent_worker_tool_io_memory_referen
     assert_eq!(agent.meta("skills"), Some(&json!(["orchestrator"])));
     let worker = find(&trace.observations, "invoke_sub_agent");
     let search = find(&trace.observations, "search_news");
-    let generations: Vec<_> = trace.observations.iter().filter(|o| o.kind == ObservationType::Generation).collect();
+    let generations: Vec<_> = trace
+        .observations
+        .iter()
+        .filter(|o| o.kind == ObservationType::Generation && o.name.starts_with("iter-"))
+        .collect();
     assert_eq!(worker.kind, ObservationType::Agent);
     assert_eq!(worker.parent_observation_id.as_ref(), Some(&agent.id));
     assert_eq!(worker.output, json!("short summary"));
@@ -765,6 +808,13 @@ async fn runs_a_signal_directly_and_records_parent_worker_tool_io_memory_referen
     assert_eq!(search.meta("result_truncated"), Some(&json!(true)));
     assert_eq!(search.meta("result_size_bytes"), Some(&json!(payload.len())));
     assert!(search.meta("memory_key").is_some_and(Value::is_string));
+    assert_eq!(search.meta("guard").unwrap()["label"], "allow");
+    assert!(
+        trace
+            .observations
+            .iter()
+            .any(|o| o.name == "guard" && o.meta("verdicts").and_then(Value::as_array).is_some_and(|v| !v.is_empty()))
+    );
     assert_eq!(generations.len(), 4);
     assert_eq!(generations.iter().filter(|o| o.parent_observation_id.as_ref() == Some(&worker.id)).count(), 1);
     for generation in &generations {
@@ -907,8 +957,10 @@ async fn exports_the_primary_loop_and_nested_worker_through_the_langfuse_adapter
     assert_eq!(attr(&tool, "langfuse.observation.type"), Some("tool"));
     assert!(attr(&tool, "langfuse.observation.metadata.memory_key").is_some());
     assert!(attr(&tool, "langfuse.observation.output").unwrap().contains("large result"));
-    let generations: Vec<_> =
-        spans.iter().filter(|s| attr(s, "langfuse.observation.type") == Some("generation")).collect();
+    let generations: Vec<_> = spans
+        .iter()
+        .filter(|s| attr(s, "langfuse.observation.type") == Some("generation") && s.name.starts_with("iter-"))
+        .collect();
     assert_eq!(generations.len(), 4);
     assert!(generations.iter().any(|s| s.parent_span_id.as_ref() == Some(&worker.span_id)));
     let usage: Value =
