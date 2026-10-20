@@ -462,7 +462,7 @@ struct ListDialogsParams {
 impl McpTools {
     #[tool(
         name = "list_userbot_dialogs",
-        annotations(read_only_hint = true, open_world_hint = true),
+        annotations(read_only_hint = true, open_world_hint = false),
         title = "List userbot dialogs (chats / channels)",
         description = "List the personal Telegram account's dialogs (channels, groups, \
             private chats) the userbot is subscribed to. Mostly useful for \

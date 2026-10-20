@@ -2284,8 +2284,8 @@ impl McpTools {
     // defeated archive as a discovery boundary.
     #[tool(
         name = "recall",
-        // The query is sent to the external embedding provider.
-        annotations(read_only_hint = true, open_world_hint = true),
+        // Closed world: the embedder is our processor, not a destination the arguments choose.
+        annotations(read_only_hint = true, open_world_hint = false),
         title = "Search everything the agents remember",
         description = "Semantic search across ALL shared memory — project documents and \
             standalone facts alike. Use it whenever the user refers to something \
@@ -2312,7 +2312,7 @@ impl McpTools {
 
     #[tool(
         name = "remember",
-        annotations(open_world_hint = true),
+        annotations(open_world_hint = false),
         title = "Store a standalone fact",
         description = "Persist a freeform fact the user asked you to remember (\"remember that …\"). \
             For anything with ongoing progress use a project document instead — a \
@@ -2345,7 +2345,7 @@ impl McpTools {
 
     #[tool(
         name = "update_fact",
-        annotations(open_world_hint = true),
+        annotations(open_world_hint = false),
         title = "Correct a fact or retire it",
         description = "Change a fact's text, tags or lifecycle state. Nothing is ever deleted: \
             mark a finished or obsolete item `done` / `archived` and it drops out of \
@@ -2417,7 +2417,7 @@ impl McpTools {
 
     #[tool(
         name = "append_doc",
-        annotations(open_world_hint = true),
+        annotations(open_world_hint = false),
         title = "Add text to the end of a document (safe default)",
         description = "Append to a document, or to one section of it. THE PREFERRED WRITE: it \
             cannot destroy existing text and needs no prior read or version.\n\n\
@@ -2438,7 +2438,7 @@ impl McpTools {
 
     #[tool(
         name = "patch_doc",
-        annotations(open_world_hint = true),
+        annotations(open_world_hint = false),
         title = "Change existing text in a document",
         description = "Apply search/replace edits. Each `old` must appear EXACTLY ONCE — copy \
             it verbatim from a fresh read_doc, including punctuation, dashes and \
@@ -2458,7 +2458,7 @@ impl McpTools {
 
     #[tool(
         name = "write_doc",
-        annotations(open_world_hint = true),
+        annotations(open_world_hint = false),
         title = "Create a document, or replace one wholesale",
         description = "Create a new document, or overwrite an existing one entirely. THE ONLY \
             OP THAT CAN LOSE CONTENT — prefer append_doc for additions and \
@@ -2508,7 +2508,7 @@ impl McpTools {
 
     #[tool(
         name = "revert_patch",
-        annotations(open_world_hint = true),
+        annotations(open_world_hint = false),
         title = "Undo a recorded change",
         description = "Undo one patch from doc_history. The newest patch always reverts \
             exactly. An older one is undone in place when later patches left its \

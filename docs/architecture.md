@@ -241,8 +241,9 @@ checks cover agent loops; user-approved saved workflows retain their own
 write semantics. `guard-eval` batches the 35 checked-in golden cases through the
 same policy/evidence builders and the real env-configured decisions client,
 reporting ASR, false blocks and accepted-label accuracy; live evaluation is manual.
-Semantic store searches (`recall`, `search_news`, `find_notes`) reach OpenAI
-embeddings and are marked open-world; `list_news` only reads stored rows. The
+Open-world means the arguments can reach a party we do not control (a URL,
+someone else's chat); our stores, the user's own accounts and the embedder
+behind semantic search are closed-world. The
 gateway preserves upstream annotations unchanged. Confirmation reasons currently block and ask the model to
 consult the user; durable confirmation waits remain future work.
 

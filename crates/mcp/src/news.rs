@@ -1203,8 +1203,8 @@ async fn fetch_article_response(news: &NewsRepository, fetcher: &ArticleFetcher,
 impl McpTools {
     #[tool(
         name = "search_news",
-        // The query is sent to the external embedding provider.
-        annotations(read_only_hint = true, open_world_hint = true),
+        // Closed world: the embedder is our processor, not a destination the arguments choose.
+        annotations(read_only_hint = true, open_world_hint = false),
         title = "Semantic search over the news store",
         description = "Vector search across every news item the pollers have ingested \
             (Hacker News, Habr, harvested Telegram channels). Returns the \

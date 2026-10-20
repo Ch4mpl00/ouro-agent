@@ -99,27 +99,13 @@ fn all_shipped_skills_pass_the_agents_startup_validation_against_prods_mcp_surfa
         assert_eq!(
             open_world,
             [
-                "add_note",
-                "append_doc",
-                "download_gmail_attachment",
                 "edit_telegram_message",
                 "fetch_article",
                 "fetch_url",
-                "find_notes",
-                "list_monobank_transactions",
-                "list_nashdom_mails",
-                "list_userbot_dialogs",
-                "patch_doc",
-                "recall",
-                "remember",
-                "revert_patch",
-                "search_news",
                 "send_telegram_chat_action",
                 "send_telegram_message",
                 "start_typing",
                 "telegram_send_status",
-                "update_fact",
-                "write_doc",
             ]
         );
         let gateway: Value =

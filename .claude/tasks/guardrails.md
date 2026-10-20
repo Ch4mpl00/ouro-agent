@@ -42,8 +42,10 @@ instrumental steps by default, with a host-enforced guard from day one.
   `code_agent`, `probe_function` and `try_workflow` are open-world synthetic
   adapters; other synthetic reads are internal. Delegation skips the parent
   guard; worker calls run through their own guard. Schedule writes still guard.
-  Semantic store searches (`recall`, `search_news`, `find_notes`) are open-world
-  because their arguments reach OpenAI embeddings; `list_news` is local.
+  Open-world follows the MCP meaning: the arguments can reach a party we do
+  not control (a URL, a search engine, someone else's chat). Our own stores,
+  the user's accounts (mail, bank, userbot) and our processors (the embedder
+  behind `recall`/`search_news`) are closed-world.
   The gateway preserves upstream annotations, including their absence.
 - **Enforced by the host.** Instructions, reasons and deterministic checks are
   compiled from git-owned files, never YAML arguments or editable skills.
