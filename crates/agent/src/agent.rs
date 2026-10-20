@@ -173,6 +173,10 @@ pub struct LoopOptions {
     pub max_iterations: usize,
     pub parent_id: Option<String>,
     pub root_request: Option<String>,
+    // Host-only evidence, kept separately from rendered history/tool inputs.
+    pub guard_request: Option<String>,
+    pub earlier_user_messages: Vec<String>,
+    pub loaded_skill_text: String,
     pub session_id: Option<String>,
     pub tags: Option<Vec<String>>,
     pub metadata: Metadata,
@@ -195,6 +199,9 @@ impl LoopOptions {
             max_iterations: 100,
             parent_id: None,
             root_request: None,
+            guard_request: None,
+            earlier_user_messages: Vec::new(),
+            loaded_skill_text: String::new(),
             session_id: None,
             tags: None,
             metadata: Map::new(),
@@ -216,6 +223,7 @@ pub struct AgentLoop {
     gate: tokio::sync::Mutex<()>,
     allowed: Option<HashSet<String>>,
     skill_names: Vec<String>,
+    loaded_skills: String,
     sub_counter: AtomicUsize,
     observation_meta: Metadata,
     // False for a loop rebuilt after a restart until a host function has
@@ -243,6 +251,12 @@ fn create_loop(
         parts.push(prompt.as_str());
     }
     parts.extend(resolved.values().filter_map(Value::as_str));
+    let loaded_skills = resolved
+        .values()
+        .filter_map(Value::as_str)
+        .chain(std::iter::once(opts.loaded_skill_text.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n\n");
     parts.push(WORKING_MEMORY_INSTRUCTIONS);
     let messages = vec![providers::system(&parts.join("\n\n---\n\n"))];
     let mut metadata = opts.metadata.clone();
@@ -283,6 +297,7 @@ fn create_loop(
         gate: Default::default(),
         allowed,
         skill_names,
+        loaded_skills,
         sub_counter: AtomicUsize::new(0),
         observation_meta,
         memory_restored: AtomicBool::new(true),
@@ -342,7 +357,9 @@ impl AgentLoop {
             if let Some(text) = text {
                 messages.push(providers::user(&text));
             }
-            json!({"loop": self.spec(), "messages": *messages, "memory": self.opts.session.memory.snapshot()})
+            let task =
+                messages.iter().find(|m| providers::role(m) == "user").and_then(providers::content).unwrap_or_default();
+            json!({"loop": self.spec(), "messages": *messages, "memory": self.opts.session.memory.snapshot(), "guard_context": self.guard_context(task)})
         };
         self.admit_guard(&input).await?;
         let result = crate::flows::run_loop_here(&engine, &self.opts.id, input, &self.scope, &self.cancel).await;
@@ -426,7 +443,8 @@ impl AgentLoop {
         if let Some(verdict) = verdict {
             span.update(ContextUpdate::metadata(json!({"guard": verdict}).as_object().unwrap().clone()));
             if !verdict.allowed() {
-                return Ok((span, verdict.reply()));
+                let context = self.guard.lock().await.context.clone().expect("admitted guard context");
+                return Ok((span, verdict.reply(&context)));
             }
         }
         let raw = match serde_json::from_str::<Value>(if call.arguments.is_empty() { "{}" } else { &call.arguments }) {
@@ -500,12 +518,16 @@ impl AgentLoop {
             "find_skills" => {
                 let params: crate::skills::FindSkillsParams = serde_json::from_value(json!(args))?;
                 params.validate()?;
-                let client = engine.deps.decisions.as_deref().ok_or_else(|| anyhow::anyhow!(
-                    "find_skills needs the agent decision client; use list_skills/read_skill while unavailable"
-                ))?;
+                let client = engine.deps.decisions.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "find_skills needs the agent decision client; use list_skills/read_skill while unavailable"
+                    )
+                })?;
                 let index = crate::skills::read_skill_index(&*engine.deps.mcp, &self.cancel).await?;
                 let scope: Scope = span;
-                Ok(crate::skills::find_skills(&*engine.deps.skill_store, &index, client, &params, &scope, &self.cancel).await?.to_string())
+                Ok(crate::skills::find_skills(&*engine.deps.skill_store, &index, client, &params, &scope, &self.cancel)
+                    .await?
+                    .to_string())
             }
             // Only validates: ending the session is the round's decision
             // (agent_settle), taken once every call has answered.
@@ -681,6 +703,9 @@ impl AgentLoop {
             .context
             .as_ref()
             .map(|c| if c.root_request.is_empty() { c.task.clone() } else { c.root_request.clone() });
+        opts.guard_request = Some(prompt.to_owned());
+        opts.earlier_user_messages =
+            self.guard.lock().await.context.as_ref().map(|c| c.earlier_user_messages.clone()).unwrap_or_default();
         opts.session_id = self.opts.session_id.clone();
         opts.trace_scope = Some(span.clone());
         if let Some(child) = child {
@@ -916,12 +941,34 @@ impl AgentLoop {
         }
     }
 
+    fn guard_context(&self, task: &str) -> crate::guard::Context {
+        crate::guard::Context {
+            task: self.opts.guard_request.clone().unwrap_or_else(|| task.to_owned()),
+            root_request: self.opts.root_request.clone().unwrap_or_default(),
+            default_chat: self.opts.session.env.telegram_chat_id.clone(),
+            earlier_user_messages: self.opts.earlier_user_messages.clone(),
+            skills: self.loaded_skills.clone(),
+        }
+    }
+
+    pub(crate) async fn restore_guard_history(&self, runs: &crate::durable::RunStore, id: &str) -> anyhow::Result<()> {
+        let mut state = self.guard.lock().await;
+        if state.history_restored {
+            return Ok(());
+        }
+        let records = runs.records(id)?;
+        state.restore_chain(&records);
+        state.history_restored = true;
+        Ok(())
+    }
+
     /// The run's input for this loop, which has not run yet, and its first
     /// user message.
     pub async fn workflow_input(&self, text: &str) -> Value {
         let mut messages = self.messages.lock().await.clone();
         messages.push(providers::user(text));
-        let input = json!({"loop": self.spec(), "messages": messages, "memory": self.opts.session.memory.snapshot()});
+        let guard_context = self.guard_context(text);
+        let input = json!({"loop": self.spec(), "messages": messages, "memory": self.opts.session.memory.snapshot(), "guard_context": guard_context});
         self.admit_guard(&input).await.expect("host loop input");
         input
     }
@@ -937,10 +984,16 @@ impl AgentLoop {
                 .and_then(providers::content)
                 .unwrap_or_default()
                 .to_owned();
-            state.context = Some(crate::guard::Context {
-                task,
-                root_request: self.opts.root_request.clone().unwrap_or_default(),
-                default_chat: self.opts.session.env.telegram_chat_id.clone(),
+            state.context = Some(if let Some(context) = input.get("guard_context") {
+                serde_json::from_value(context.clone())?
+            } else {
+                crate::guard::Context {
+                    task,
+                    root_request: self.opts.root_request.clone().unwrap_or_default(),
+                    default_chat: self.opts.session.env.telegram_chat_id.clone(),
+                    // Legacy runs did not snapshot skills separately from system text.
+                    ..Default::default()
+                }
             });
         }
         Ok(())
@@ -954,26 +1007,12 @@ impl AgentLoop {
             .context
             .clone()
             .ok_or_else(|| anyhow::anyhow!("guard requires the host's admitted loop input"))?;
-        let messages = self.messages.lock().await.clone();
-        // Pair within each assistant round: providers may reuse call ids in
-        // later rounds, so a global id-to-reply map would invent prior writes.
-        let mut pending = HashMap::new();
-        let mut writes = Vec::new();
-        for message in &messages {
-            if providers::role(message) == "assistant" {
-                pending = providers::tool_calls(message).into_iter().map(|c| (c.id.clone(), c)).collect();
-            } else if providers::role(message) == "tool"
-                && let Some(id) = message.get("tool_call_id").and_then(Value::as_str)
-                && let Some(call) = pending.remove(id)
-                && crate::guard::needs_guard(engine, &call)
-            {
-                let reply = providers::content(message).unwrap_or_default();
-                if !reply.starts_with("[guard] blocked:") {
-                    writes.push(json!({"id":call.id,"name":call.name,"arguments":call.arguments,"reply":reply}));
-                }
-            }
-        }
-        let verdicts = crate::guard::judge(engine, &context, calls, &writes, &self.scope, &self.cancel).await?;
+        let (chain, call_count) = {
+            let state = self.guard.lock().await;
+            (state.chain.clone(), state.call_count)
+        };
+        let verdicts =
+            crate::guard::judge(engine, &context, calls, &chain, call_count, &self.scope, &self.cancel).await?;
         let output = json!(verdicts);
         self.guard.lock().await.verdicts.extend(verdicts);
         Ok(output)
@@ -1127,6 +1166,7 @@ pub async fn loop_tool(
     } else {
         None
     };
+    let guard_call = loop_.guard.lock().await.record_call(&call, verdict.as_ref().is_some_and(|v| !v.allowed()));
     let (span, raw) = loop_.start_call(engine, &call, child, runs, verdict.as_ref()).await?;
     let failed = raw.starts_with("[guard] blocked:") || is_tool_error(&raw);
     let (mut presented, stored) = loop_.present(&call.name, &raw, &span);
@@ -1139,7 +1179,7 @@ pub async fn loop_tool(
         presented = Value::Object(reply).to_string();
     }
     span.end(if failed { SpanEnd::error(raw.clone()).with_output(raw.clone()) } else { SpanEnd::output(raw.clone()) });
-    let mut out = json!({"presented": presented, "failed": failed, "stored": stored});
+    let mut out = json!({"presented": presented, "failed": failed, "stored": stored, "guard_call": guard_call});
     if !failed {
         let parsed: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
         match call.name.as_str() {

@@ -722,6 +722,44 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
 }
 
 #[tokio::test]
+async fn guard_gets_only_preloaded_user_messages_and_raw_signal_for_parent_and_worker() {
+    let history = json!({"messages":[
+        {"id":1,"chat_id":42,"thread_id":null,"role":"user","text":"Yesterday: keep a weekly summary","created_at":"2026-09-06 11:58:00"},
+        {"id":2,"chat_id":42,"thread_id":null,"role":"assistant","text":"BOT_HISTORY_MUST_STAY_OUT","created_at":"2026-09-06 11:59:00"},
+    ]});
+    let mut h = Harness::new(
+        task_context("task"),
+        vec![
+            turn(|_| call("invoke_sub_agent", json!({"prompt":"prepare notes","input_refs":["telegram.history"]}))),
+            turn(|_| call("set_memory", json!({"key":"worker_notes","value":"summary"}))),
+            turn(|_| answer("notes ready")),
+            turn(|_| call("set_memory", json!({"key":"parent_notes","value":"summary"}))),
+            turn(|_| answer("done")),
+        ],
+        &history.to_string(),
+        null(),
+    );
+    let api = Arc::new(GuardApi::default());
+    Arc::get_mut(&mut h.engine).unwrap().deps.decisions =
+        Some(agent::decisions::decision_client("guard-test".into(), api.clone()));
+    let content = "Telegram message in chat 42.\nText: \"do what I asked yesterday\"";
+    assert_eq!(supervisor(&h).run_signal(&signal("telegram", content)).await.unwrap(), "done");
+    let requests = api.requests.lock().unwrap();
+    let guards: Vec<_> = requests.iter().filter(|r| r["questions"].get("call_0").is_some()).collect();
+    assert_eq!(guards.len(), 2);
+    assert_eq!(guards[0]["state"]["task"], "prepare notes");
+    assert_eq!(guards[0]["state"]["root_request"], content);
+    assert_eq!(guards[1]["state"]["task"], content);
+    for request in guards {
+        assert!(
+            request["state"]["earlier_user_messages"].as_str().unwrap().contains("Yesterday: keep a weekly summary")
+        );
+        assert!(!request.to_string().contains("BOT_HISTORY_MUST_STAY_OUT"));
+        assert!(!request.to_string().contains("Working-memory inputs"));
+    }
+}
+
+#[tokio::test]
 async fn runs_a_signal_directly_and_records_parent_worker_tool_io_memory_references_and_per_iteration_usage() {
     let (primary, primary_written) = recording();
     let (mirror, mirror_written) = recording();

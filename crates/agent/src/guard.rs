@@ -23,14 +23,33 @@ struct Reason {
 }
 #[derive(Deserialize)]
 struct Policy {
-    denied_tools: Vec<String>,
     reasons: HashMap<String, Reason>,
 }
 static POLICY: LazyLock<Policy> =
     LazyLock::new(|| serde_json::from_str(include_str!("../guard/reasons.json")).expect("compiled guard policy"));
 const INSTRUCTIONS: &str = include_str!("../guard/instructions.md");
-const MODEL_REASONS: &[&str] =
-    &["allow", "off_request", "injected", "wrong_target", "data_leak", "destructive", "repeat", "needs_confirmation"];
+const MODEL_REASONS: &[&str] = &["allow", "misaligned", "needs_confirmation"];
+const CHAIN_LIMIT: usize = 64;
+const ARGUMENT_CHARS: usize = 4_000;
+const REQUEST_CHARS: usize = 16_000;
+const SKILL_CHARS: usize = 24_000;
+const GOAL_CHARS: usize = 500;
+
+fn truncate(text: &str, limit: usize) -> String {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(limit).collect();
+    if chars.next().is_some() { format!("{head}… [truncated]") } else { head }
+}
+
+fn earlier_messages(messages: &[String]) -> String {
+    let text = messages.join("\n\n");
+    let count = text.chars().count();
+    if count > REQUEST_CHARS {
+        format!("[truncated] …{}", text.chars().skip(count - REQUEST_CHARS).collect::<String>())
+    } else {
+        text
+    }
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Verdict {
@@ -46,23 +65,104 @@ impl Verdict {
     pub fn allowed(&self) -> bool {
         self.label == "allow"
     }
-    pub fn reply(&self) -> String {
-        format!("[guard] blocked: {} — {}", self.label, self.guidance)
+    pub fn reply(&self, context: &Context) -> String {
+        let goal = if context.root_request.is_empty() { &context.task } else { &context.root_request };
+        format!(
+            "[guard] blocked: {} — {}. The user's goal: {}",
+            self.label,
+            self.guidance.trim_end_matches('.'),
+            truncate(goal, GOAL_CHARS)
+        )
     }
 }
 
 // Set only from live loop admission or a durable run's admitted input, never
 // from the arguments to a workflow task. Verdicts intentionally do not persist.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Context {
     pub task: String,
     pub root_request: String,
     pub default_chat: Option<String>,
+    #[serde(default)]
+    pub earlier_user_messages: Vec<String>,
+    #[serde(default)]
+    pub skills: String,
 }
 #[derive(Default)]
 pub struct State {
     pub context: Option<Context>,
     pub verdicts: HashMap<String, Verdict>,
+    pub chain: Vec<Value>,
+    pub call_count: usize,
+    pub history_restored: bool,
+}
+
+impl State {
+    // Recorded by the host before dispatch, including reads and blocks. The
+    // sequence survives in the host tool response, never in model/YAML input.
+    pub fn record_call(&mut self, call: &ToolCall, blocked: bool) -> Value {
+        let mut entry = call_evidence(call, blocked);
+        entry["sequence"] = self.call_count.into();
+        self.call_count += 1;
+        self.chain.push(entry.clone());
+        if self.chain.len() > CHAIN_LIMIT {
+            self.chain.remove(0);
+        }
+        entry
+    }
+    pub fn restore_chain(&mut self, records: &[owf::durable::Record]) {
+        use owf::durable::{CallState, Record};
+        let mut entries = Vec::new();
+        for record in records {
+            if let Record::Call { function, arguments, state, logical, .. } = record
+                && function == "tool"
+                && !matches!(state, CallState::NotExecuted(_))
+            {
+                let saved = match state {
+                    CallState::Done(Ok(output)) => output.get("guard_call").cloned(),
+                    _ => None,
+                };
+                let entry = saved.or_else(|| {
+                    // Pending intent or legacy record: preserve the attempted
+                    // call, without interpreting or serializing its result.
+                    let value = &arguments["call"];
+                    let call = ToolCall {
+                        id: value["id"].as_str()?.into(),
+                        name: value["name"].as_str()?.into(),
+                        arguments: value["arguments"].as_str().unwrap_or_default().into(),
+                    };
+                    let blocked = matches!(state, CallState::Done(Ok(output))
+                        if output["presented"].as_str().is_some_and(|s| s.starts_with("[guard] blocked:")));
+                    Some(call_evidence(&call, blocked))
+                });
+                if let Some(entry) = entry {
+                    let position = arguments["i"].as_u64().zip(arguments["index"].as_u64());
+                    entries.push((position, logical, entry));
+                }
+            }
+        }
+        // The built-in loop supplies round/index positions even for pending
+        // intents, so a crash cannot move an earlier call behind a completed
+        // sibling. Overrides without positions use saved dispatch sequence;
+        // an unknown intent has only its logical reference as a final fallback.
+        if entries.iter().all(|(position, _, _)| position.is_some()) {
+            entries.sort_by_key(|(position, logical, _)| (*position, *logical));
+        } else {
+            entries.sort_by_key(|(_, logical, entry)| (entry["sequence"].as_u64().unwrap_or(u64::MAX), *logical));
+        }
+        self.call_count = entries.len();
+        self.chain = entries
+            .into_iter()
+            .enumerate()
+            .rev()
+            .take(CHAIN_LIMIT)
+            .map(|(sequence, (_, _, mut entry))| {
+                entry["sequence"] = sequence.into();
+                entry
+            })
+            .collect();
+        self.chain.reverse();
+    }
 }
 
 pub fn key(call: &ToolCall) -> String {
@@ -121,15 +221,13 @@ fn has_secret(value: &Value) -> bool {
     }
 }
 fn deterministic(context: &Context, call: &ToolCall) -> Option<Verdict> {
-    let reason = if POLICY.denied_tools.contains(&call.name) {
-        "denied_tool"
-    } else if call.name == "send_telegram_message"
+    let reason = if call.name == "send_telegram_message"
         && !target(call, context).is_some_and(|id| {
             context.default_chat.as_ref() == Some(&id)
                 || mentions(&context.task, &id)
                 || mentions(&context.root_request, &id)
-        })
-    {
+                || context.earlier_user_messages.iter().any(|m| mentions(m, &id))
+        }) {
         "unknown_chat"
     } else if has_secret(&serde_json::from_str::<Value>(&call.arguments).unwrap_or_else(|_| json!(call.arguments))) {
         "secret_pattern"
@@ -145,12 +243,19 @@ fn current_reply(context: &Context, call: &ToolCall) -> bool {
     target(call, context).is_some_and(|id| mentions(request, &id))
 }
 
+// Only call fields and the host's block status leave this projection. Tool
+// result bodies and assistant text/reasoning never enter the decision request.
+fn call_evidence(call: &ToolCall, blocked: bool) -> Value {
+    json!({"id": truncate(&call.id, 256), "name": truncate(&call.name, 256),
+        "arguments": truncate(&call.arguments, ARGUMENT_CHARS), "blocked": blocked})
+}
 // ── 3. round judgement ──────────────────────────────────────────────────────
 pub async fn judge(
     engine: &Engine,
     context: &Context,
     calls: &[ToolCall],
-    writes: &[Value],
+    chain: &[Value],
+    call_count: usize,
     scope: &Scope,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Vec<(String, Verdict)>> {
@@ -176,9 +281,12 @@ pub async fn judge(
             .collect::<anyhow::Result<Vec<_>>>()?;
         let mut request = DecisionRequest::new(
             json!({
-                "task": context.task, "root_request": context.root_request,
-                "calls": pending.iter().map(|c| json!({"id":c.id,"name":c.name,"arguments":c.arguments})).collect::<Vec<_>>(),
-                "prior_writes": writes,
+                "task": truncate(&context.task, REQUEST_CHARS), "root_request": truncate(&context.root_request, REQUEST_CHARS),
+                "earlier_user_messages": earlier_messages(&context.earlier_user_messages),
+                "skills": truncate(&context.skills, SKILL_CHARS),
+                "calls": pending.iter().map(|c| call_evidence(c, false)).collect::<Vec<_>>(),
+                "chain": &chain[chain.len().saturating_sub(CHAIN_LIMIT)..],
+                "chain_omitted": call_count.saturating_sub(chain.len()),
             }),
             child,
             cancel.clone(),
@@ -226,11 +334,8 @@ mod tests {
     }
     #[test]
     fn policy_has_exact_reasons_and_guidance() {
-        let expected: Vec<_> = MODEL_REASONS
-            .iter()
-            .copied()
-            .chain(["denied_tool", "unknown_chat", "secret_pattern", "guard_unavailable"])
-            .collect();
+        let expected: Vec<_> =
+            MODEL_REASONS.iter().copied().chain(["unknown_chat", "secret_pattern", "guard_unavailable"]).collect();
         assert_eq!(POLICY.reasons.len(), expected.len());
         for label in expected {
             assert!(!POLICY.reasons[label].when.is_empty());
@@ -264,6 +369,7 @@ mod tests {
             task: "Chat -100123".into(),
             root_request: "reply to chat 42".into(),
             default_chat: Some("99".into()),
+            ..Default::default()
         };
         for id in [json!(-100123), json!("42"), json!(99), Value::Null] {
             assert!(deterministic(&context, &call("send_telegram_message", json!({"chatId":id}))).is_none());
@@ -277,6 +383,73 @@ mod tests {
         assert!(!current_reply(&context, &call("send_telegram_message", json!({"chatId":99}))));
         assert!(current_reply(&context, &call("reply_to_peer", json!({"threadId":"42"}))));
     }
+    #[test]
+    fn evidence_and_goal_have_visible_unicode_safe_limits() {
+        let text = "я".repeat(ARGUMENT_CHARS + 1);
+        let evidence = call_evidence(&call("search", json!({"q":text})), false);
+        assert!(evidence["arguments"].as_str().unwrap().ends_with("… [truncated]"));
+        assert!(evidence["arguments"].as_str().unwrap().chars().count() < ARGUMENT_CHARS + 20);
+        let context = Context { task: "я".repeat(GOAL_CHARS + 1), ..Default::default() };
+        let verdict = Verdict::new("needs_confirmation");
+        assert_eq!(
+            verdict.reply(&context),
+            format!(
+                "[guard] blocked: needs_confirmation — {}. The user's goal: {}… [truncated]",
+                verdict.guidance.trim_end_matches('.'),
+                "я".repeat(GOAL_CHARS)
+            )
+        );
+        let earlier = earlier_messages(&["old".repeat(REQUEST_CHARS), "recent confirmation".into()]);
+        assert!(earlier.starts_with("[truncated]"));
+        assert!(earlier.ends_with("recent confirmation"));
+    }
+
+    #[test]
+    fn host_chain_keeps_reads_and_blocks_bounded_with_order_and_exact_ids() {
+        let mut state = State::default();
+        state.record_call(&call("search", json!({"q":"read"})), false);
+        state.record_call(&call("send", json!({"q":"blocked"})), true);
+        assert_eq!(state.chain[0]["name"], "search");
+        assert_eq!(state.chain[1]["blocked"], true);
+        for _ in 0..CHAIN_LIMIT {
+            state.record_call(&call("search", json!({})), false);
+        }
+        assert_eq!(state.chain.len(), CHAIN_LIMIT);
+        assert_eq!(state.call_count, CHAIN_LIMIT + 2);
+        assert_eq!(state.chain[0]["sequence"], 2);
+    }
+
+    #[test]
+    fn restore_keeps_pending_calls_in_round_order_without_result_bodies() {
+        use owf::{
+            durable::{CallState, Delivery, Record},
+            run::Effect,
+        };
+        let record = |index: u64, name: &str, state| Record::Call {
+            logical: format!("call-{index}"),
+            function: "tool".into(),
+            arguments: json!({"i":1,"index":index,"call":{"id":name,"name":name,"arguments":"{}"}}),
+            effect: Effect::Write,
+            delivery: Delivery::AtMostOnce,
+            state,
+        };
+        let mut state = State::default();
+        state.restore_chain(&[
+            record(
+                1,
+                "send",
+                CallState::Done(Ok(json!({"guard_call":{
+                "id":"send","name":"send","arguments":"{}","blocked":true,"sequence":1},
+                "presented":"RESULT_MUST_STAY_OUT"}))),
+            ),
+            record(0, "search", CallState::Pending),
+        ]);
+        assert_eq!(state.chain[0]["name"], "search");
+        assert_eq!(state.chain[1]["name"], "send");
+        assert_eq!(state.chain[1]["blocked"], true);
+        assert!(!json!(state.chain).to_string().contains("RESULT_MUST_STAY_OUT"));
+    }
+
     #[test]
     fn verdict_key_binds_id_name_and_exact_arguments() {
         let a = call("write_doc", json!({"text":"a"}));

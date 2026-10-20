@@ -198,20 +198,37 @@ joins it rather than starting another. Recovery runs the same workflow in
 process. The records of runs that ended more than 7 days ago are swept.
 
 The host guard (`guard.rs`, compiled policy in `crates/agent/guard/`) reviews
-all writes of a round in one Jev decisions request, after deterministic tool,
+all writes of a round in one Jev decisions request, after deterministic
 chat and secret checks. Reads, working memory, `finish` and delegation skip
 review; workers guard their own writes. A verdict belongs to the loop, call
 id and SHA-256 of the exact tool name and argument bytes. `tool` requires an
 allow verdict and reviews again when one is missing, including after restart
 or when an override changes arguments. Overrides cannot call writes directly
-to bypass `tool`. A block returns `[guard] blocked: <reason> — <guidance>` as
+to bypass `tool`. A block returns `[guard] blocked: <label> — <guidance>. The user's goal: <request>` as
 a failed tool result; `finish` in that round cannot end the loop.
 
 Guard authority comes from the live loop's first admitted user message or
 its durable run's original input, never workflow task arguments. Workers
 also retain the primary request in their admitted loop spec across restarts.
-Known Telegram targets come from those requests and the session's configured
-default chat (`TELEGRAM_DEFAULT_CHAT_ID`); `TELEGRAM_TOPICS_JSON` lists threads
+Jev chooses only `allow` (default, including instrumental work), `misaligned`
+(positive signs of an unrelated action or goal hijacking/disclosure), or
+`needs_confirmation` (consequential, hard to undo and not explicitly requested).
+The host snapshots the request, worker root/task, structured preloaded user
+messages and exact loaded skills (including preselection) in the admitted input.
+It supplies ordered prior tool names/arguments, reads and blocked attempts
+included, plus current calls. Assistant prose/reasoning, tool result bodies,
+worker input-ref contents and arbitrary rendered system context stay out.
+Telegram preloads retain structured user messages; peer history currently
+survives only as rendered text and is skipped. Host dispatch records track
+calls independently of the transcript; durable tool records restore the chain
+after restart, using round/index positions to retain pending-call order.
+The chain retains the recent 64 calls with an omission count; args cap at 4,000 Unicode characters, names/ids at 256, request/root at
+16,000 each, earlier user text at its recent 16,000, skills at 24,000 combined,
+blocked goal at 500. Truncation has a visible marker; full args still bind
+verdicts and undergo deterministic checks. `unknown_chat` and `secret_pattern`
+are deterministic labels; an outage uses `guard_unavailable`.
+Known Telegram targets come from those requests, earlier user messages and
+the session's configured default chat (`TELEGRAM_DEFAULT_CHAT_ID`); `TELEGRAM_TOPICS_JSON` lists threads
 within that chat, not additional chats. Jev outages permit replies only to a
 conversation named in the primary request; other writes fail closed. These
 checks cover agent loops; user-approved saved workflows retain their own

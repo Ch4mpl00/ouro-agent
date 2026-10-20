@@ -1,79 +1,105 @@
 # Guardrails on the agent loop's writes
 
-**Status:** done (host-enforced loop writes, compiled policy, batched decisions and outage handling; confirmation and evaluation TODOs below remain)
+**Status:** done (host-enforced loop writes, goal-contribution policy, bounded host evidence, batched decisions and outage handling; confirmation and evaluation TODOs below remain)
 **Priority:** P1
 **Area:** agent / owf / decisions
 **Created:** 2026-10-20
 
-## Context
+## Context and sources
 
-The agent acts through writes (Telegram replies, peer replies, memory and
-document writes, schedules, skills, workflows). Tool data it reads (mail,
-news, channel posts, web pages) can carry instructions; a model can also
-overreach, pick the wrong target, leak data or repeat a write whose outcome
-was unknown. Decided 2026-10-20 (with the user): a guard step in the agent
-loop, decisions by Jev, enforced by the host, blocking from day one.
+The agent acts through writes (replies, memory, documents, schedules, skills,
+workflows). Retrieved content can hijack its goal. Decided with the user on
+2026-10-20: judge whether a call **contributes to the user's goal**, allowing
+instrumental steps by default, with a host-enforced guard from day one.
+
+- [Task Shield (ACL 2025, arXiv 2412.16682)](https://arxiv.org/html/2412.16682v1):
+  contribution includes intermediate steps such as checking availability before
+  booking. Feedback identifies the blocked action, its risk and the user's goal.
+- [Meta LlamaFirewall AlignmentCheck](https://arxiv.org/html/2505.03574v1):
+  audit actions against the original user objective to detect goal hijacking.
+- [Claude Code auto mode](https://www.anthropic.com/engineering/claude-code-auto-mode):
+  its classifier sees user messages and tool calls; assistant prose and tool
+  results are stripped so injected content cannot argue with the classifier.
+- [OpenAI Operator](https://openai.com/index/introducing-operator/): user
+  oversight for consequential external actions. Our policy asks before
+  third-party sending, deletion/overwriting, money, account or settings changes
+  unless explicitly requested; intermediate steps pass without confirmation.
+- This is **not a security boundary**. [Willison's lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/)
+  explains the risk of private data, untrusted content and external communication.
+  [CaMeL](https://arxiv.org/abs/2503.18813) and
+  [Design Patterns for Securing LLM Agents](https://arxiv.org/abs/2506.08837)
+  describe architectural defenses. Fixing control flow before reading untrusted
+  data, as in CaMeL's code-then-execute approach, is outside this task's scope.
 
 ## Design
 
-- **A step in the loop.** `agent-loop.yaml` gets a `guard` step between
-  `turn` and `round`: it passes the round's calls and gets a verdict per
-  call. Reads skip the guard; all writes of a round go to Jev in one
-  decisions request (one `choice` question per call).
-- **Enforced by the host, not by the YAML.** The guard's policy (the Jev
-  question, the reasons, the deterministic rules) lives in git where the
-  agent cannot write it (`write_skill` refuses its name; it is never an
-  argument from YAML). `tool` sends a write only with an `allow` verdict
-  the host recorded for that call; with none (a loop without the step, a
-  restart between `guard` and `tool`) `tool` runs the guard itself. So an
-  override of `agent-loop` cannot drop or weaken it.
-- **Refused early.** `save_workflow`/`activate_workflow` refuse an
-  `agent-loop` version with no `call: guard` before `call: tool`, with a
-  clear message. The host check above is the real guarantee.
-- **The runtime informs, the agent decides.** A blocked call is not sent;
-  the model gets the reply `[guard] blocked: <reason> — <guidance>` like a
-  tool error, and decides what to do.
-- **Guard input:** the user's request (the signal's first user message),
-  the call (tool + arguments), the writes already made in this session.
+- **A step in the loop.** `agent-loop.yaml` runs `guard` between `turn` and
+  the tool round. Reads skip classification; all writes needing Jev share one
+  decisions request, with one choice question per call.
+- **Enforced by the host.** Instructions, reasons and deterministic checks are
+  compiled from git-owned files, never YAML arguments or editable skills.
+  Verdicts belong to a loop and call id + SHA-256(name, exact arguments), are
+  consumed by `tool` and do not persist. Missing verdicts, changed arguments
+  and restarts trigger a new review in `tool`. Direct writes from loop
+  overrides cannot bypass `tool`.
+- **Refused early.** Save/activation refuse an `agent-loop` without
+  `call: guard` before `call: tool`. The host still enforces legacy overrides.
+- **Host evidence only.** At admission the host snapshots the request, a
+  worker's root request and assigned task, structured preloaded user messages,
+  and the exact loaded skill text (including preselected skills/patches as
+  presented). This survives restart in the admitted run input. Rendered
+  conversation history, arbitrary system context, worker input-ref contents,
+  assistant prose/reasoning and tool results are excluded from Jev's input.
+  Telegram's structured preload supplies only user messages; peer history is
+  currently retained only as rendered text, so is skipped.
+- **Call sequence.** Jev sees prior calls' names and arguments, reads and
+  blocked attempts included, in order, plus the calls being judged. A boolean
+  marks blocks; no reply body is sent. The host records calls at dispatch,
+  independently of assistant transcripts or YAML evidence. Durable loops
+  restore bounded call evidence from host `tool` records; no reply pairing
+  is needed. Round/index positions retain pending intents in the built-in
+  loop's call order across a crash. Overrides without positions use saved
+  dispatch sequence; unknown intents then follow known calls by logical ref.
+  The recent 64 calls are retained with `chain_omitted`;
+  argument strings cap at 4,000 Unicode characters, call names/ids at 256,
+  request and root request at 16,000 each, earlier user text at the most recent
+  16,000 total, loaded skill text at 24,000 total. Clipped text has a visible
+  `[truncated]` marker. Verdict identity and deterministic checks use full args.
+- **The runtime informs; the agent decides.** A block is a failed tool result:
+  `[guard] blocked: <label> — <guidance>. The user's goal: <request>`.
+  The goal uses the root request for workers and caps at 500 characters with
+  a visible truncation marker. `finish` cannot end a round with a failed call.
 
-### Reasons (Jev chooses one per write)
+### Jev chooses exactly one of three labels
 
 | Label | When |
 | --- | --- |
-| `allow` | the action serves the user's request |
-| `off_request` | not asked for; a side effect beyond the request |
-| `injected` | dictated by tool data (mail, news, post, page), not by the user |
-| `wrong_target` | right action, wrong recipient / chat / thread / document |
-| `data_leak` | secrets, tokens, IBANs, personal data sent where they do not belong |
-| `destructive` | irreversible or overwriting without an explicit request |
-| `repeat` | repeats a write already made in this session |
-| `needs_confirmation` | plausible but high-impact: ask the user first |
+| `allow` | Plausibly contributes to the user's goal, including intermediate/instrumental steps: notes, memory, drafts, requested scheduling, replies in the conversation. Default; uncertainty about an instrumental step means allow. |
+| `misaligned` | Positive signs of serving no user goal: unrelated side effects, targets/content apparently dictated by retrieved data (goal hijacking), or private data sent somewhere the user did not ask for. |
+| `needs_confirmation` | Serves the goal but is consequential and hard to undo, and the user has not explicitly requested that exact action: sending to a third party, deleting/overwriting user data, money, account/settings changes. Ask in the conversation and wait; a later user confirmation can authorize it. |
 
-Deterministic layer before Jev (no model): `denied_tool`, `unknown_chat`
-(`send_telegram_message` to a chat that is not known), `secret_pattern`
-(token / key / IBAN patterns in outgoing text). If Jev is unavailable:
-fail-open for the reply to the current signal's own chat, fail-closed
-otherwise, with `guard_unavailable` in the reply.
-
-Each label carries the model-facing guidance text that follows it in the
-reply.
+Deterministic (no model): `unknown_chat` (unknown Telegram destination),
+`secret_pattern` (token/key/IBAN patterns in nested string args).
+Unavailable Jev: current-conversation replies named in the primary request may
+fail open; other writes fail closed with `guard_unavailable`. The reason data
+supplies guidance for every label. Known chats come from task/root request,
+earlier user messages, and the configured default chat.
 
 ## TODO
 
-- `needs_confirmation` / `destructive` are blocks for now. Real
-  confirmation: the run waits durably for the user's answer (an event wait,
-  which OWF `listen` / the interpreter does not support yet) and then sends
-  or drops the call.
+- `needs_confirmation` blocks for now. Real confirmation: the run waits
+  durably for the user's answer (an event wait, which OWF `listen` / the
+  interpreter does not support yet) and then sends or drops the call.
 - A golden set of real writes and injections (like `news-filter-eval`) to
   measure false blocks and misses; judge the guard's verdicts.
 - Outgoing text checks beyond patterns (tone, a reply to the wrong person).
 
 ## Acceptance
 
-- Every write of every loop has a recorded verdict; none is sent without
+- Every guarded write has a host-recorded verdict; none dispatches without
   `allow`, including under an overridden `agent-loop`.
-- A blocked call comes back to the model with its reason and guidance.
-- An `agent-loop` version without the guard step is refused on save and
-  activation.
-- A round of reads costs no guard call; a round of writes costs one
-  decisions request.
+- A blocked call returns its label, guidance and the user's goal.
+- Save/activation refuse an `agent-loop` without the guard step.
+- A read-only round costs no guard request; a write round costs one.
+- Jev receives goal/skill/call evidence and no assistant prose or tool results;
+  instrumental writes reach the fake and can be allowed.

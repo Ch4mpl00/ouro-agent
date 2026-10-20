@@ -469,6 +469,9 @@ impl owf::run::Functions for Functions {
                     serde_json::from_value(admitted["loop"].clone()).map_err(|e| invalid(name, e))?;
                 let live = engine.loop_for(&spec, &root, info.cancel).await.map_err(failed)?;
                 live.admit_guard(&admitted).await.map_err(failed)?;
+                if let Some(runs) = &self.runs {
+                    live.restore_guard_history(runs, info.run_id).await.map_err(failed)?;
+                }
                 let mut args = args;
                 args["loop"] = admitted["loop"].clone();
                 match name {
