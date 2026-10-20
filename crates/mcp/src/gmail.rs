@@ -502,29 +502,29 @@ fn format_attachment(att: &AttachmentRef) -> String {
 
 fn nashdom_content(m: &MessageSummary, attachments: &[AttachmentRef]) -> String {
     let meta = [
-        format!("Subject: {}", m.subject.as_deref().unwrap_or("(без темы)")),
-        format!("From: {}", m.from.as_deref().unwrap_or("(неизвестно)")),
-        format!("Date: {}", m.date.as_deref().or(m.internal_date.as_deref()).unwrap_or("(неизвестно)")),
+        format!("Subject: {}", m.subject.as_deref().unwrap_or("(no subject)")),
+        format!("From: {}", m.from.as_deref().unwrap_or("(unknown)")),
+        format!("Date: {}", m.date.as_deref().or(m.internal_date.as_deref()).unwrap_or("(unknown)")),
         format!("messageId: {}", m.id),
     ];
     let pdfs: Vec<&AttachmentRef> = attachments.iter().filter(|a| is_pdf(a)).collect();
     let mut lines: Vec<String> = Vec::new();
     if pdfs.is_empty() {
-        lines.push("Пришло новое письмо от NashDom без вложений — перешли пользователю в Telegram subject и краткое содержание.".into());
+        lines.push("A new NashDom email arrived without attachments: forward its subject and a short summary to the user in Telegram.".into());
         lines.push(String::new());
         lines.extend(meta);
         lines.push(format!("Snippet: {}", m.snippet));
         lines.push(String::new());
-        lines.push("Шаг: send_telegram_message(text).".into());
+        lines.push("Step: send_telegram_message(text).".into());
     } else {
-        lines.push("Пришла новая квитанция NashDom. Скачай PDF, прочитай его и отправь пользователю в Telegram короткую сводку (тип квитанции, период, 2–5 ключевых позиций, итого).".into());
+        lines.push("A new NashDom bill arrived. Download the PDF, read it and send the user a short summary in Telegram (bill type, period, 2–5 key line items, total).".into());
         lines.push(String::new());
         lines.extend(meta);
         lines.push("Attachments:".into());
         lines.extend(pdfs.iter().map(|a| format_attachment(a)));
         lines.push(String::new());
         lines.push(
-            "Шаги: download_gmail_attachment(messageId, attachmentId) → read_pdf(filePath) → send_telegram_message(text)."
+            "Steps: download_gmail_attachment(messageId, attachmentId) → read_pdf(filePath) → send_telegram_message(text)."
                 .into(),
         );
     }
@@ -787,11 +787,11 @@ mod tests {
         serde_json::from_value(json!({
             "id": "m1",
             "threadId": "t1",
-            "snippet": "Квитанція",
+            "snippet": "Bill",
             "internalDate": "1780000000000",
             "payload": {
                 "mimeType": "multipart/mixed",
-                "headers": [{ "name": "subject", "value": "Квитанція за квітень" }, { "name": "From", "value": "nashdom@x" }],
+                "headers": [{ "name": "subject", "value": "Bill for April" }, { "name": "From", "value": "nashdom@x" }],
                 "parts": [
                     { "mimeType": "text/plain", "body": { "size": 10 } },
                     { "mimeType": "application/pdf", "filename": "bill.pdf", "body": { "attachmentId": "ANGjdJ_9-x", "size": 2048 } },
@@ -816,7 +816,7 @@ mod tests {
     #[test]
     fn headers_match_case_insensitively() {
         let summary = message().summary().unwrap();
-        assert_eq!(summary.subject.as_deref(), Some("Квитанція за квітень"));
+        assert_eq!(summary.subject.as_deref(), Some("Bill for April"));
         assert_eq!(summary.to, None);
     }
 
@@ -824,7 +824,7 @@ mod tests {
     fn bill_signal_lists_the_pdf_and_the_steps() {
         let msg = message();
         let content = nashdom_content(&msg.summary().unwrap(), &find_attachments(&msg));
-        assert!(content.starts_with("Пришла новая квитанция NashDom."));
+        assert!(content.starts_with("A new NashDom bill arrived."));
         assert!(content.contains(
             "  - attachmentId: ANGjdJ_9-x\n    filename: bill.pdf\n    mimeType: application/pdf\n    sizeBytes: 2048"
         ));

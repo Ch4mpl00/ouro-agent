@@ -656,7 +656,7 @@ pub fn chunk_markdown(body: &str, max_chars: usize) -> Vec<MarkdownChunk> {
     chunks
 }
 
-// Chunks must be self-contained; documents must not (D8). "застрял на
+// Chunks must be self-contained; documents must not (D8). "stuck on
 // Dijkstra" matches nothing alone, so the subject goes into the indexed text
 // while the stored document stays clean.
 pub fn build_index_text(project_title: &str, doc_name: &str, heading_path: &str, text: &str) -> String {
@@ -2223,7 +2223,7 @@ struct AppendDocParams {
     doc: String,
     /// Markdown to append. One blank line is inserted before it.
     text: String,
-    /// Append at the end of this section instead of the file, e.g. "Прогресс".
+    /// Append at the end of this section instead of the file, e.g. "Progress".
     under_heading: Option<String>,
     /// The user's own words that prompted this write.
     rationale: Option<String>,
@@ -2288,7 +2288,7 @@ impl McpTools {
         title = "Search everything the agents remember",
         description = "Semantic search across ALL shared memory — project documents and \
             standalone facts alike. Use it whenever the user refers to something \
-            from the past (\"что там у нас было по X\", \"напомни про Y\") and \
+            from the past (\"what did we have on X\", \"remind me about Y\") and \
             before starting work that might already have a project. Archived facts \
             are intentionally excluded from this ordinary recall path.\n\n\
             Returns REFS, not full content: `doc:<project>/<file>#<chunk>` or \
@@ -2312,12 +2312,12 @@ impl McpTools {
     #[tool(
         name = "remember",
         title = "Store a standalone fact",
-        description = "Persist a freeform fact the user asked you to remember (\"запомни, что …\"). \
+        description = "Persist a freeform fact the user asked you to remember (\"remember that …\"). \
             For anything with ongoing progress use a project document instead — a \
             fact is a single self-contained statement, not a running log.\n\n\
             YOU generate the tags: 3–6 short lowercase topical words. Recall runs \
-            over the TEXT, so write a body that names its own subject (\"Лёша \
-            платит за интернет 1-го числа\", not \"платит 1-го\")."
+            over the TEXT, so write a body that names its own subject (\"Lyosha \
+            pays for the internet on the 1st\", not \"pays on the 1st\")."
     )]
     async fn remember(&self, Parameters(p): Parameters<RememberParams>) -> ToolResult {
         if p.body.is_empty() || !nonempty_tags(p.tags.as_ref(), 12) {
@@ -2978,17 +2978,17 @@ mod tests {
     #[test]
     fn near_matches_recover_normalised_quotes() {
         assert_eq!(
-            find_near_matches("Цель — пройти графы за месяц.\n", "Цель - пройти графы за месяц.", 3),
-            ["Цель — пройти графы за месяц."]
+            find_near_matches("Goal — finish graphs in a month.\n", "Goal - finish graphs in a month.", 3),
+            ["Goal — finish graphs in a month."]
         );
         assert_eq!(
-            find_near_matches("- [ ] Обойдём граф в ширину\n", "Обойдем граф в ширину", 3),
-            ["Обойдём граф в ширину"]
+            find_near_matches("- [ ] Walk the graph from Орёл\n", "Walk the graph from Орел", 3),
+            ["Walk the graph from Орёл"]
         );
-        assert_eq!(find_near_matches("Плана\n    нет\n", "Плана нет", 3), ["Плана\n    нет"]);
+        assert_eq!(find_near_matches("No\n    plan\n", "No plan", 3), ["No\n    plan"]);
         assert_eq!(
-            find_near_matches("Проект «Графы» стартовал.\n", "Проект \"Графы\" стартовал.", 3),
-            ["Проект «Графы» стартовал."]
+            find_near_matches("Project «Graphs» started.\n", "Project \"Graphs\" started.", 3),
+            ["Project «Graphs» started."]
         );
         assert_eq!(
             find_near_matches(
@@ -2999,10 +2999,10 @@ mod tests {
             ["- [ ] Dijkstra shortest path"]
         );
         assert!(find_near_matches("# Roadmap\n\n- [ ] BFS\n", "completely unrelated sentence", 3).is_empty());
-        let failure = &apply_edits("Цель — пройти графы.\n", &[edit("Цель - пройти графы.", "x")]).unwrap_err()[0];
+        let failure = &apply_edits("Goal — finish graphs.\n", &[edit("Goal - finish graphs.", "x")]).unwrap_err()[0];
         assert_eq!(
             (failure.reason, failure.suggestions.clone()),
-            (EditFailureReason::NotFound, vec!["Цель — пройти графы.".to_owned()])
+            (EditFailureReason::NotFound, vec!["Goal — finish graphs.".to_owned()])
         );
     }
 
@@ -3084,8 +3084,8 @@ mod tests {
     #[test]
     fn index_text_names_its_subject() {
         assert_eq!(
-            build_index_text("Графы для интервью", "progress.md", "Прогресс", "застрял на Dijkstra"),
-            "Графы для интервью — progress.md · Прогресс\n\nзастрял на Dijkstra"
+            build_index_text("Graphs for interviews", "progress.md", "Progress", "stuck on Dijkstra"),
+            "Graphs for interviews — progress.md · Progress\n\nstuck on Dijkstra"
         );
         assert_eq!(build_index_text("P", "d.md", "", "body"), "P — d.md\n\nbody");
     }
@@ -3164,33 +3164,33 @@ mod tests {
     #[tokio::test]
     async fn round_trips_a_project_and_lists_docs_with_summaries() {
         let h = harness();
-        h.service.create_project("leetcode-graphs", "Графы для интервью").await.unwrap();
+        h.service.create_project("leetcode-graphs", "Graphs for interviews").await.unwrap();
         h.service
             .write_doc(WriteDoc {
                 searchable: None,
-                summary: Some("Цель и рамки проекта"),
-                ..write("leetcode-graphs", "passport.md", "# Паспорт\n\nЦель.\n")
+                summary: Some("Project goal and scope"),
+                ..write("leetcode-graphs", "passport.md", "# Passport\n\nGoal.\n")
             })
             .await
             .unwrap();
         h.service
             .write_doc(WriteDoc {
                 searchable: None,
-                summary: Some("Список тем"),
+                summary: Some("List of topics"),
                 ..write("leetcode-graphs", "roadmap.md", "# Roadmap\n")
             })
             .await
             .unwrap();
 
         let list = h.service.list_docs("leetcode-graphs").await.unwrap();
-        assert_eq!(list.project.title, "Графы для интервью");
+        assert_eq!(list.project.title, "Graphs for interviews");
         let docs: Vec<(String, Option<String>, i32)> =
             list.docs.iter().map(|d| (d.name.clone(), d.summary.clone(), d.version)).collect();
         assert_eq!(
             docs,
             [
-                ("passport.md".into(), Some("Цель и рамки проекта".into()), 1),
-                ("roadmap.md".into(), Some("Список тем".into()), 1)
+                ("passport.md".into(), Some("Project goal and scope".into()), 1),
+                ("roadmap.md".into(), Some("List of topics".into()), 1)
             ]
         );
         assert_eq!(h.service.read_doc("leetcode-graphs", "roadmap.md").await.unwrap().body, "# Roadmap\n");
@@ -3200,12 +3200,12 @@ mod tests {
     async fn appends_without_a_version_and_names_what_exists_on_misses() {
         let h = harness();
         h.service.create_project("p", "P").await.unwrap();
-        h.service.write_doc(write("p", "progress.md", "# Прогресс\n\nДень 1: BFS\n")).await.unwrap();
-        let written = h.service.append_doc("p", "progress.md", "День 2: Dijkstra", None, ACTOR, None).await.unwrap();
+        h.service.write_doc(write("p", "progress.md", "# Progress\n\nDay 1: BFS\n")).await.unwrap();
+        let written = h.service.append_doc("p", "progress.md", "Day 2: Dijkstra", None, ACTOR, None).await.unwrap();
         assert_eq!(written.version, 2);
         assert_eq!(
             h.service.read_doc("p", "progress.md").await.unwrap().body,
-            "# Прогресс\n\nДень 1: BFS\n\nДень 2: Dijkstra\n"
+            "# Progress\n\nDay 1: BFS\n\nDay 2: Dijkstra\n"
         );
 
         let (c, d) = code(h.service.append_doc("p", "roadmap2.md", "y", None, ACTOR, None).await.unwrap_err());
@@ -3223,7 +3223,7 @@ mod tests {
                 .to_string()
                 .contains("Invalid document name")
         );
-        assert_eq!(code(h.service.create_project("p", "Другое").await.unwrap_err()).0, "project_exists");
+        assert_eq!(code(h.service.create_project("p", "Other").await.unwrap_err()).0, "project_exists");
     }
 
     #[tokio::test]
@@ -3245,7 +3245,7 @@ mod tests {
         h.service.write_doc(write("p", "roadmap.md", ROADMAP)).await.unwrap();
         let ok = h
             .service
-            .patch_doc("p", "roadmap.md", 1, vec![edit("- [ ] Dijkstra", "- [x] Dijkstra")], ACTOR, Some("отметь"))
+            .patch_doc("p", "roadmap.md", 1, vec![edit("- [ ] Dijkstra", "- [x] Dijkstra")], ACTOR, Some("mark it"))
             .await;
         assert_eq!(ok.unwrap().version, 2);
 
@@ -3313,7 +3313,7 @@ mod tests {
         h.service.write_doc(write("p", "roadmap.md", "- [ ] BFS\n- [ ] Dijkstra\n")).await.unwrap();
         let first = h
             .service
-            .patch_doc("p", "roadmap.md", 1, vec![edit("- [ ] BFS", "- [x] BFS")], "claude-code", Some("BFS пройден"))
+            .patch_doc("p", "roadmap.md", 1, vec![edit("- [ ] BFS", "- [x] BFS")], "claude-code", Some("BFS done"))
             .await
             .unwrap();
         let history = h.service.history("p", "roadmap.md", 20).await.unwrap();
@@ -3330,14 +3330,11 @@ mod tests {
         let a =
             h.service.patch_doc("p", "roadmap.md", 3, vec![edit("- [ ] BFS", "- [x] BFS")], ACTOR, None).await.unwrap();
         h.service
-            .patch_doc("p", "roadmap.md", 4, vec![edit("- [x] BFS", "- [x] BFS (повторить)")], ACTOR, None)
+            .patch_doc("p", "roadmap.md", 4, vec![edit("- [x] BFS", "- [x] BFS (repeat)")], ACTOR, None)
             .await
             .unwrap();
         h.service.revert("p", "roadmap.md", &a.patch_id, false, ACTOR).await.unwrap();
-        assert_eq!(
-            h.service.read_doc("p", "roadmap.md").await.unwrap().body,
-            "- [ ] BFS (повторить)\n- [ ] Dijkstra\n"
-        );
+        assert_eq!(h.service.read_doc("p", "roadmap.md").await.unwrap().body, "- [ ] BFS (repeat)\n- [ ] Dijkstra\n");
 
         let b = h
             .service
@@ -3345,16 +3342,13 @@ mod tests {
             .await
             .unwrap();
         h.service
-            .patch_doc("p", "roadmap.md", 7, vec![edit("- [x] Dijkstra", "- [x] Дейкстра")], ACTOR, None)
+            .patch_doc("p", "roadmap.md", 7, vec![edit("- [x] Dijkstra", "- [x] Shortest paths")], ACTOR, None)
             .await
             .unwrap();
         let (c, d) = code(h.service.revert("p", "roadmap.md", &b.patch_id, false, ACTOR).await.unwrap_err());
         assert_eq!((c, &d["rollbackToVersion"]), ("revert_conflict", &json!(6)));
         h.service.revert("p", "roadmap.md", &b.patch_id, true, ACTOR).await.unwrap();
-        assert_eq!(
-            h.service.read_doc("p", "roadmap.md").await.unwrap().body,
-            "- [ ] BFS (повторить)\n- [ ] Dijkstra\n"
-        );
+        assert_eq!(h.service.read_doc("p", "roadmap.md").await.unwrap().body, "- [ ] BFS (repeat)\n- [ ] Dijkstra\n");
 
         let (c, d) = code(h.service.revert("p", "roadmap.md", "pa:beef", false, ACTOR).await.unwrap_err());
         assert_eq!(c, "patch_not_found");
@@ -3375,35 +3369,38 @@ mod tests {
     #[tokio::test]
     async fn facts_round_trip_and_archive_out_of_recall() {
         let h = harness();
-        let fact =
-            h.service.remember("Лёша платит за интернет 1-го числа", Some(&["интернет".into()]), None).await.unwrap();
+        let fact = h
+            .service
+            .remember("Lyosha pays for the internet on the 1st", Some(&["internet".into()]), None)
+            .await
+            .unwrap();
         assert_eq!(h.service.get_fact(fact.id).await.unwrap().body, fact.body);
         assert_eq!(code(h.service.remember("  ", None, None).await.unwrap_err()).0, "empty_body");
         assert_eq!(code(h.service.get_fact(999).await.unwrap_err()).0, "fact_not_found");
 
-        let hits = h.service.recall("интернет Лёша", None, None, None, Utc::now()).await.unwrap();
+        let hits = h.service.recall("internet Lyosha", None, None, None, Utc::now()).await.unwrap();
         assert_eq!(hits[0].r#ref, fact_ref(fact.id));
         h.service.update_fact(fact.id, None, None, Some(MemoryState::Archived)).await.unwrap();
-        assert!(h.service.recall("интернет Лёша", None, None, None, Utc::now()).await.unwrap().is_empty());
+        assert!(h.service.recall("internet Lyosha", None, None, None, Utc::now()).await.unwrap().is_empty());
         let archived =
-            h.service.recall("интернет Лёша", None, Some(&[MemoryState::Archived]), None, Utc::now()).await.unwrap();
+            h.service.recall("internet Lyosha", None, Some(&[MemoryState::Archived]), None, Utc::now()).await.unwrap();
         assert_eq!(archived.len(), 1);
     }
 
     #[tokio::test]
     async fn recall_spans_documents_and_drops_stale_chunks() {
         let h = harness();
-        h.service.create_project("graphs", "Графы").await.unwrap();
-        h.service.write_doc(write("graphs", "progress.md", "## Прогресс\n\nзастрял на dijkstra\n")).await.unwrap();
-        h.service.remember("купить молоко и хлеб", None, None).await.unwrap();
-        let hits = h.service.recall("dijkstra прогресс графы", Some(1), None, None, Utc::now()).await.unwrap();
+        h.service.create_project("graphs", "Graphs").await.unwrap();
+        h.service.write_doc(write("graphs", "progress.md", "## Progress\n\nstuck on dijkstra\n")).await.unwrap();
+        h.service.remember("buy milk and bread", None, None).await.unwrap();
+        let hits = h.service.recall("dijkstra progress graphs", Some(1), None, None, Utc::now()).await.unwrap();
         assert_eq!(hits[0].r#ref, "doc:graphs/progress.md#0");
 
         h.service
             .write_doc(WriteDoc { searchable: None, expected_version: Some(1), ..write("graphs", "progress.md", "") })
             .await
             .unwrap();
-        let hits = h.service.recall("dijkstra прогресс графы", None, None, None, Utc::now()).await.unwrap();
+        let hits = h.service.recall("dijkstra progress graphs", None, None, None, Utc::now()).await.unwrap();
         assert!(hits.iter().all(|hit| !hit.r#ref.starts_with("doc:")));
     }
 
@@ -3450,10 +3447,10 @@ mod tests {
         let h = harness();
         h.embedder.set_down(true);
         h.service.create_project("p", "P").await.unwrap();
-        h.service.write_doc(write("p", "a.md", "текст\n")).await.unwrap();
-        h.service.patch_doc("p", "a.md", 1, vec![edit("текст", "новый текст")], ACTOR, None).await.unwrap();
+        h.service.write_doc(write("p", "a.md", "draft\n")).await.unwrap();
+        h.service.patch_doc("p", "a.md", 1, vec![edit("draft", "new draft")], ACTOR, None).await.unwrap();
         assert_eq!(
-            code(h.service.recall("текст", None, None, None, Utc::now()).await.unwrap_err()).0,
+            code(h.service.recall("draft", None, None, None, Utc::now()).await.unwrap_err()).0,
             "search_unavailable"
         );
 
@@ -3461,25 +3458,20 @@ mod tests {
         let drained = h.service.indexer().embed_missing_batch(100, 0).await.unwrap();
         assert_eq!((drained.embedded, drained.failed), (1, 0));
         assert_eq!(h.service.indexer().embed_missing_batch(100, 0).await.unwrap().embedded, 0);
-        assert_eq!(
-            h.service.recall("новый текст", None, None, None, Utc::now()).await.unwrap()[0].r#ref,
-            "doc:p/a.md#0"
-        );
+        assert_eq!(h.service.recall("new draft", None, None, None, Utc::now()).await.unwrap()[0].r#ref, "doc:p/a.md#0");
     }
 
     #[tokio::test]
     async fn imports_legacy_notes_idempotently() {
         let h = harness();
         let notes = vec![
-            LegacyNote {
-                id: 1, body: "пароль от роутера на наклейке".into(), tags: vec!["роутер".into()]
-            },
+            LegacyNote { id: 1, body: "router password is on the sticker".into(), tags: vec!["router".into()] },
             LegacyNote { id: 2, body: "   ".into(), tags: vec![] },
         ];
         assert_eq!(import_legacy_notes(&notes, &h.service).await.unwrap(), (1, 1));
         assert_eq!(import_legacy_notes(&notes, &h.service).await.unwrap(), (0, 2));
         let fact = h.store.get_fact_by_source(&legacy_note_source(1)).await.unwrap().unwrap();
-        assert_eq!(fact.tags, ["роутер"]);
+        assert_eq!(fact.tags, ["router"]);
     }
 
     // The same rules against Postgres: the CAS, patch history order, revert,
@@ -3496,7 +3488,7 @@ mod tests {
             .write_doc(WriteDoc {
                 searchable: None,
                 summary: Some("roadmap"),
-                ..write(&slug, "roadmap.md", "## Темы\n\n- [ ] BFS\n- [ ] Dijkstra\n")
+                ..write(&slug, "roadmap.md", "## Topics\n\n- [ ] BFS\n- [ ] Dijkstra\n")
             })
             .await
             .unwrap();
@@ -3509,11 +3501,11 @@ mod tests {
             code(service.patch_doc(&slug, "roadmap.md", 1, vec![edit("x", "y")], ACTOR, None).await.unwrap_err()).0,
             "version_conflict"
         );
-        service.append_doc(&slug, "roadmap.md", "- [ ] A*", Some("Темы"), ACTOR, None).await.unwrap();
+        service.append_doc(&slug, "roadmap.md", "- [ ] A*", Some("Topics"), ACTOR, None).await.unwrap();
 
         let doc = service.read_doc(&slug, "roadmap.md").await.unwrap();
         assert_eq!((doc.version, doc.summary.as_deref()), (3, Some("roadmap")));
-        assert_eq!(doc.body, "## Темы\n\n- [x] BFS\n- [ ] Dijkstra\n\n- [ ] A*\n");
+        assert_eq!(doc.body, "## Topics\n\n- [x] BFS\n- [ ] Dijkstra\n\n- [ ] A*\n");
         let history = service.history(&slug, "roadmap.md", 10).await.unwrap();
         assert_eq!(
             history.iter().map(|h| h.kind).collect::<Vec<_>>(),
@@ -3524,25 +3516,28 @@ mod tests {
         service.revert(&slug, "roadmap.md", &patched.patch_id, false, ACTOR).await.unwrap();
         assert!(service.read_doc(&slug, "roadmap.md").await.unwrap().body.contains("- [ ] BFS"));
 
-        let hits = service.recall("Dijkstra темы", Some(5), None, None, Utc::now()).await.unwrap();
+        let hits = service.recall("Dijkstra topics", Some(5), None, None, Utc::now()).await.unwrap();
         assert!(hits.iter().any(|h| h.r#ref == format!("doc:{slug}/roadmap.md#0")));
 
         let tag = format!("tag{}", rand::random::<u32>());
-        let fact = service.remember("кот любит сметану", Some(std::slice::from_ref(&tag)), Some("test")).await.unwrap();
-        let tagged =
-            service.recall("кот сметана", Some(5), None, Some(std::slice::from_ref(&tag)), Utc::now()).await.unwrap();
+        let fact =
+            service.remember("the cat loves sour cream", Some(std::slice::from_ref(&tag)), Some("test")).await.unwrap();
+        let tagged = service
+            .recall("cat sour cream", Some(5), None, Some(std::slice::from_ref(&tag)), Utc::now())
+            .await
+            .unwrap();
         assert_eq!(tagged.iter().map(|h| h.r#ref.clone()).collect::<Vec<_>>(), [fact_ref(fact.id)]);
-        service.update_fact(fact.id, Some(" кот любит сливки "), None, Some(MemoryState::Archived)).await.unwrap();
-        assert_eq!(service.get_fact(fact.id).await.unwrap().body, "кот любит сливки");
+        service.update_fact(fact.id, Some(" the cat loves cream "), None, Some(MemoryState::Archived)).await.unwrap();
+        assert_eq!(service.get_fact(fact.id).await.unwrap().body, "the cat loves cream");
         assert!(
             service
-                .recall("кот", Some(5), None, Some(std::slice::from_ref(&tag)), Utc::now())
+                .recall("cat", Some(5), None, Some(std::slice::from_ref(&tag)), Utc::now())
                 .await
                 .unwrap()
                 .is_empty()
         );
         let archived =
-            service.recall("кот", Some(5), Some(&[MemoryState::Archived]), Some(&[tag]), Utc::now()).await.unwrap();
+            service.recall("cat", Some(5), Some(&[MemoryState::Archived]), Some(&[tag]), Utc::now()).await.unwrap();
         assert_eq!(archived.len(), 1);
 
         // Emptying a document drops its chunks from the projection.
@@ -3550,7 +3545,7 @@ mod tests {
             .write_doc(WriteDoc { searchable: None, expected_version: Some(4), ..write(&slug, "roadmap.md", "") })
             .await
             .unwrap();
-        let after = service.recall("Dijkstra темы", Some(50), None, None, Utc::now()).await.unwrap();
+        let after = service.recall("Dijkstra topics", Some(50), None, None, Utc::now()).await.unwrap();
         assert!(after.iter().all(|h| !h.r#ref.starts_with(&format!("doc:{slug}/"))));
     }
 
@@ -3979,7 +3974,7 @@ mod journal_tests {
     async fn pg_i2_tail_is_newest_first_and_round_trips_the_body_byte_for_byte() {
         let Some(service) = pg_service().await else { return };
         let stream = unique("order");
-        let body = "  multi\nline «тело» ё  \n";
+        let body = "  multi\nline «body» ё  \n";
         append(&service, &stream, "older", None).await.unwrap();
         append(&service, &stream, body, None).await.unwrap();
         assert_eq!(bodies(&service, &stream, Some(2)).await, [body, "older"]);

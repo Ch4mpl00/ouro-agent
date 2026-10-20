@@ -75,7 +75,7 @@ fn alphabet() -> impl Strategy<Value = char> {
 }
 
 // Mostly random characters, sometimes a run of one character: repeats are
-// where quotes overlap ("ее" occurs twice in "еее"), and uniformly random
+// where quotes overlap ("aa" occurs twice in "aaa"), and uniformly random
 // text almost never has them.
 pub fn text(max_length: usize) -> impl Strategy<Value = String> {
     prop_oneof![

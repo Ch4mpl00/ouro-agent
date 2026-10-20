@@ -63,7 +63,7 @@ enum Op {
 
 fn text() -> impl Strategy<Value = String> {
     prop_oneof![
-        5 => proptest::sample::select(vec!["Ищу новости", "Читаю PDF", "Собираю дайджест", "step 2"]).prop_map(str::to_owned),
+        5 => proptest::sample::select(vec!["Searching the news", "Reading the PDF", "Collecting the digest", "step 2"]).prop_map(str::to_owned),
         2 => proptest::sample::select(vec!["", "   "]).prop_map(str::to_owned),
         1 => Just("я".repeat(4096)),
     ]

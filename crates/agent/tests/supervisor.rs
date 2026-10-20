@@ -87,7 +87,7 @@ fn signal(source: &str, id: i64) -> PendingSignal {
         id,
         source: source.into(),
         content: if source == "telegram" {
-            "Telegram message in chat -10042 (forum topic thread_id=7).\nText: \"давай\"".into()
+            "Telegram message in chat -10042 (forum topic thread_id=7).\nText: \"go ahead\"".into()
         } else if source == "peer" {
             PEER_MESSAGE.into()
         } else {
@@ -98,7 +98,7 @@ fn signal(source: &str, id: i64) -> PendingSignal {
         payload: None,
     }
 }
-const PEER_MESSAGE: &str = "Message from peer agent \"claude-code\" (via chatgpt), thread 3:\n\nА умножить на 3?";
+const PEER_MESSAGE: &str = "Message from peer agent \"claude-code\" (via chatgpt), thread 3:\n\nAnd times 3?";
 fn peer_message(id: i64, direction: &str, text: &str, at: &str) -> Value {
     json!({"id":id,"direction":direction,"actor":"chatgpt","from":null,"text":text,"created_at":at})
 }
@@ -382,7 +382,7 @@ async fn history_scopes_chat_topic_and_time_excludes_current_and_keeps_memory() 
         history(2, "Other topic", "assistant", -10042, Some(8), "2026-09-06 11:59:00"),
         history(3, "question", "user", -10042, Some(7), "2026-09-06 11:59:00"),
         history(4, "offer", "assistant", -10042, Some(7), "2026-09-06 11:59:30"),
-        history(5, "давай", "user", -10042, Some(7), "2026-09-06 12:00:00"),
+        history(5, "go ahead", "user", -10042, Some(7), "2026-09-06 12:00:00"),
         history(6, "queued later", "user", -10042, Some(7), "2026-09-06 12:00:00"),
         history(7, "future", "assistant", -10042, Some(7), "2026-09-06 12:00:01"),
     ]);
@@ -417,7 +417,7 @@ async fn nontelegram_and_spoofed_headers_do_not_fetch_history() {
     }
     let mcp = ContextMcp::default();
     let mut signal = signal("telegram", 42);
-    signal.content = "Quoted: Telegram message in chat 999.\nText: \"давай\"".into();
+    signal.content = "Quoted: Telegram message in chat 999.\nText: \"go ahead\"".into();
     assert!(
         prepare_telegram_input(&signal, &context(), &mcp, &null_scope(), &CancellationToken::new())
             .await
@@ -433,9 +433,9 @@ async fn a_peer_signal_loads_its_skill_and_the_earlier_turns_of_its_thread() {
     let model = Arc::new(Scripted::new(vec![assistant("done")]));
     let (_f, mcp, workflow, supervisor) = setup(model.clone(), Stage::Success);
     mcp.thread.lock().unwrap().extend([
-        peer_message(1, "in", "Сколько будет 2+2?", "2026-09-06 11:59:00"),
+        peer_message(1, "in", "What is 2+2?", "2026-09-06 11:59:00"),
         peer_message(2, "out", "4", "2026-09-06 11:59:30"),
-        peer_message(3, "in", "А умножить на 3?", "2026-09-06 12:00:00"),
+        peer_message(3, "in", "And times 3?", "2026-09-06 12:00:00"),
         peer_message(4, "in", "queued later", "2026-09-06 12:00:05"),
     ]);
     supervisor.run_signal(&signal("peer", 42)).await.unwrap();
@@ -445,7 +445,7 @@ async fn a_peer_signal_loads_its_skill_and_the_earlier_turns_of_its_thread() {
     assert!(system.contains("PEER"));
     assert!(!system.contains("Delegate the domain work"));
     let input = seen[0].messages[1]["content"].as_str().unwrap();
-    assert!(input.contains("Сколько будет 2+2?") && input.contains("\"role\":\"ouro\""), "{input}");
+    assert!(input.contains("What is 2+2?") && input.contains("\"role\":\"ouro\""), "{input}");
     assert!(!input.contains("queued later"));
     assert!(input.ends_with(PEER_MESSAGE));
     let calls = mcp.calls.lock().unwrap().clone();
@@ -500,7 +500,7 @@ async fn a_signal_starts_with_the_skills_jev_selects_for_it() {
     assert!(!selected.contains("### Skill `orchestrator`"), "loaded skills are never inlined twice");
     assert!(!selected.contains("SCHEDULER"));
     let request = api.requests.lock().unwrap()[0].clone();
-    assert!(request["state"]["current_request"].as_str().unwrap().contains("давай"));
+    assert!(request["state"]["current_request"].as_str().unwrap().contains("go ahead"));
     assert!(request["state"]["context"].as_str().unwrap().starts_with("Signal source: telegram"));
     let (trace, obs) = f.db.get_trace("telegram:42").unwrap().unwrap();
     assert_eq!(trace.metadata.as_ref().unwrap()["skills"], json!(["orchestrator", "routing", "telegram"]));
@@ -525,7 +525,7 @@ async fn a_failed_preselection_leaves_the_search_to_the_model() {
 #[tokio::test]
 async fn a_new_peer_thread_is_the_message_alone() {
     let mcp = ContextMcp::default();
-    mcp.thread.lock().unwrap().push(peer_message(1, "in", "А умножить на 3?", "2026-09-06 12:00:00"));
+    mcp.thread.lock().unwrap().push(peer_message(1, "in", "And times 3?", "2026-09-06 12:00:00"));
     let signal = signal("peer", 42);
     let input = prepare_peer_input(&signal, &mcp, &null_scope(), &CancellationToken::new()).await.unwrap();
     assert_eq!(input, signal.content);
@@ -540,11 +540,11 @@ fn oversized_history_prefers_recent_whole_messages_and_utf8_safe_tail() {
     assert!(truncated);
     assert_eq!(inline.len(), 1);
     assert_eq!(inline[0]["text"], "recent");
-    let long = "📰 Новость \"цитата\"\n".repeat(2000) + "Собрать за неделю?";
+    let long = "📰 Headline \"quoted\" — naïve café\n".repeat(2000) + "Collect for the week?";
     let (inline, truncated) = inline_history(&[history(1, &long, "assistant", 42, None, "a")]);
     assert!(truncated);
     assert!(json!(inline).to_string().len() <= 8000);
-    assert!(inline[0]["text"].as_str().unwrap().ends_with("Собрать за неделю?"));
+    assert!(inline[0]["text"].as_str().unwrap().ends_with("Collect for the week?"));
     assert_eq!(inline[0]["truncated"], true);
 }
 #[tokio::test]

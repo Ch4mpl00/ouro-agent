@@ -1,4 +1,4 @@
-// Persistent state for the closed-loop improver (Phase 3, п3): one row per
+// Persistent state for the closed-loop improver (Phase 3, part 3): one row per
 // (skill, axis) in agent.db's `improver_state`, holding the last cycle's
 // outcome and — when the last attempt shipped — the live-monitor bookkeeping
 // (pre-ship baseline + shipped lesson + status). The improver owns this

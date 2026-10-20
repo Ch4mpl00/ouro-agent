@@ -60,11 +60,11 @@ fn starts_empty_without_shared_state_between_instances() {
 
 #[test]
 fn preserves_values_exactly_on_repeated_reads() {
-    let long = "новость\n".repeat(10_000);
+    let long = "news\n".repeat(10_000);
     for value in [
         "",
         "  first\r\nsecond\n\t",
-        "Новини 📰 e\u{0301}",
+        "News 📰 e\u{0301}",
         "{ \"items\": [1, null, false] }",
         "${news.raw} {\"ref\":\"news\"}",
         long.as_str(),

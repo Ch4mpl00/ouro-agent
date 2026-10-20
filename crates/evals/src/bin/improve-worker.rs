@@ -1,4 +1,4 @@
-// Closed-loop improver cron (Phase 3, п3; compose service `improve-worker`,
+// Closed-loop improver cron (Phase 3, part 3; compose service `improve-worker`,
 // `evals` profile): walks every (skill, axis) in the judged corpus, monitors
 // the prod trend of the last ship (auto-reverting if it didn't hold), and
 // otherwise runs one improve cycle. Ships ONLY when IMPROVE_APPLY is set —

@@ -33,7 +33,7 @@ fn mails() -> Vec<FakeMail> {
         .map(|(id, atts)| FakeMail {
             id: (*id).into(),
             internal_date: 1_790_000_000_000,
-            subject: "Рахунок".into(),
+            subject: "Bill".into(),
             matches: true,
             attachments: atts
                 .iter()
@@ -70,7 +70,7 @@ fn download() -> impl Strategy<Value = Download> {
         5.0 / 6.0,
         proptest::sample::select(vec![
             "bill.pdf",
-            "травень_ДГ.pdf",
+            "may_bill_ДГ.pdf",
             "../../evil.pdf",
             "..",
             ".",
@@ -249,7 +249,7 @@ fn pages_through_every_nashdom_mail_once_newest_first_with_exactly_its_pdfs() {
                     .map(|(i, (matches, atts))| FakeMail {
                         id: format!("m{i:04x}"),
                         internal_date: t0 + i as i64 * 60_000,
-                        subject: format!("Рахунок {i}"),
+                        subject: format!("Bill {i}"),
                         matches: *matches,
                         attachments: atts
                             .iter()

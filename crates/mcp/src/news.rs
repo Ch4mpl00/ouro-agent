@@ -1458,14 +1458,14 @@ mod tests {
 
     #[test]
     fn extracts_a_readable_article() {
-        let body = "Графы — это набор вершин и рёбер. ".repeat(40);
+        let body = "Graphs (графы) are a set of vertices and edges. ".repeat(40);
         let html = format!(
-            "<html><head><title>Про графы</title><meta property=\"og:site_name\" content=\"Хабр\">\
+            "<html><head><title>About graphs</title><meta property=\"og:site_name\" content=\"Хабр\">\
              <meta property=\"article:published_time\" content=\"2026-01-02T00:00:00Z\"></head>\
-             <body><nav>menu</nav><article><h1>Про графы</h1><p>{body}</p><p>{body}</p></article></body></html>"
+             <body><nav>menu</nav><article><h1>About graphs</h1><p>{body}</p><p>{body}</p></article></body></html>"
         );
         let article = extract_article("https://habr.com/ru/articles/1/", &html).unwrap();
-        assert!(article.text.contains("набор вершин"));
+        assert!(article.text.contains("(графы) are a set of vertices"));
         assert_eq!(article.site.as_deref(), Some("Хабр"));
         assert_eq!(article.published_at, parse_js_date("2026-01-02T00:00:00Z"));
     }
@@ -1530,7 +1530,7 @@ mod tests {
         let items = vec![
             item(&source, "a", "Rust async runtimes", "tokio executor scheduling futures", "2026-01-01T00:00:00Z"),
             item(&source, "b", "Postgres vector search", "pgvector cosine distance ivfflat", "2026-01-02T00:00:00Z"),
-            item(&source, "c", "Одесса новости", "удары дронов по Одессе ночью", "2026-01-03T00:00:00Z"),
+            item(&source, "c", "Odesa news", "drone strikes on Odesa overnight", "2026-01-03T00:00:00Z"),
         ];
         assert_eq!(repo.save(&items).await.unwrap(), SaveResult { saved: 3, embedded: 3, failed: 0 });
         // Re-saving the same natural keys is a no-op.
@@ -1548,7 +1548,7 @@ mod tests {
         let hits = repo.search(&["pgvector cosine distance".into()], 2, &filter, false).await.unwrap();
         assert_eq!(hits[0].url.as_deref(), Some("https://example.com/b"));
         assert!(hits[0].matched_queries.is_none());
-        let multi = repo.search(&["tokio futures".into(), "Одесса дроны".into()], 5, &filter, true).await.unwrap();
+        let multi = repo.search(&["tokio futures".into(), "Odesa drones".into()], 5, &filter, true).await.unwrap();
         assert_eq!(multi.len(), 3);
         assert!(multi.iter().all(|h| h.matched_queries.is_some()));
 

@@ -131,7 +131,7 @@ fn keeps_a_news_run_with_hundreds_of_full_articles_within_budget_without_bodies_
         json!({}),
     ));
 
-    let packet = project(&trace("telegram:1", json!({"input":"дай дайджест новостей"})), &observations);
+    let packet = project(&trace("telegram:1", json!({"input":"give me the news digest"})), &observations);
     let text = packet.to_string();
     assert!(utf16_len(&text) <= ProjectionBudget::default().total_chars);
     assert!(!text.contains("ARTICLE-BODY-SENTINEL"));
@@ -190,7 +190,7 @@ fn reads_a_scheduler_workflow_from_tool_metadata_not_from_step_names_or_the_exec
         ),
         tool(
             "step[1]:tool",
-            json!({"tool":"send_telegram_message","args":{"text":"Утренний дайджест"}}),
+            json!({"tool":"send_telegram_message","args":{"text":"Morning digest"}}),
             json!({"delivered":true,"messageId":9}),
             json!({"parentObservationId":"runner","metadata":{"tool":"send_telegram_message"}}),
         ),
@@ -223,7 +223,7 @@ fn reads_a_scheduler_workflow_from_tool_metadata_not_from_step_names_or_the_exec
             (json!("set_memory"), json!("error"))
         ]
     );
-    assert_eq!(packet["actions"][1]["args"], json!({"text":"Утренний дайджест"}));
+    assert_eq!(packet["actions"][1]["args"], json!({"text":"Morning digest"}));
     // Delivered, then a later failure: the run failed, the delivery stands.
     assert_eq!(packet["status"], "error");
     assert!(packet["error"].as_str().unwrap().contains("set_memory"));
@@ -252,17 +252,17 @@ fn keeps_a_partial_send_as_a_failed_send_with_its_delivery_evidence() {
 
 #[test]
 fn gives_a_follow_up_the_conversation_the_primary_loop_was_given_not_the_raw_history_fetch() {
-    let signal = "Telegram message in chat 42.\nText: \"да\"";
+    let signal = "Telegram message in chat 42.\nText: \"yes\"";
     let given = [
         "## Recent Telegram history".to_owned(),
-        json!([{"role":"assistant","text":"Поставить напоминание на 9:00?"}]).to_string(),
+        json!([{"role":"assistant","text":"Set a reminder for 9:00?"}]).to_string(),
         String::new(),
         "## Current Telegram signal".to_owned(),
         signal.to_owned(),
     ]
     .join("\n");
     let packet = project(
-        &trace("telegram:5", json!({"input":signal,"output":"Готово, напомню в 9:00"})),
+        &trace("telegram:5", json!({"input":signal,"output":"Done, I'll remind you at 9:00"})),
         &[
             root(),
             tool(
@@ -272,16 +272,16 @@ fn gives_a_follow_up_the_conversation_the_primary_loop_was_given_not_the_raw_his
                 json!({"metadata":{"automatic":true}}),
             ),
             obs(
-                json!({"type":"CHAIN","name":"agent_loop","input":given,"output":"Готово, напомню в 9:00","metadata":{"activity":"primary_loop"}}),
+                json!({"type":"CHAIN","name":"agent_loop","input":given,"output":"Done, I'll remind you at 9:00","metadata":{"activity":"primary_loop"}}),
             ),
         ],
     );
     let context = packet["context"].as_str().unwrap();
-    assert!(context.contains("Поставить напоминание на 9:00?"));
-    assert!(!context.contains("Text: \"да\""));
+    assert!(context.contains("Set a reminder for 9:00?"));
+    assert!(!context.contains("Text: \"yes\""));
     assert!(!packet.to_string().contains("OTHER-TOPIC-SENTINEL"));
     assert_subset(&packet["omitted"], &json!({"automatic_context_fetch":1}), "omitted");
-    assert_eq!(packet["final"], "Готово, напомню в 9:00");
+    assert_eq!(packet["final"], "Done, I'll remind you at 9:00");
     assert_eq!(packet["input"], signal);
 }
 

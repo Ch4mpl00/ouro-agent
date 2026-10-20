@@ -844,7 +844,7 @@ async fn a_json_compose_answers_an_object_a_switch_branches_on() {
 // sentinel branch would have mistaken for a digest never goes out.
 #[tokio::test]
 async fn a_json_compose_that_answers_text_faults_before_any_write() {
-    for reply in ["Тихий день.", "[1, 2]", r#"{"quiet": tr"#] {
+    for reply in ["Quiet day.", "[1, 2]", r#"{"quiet": tr"#] {
         let w = world(vec![reply]);
         w.activate("digest", QUIET_OR_DIGEST);
         let (result, _) = w.run("digest").await;

@@ -28,7 +28,7 @@ fn kv_key() -> impl Strategy<Value = String> {
         "news_digest.last_read_at".to_owned(),
         "tech_digest.last_read_at".to_owned(),
         "a".to_owned(),
-        "ключ".to_owned(),
+        "key-ё".to_owned(),
         "x".repeat(300),
     ])
 }
@@ -356,7 +356,7 @@ fn trace(id: &str, at: &str) -> StoredTrace {
         skill: None,
         session_id: Some(id.into()),
         tags: vec!["telegram".into()],
-        input: Some(json!({"user":"Привет 🦊"})),
+        input: Some(json!({"user":"Hello 🦊"})),
         output: None,
         metadata: Some(json!({"signal_source":"telegram"}).as_object().unwrap().clone()),
         observations: Vec::new(),

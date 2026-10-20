@@ -196,16 +196,16 @@ impl McpTools {
     #[tool(
         name = "add_note",
         title = "Save a note to the personal knowledge base",
-        description = "Persist a freeform fact the user asked you to remember (\"запомни, \
-            что …\", \"запиши …\", \"заметка: …\"). The note becomes semantically \
+        description = "Persist a freeform fact the user asked you to remember (\"remember \
+            that …\", \"write down …\", \"note: …\"). The note becomes semantically \
             searchable later via find_notes.\n\n\
-            YOU generate the tags: pick 3–6 short, lowercase topical tags на свой \
-            вкус — the things you'd later search this note by (people, topics, \
-            objects), e.g. [\"роутер\", \"пароль\", \"wifi\"]. Tags are metadata \
+            YOU generate the tags: pick 3–6 short, lowercase topical tags of your \
+            choosing — the things you'd later search this note by (people, topics, \
+            objects), e.g. [\"router\", \"password\", \"wifi\"]. Tags are metadata \
             only: they help filtering and scanning, but recall runs over the note \
             TEXT, so write a self-contained `body` that names its subject \
-            explicitly (\"Лёша платит за интернет 1-го числа\", not \"платит \
-            1-го\"). Returns the new note id."
+            explicitly (\"Lyosha pays for the internet on the 1st\", not \"pays \
+            on the 1st\"). Returns the new note id."
     )]
     async fn add_note(&self, Parameters(p): Parameters<AddNoteParams>) -> ToolResult {
         if p.body.is_empty() || p.tags.as_ref().is_some_and(|t| t.len() > 12 || t.iter().any(String::is_empty)) {
@@ -220,8 +220,8 @@ impl McpTools {
         annotations(read_only_hint = true),
         title = "Semantic search over the personal knowledge base",
         description = "Recall notes saved with add_note by meaning, not exact wording \
-            (\"что ты помнишь про роутер?\", \"когда Лёша платит за интернет?\", \
-            \"напомни пароль от роутера\"). Returns the closest notes by semantic \
+            (\"what do you remember about the router?\", \"when does Lyosha pay for the internet?\", \
+            \"remind me of the router password\"). Returns the closest notes by semantic \
             similarity to `query`, each with body, tags, source, created_at and \
             distance (lower = closer). Optionally pass `tags` to additionally \
             restrict to notes sharing at least one tag. This is the ONLY way to \
@@ -253,21 +253,25 @@ mod tests {
         let repo = KnowledgeRepository::new(pool, crate::embeddings::testing::FakeEmbedder::with_dims(1536));
         let tag = format!("t{}", rand::random::<u32>());
         let added = repo
-            .add_note("пароль от роутера на наклейке снизу", Some(&[tag.clone(), tag.clone()]), Some("telegram"))
+            .add_note(
+                "the router password is on the sticker underneath",
+                Some(&[tag.clone(), tag.clone()]),
+                Some("telegram"),
+            )
             .await
             .unwrap();
         assert_eq!(added["embedded"], true);
         assert_eq!(added["tags"], json!([tag]));
-        let hits = repo.find_notes("пароль роутера", 5, Some(std::slice::from_ref(&tag))).await.unwrap();
+        let hits = repo.find_notes("router password", 5, Some(std::slice::from_ref(&tag))).await.unwrap();
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].body, "пароль от роутера на наклейке снизу");
-        assert!(repo.find_notes("пароль роутера", 5, Some(&["no-such-tag-xyz".into()])).await.unwrap().is_empty());
+        assert_eq!(hits[0].body, "the router password is on the sticker underneath");
+        assert!(repo.find_notes("router password", 5, Some(&["no-such-tag-xyz".into()])).await.unwrap().is_empty());
     }
 
     #[test]
     fn normalizes_tags_without_imposing_a_scheme() {
-        let raw = vec![" роутер ".to_owned(), "".into(), "WiFi".into(), "роутер".into()];
-        assert_eq!(normalize_tags(Some(&raw)), ["роутер", "WiFi"]);
+        let raw = vec![" router ".to_owned(), "".into(), "WiFi".into(), "router".into()];
+        assert_eq!(normalize_tags(Some(&raw)), ["router", "WiFi"]);
         assert!(normalize_tags(None).is_empty());
     }
 }

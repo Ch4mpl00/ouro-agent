@@ -64,7 +64,7 @@ impl ServerHandler for Server {
         let result = match p.name.as_ref() {
             "get_next_signal" => {
                 if self.0.polls.fetch_add(1, Ordering::SeqCst) == 0 {
-                    json!({"signal":{"id":42,"source":self.0.source,"content":if self.0.source=="telegram"{"Telegram message in chat 42.\nText: \"привет\""}else{"scheduled task"},"envContext":"Send to chat 42","created_at":"2026-10-01T12:00:00Z"},"pendingAfter":0})
+                    json!({"signal":{"id":42,"source":self.0.source,"content":if self.0.source=="telegram"{"Telegram message in chat 42.\nText: \"hello\""}else{"scheduled task"},"envContext":"Send to chat 42","created_at":"2026-10-01T12:00:00Z"},"pendingAfter":0})
                 } else {
                     json!({"signal":null,"pendingAfter":0})
                 }
@@ -140,7 +140,7 @@ impl Fixture {
         let export_state = state.clone();
         let app=axum::Router::new().nest_service("/mcp",mcp).route("/chat/completions",axum::routing::post(move|headers:axum::http::HeaderMap,axum::Json(body):axum::Json<Value>|{let state=llm_state.clone();async move{
    assert_eq!(headers["authorization"],"Bearer fixture-key");state.requests.lock().unwrap().push(body.clone());state.model_started.notify_one();if state.wait_model{std::future::pending::<()>().await;}
-   let system=body["messages"][0]["content"].as_str().unwrap_or_default();let message=if system.starts_with("You write one entry of the activity journal"){json!({"role":"assistant","content":"Получен запрос.\nОтправлено сообщение в Telegram."})}else if body["response_format"]["type"]=="json_object"{json!({"role":"assistant","content":json!({"version":1,"steps":[{"kind":"tool","tool":"send_telegram_message","args":{"chatId":"42","text":"workflow"}},{"kind":"terminal"}]}).to_string()})}else if system.contains("RECOVERY")||body["messages"].as_array().unwrap().iter().any(|m|m["role"]=="tool"){json!({"role":"assistant","content":"done"})}else{json!({"role":"assistant","content":null,"tool_calls":[{"id":"send","type":"function","function":{"name":"send_telegram_message","arguments":"{\"chatId\":\"42\",\"text\":\"agent\"}"}}]})};axum::Json(json!({"model":"gpt-fixture","choices":[{"message":message,"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}))
+   let system=body["messages"][0]["content"].as_str().unwrap_or_default();let message=if system.starts_with("You write one entry of the activity journal"){json!({"role":"assistant","content":"Request received.\nSent a message to Telegram."})}else if body["response_format"]["type"]=="json_object"{json!({"role":"assistant","content":json!({"version":1,"steps":[{"kind":"tool","tool":"send_telegram_message","args":{"chatId":"42","text":"workflow"}},{"kind":"terminal"}]}).to_string()})}else if system.contains("RECOVERY")||body["messages"].as_array().unwrap().iter().any(|m|m["role"]=="tool"){json!({"role":"assistant","content":"done"})}else{json!({"role":"assistant","content":null,"tool_calls":[{"id":"send","type":"function","function":{"name":"send_telegram_message","arguments":"{\"chatId\":\"42\",\"text\":\"agent\"}"}}]})};axum::Json(json!({"model":"gpt-fixture","choices":[{"message":message,"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}))
   }})).route("/api/public/otel/v1/traces",axum::routing::post(move|headers:axum::http::HeaderMap,axum::Json(body):axum::Json<Value>|{let state=export_state.clone();async move{assert_eq!(headers["authorization"],"Basic cHVibGljOnNlY3JldA==");state.exports.lock().unwrap().push(body);axum::http::StatusCode::OK}}));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -283,7 +283,7 @@ async fn binary_journal_records_one_completed_run_without_creating_recursive_tra
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["metadata"]["trace_id"], trace.id);
     assert_eq!(entries[0]["metadata"]["source"], "telegram");
-    assert!(entries[0]["body"].as_str().unwrap().contains("Отправлено сообщение"));
+    assert!(entries[0]["body"].as_str().unwrap().contains("Sent a message"));
     assert_eq!(f.state.requests.lock().unwrap().len(), 3);
     for export in f.state.exports.lock().unwrap().iter() {
         for span in export["resourceSpans"][0]["scopeSpans"][0]["spans"].as_array().unwrap() {

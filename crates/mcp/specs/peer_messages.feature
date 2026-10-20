@@ -12,13 +12,13 @@ Feature: Talking to ouro from another agent
   Scenario: A peer's message becomes a signal for ouro
     When the peer calls "ask_ouro" with:
       """
-      { "text": "Что у меня в roadmap?", "from": "claude-code" }
+      { "text": "What's on my roadmap?", "from": "claude-code" }
       """
     And I remember "threadId" as "thread"
     And I call "get_next_signal"
     Then the result includes:
       """
-      { "signal": { "source": "peer", "content": "Message from peer agent \"claude-code\" (via chatgpt), thread {{thread}}:\n\nЧто у меня в roadmap?" } }
+      { "signal": { "source": "peer", "content": "Message from peer agent \"claude-code\" (via chatgpt), thread {{thread}}:\n\nWhat's on my roadmap?" } }
       """
 
   Scenario: A peer that gives no name is still told apart by its endpoint
@@ -36,12 +36,12 @@ Feature: Talking to ouro from another agent
   Scenario: Ouro's reply reaches the peer
     Given the peer called "ask_ouro" with:
       """
-      { "text": "Как дела?" }
+      { "text": "How are you?" }
       """
     And I remember "threadId" as "thread"
     When I call "reply_to_peer" with:
       """
-      { "threadId": {{thread}}, "text": "Всё хорошо" }
+      { "threadId": {{thread}}, "text": "All good" }
       """
     And the peer calls "read_replies" with:
       """
@@ -49,23 +49,23 @@ Feature: Talking to ouro from another agent
       """
     Then the result includes:
       """
-      { "replies": [{ "text": "Всё хорошо" }] }
+      { "replies": [{ "text": "All good" }] }
       """
 
   Scenario: Reading after a reply returns only newer ones
     Given the peer called "ask_ouro" with:
       """
-      { "text": "Два вопроса" }
+      { "text": "Two questions" }
       """
     And I remember "threadId" as "thread"
     And I call "reply_to_peer" with:
       """
-      { "threadId": {{thread}}, "text": "первый" }
+      { "threadId": {{thread}}, "text": "first" }
       """
     And I remember "messageId" as "first"
     And I call "reply_to_peer" with:
       """
-      { "threadId": {{thread}}, "text": "второй" }
+      { "threadId": {{thread}}, "text": "second" }
       """
     When the peer calls "read_replies" with:
       """
@@ -73,13 +73,13 @@ Feature: Talking to ouro from another agent
       """
     Then the result includes:
       """
-      { "replies": [{ "text": "второй" }] }
+      { "replies": [{ "text": "second" }] }
       """
 
   Scenario: A wait with no reply ends empty
     Given the peer called "ask_ouro" with:
       """
-      { "text": "Ответишь?" }
+      { "text": "Will you answer?" }
       """
     And I remember "threadId" as "thread"
     When the peer calls "read_replies" with:
@@ -94,20 +94,20 @@ Feature: Talking to ouro from another agent
   Scenario: A waiting peer hears the reply at once
     Given the peer called "ask_ouro" with:
       """
-      { "text": "Жду" }
+      { "text": "Waiting" }
       """
     And I remember "threadId" as "thread"
-    When the peer waits up to 20 seconds for a reply in thread {{thread}} while I reply "Готово"
-    Then the peer got "Готово" within 2 seconds
+    When the peer waits up to 20 seconds for a reply in thread {{thread}} while I reply "Done"
+    Then the peer got "Done" within 2 seconds
 
   Scenario: The supervisor's wait hears a peer at once
-    When the supervisor waits up to 20 seconds for a signal while the peer asks "Ты тут?"
+    When the supervisor waits up to 20 seconds for a signal while the peer asks "Are you there?"
     Then the wait saw 1 pending signal within 2 seconds
 
   Scenario: Continuing a thread keeps the whole conversation
     Given the peer called "ask_ouro" with:
       """
-      { "text": "Сколько будет 2+2?" }
+      { "text": "What is 2+2?" }
       """
     And I remember "threadId" as "thread"
     And I call "reply_to_peer" with:
@@ -116,7 +116,7 @@ Feature: Talking to ouro from another agent
       """
     And the peer called "ask_ouro" with:
       """
-      { "threadId": {{thread}}, "text": "А умножить на 3?" }
+      { "threadId": {{thread}}, "text": "And times 3?" }
       """
     When I call "get_peer_thread" with:
       """
@@ -125,23 +125,23 @@ Feature: Talking to ouro from another agent
     Then the result includes:
       """
       { "messages": [
-          { "direction": "in",  "text": "Сколько будет 2+2?" },
+          { "direction": "in",  "text": "What is 2+2?" },
           { "direction": "out", "text": "4" },
-          { "direction": "in",  "text": "А умножить на 3?" }
+          { "direction": "in",  "text": "And times 3?" }
       ] }
       """
 
   Scenario: Ouro cannot answer a thread that does not exist
     When I call "reply_to_peer" with:
       """
-      { "threadId": 999, "text": "кому?" }
+      { "threadId": 999, "text": "to whom?" }
       """
     Then the call fails with "Unknown thread 999"
 
   Scenario: A peer cannot continue a thread that does not exist
     When the peer calls "ask_ouro" with:
       """
-      { "threadId": 999, "text": "алло" }
+      { "threadId": 999, "text": "hello?" }
       """
     Then the call fails with "Unknown thread 999"
     And 0 signals are waiting

@@ -178,11 +178,7 @@ fn turns_every_matching_mail_into_exactly_one_signal_in_order_across_failures_an
                                 env.fake.lock().mails.push(FakeMail {
                                     id: format!("m{n}"),
                                     internal_date: clock,
-                                    subject: if m.nul {
-                                        format!("Рахунок {n}\0")
-                                    } else {
-                                        format!("Рахунок {n}")
-                                    },
+                                    subject: if m.nul { format!("Bill {n}\0") } else { format!("Bill {n}") },
                                     matches: m.matches,
                                     attachments: pdf.chain(other).collect(),
                                 });

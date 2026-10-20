@@ -442,14 +442,14 @@ async fn surfaces_a_codex_failure_as_step_failed() {
 
 fn posts() -> Value {
     json!([
-        {"id":1,"body":"ФОП: новая ставка ЕСВ"},
-        {"id":2,"body":"Доброе утро!"},
-        {"id":3,"body":"Бронирование: новые правила"},
+        {"id":1,"body":"Sole proprietors: new social tax rate"},
+        {"id":2,"body":"Good morning!"},
+        {"id":3,"body":"Draft deferral: new rules"},
     ])
 }
 
 fn decide_plan(extra: Value) -> Value {
-    let mut step = json!({"kind":"decide","preset":"filter","items":"${posts.items}","prompt":"Правила для ${env.chatId}","bind":"kept"});
+    let mut step = json!({"kind":"decide","preset":"filter","items":"${posts.items}","prompt":"Rules for ${env.chatId}","bind":"kept"});
     for (k, v) in extra.as_object().unwrap() {
         step[k] = v.clone();
     }
@@ -464,13 +464,13 @@ fn ctx_with_posts() -> Ctx {
 
 #[tokio::test]
 async fn filters_the_bound_array_with_the_substituted_prompt_and_binds_the_kept_items() {
-    let (client, api) = fake_decisions(|item| if item.to_string().contains("Доброе") { 0.05 } else { 0.8 }, None);
+    let (client, api) = fake_decisions(|item| if item.to_string().contains("Good morning") { 0.05 } else { 0.8 }, None);
     let e = Exec::new(Setup { decisions: Some(client), ..Setup::default() });
     let ctx = ctx_with_posts();
     let (r, _) = e.run(decide_plan(json!({})), &ctx).await;
     assert!(ok(&r));
     assert_eq!(ctx.store.get("kept").unwrap(), json!([posts()[0], posts()[2]]));
-    assert_eq!(*api.rules.lock().unwrap(), ["Правила для 42"]);
+    assert_eq!(*api.rules.lock().unwrap(), ["Rules for 42"]);
 }
 
 #[tokio::test]
@@ -701,13 +701,11 @@ async fn interpolates_a_parsed_objects_field_into_a_mixed_string() {
 
 #[tokio::test]
 async fn keeps_plain_prose_as_a_string() {
-    let e = Exec::new(Setup {
-        llm: vec![answer("Привет! Вот твой дайджест за сегодня.")], ..Setup::default()
-    });
+    let e = Exec::new(Setup { llm: vec![answer("Hi! Here is your digest for today.")], ..Setup::default() });
     let ctx = base_ctx();
     let (r, _) = e.run(plan(json!([{"kind":"llm_compose","preset":"base","prompt":"greet","input":{},"bind":"reply"},{"kind":"terminal"}])), &ctx).await;
     assert!(ok(&r));
-    assert_eq!(ctx.store.get("reply").unwrap(), "Привет! Вот твой дайджест за сегодня.");
+    assert_eq!(ctx.store.get("reply").unwrap(), "Hi! Here is your digest for today.");
 }
 
 #[tokio::test]
@@ -816,13 +814,13 @@ fn agent_step(prompt: &str, tools: Value, max_iterations: u32, bind: &str) -> Va
 #[tokio::test]
 async fn spawns_a_child_session_with_the_tool_whitelist_and_binds_its_result() {
     let e = Exec::new(Setup {
-        llm: vec![Ok(call("search_news", json!({"query":"Одесса"}))), answer("agent answer")],
+        llm: vec![Ok(call("search_news", json!({"query":"Odesa"}))), answer("agent answer")],
         skills: vec![("news-query", "NEWS QUERY RULES")],
         tools: vec![("search_news", Reply::Text("found"))],
         ..Setup::default()
     });
     let ctx = base_ctx();
-    ctx.store.set("query", json!("что в Одессе")).unwrap();
+    ctx.store.set("query", json!("what's up in Odesa")).unwrap();
     let (r, obs) = e
         .run(
             plan(json!([agent_step("${query}", json!(["search_news","list_news"]), 5, "answer"), {"kind":"terminal"}])),
@@ -845,7 +843,7 @@ async fn spawns_a_child_session_with_the_tool_whitelist_and_binds_its_result() {
     assert!(system.contains("NEWS QUERY RULES"));
     // includeEngineSkills: false.
     assert!(!system.contains("ORCHESTRATOR"));
-    assert_eq!(first.messages.iter().find(|m| role(m) == "user").unwrap()["content"], "что в Одессе");
+    assert_eq!(first.messages.iter().find(|m| role(m) == "user").unwrap()["content"], "what's up in Odesa");
     // The child shares the executor's session: its tool result is in it.
     assert_eq!(ctx.session.memory.list().len(), 1);
     let step = obs.iter().find(|o| o.name == "step[0]:llm_agent").unwrap();
@@ -1047,7 +1045,7 @@ async fn runs_a_news_digest_shaped_plan_to_completion() {
             ("send_telegram_message", Reply::Json(json!({"delivered":true}))),
             // No set_memory on purpose: it is not an MCP tool.
         ],
-        llm: vec![answer("📰 Новости · 3 июня\n• fake digest")],
+        llm: vec![answer("📰 News · June 3\n• fake digest")],
         skills: vec![("news-digest", "DIGEST RULES")],
         ..Setup::default()
     });
@@ -1076,7 +1074,7 @@ async fn runs_a_news_digest_shaped_plan_to_completion() {
 
     let (r, _) = e.run(p, &ctx).await;
     assert!(ok(&r));
-    assert!(ctx.store.get("digest").unwrap().as_str().unwrap().contains("📰 Новости"));
+    assert!(ctx.store.get("digest").unwrap().as_str().unwrap().contains("📰 News"));
     // Telegram fired via MCP; the watermark went to the engine's writer.
     let names: Vec<String> = e.tool_calls().into_iter().map(|(n, _)| n).collect();
     assert!(names.contains(&"send_telegram_message".to_owned()));
@@ -1086,7 +1084,7 @@ async fn runs_a_news_digest_shaped_plan_to_completion() {
         [("news_digest.last_read_at".to_owned(), "2026-06-03T05:05:00Z".to_owned())]
     );
     let send = e.tool_calls().into_iter().find(|(n, _)| n == "send_telegram_message").unwrap();
-    assert_eq!(Value::Object(send.1), json!({"chatId":42,"text":"📰 Новости · 3 июня\n• fake digest"}));
+    assert_eq!(Value::Object(send.1), json!({"chatId":42,"text":"📰 News · June 3\n• fake digest"}));
 }
 
 // ── renderInputAsXml ────────────────────────────────────────────────────────

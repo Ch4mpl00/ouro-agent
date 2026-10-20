@@ -101,14 +101,17 @@ fn live_reply() -> Value {
 async fn sends_the_native_questions_schema_to_the_decisions_endpoint() {
     let api = scripted(vec![Ok(live_reply())]);
     let q = questions();
-    client(api.clone(), "typesafe/jev-1.13").decide(request(json!({ "message": "скинь дайджест" }), &q)).await.unwrap();
+    client(api.clone(), "typesafe/jev-1.13")
+        .decide(request(json!({ "message": "send me the digest" }), &q))
+        .await
+        .unwrap();
     let (url, body) = api.requests.lock().unwrap()[0].clone();
     assert_eq!(url, OPENROUTER_DECISIONS_URL);
     assert_eq!(
         body,
         json!({
             "model": "typesafe/jev-1.13",
-            "state": { "message": "скинь дайджест" },
+            "state": { "message": "send me the digest" },
             "questions": {
                 "intent": {
                     "type": "choice",
@@ -130,7 +133,7 @@ async fn sends_the_native_questions_schema_to_the_decisions_endpoint() {
 async fn normalises_answers_score_levels_by_label_noul_as_a_probability() {
     let api = scripted(vec![Ok(live_reply())]);
     let q = questions();
-    let decision = client(api, "typesafe/jev-1.13").decide(request(json!("скинь дайджест"), &q)).await.unwrap();
+    let decision = client(api, "typesafe/jev-1.13").decide(request(json!("send me the digest"), &q)).await.unwrap();
     let intent = decision.answer("intent", &q.intent).unwrap();
     assert_eq!(intent.choice, "digest");
     assert_eq!(intent.confidence, 1.0);

@@ -104,7 +104,7 @@ fn fake_tools() -> Vec<ToolDef> {
 
 fn valid_plan() -> String {
     json!({"version":1,"steps":[
-        {"kind":"llm_agent","preset":"smart","skill":"telegram","prompt":"что нового","tools":["search_news"],"maxIterations":5,"bind":"answer"},
+        {"kind":"llm_agent","preset":"smart","skill":"telegram","prompt":"what's new","tools":["search_news"],"maxIterations":5,"bind":"answer"},
         {"kind":"terminal"},
     ]})
     .to_string()
@@ -151,7 +151,7 @@ fn signal() -> WorkflowSignal {
     WorkflowSignal {
         id: 1,
         source: "telegram".into(),
-        content: "что нового".into(),
+        content: "what's new".into(),
         env_context: Some("Default chat id: 285083560".into()),
     }
 }
@@ -207,7 +207,7 @@ async fn splits_the_prompt_static_tools_and_skills_in_system_variable_signal_in_
     for part in [
         "<signal>",
         "Source: telegram",
-        "что нового",
+        "what's new",
         "<env>",
         "Europe/Kiev",
         "News last read at: 2026-06-02T18:00:00Z",

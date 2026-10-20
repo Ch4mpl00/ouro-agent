@@ -384,7 +384,7 @@ mod tests {
 
     #[test]
     fn truncates_on_characters_not_bytes() {
-        assert_eq!(truncate_chars("привет", 3), "при");
+        assert_eq!(truncate_chars("héllo wörld", 3), "hél");
         assert_eq!(truncate_chars("hi", 10), "hi");
     }
 }

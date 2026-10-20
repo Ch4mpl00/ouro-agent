@@ -536,7 +536,7 @@ mod tests {
                    '2026-06-01 10:00:00', '2026-06-01 10:00:00');
                  CREATE TABLE telegram_messages (id INTEGER PRIMARY KEY, chat_id INTEGER, tg_message_id INTEGER,
                    thread_id INTEGER, role TEXT, text TEXT, created_at TEXT);
-                 INSERT INTO telegram_messages VALUES (41, 7, 100, NULL, 'user', 'привет', '2026-10-01 09:00:00');
+                 INSERT INTO telegram_messages VALUES (41, 7, 100, NULL, 'user', 'hello', '2026-10-01 09:00:00');
                  CREATE TABLE telegram_kv (key TEXT PRIMARY KEY, value TEXT);
                  INSERT INTO telegram_kv VALUES ('last_update_id', '555');
                  CREATE TABLE gmail_kv (key TEXT PRIMARY KEY, value TEXT);

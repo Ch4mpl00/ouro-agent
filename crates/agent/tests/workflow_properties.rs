@@ -575,7 +575,7 @@ fn overlay() -> impl Strategy<Value = Overlay> {
             "Prefer short items.",
             "  \n",
             "- lesson one\n- lesson two\n\n",
-            "Никогда не выдумывай ссылки."
+            "Never invent links."
         ])
         .prop_map(Overlay::Written),
         Just(Overlay::Removed("Prefer short items.")),

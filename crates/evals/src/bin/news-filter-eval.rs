@@ -152,8 +152,10 @@ async fn run_jev() -> anyhow::Result<()> {
         if batch == 1 {
             let Some(item) = posts.first() else { return Ok((Vec::new(), None)) };
             let keep = noul(
-                &format!("Этот пост стоит включить в дайджест читателя согласно правилам отбора.\n\n{rubric}"),
-                Some(("Включить", "Пропустить")),
+                &format!(
+                    "This post is worth including in the reader's digest according to the selection rules.\n\n{rubric}"
+                ),
+                Some(("Include", "Skip")),
             );
             let decision = client
                 .decide(request(json!({ "channel": item.channel, "text": item.text })).question("keep", &keep))
@@ -165,10 +167,10 @@ async fn run_jev() -> anyhow::Result<()> {
             .map(|i| {
                 noul(
                     &format!(
-                        "Пост №{} из posts стоит включить в дайджест читателя согласно правилам отбора из rules.",
+                        "Post #{} in posts is worth including in the reader's digest according to the selection rules in rules.",
                         i + 1
                     ),
-                    Some(("Включить", "Пропустить")),
+                    Some(("Include", "Skip")),
                 )
             })
             .collect();
@@ -584,7 +586,7 @@ async fn run_pipeline() -> anyhow::Result<()> {
                 k,
                 noul(
                     &format!(
-                        "Пост №{k} из posts стоит включить в дайджест читателя согласно правилам отбора из rules."
+                        "Post #{k} in posts is worth including in the reader's digest according to the selection rules in rules."
                     ),
                     None,
                 ),
@@ -592,18 +594,20 @@ async fn run_pipeline() -> anyhow::Result<()> {
             covers.push((
                 k,
                 noul(
-                    &format!("Событие поста №{k} уже есть в previous_digest, и пост не добавляет к нему новых фактов."),
+                    &format!(
+                        "The event of post #{k} is already in previous_digest, and the post adds no new facts to it."
+                    ),
                     None,
                 ),
             ));
             let candidates: Vec<usize> = graph[id].iter().filter_map(|c| n.get(&c.id).copied()).collect();
             if !candidates.is_empty() {
                 let mut options = Map::new();
-                options.insert("none".into(), "Такого поста нет".into());
+                options.insert("none".into(), "No such post".into());
                 for m in candidates {
-                    options.insert(m.to_string(), format!("Пост №{m}").into());
+                    options.insert(m.to_string(), format!("Post #{m}").into());
                 }
-                dups.insert(k, choice(&format!("Пост №{k} сообщает о том же событии, что и другой пост из posts, в котором фактов не меньше. Какой это пост?"), options)?);
+                dups.insert(k, choice(&format!("Post #{k} reports the same event as another post in posts that has at least as many facts. Which post is it?"), options)?);
             }
         }
         let mut count = 0;

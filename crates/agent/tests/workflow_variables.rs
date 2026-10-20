@@ -164,11 +164,11 @@ fn passes_non_string_primitives_through_unchanged() {
 
 #[test]
 fn handles_deeply_nested_args_without_losing_types() {
-    let s = store(json!({"env":{"chatId":285083560},"digest":"📰 Новости"}));
+    let s = store(json!({"env":{"chatId":285083560},"digest":"📰 News"}));
     let args = json!({"chatId":"${env.chatId}","text":"${digest}","meta":{"recipient":"${env.chatId}"}});
     assert_eq!(
         substitute(&args, &s).unwrap(),
-        json!({"chatId":285083560,"text":"📰 Новости","meta":{"recipient":285083560}})
+        json!({"chatId":285083560,"text":"📰 News","meta":{"recipient":285083560}})
     );
 }
 

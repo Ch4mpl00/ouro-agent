@@ -1,4 +1,4 @@
-// The improver's brain (Phase 3, п2): turn a corpus of judged nodes into a
+// The improver's brain (Phase 3, part 2): turn a corpus of judged nodes into a
 // candidate append-only patch, then decide whether the gate's measured Δ earns
 // shipping it. Pure logic lives here (cluster selection, ship decision, prompt
 // building); the IO (reading judgements, replaying through the gate, writing the
@@ -327,7 +327,7 @@ fn target_grades(results: &[NodeGateResult], axis: NoiseAxis) -> Vec<&AxisGrade>
 // Accept a patch iff it NET-improves the target axis on the cluster AND causes
 // no regression anywhere (cluster collateral OR holdout) — conservative, since
 // shipping is automatic. A single regress kills it: prod is the ground truth,
-// and a live-trend monitor (п3) is the second line, not this gate.
+// and a live-trend monitor (part 3) is the second line, not this gate.
 pub fn decide_ship(axis: NoiseAxis, cluster: &[NodeGateResult], holdout: &[NodeGateResult]) -> ShipDecision {
     let mut reasons = Vec::new();
     let target = target_grades(cluster, axis);

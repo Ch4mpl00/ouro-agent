@@ -720,7 +720,7 @@ async fn waits_for_cancellation_and_trace_cleanup_on_shutdown_without_starting_r
 async fn loads_telegram_history_before_the_first_generation_and_shares_its_reference_with_workers() {
     let (tracer, written) = recording();
     let history = json!({"messages":[
-        {"id":1,"chat_id":42,"thread_id":null,"role":"assistant","text":"Собрать сводку за неделю?","created_at":"2026-09-06 11:59:00"},
+        {"id":1,"chat_id":42,"thread_id":null,"role":"assistant","text":"Put together a weekly summary?","created_at":"2026-09-06 11:59:00"},
     ]});
     let mcp_calls: Arc<Mutex<Option<Arc<ToolMcp>>>> = Arc::default();
     let seen = mcp_calls.clone();
@@ -736,11 +736,11 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
                         ("journal_tail".to_owned(), obj(json!({"stream":"ouro/activity","n":10}))),
                     ]
                 );
-                assert!(mentions(&p.messages, "Собрать сводку за неделю?"));
+                assert!(mentions(&p.messages, "Put together a weekly summary?"));
                 call("invoke_sub_agent", json!({"prompt":"summarize","input_refs":["telegram.history"]}))
             }),
             turn(|p| {
-                assert!(mentions(&p.messages, "Собрать сводку за неделю?"));
+                assert!(mentions(&p.messages, "Put together a weekly summary?"));
                 answer("summary")
             }),
             turn(|_| answer("done")),
@@ -750,7 +750,7 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
     );
     *mcp_calls.lock().unwrap() = Some(h.mcp.clone());
     let runner = supervisor(&h, Arc::new(NeverWorkflow));
-    let content = "Telegram message in chat 42.\nText: \"давай\"";
+    let content = "Telegram message in chat 42.\nText: \"go ahead\"";
     assert_eq!(runner.run_signal(&signal("telegram", content)).await.unwrap(), "done");
     // History + activity; no worker fetch or extra LLM retrieval turn.
     assert_eq!(h.mcp.calls.lock().unwrap().len(), 2);

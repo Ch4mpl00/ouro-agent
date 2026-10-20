@@ -1342,8 +1342,8 @@ mod tests {
 
     #[test]
     fn status_frames_cycle_trailing_dots() {
-        let frames: Vec<String> = (0..5).map(|f| render_status("Работаю", f)).collect();
-        assert_eq!(frames, ["Работаю", "Работаю.", "Работаю..", "Работаю...", "Работаю"]);
+        let frames: Vec<String> = (0..5).map(|f| render_status("Working", f)).collect();
+        assert_eq!(frames, ["Working", "Working.", "Working..", "Working...", "Working"]);
     }
 }
 
@@ -1460,13 +1460,13 @@ mod split_tests {
 
     #[test]
     fn cuts_a_digest_between_blocks_not_inside_one() {
-        let block = |n: usize| format!("Блок {n}\n• {}\n", "новость ".repeat(300));
+        let block = |n: usize| format!("Block {n}\n• {}\n", "headline ".repeat(300));
         let text = [1, 2, 3].map(block).join("\n");
         let parts = split_telegram_text(&text, TELEGRAM_TEXT_LIMIT);
         assert!(parts.len() > 1);
         assert_eq!(parts.concat(), text);
         for part in &parts[1..] {
-            assert!(part.starts_with("Блок "), "{part:.20}");
+            assert!(part.starts_with("Block "), "{part:.20}");
         }
     }
 

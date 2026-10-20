@@ -53,7 +53,7 @@ async fn journal_tools_end_to_end() {
     assert!(matches(&tail, &want), "{tail}");
 
     // lists journal streams next to the projects
-    call_ok(&client, "create_project", json!({ "slug": "graphs", "title": "Графы" })).await;
+    call_ok(&client, "create_project", json!({ "slug": "graphs", "title": "Graphs" })).await;
     call_ok(&client, "journal_append", json!({ "stream": "digest/news", "body": "x" })).await;
     let listed = call_ok(&client, "list_memory", json!({})).await;
     let want = json!({

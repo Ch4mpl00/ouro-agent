@@ -677,7 +677,7 @@ fn reports_a_delivered_message_as_delivered_even_when_the_chat_log_write_fails()
 // ── send_telegram_message, long text (tools/telegram.test.ts) ────────────────
 
 fn digest() -> String {
-    format!("{}\n\n{}", "• новость ".repeat(300), "• ещё новость ".repeat(200))
+    format!("{}\n\n{}", "• headline ".repeat(300), "• another headline ".repeat(200))
 }
 
 #[test]
@@ -713,7 +713,7 @@ fn keeps_a_short_text_a_single_message() {
     env.fake.reset();
     runtime().block_on(async {
         let reply = ok_value(
-            &call(&env.client, "send_telegram_message", json!({ "chatId": CHAT, "text": "короткое сообщение" })).await,
+            &call(&env.client, "send_telegram_message", json!({ "chatId": CHAT, "text": "a short message" })).await,
             "send",
         );
         let first = env.fake.lock().sent[0].message_id;

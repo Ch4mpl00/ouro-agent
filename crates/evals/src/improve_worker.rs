@@ -1,4 +1,4 @@
-// The closed-loop improver's cron driver (Phase 3, п3). On each tick it walks
+// The closed-loop improver's cron driver (Phase 3, part 3). On each tick it walks
 // every (skill, axis) present in the judged corpus and, per pair:
 //   1. MONITOR — if the last ship is still "pending", compare the axis's prod
 //      scores on traces that ran AFTER the ship against the pre-ship baseline.

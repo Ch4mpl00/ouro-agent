@@ -1,4 +1,4 @@
-// Live-trend monitor + patch bookkeeping (Phase 3, п3), all pure. The gate can
+// Live-trend monitor + patch bookkeeping (Phase 3, part 3), all pure. The gate can
 // be fooled (it optimizes the judge's score on a frozen cluster); PROD is the
 // ground truth. After a patch ships, the cron worker gathers the target axis's
 // scores on traces that ran AFTER the ship and asks `decide_revert` whether the

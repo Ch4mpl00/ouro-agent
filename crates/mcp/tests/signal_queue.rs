@@ -126,7 +126,7 @@ fn content() -> impl Strategy<Value = String> {
     prop_oneof![
         8 => "\\PC{0,120}",
         1 => Just(String::new()),
-        1 => Just("🧾 Рахунок №42 — «НашДім»\n".repeat(800)),
+        1 => Just("🧾 Bill №42 — «NashDim»\n".repeat(800)),
     ]
 }
 

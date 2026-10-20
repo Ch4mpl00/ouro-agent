@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn normalises_minor_units_and_currency() {
         let raw: RawItem = serde_json::from_value(json!({
-            "id": "x", "time": 1780000000, "description": "Сільпо", "mcc": 5411, "originalMcc": 5411,
+            "id": "x", "time": 1780000000, "description": "Silpo", "mcc": 5411, "originalMcc": 5411,
             "hold": false, "amount": -12550, "operationAmount": -10000, "currencyCode": 980,
             "commissionRate": 0, "cashbackAmount": 0, "balance": 100000
         }))

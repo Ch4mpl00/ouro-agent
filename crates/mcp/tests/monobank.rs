@@ -84,7 +84,7 @@ async fn statement(
         .take(PAGE)
         .map(|i| {
             json!({
-                "id": i.id, "time": i.time, "description": "Покупка", "mcc": 5411, "originalMcc": 5411, "hold": false,
+                "id": i.id, "time": i.time, "description": "Purchase", "mcc": 5411, "originalMcc": 5411, "hold": false,
                 "amount": i.amount, "operationAmount": i.amount, "currencyCode": i.currency_code,
                 "commissionRate": 0, "cashbackAmount": i.cashback, "balance": 1_000_000,
             })

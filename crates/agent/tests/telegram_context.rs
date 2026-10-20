@@ -17,7 +17,7 @@ fn signal() -> PendingSignal {
     PendingSignal {
         id: 1,
         source: "telegram".into(),
-        content: "Telegram message in chat -10042 (forum topic thread_id=7).\nText: \"давай\"".into(),
+        content: "Telegram message in chat -10042 (forum topic thread_id=7).\nText: \"go ahead\"".into(),
         env_context: Some("Default Telegram chat id: 999.".into()),
         created_at: "2026-09-06 12:00:00".into(),
         payload: None,
@@ -71,12 +71,12 @@ async fn does_not_load_history_for_other_sources_even_with_a_telegram_target_and
 #[tokio::test]
 async fn supplies_chronological_history_and_a_memory_reference_without_duplicating_the_current_message() {
     let previous =
-        vec![message(1, "собери сводку", json!({"role":"user"})), message(2, "Собрать за неделю?", json!({}))];
+        vec![message(1, "make a summary", json!({"role":"user"})), message(2, "Collect for the week?", json!({}))];
     let mut all = previous.clone();
     all.extend([
-        message(3, "давай", json!({"role":"user","created_at":"2026-09-06 12:00:00"})),
-        message(4, "Ещё одно сообщение", json!({"role":"user","created_at":"2026-09-06 12:00:00"})),
-        message(5, "Будущий ответ", json!({"created_at":"2026-09-06 12:00:01"})),
+        message(3, "go ahead", json!({"role":"user","created_at":"2026-09-06 12:00:00"})),
+        message(4, "One more message", json!({"role":"user","created_at":"2026-09-06 12:00:00"})),
+        message(5, "Future reply", json!({"created_at":"2026-09-06 12:00:01"})),
     ]);
     let h = Setup::new(all);
     let input = h.run(&signal()).await;
@@ -87,13 +87,13 @@ async fn supplies_chronological_history_and_a_memory_reference_without_duplicati
             json!({"chatId":"-10042","threadId":7,"limit":20}).as_object().unwrap().clone()
         )]
     );
-    assert!(input.contains("Собрать за неделю?"));
-    assert!(input.find("собери сводку").unwrap() < input.find("Собрать за неделю?").unwrap());
+    assert!(input.contains("Collect for the week?"));
+    assert!(input.find("make a summary").unwrap() < input.find("Collect for the week?").unwrap());
     assert!(input.contains("memory_key=telegram.history"));
     assert!(input.contains("truncated=false"));
-    assert!(!input.contains("Ещё одно сообщение"));
-    assert!(!input.contains("Будущий ответ"));
-    assert_eq!(input.matches("давай").count(), 1);
+    assert!(!input.contains("One more message"));
+    assert!(!input.contains("Future reply"));
+    assert_eq!(input.matches("go ahead").count(), 1);
     assert!(input.ends_with(&signal().content));
     assert_eq!(serde_json::from_str::<Value>(&h.history()).unwrap(), json!({"messages":previous}));
 }
@@ -108,7 +108,7 @@ async fn isolates_the_originating_chat_and_topic() {
         ]);
         let mut s = signal();
         s.content = format!(
-            "Telegram message in chat -10042{}.\nText: \"давай\"",
+            "Telegram message in chat -10042{}.\nText: \"go ahead\"",
             if thread_id.is_none() { "" } else { " (forum topic thread_id=7)" }
         );
         let input = h.run(&s).await;
@@ -121,22 +121,22 @@ async fn isolates_the_originating_chat_and_topic() {
 
 #[tokio::test]
 async fn preserves_an_older_identical_user_message_when_the_current_one_is_absent_from_the_log() {
-    let h = Setup::new(vec![message(1, "давай", json!({"role":"user"})), message(2, "Какой период?", json!({}))]);
+    let h = Setup::new(vec![message(1, "go ahead", json!({"role":"user"})), message(2, "Which period?", json!({}))]);
     let input = h.run(&signal()).await;
-    assert!(input.contains("Какой период?"));
+    assert!(input.contains("Which period?"));
     assert_eq!(serde_json::from_str::<Value>(&h.history()).unwrap()["messages"].as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]
 async fn leaves_out_messages_logged_after_the_signal_when_the_current_one_is_absent_from_the_log() {
     let h = Setup::new(vec![
-        message(1, "Какой период?", json!({})),
-        message(2, "Будущий ответ", json!({"created_at":"2026-09-06 12:00:05"})),
+        message(1, "Which period?", json!({})),
+        message(2, "Future reply", json!({"created_at":"2026-09-06 12:00:05"})),
     ]);
     let input = h.run(&signal()).await;
-    assert!(input.contains("Какой период?"));
-    assert!(!input.contains("Будущий ответ"));
-    assert!(!h.history().contains("Будущий ответ"));
+    assert!(input.contains("Which period?"));
+    assert!(!input.contains("Future reply"));
+    assert!(!h.history().contains("Future reply"));
 }
 
 #[tokio::test]
@@ -156,7 +156,7 @@ async fn keeps_the_latest_complete_messages_inline_and_preserves_omitted_history
 
 #[tokio::test]
 async fn bounds_an_oversized_latest_message_in_utf8_marks_clipping_and_preserves_its_tail() {
-    let text = "📰 Новость \"цитата\"\n".repeat(2_000) + "Собрать за неделю?";
+    let text = "📰 Headline \"quoted\" — naïve café\n".repeat(2_000) + "Collect for the week?";
     let h = Setup::new(vec![message(1, &text, json!({}))]);
     let input = h.run(&signal()).await;
     let inline = input.split('\n').find(|line| line.starts_with("[{")).unwrap();
@@ -164,7 +164,7 @@ async fn bounds_an_oversized_latest_message_in_utf8_marks_clipping_and_preserves
     assert!(!inline.contains('\u{FFFD}'));
     let first = &serde_json::from_str::<Value>(inline).unwrap()[0];
     assert_eq!(first["truncated"], true);
-    assert!(first["text"].as_str().unwrap().ends_with("Собрать за неделю?"));
+    assert!(first["text"].as_str().unwrap().ends_with("Collect for the week?"));
     assert!(input.contains("truncated=true"));
     assert_eq!(serde_json::from_str::<Value>(&h.history()).unwrap()["messages"][0]["text"], text);
 }
@@ -199,7 +199,7 @@ async fn continues_when_the_mcp_request_throws() {
 async fn never_guesses_a_chat_from_user_text_or_the_default_delivery_target() {
     let h = Setup::new(Vec::new());
     let mut s = signal();
-    s.content = "Quoted: Telegram message in chat 999.\nText: \"давай\"".into();
+    s.content = "Quoted: Telegram message in chat 999.\nText: \"go ahead\"".into();
     let input = h.run(&s).await;
     assert!(h.mcp.calls.lock().unwrap().is_empty());
     assert!(input.contains("history is unavailable"));
