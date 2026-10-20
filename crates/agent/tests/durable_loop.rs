@@ -277,6 +277,10 @@ async fn a_parent_reads_what_its_durable_worker_did() {
     assert_eq!(agent::agent::tool_effect(&engine, "read_run"), owf::run::Effect::Read);
     let seen = llm.seen.lock().unwrap();
     assert!(seen[1].tools.iter().any(|tool| tool.name == "read_run"), "workers can read history too");
+    let delegated = seen[3].messages.last().unwrap()["content"].as_str().unwrap();
+    let delegated: Value = serde_json::from_str(delegated).unwrap();
+    assert_eq!(delegated["worker_run"], child, "the reply names the worker's run");
+    assert_eq!(delegated["content"], "worker found three telescopes", "beside the answer, not in it");
     let listing = seen[4].messages.last().unwrap()["content"].as_str().unwrap();
     for expected in [child, "completed", "check the violet telescope", "worker found three telescopes"] {
         assert!(listing.contains(expected), "{listing}");
