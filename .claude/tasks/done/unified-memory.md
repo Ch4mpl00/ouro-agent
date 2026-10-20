@@ -1,6 +1,9 @@
 # Unified memory shared by all agents
 
-**Status:** v1 implemented (2026-08-23) — see "What shipped" below
+**Status:** done. v1 implemented 2026-08-23 in TypeScript and ported to Rust
+(`crates/mcp/src/memory.rs`; the D-numbers below are cited from that file).
+Not built: the phase-2 memory agent (Q10) and the removal of the legacy
+`add_note` / `find_notes` toolset (`../open-findings-from-tests.md`).
 **Priority:** P1
 **Area:** mcp / memory
 **Created:** 2026-08-21
@@ -39,16 +42,15 @@ text) rather than by replaying an event log — see
 
 ### Constraints already on the table
 
-- **MCP is single-connect today, on purpose.** `runHttpTransport` binds
-  one process-wide `McpServer`; a second `initialize` throws
-  `Already connected`. Per [mcp-connection-lifecycle.md] that protects
-  the **signals queue** (two agents would race for the same signal), not
-  the tool surface. Unified memory needs many clients — see D1.
+- **MCP was single-connect, on purpose** (at design time). One
+  process-wide server; a second `initialize` threw `Already connected`.
+  Per `mcp-connection-lifecycle.md` that protects the **signals queue**
+  (two agents would race for the same signal), not the tool surface.
+  Unified memory needs many clients — see D1.
 - PG + pgvector, `EmbeddingService` and the chunker are already there and
   reusable (`text-embedding-3-small`, 1536-dim).
-- Module rules from CLAUDE.md apply: `services/memory/module.ts` with
-  `createMemoryModule(deps)`, repos next to the tables they own, no
-  singletons.
+- Module rules from CLAUDE.md apply: one domain, one file, repos next to the
+  tables they own, no singletons.
 
 ## v1 shape
 
@@ -84,7 +86,7 @@ initialize(role=memory)     → memory tools (+ read-only tools)
 Signal delivery stays safe without a claim/lease: a non-supervisor client
 never sees `get_next_signal`, so it cannot compete for signals. This
 supersedes the "multi-connect is P3, don't start" stance in
-[mcp-connection-lifecycle.md] — and subsumes that task's P1 fix, since
+`mcp-connection-lifecycle.md` — and subsumes that task's P1 fix, since
 per-session servers can't get stuck bound to a dead transport. Keep at
 most one **supervisor** session, newest wins.
 
@@ -324,16 +326,16 @@ by waiting — until then, all the raw material is in the documents.
 
 ## What shipped (2026-08-23)
 
-`packages/mcp/src/services/memory/` — the module, and `tools/memory.ts` — the
-twelve MCP tools, registered as the `memory` toolset and part of the default
-surface. PG tables per the v1 shape above (`memory_*`), migration
-`0003_lazy_puppet_master.sql`, applied on mcp boot.
+`crates/mcp/src/memory.rs` (originally `packages/mcp/src/services/memory/`) —
+the module and its twelve MCP tools, registered as the `memory` toolset and part
+of the default surface. PG tables per the v1 shape above (`memory_*`), migration
+`0003_lazy_puppet_master.sql`, applied on mcp boot (later `0005`/`0006` added the
+journal and its metadata).
 
 The one structural choice not in the design: **the store is a port**
-(`store.ts`) with a PG implementation (`store.pg.ts`) and an in-memory one
-(`store.memory.ts`). Every rule lives in `service.ts`; the store is dumb CRUD.
-That is what makes the acceptance list below testable — there is no Postgres in
-CI, and the alternative was shipping the interesting half unverified.
+(`MemoryStore`) with a Postgres implementation and an in-memory one
+(`InMemoryStore`). Every rule lives in `MemoryService`; the store is dumb CRUD.
+That is what makes the acceptance list below testable without a Postgres.
 
 Delivered against the acceptance list:
 
@@ -348,11 +350,11 @@ Delivered against the acceptance list:
   and a clean `revert_conflict` naming the rollback version otherwise.
   `rollback: true` performs it.
 - `recall` spans documents and facts and returns refs that resolve.
-- `knowledge_base_notes` import (`pnpm memory:import-notes`), idempotent via
+- `knowledge_base_notes` import (`memory-import-notes`), idempotent via
   recorded provenance. The old table and `add_note` / `find_notes` are left in
   place — removing them is a follow-up once the skills stop naming them.
 - Embedder down: documents still write, read and patch; recall says
-  `search_unavailable` rather than "nothing found"; `pnpm embed:backfill`
+  `search_unavailable` rather than "nothing found"; `embed-backfill`
   drains the NULL-vector backlog.
 - Hand-off between two sessions over one store — covered end to end.
 
@@ -365,7 +367,7 @@ Not delivered, deliberately:
 - **Per-token roles.** The actor stamped on a write comes from
   `MCP_MEMORY_ACTOR` on the instance, not from the client — a self-declared
   actor would be forgeable. Real per-token identity is
-  [mcp-auth-and-tool-scoping.md] A2.
+  `../mcp-auth-and-tool-scoping.md` A2.
 - **No compose service and no tunnel exposure.** Adding `memory` to
   `mcp-tunnel`'s `MCP_TOOLSETS` would hand ChatGPT write access to shared
   memory; that is a decision to take deliberately, not a side effect of this
@@ -391,17 +393,18 @@ agent pass `states: ["archived"]` defeated archive as a discovery boundary.
 
 - ~~**Q8 — tool surface.**~~ Answered above: twelve tools, one fold.
 - ~~**Q9 — role handshake.**~~ Answered in
-  [mcp-auth-and-tool-scoping.md] A2: the role is a property of the
+  `../mcp-auth-and-tool-scoping.md` A2: the role is a property of the
   client's token, not something the client declares. Self-declared roles
   are forgeable and don't bound anything.
-- **Q10 — where the phase-2 memory agent runs.** New compose service like
-  `judge-worker`, or a tick inside MCP? Which model, what cost ceiling?
+- **Q10 — where the phase-2 memory agent runs.** Never built (the nightly
+  `dreaming` skill is the nearest thing). Which worker, which model, what cost
+  ceiling?
 - ~~**Q11 — how Claude Code reaches the droplet's memory.**~~ Covered by
-  [mcp-auth-and-tool-scoping.md]: TLS proxy + a scoped bearer token in
+  `../mcp-auth-and-tool-scoping.md`: TLS proxy + a scoped bearer token in
   `.mcp.json` (`{"type":"http","headers":{"Authorization":"Bearer
   ${MCP_TOKEN}"}}`). That task is now a prerequisite for this one.
 
 ## Notes
 
-- Related: [mcp-connection-lifecycle.md] (superseded in part by D1),
-  [multi-chunk-rag.md] (chunking quality feeds D8), [infra-module.md].
+- Related: `mcp-connection-lifecycle.md` (superseded in part by D1),
+  `../multi-chunk-rag.md` (chunking quality feeds D8).

@@ -1,296 +1,176 @@
-# Durable workflows — состояние запусков, ожидания и ввод пользователя
+# Durable workflows: run state, waits and user input
 
-**Status:** in-progress
+**Status:** in-progress. The durable core is built and used by saved workflows
+and the agent loop (see "Done"). Open: external events and user replies as
+waits, a durable inbox with MCP lease/ack, atomic admission of scheduler fires,
+and a user-facing inspect/cancel/resolve-unknown API.
 **Priority:** P3
 **Area:** agent / workflow / supervisor / persistence
 **Created:** 2026-10-16
 
 ## Context
 
-Архитектурное направление согласовано 2026-10-16: конструктор процессов
-развивается поверх текущего `crates/agent/src/workflow.rs`. Общая логика
-оркестрации принадлежит агентской стороне. MCP предоставляет инструменты,
-данные и доставку внешних событий, но не исполняет workflow DSL.
+Agreed 2026-10-16: the process builder grows on the agent side, on top of the
+saved OWF workflows (`crates/agent/src/flows.rs`, `durable.rs` over
+`crates/owf`). MCP provides tools, data and delivery of external events; it
+does not run workflow DSL or know a run's position.
 
-Требуются долгие задачи, продолжение после рестарта, ожидание времени,
-внешнего события и ответа пользователя. Обычный LLM-шаг вызывается прямо
-из executor и возвращает результат; отдельный сигнал/callback для каждого
-модельного шага не нужен.
+Needed: long tasks, continuation after restart, waiting for time, an external
+event or a user's reply. An ordinary LLM step is a direct await in the
+executor; no signal/callback per model step.
 
-Реализация согласована 2026-10-18. Первый этап — явный контракт инвариантов
-в `crates/owf/src/durable.rs`; конкретная схема таблиц и синтаксис новых
-шагов пока не выбраны.
+Contract and boundaries: `crates/owf/README.md`. Invariants, including the
+requirements for the future event integration: `crates/owf/src/durable.rs`.
 
-## Границы ответственности
+## Ownership
 
-**Agent workflow runtime** владеет определениями и версиями процессов,
-запусками, результатами шагов, условиями/обходами, ожиданиями, retries,
-корреляцией ответов и продолжением. Состояние хранится в принадлежащей
-агенту БД. Текущий `WorkflowRunner` — исходная точка развития.
+- **Agent workflow runtime** owns definitions and versions, runs, step
+  results, conditions/loops, waits, retries, reply correlation and
+  continuation, in the agent's own DB (agent.db).
+- **MCP** owns integrations, datasets and their invariants, guarded HTTP, the
+  signals queue and external pollers. It never stores execution position and
+  does not understand a workflow's bindings, skills or checkpoints.
+- **A signal** is an event with a stable id, type, payload and origin. An
+  optional correlation/run id is opaque to MCP; the runtime links an event to a
+  stored wait. A shared event contract is needed, a shared workflow format
+  between processes is not.
+- **Cron** is the agent's (moved 2026-10-18, `crates/agent/src/schedule.rs`):
+  rows in agent.db, a 30 s tick hands the fire straight to the supervisor,
+  a task with `workflow` runs the saved process. A durable time wait belongs to
+  the runtime and is restored from the stored deadline (recovery worker), not
+  from a sent signal.
 
-**MCP** владеет интеграциями, datasets и их инвариантами, guarded HTTP,
-очередью сигналов и внешними поллерами. Это инструменты
-и инфраструктура с собственной доменной логикой. MCP не хранит позицию
-исполнения workflow и не понимает его bindings, skills или checkpoints.
+## Done
 
-**Сигнал** — событие с устойчивым ID, типом, payload и происхождением.
-Опциональный correlation/run ID непрозрачен для MCP. Runtime связывает
-событие с сохранённым ожиданием; MCP не пересылает полное состояние задачи.
-Общий контракт событий необходим, общий workflow-формат между процессами — нет.
+- `crates/owf`: replay of completed steps and contexts, separate checkpoints of
+  call replies, stable paths for iterations/then/retry/functions/fork, absolute
+  deadlines, stored retry decisions and the `compete` winner.
+- Delivery via `metadata.delivery: at_least_once | at_most_once`. An unknown
+  outcome of an at-most-once call stops the run with `outcome_unknown`; proof
+  that it did not execute allows a retry. The MCP durable adapter never
+  retries `tools/call` silently. LLM adapters are at-least-once only (their
+  internal retry has no single-attempt API yet).
+- agent.db: `workflow_runs` and `workflow_records` (WAL/FULL), pinned
+  definition/input, lease with heartbeat and fencing on every commit. The
+  supervisor uses the durable runner; the recovery worker resumes due waits and
+  expired leases (up to 4 runs in parallel). Shutdown leaves a run resumable;
+  an explicit cancel is terminal. Interrupted runs restart with backoff from 2 s
+  and fail after `MAX_INTERRUPTIONS` (10) in a row; a new run is admitted
+  already claimed (`RunStore::start`); `Interrupted` in the supervisor does not
+  start `recovery`.
+- Write-call retries (2026-10-18): the key of a protected call (`Write` or any
+  `at_most_once`) is run id + path with every enclosing `try` attempt replaced by
+  the first, so a `try` retry is not a new logical call; `for` iterations,
+  `then` entries, calling functions and `fork` branches stay distinct. The key
+  is built from the attempt prefixes the interpreter itself executes and stored
+  in the call record (`Record::Call::logical`). An early attempt's success is
+  returned without sending; a tool error or lost reply is sent again per the
+  delivery policy; different arguments under the same key are a fatal
+  `conflict`; an at-most-once call with unknown outcome or a tool error still
+  blocks the retry.
+- Tests: crash tests before/after commits, real SIGKILL of a child worker at
+  eight points per delivery policy (16 scenarios, independent fsync journal of
+  effects, rollback and `integrity_check` verified), durable property tests
+  (`PROPERTY_RUNS=256 cargo test -p owf --test durable`), `cargo test -p agent
+  --test durable`.
+- The agent loop and the `signal` workflow run on this machinery
+  (`agent-loop-on-owf.md`).
 
-Cron тоже принадлежит агенту (перенесён 2026-10-18,
-`crates/agent/src/schedule.rs`): задачи в agent.db, тик раз в 30 с отдаёт
-срабатывание прямо supervisor'у, без очереди MCP; задача с `workflow`
-запускает сохранённый процесс; заметку об окружении (chat id, топики)
-агент собирает сам из тех же переменных. От MCP остались часовой пояс
-пользователя и старая таблица задач, которую первый старт агента
-импортирует. Долговечное ожидание времени принадлежит runtime и
-восстанавливается из сохранённого deadline (recovery worker), а не из
-отправленного сигнала.
+## Open: acceptance
 
-## Acceptance
+### Waits and user input
 
-### Сохранение и восстановление
+- Support waiting for a deadline, an external event and a user's reply
+  (the interpreter rejects `listen` today). A wait is stored and frees the
+  worker.
+- A sent question is linked to run/step and chat/thread/message ids. An
+  incoming reply is accepted only in that context and checked against the
+  expected format; an ambiguous reply asks for clarification.
+- A repeated event never continues a step twice. A fast reply that arrives
+  before the question's message id is saved is not lost (the event stays
+  available for re-matching). Early, late and unrelated messages have defined
+  behaviour.
+- Timeout, cancel and reply compete for one wait; exactly one transition ends
+  it. A cancelled run is never resumed by a late reply.
+- Accepting an incoming event is persisted on the agent side before its final
+  acknowledgement in MCP. The current destructive dequeue (`get_next_signal`)
+  does not guarantee that: add a lease/ack or an equivalent delivery protocol.
+  The guarantee starts after admission today; the dequeue before it has a gap
+  (a crash after the pop loses the signal).
+- On continuation the LLM gets the needed stored data; no live session,
+  unbounded history or busy worker for the whole wait.
 
-- Сохранять определения процессов с неизменяемыми версиями; запуск
-  закрепляется за версией, использованной при старте.
-- Сохранять входы, результаты шагов, состояние выполнения и ожидания.
-  Завершённые шаги используют сохранённый результат при продолжении.
-- Начальный набор состояний различает runnable/running, waiting, completed,
-  failed и cancelled. Конкретные имена и таблицы выбрать при реализации.
-- Рестарт не теряет ожидающие задачи; зависшие исполнения восстанавливаются
-  без параллельного commit от старого и нового исполнителя.
-- Детерминированный процесс исполняется без повторного compile на каждом
-  тике. Вызовы LLM/Jev происходят только в явно описанных шагах.
-- Durable state не обещает exactly-once для внешних вызовов: crash после
-  эффекта, но до сохранения ответа, оставляет неоднозначный исход. Повтор
-  конкретного вызова определяется его delivery-политикой в DSL; повторять
-  весь процесс без учёта сохранённых результатов нельзя.
+### Builder and harness independence
 
-### Ожидания и пользовательский ввод
+- Evolve validate, preview, version save, run, inspect and cancel; design the
+  exact API before implementing (partly there: `save_workflow`,
+  `try_workflow`, `read_run`).
+- The executor depends on injected interfaces (tools, model calls, agent
+  delegation), not directly on `Engine`; the author (compiler/agent) stays
+  separate from the runtime. An ordinary LLM/Jev step is a direct await through
+  a provider adapter; a full agent step delegates through the agent executor
+  and stores its result. Replacing the authoring agent needs no rewrite of
+  processes; replacing the harness inside an agent step needs an adapter.
+- Managing processes should be reachable by a future external agent, if
+  needed through a thin MCP interface to the agent-owned service; state
+  ownership and DSL interpretation stay in the agent.
 
-- Поддержать ожидание deadline, внешнего события и пользовательского ответа.
-  Ожидание сохраняется в БД и освобождает исполнителя/supervisor.
-- Отправленный вопрос связывается с run/step и chat/thread/message IDs.
-  Входящий ответ принимается только в соответствующем контексте и проходит
-  проверку ожидаемого формата. Неоднозначный ответ требует уточнения.
-- Повторное событие не продолжает шаг дважды. Быстрый ответ, пришедший до
-  сохранения message ID вопроса, не теряется: событие доступно для повторного
-  сопоставления. Ранние/поздние и не относящиеся к ожиданию сообщения имеют
-  определённое поведение.
-- Timeout, отмена и ответ конкурируют за одно ожидание; завершить его может
-  только один переход. Отменённый run не возобновляется поздним ответом.
-- Принятие входящего события сохраняется на агентской стороне до его
-  окончательного подтверждения в MCP. Если текущий dequeue этого не
-  позволяет, добавить lease/ack либо эквивалентный протокол доставки.
-  Не предполагать, что нынешняя очередь уже гарантирует этот контракт.
-- Для продолжения LLM получает нужные сохранённые данные; живая сессия,
-  бесконечная история и занятый worker на весь срок ожидания не требуются.
+### Verification
 
-### Конструктор и независимость от harness
-
-- Развить операции проверки, preview, сохранения версии, запуска,
-  инспекции и отмены процесса; точный API спроектировать перед реализацией.
-- DSL/executor отделить от прямой зависимости на `Engine`: инструменты,
-  model calls и agent delegation доступны через внедрённые интерфейсы.
-  Compiler и интерактивный агент остаются авторами процессов.
-- Обычный LLM/Jev-шаг — прямой await через provider adapter. Полноценный
-  agent step делегирует через agent executor и сохраняет свой результат.
-- Замена агента-автора не требует переписывать процессы. Замена harness
-  внутри агентского шага требует адаптера; полностью убрать наш runtime
-  и сохранить его workflow-семантику без другого executor невозможно.
-- Управление процессами должно быть доступно будущему внешнему агенту.
-  При необходимости через MCP публикуется тонкий интерфейс к agent-owned
-  workflow service; владение состоянием и интерпретация DSL остаются там.
-  Сетевой механизм этого доступа — отдельная деталь, не копия executor в MCP.
-- Первоначально runtime может работать в текущем agent-приложении. Границы
-  кода позволяют позже выделить worker без обязательного нового сервиса сейчас.
-
-### Проверка
-
-- Run переживает restart до и после завершения шага, во время ожидания
-  пользователя и deadline; успешно сохранённые результаты не вычисляются снова.
-- Пользовательский ответ продолжает нужный run при нескольких задачах
-  одного чата; дубликат, быстрый/поздний ответ и отмена покрыты тестами.
-- Другие сигналы обрабатываются, пока одна задача ждёт.
-- Ошибка модели повторяется по политике шага; неоднозначный результат
-  внешнего side effect не приводит к слепому повтору действия.
-- Сохранённый процесс получения данных исполняется повторно без planner;
-  процесс с LLM вызывает модель непосредственно из executor.
-- Использовать fake clock/providers/tools и тестовую БД; build/dev и
-  production-поллеры не запускать.
+- A run survives restart before/after a step, during a user wait and a
+  deadline; stored results are not recomputed.
+- A reply continues the right run with several tasks in one chat; duplicate,
+  fast/late reply and cancel are covered by tests.
+- Other signals are processed while one task waits.
+- A model error retries by step policy; an ambiguous external side effect never
+  causes a blind repeat.
+- Use fake clock/providers/tools and a test DB.
 
 ## Notes
 
-### Реализация ядра — 2026-10-18
+### Call policy decisions (2026-10-18)
 
-- `crates/owf`: replay завершённых шагов и контекстов, отдельные checkpoints
-  ответов вызовов, устойчивые пути итераций/then/retry/functions/fork,
-  абсолютные deadlines, сохранённые retry-решения и победитель compete.
-- Delivery задаётся через `metadata.delivery: at_least_once | at_most_once`.
-  При unknown для at-most-once прогон останавливается с `outcome_unknown`;
-  подтверждённое отсутствие исполнения позволяет retry. MCP durable adapter
-  не повторяет `tools/call` скрыто. LLM adapters пока допускают только
-  at-least-once: их внутренняя retry-обвязка ещё не имеет single-attempt API.
-- Agent SQLite: `workflow_runs` и `workflow_records`, WAL/FULL, pinned
-  definition/input, lease с heartbeat и fencing при каждом commit. Supervisor
-  использует durable runner; recovery worker поднимает due waits и истёкшие
-  leases. Shutdown оставляет run восстанавливаемым; явная отмена терминальна.
-- Добавлены crash-тесты до/после commits, at-most-once без повторных
-  dispatches, reopen SQLite, fencing старого worker, сохранение версии
-  workflow при рестарте, shutdown и потерянный MCP-ответ.
-- Проверено: полный `cargo test --offline -p owf` (70 тестов) и выбранные
-  agent suites `agent_db`, `durable`, `flows`, `supervisor`, `supervisor_e2e`,
-  `mcp_client` (51 тест). MCP-тесты используют временный localhost-сервер;
-  build/dev scripts и production-поллеры не запускались.
-- Дополнено тестирование 2026-10-18: настоящий SIGKILL дочернего worker в
-  восьми точках для каждой delivery-политики (16 сценариев), включая открытую
-  незакоммиченную SQLite-транзакцию, потерянный ответ, wait и terminal commit.
-  Внешние эффекты пишутся в независимый fsync-журнал; восстановление и повторная
-  проверка terminal state идут в новых процессах на той же agent.db. Истечение
-  lease ускорено изменением timestamp в тестовой БД. Проверены rollback,
-  integrity_check, output/context и точное число эффектов.
-- Durable property tests переиспользуют существующий генератор DSL:
-  workflow + до восьми последовательных сбоев до/после commit, смешанные
-  delivery-политики, циклы, functions, fork/compete, поздняя отмена и
-  terminal replay. Для детерминированного подмножества сравниваются output,
-  ошибки и сохранённые контексты с прогоном без сбоев. После каждого resume
-  состояние проходит сериализацию; Run/Host пересоздаются.
-- Новые проверки прошли: `PROPERTY_RUNS=256 cargo test --offline -p owf
-  --test durable` (11 тестов, 512 property cases) и `cargo test --offline -p
-  agent --test durable` (3 теста; ignored worker вызывается из SIGKILL-теста).
-- Оставшийся объём этой задачи: внешние события/ответы пользователя,
-  durable inbox + MCP lease/ack, атомарная передача scheduler fire в admission,
-  пользовательский API инспекции/отмены/разбора unknown. Текущая гарантия
-  начинается после admission: прежний destructive dequeue до него имеет gap.
+Call accounting belongs to the agent's durable layer (agent.db) so it works
+with third-party MCP servers unchanged; a mandatory effect journal in MCP was
+rejected. This chooses retry semantics, it is not universal idempotency.
 
-Контракт и границы: `crates/owf/README.md`. Инварианты в
-`crates/owf/src/durable.rs` включают требования к будущей event-интеграции;
-задача остаётся in-progress до завершения оставшегося объёма.
+- A call has a stable id `runId + reference + iteration path`
+  (`run-1:/do/1/loop[3]/do/0/send`). The argument fingerprint is checked
+  separately; changed arguments must not turn recovery of an old call into a new
+  external effect.
+- `at_least_once` (default): the reply becomes a checkpoint only after durable
+  save; without a saved reply recovery may repeat the call (duplicates
+  possible). A tool error is a reply handled by DSL error/retry policy.
+- `at_most_once`: with an unknown outcome the call is never repeated (recovery,
+  DSL retries, transport retries). Retry is allowed only with proof of no
+  execution (request not sent, or rejected by the server before the tool ran);
+  timeout, a disconnect after send, or a tool error are no such proof, so the
+  transport adapter must tell `not_executed` from `outcome_unknown`.
+- Plain MCP `tools/call` has no separate acceptance acknowledgement, so the
+  agent persists the intent before sending. On recovery without a reply the
+  outcome stays unknown. A crash between the intent write and the send can lose
+  an execution: the accepted price of at-most-once.
+- Pending/unknown is not success: dependent steps get no invented output; an
+  explicit error/inspection path is needed. SSE recovery to read a reply differs
+  from replaying `tools/call`.
+- Grounds: MCP spec 2025-11-25, "Calling tools" and "Transports / Sending
+  messages to the server".
 
-Первый прикладной сценарий: [data sources](data-sources.md). Связанные
-задачи: [watch tasks](watch-tasks.md), [JIT](agent-jit-workflows.md).
-[Исследование](data-sources-design.md) сохраняет альтернативы; предложения
-об executor в MCP и обязательных reasoning jobs были пересмотрены.
+### Design choices from the 2026-10-18 estimate
 
-Перед реализацией прочитать текущие workflow/supervisor/db и контракт
-очереди сигналов. Не переносить исторические TypeScript-пути из старых
-задач и не считать существующий in-memory workflow уже durable.
+- Replaying the interpreter with stored results of finished steps is enough;
+  no serialisable stack and no jump to a position.
+- Store current durable state, not a history of snapshots: step records needed
+  for replay, context, waits and unfinished operations (one latest call result
+  is not enough). Several tables/rows updated transactionally; big results
+  stored apart from the hot state; waiting tasks hold no live session. Deleting
+  old snapshots must not remove data still needed for replay or effect dedup.
+- Version the state format and executor semantics together with the immutable
+  definition version.
+- Hard parts: atomic transitions, unfinished external calls, wait/timeout/cancel
+  races, and the fate of unfinished runs after an interpreter update.
+- Telegram reply correlation, reliable signal delivery and MCP-write
+  idempotency need our integration even with an off-the-shelf runtime.
 
-### Ретраи write-вызовов — сделано 2026-10-18
-
-Ключ protected-вызова (`Write` или любой `at_most_once`) — run ID + путь,
-в котором каждая объемлющая попытка `try` заменена первой: ретрай `try` —
-не новый логический вызов, как и предполагало решение от 99c527f; Codex
-сначала включил номер попытки в ключ, и ретрай повторял уже прошедшую
-отправку. Итерации `for`, заходы `then`, вызывающие функции и ветки `fork`
-остаются различными. Ключ строится не разбором строки (задача-цикл с именем
-`try` даёт `/do/0/try[1]/…`), а из префиксов попыток, которые интерпретатор
-сам исполняет, и сохраняется в записи вызова (`Record::Call::logical`):
-после рестарта завершённый вложенный `try` восстанавливается без своих
-попыток, пересчитать ключ его записей нельзя.
-
-Успех ранней попытки возвращается без отправки; ошибка инструмента или
-потерянный ответ отправляются снова по delivery-политике; другие аргументы
-при том же ключе — фатальный `conflict`, ничего не отправляется. `at_most_once`
-с неизвестным исходом или ошибкой инструмента по-прежнему блокирует ретрай.
-Ephemeral-прогон сохраняет прежний запрет. Тесты: `crates/owf/tests/durable.rs`
-(раздел retries of protected calls, мутационно проверены) и
-`a_retry_after_restart_does_not_resend_a_delivered_message` в agent `flows`.
-
-Там же: прерванные runs перезапускаются с backoff и после
-`MAX_INTERRUPTIONS` (10) подряд становятся `failed`; новый run допускается
-сразу захваченным (`RunStore::start`); recovery worker восстанавливает до
-4 runs параллельно; `Interrupted` в supervisor не запускает `recovery`.
-
-### Политика внешних вызовов — уточнено 2026-10-18
-
-Учёт вызовов принадлежит durable-слою агента и хранится в agent SQLite:
-он должен работать со сторонними MCP без изменений их инструментов.
-Прежнее предложение об обязательном журнале эффектов в MCP пересмотрено.
-Это выбор семантики повторов, а не универсальная идемпотентность внешних
-операций. Делать вместе с durable execution.
-
-- У вызова устойчивый ID `runId + reference + путь итераций`
-  (`run-1:/do/1/loop[3]/do/0/send`), включая идентичность повторных
-  посещений/попыток там, где это действительно новый логический вызов.
-  Отпечаток аргументов проверяется отдельно; изменение аргументов не должно
-  превращать восстановление старого вызова в новый внешний эффект.
-- Согласовано: delivery на уровне DSL, по умолчанию
-  `at least once`, с явным `at most once` для выбранных вызовов.
-  Точный синтаксис ещё не выбран.
-- `At least once`: ответ становится checkpoint только после устойчивого
-  сохранения. Если сохранённого ответа нет, восстановление может повторить
-  вызов; возможны дубли внешнего эффекта. Ошибка инструмента тоже является
-  ответом и обрабатывается через DSL error/retry policy, а не как успех.
-- `At most once`: при неизвестном исходе повтор вызова запрещён, включая
-  восстановление после рестарта, DSL retries и повторы внутри транспорта.
-  Повтор разрешён только при доказанном отсутствии исполнения: запрос не
-  отправлен либо сервер гарантированно отклонил его до запуска инструмента.
-  Timeout, обрыв после отправки и ошибка инструмента сами по себе такого
-  доказательства не дают. Транспортный адаптер должен различать
-  `not_executed` и `outcome_unknown`; одного общего `Err` недостаточно.
-- Обычный MCP `tools/call` не даёт
-  универсального отдельного подтверждения принятия. Для предотвращения
-  повторной отправки при неизвестном исходе агент должен устойчиво записать
-  намерение до потенциальной отправки. При ответе сохраняется результат;
-  при восстановлении без ответа исход остаётся неизвестным, повтор
-  запрещён. Это может потерять выполнение при падении между записью и
-  отправкой — допустимая цена `at most once`.
-- `Pending/unknown` не означает успешное завершение: нельзя выдумать output
-  для зависимых шагов. Нужен явный путь ошибки/разбора. Политика должна
-  учитываться также retry-обвязкой и MCP-транспортом; восстановление SSE
-  для чтения ответа отличается от повторного `tools/call`.
-
-Основания: [MCP tools/call](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#calling-tools)
-и [MCP transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#sending-messages-to-the-server).
-
-### Оценка собственного runtime — 2026-10-18
-
-Оценка по текущему коду, не решение о начале реализации. Рассматривается
-durable-слой только для нашего интерпретатора, один agent-процесс и SQLite.
-Продолжение произвольного Rust-кода, распределённый кластер и перенос
-работающих запусков на изменённое определение процесса не входят в объём.
-
-- Первая полезная версия: последовательности, циклы, сохранённые результаты,
-  восстановление после рестарта, durable-таймеры и остановка при неизвестном
-  исходе write-вызова — ориентировочно 5–8 человеко-дней.
-- Весь описанный выше объём, включая fork/join/compete, retries, ответы
-  пользователя, надёжную доставку сигналов, идемпотентность MCP-записей,
-  инспекцию/отмену и тесты падений — 15–25 человеко-дней суммарно.
-- Резерв поддержки: 0,5–1 дня в месяц в первые месяцы; затем 2–4 часа в
-  месяц при стабильной семантике DSL. Новые конструкции и миграции состояния
-  оцениваются отдельно. Это плановый резерв, не измеренная статистика.
-
-На момент оценки `Journal`, `Record` и `resume` были заготовкой:
-агентский executor вызывал `run`, а durable-хранилище и восстановление
-ещё не были подключены. Сложность сосредоточена в атомарных переходах,
-незавершённых внешних вызовах, гонках ожидания/таймаута/отмены и сохранении
-семантики незавершённых запусков после обновления интерпретатора.
-
-Уточнение подхода с пользователем: достаточно replay интерпретатора с
-повторным использованием сохранённых результатов выполненных шагов.
-Сериализуемый стек и прямой переход к позиции исполнения не обязательны;
-переписывать интерпретатор в отдельный автомат ради этого не требуется.
-При replay должны воспроизводиться устойчивые ID вызовов, результаты,
-контексты и решения, включая попытки retries и победителя compete.
-
-Хранить актуальное durable-состояние прогона, без обязательной истории
-предыдущих снимков. Оно включает записи выполненных шагов, нужные для
-replay, контекст, ожидания и незавершённые операции; одного последнего
-результата вызова недостаточно. Актуальное состояние может состоять из
-нескольких таблиц/строк и обновляется транзакционно: один снимок не требует
-перезаписи единственного большого JSON при каждом шаге. Число записей
-выполненных шагов может расти; удаление старых снимков само по себе не
-означает, что можно удалить данные, ещё необходимые для replay или
-дедупликации эффектов.
-
-Большие результаты лучше хранить отдельно от часто обновляемого состояния;
-ожидающие задачи не должны держать живую сессию или полный контекст в памяти.
-Версию формата состояния и семантики исполнителя учитывать наряду с
-неизменяемой версией определения.
-
-Корреляция Telegram-ответов, надёжная передача сигналов и выбранная семантика
-повторов MCP-вызовов потребуют нашей интеграции и при использовании готового runtime;
-не вся приведённая оценка является дополнительной ценой собственного ядра.
-Оценка не подтверждена реализацией, нагрузочными или crash-тестами.
+First application scenarios: `data-sources.md`, `watch-tasks.md`,
+`agent-jit-workflows.md`.

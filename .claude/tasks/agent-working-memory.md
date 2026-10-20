@@ -1,178 +1,82 @@
-# Оперативная память агента — функциональные требования
+# Working memory: work with data by reference, read it selectively
 
-**Status:** in-progress
-**Priority:** P2
+**Status:** in-progress. Stage 1 (a string KV, results stored by reference,
+`input_refs` for sub-agents) is built; selective reads, derived-data
+provenance and text probes are not.
+**Priority:** P3
 **Area:** agent / session-context
 **Created:** 2026-09-06
 
-Выбран первый этап: простой строковый KV с инвариантами, закреплёнными в тестах.
-Ядро находится в session context. AgentLoop сохраняет результаты вызовов в память;
-подагенты работают с тем же экземпляром. Общие требования ниже описывают направление
-развития. Маршрутизация детерминирована по источнику: сигналы `scheduler`
-компилируются в workflow, остальные обрабатывает AgentLoop.
+## Context
 
-## Первый этап: строковый KV
+The agent should work with data by reference: store it, hand it to a
+sub-agent, use the result, without pushing the whole content through its own
+LLM context. When it needs the data it can read all of it or a part.
 
-Реализация: [`session-context.ts`](../../packages/agent/src/session-context.ts).
-Тесты: [`session-context.test.ts`](../../packages/agent/src/session-context.test.ts).
+## What is built (stage 1)
 
-```text
-createSessionContext({ id, env }) → { id, env, memory }
-  memory.put(key, value, format = "text")
-  memory.get(key) → string
-  memory.list() → [{ key, format, sizeBytes }]
-  memory.delete(key) → boolean
+Code: `crates/agent/src/session.rs` (the KV), `tool_results.rs` (storing
+results), `agent.rs` (the synthetic tools, `invoke_sub_agent`).
 
-renderContext(env) → текст окружения для prompt
-```
+- **Session KV.** One instance per signal/task, shared by the primary loop,
+  recovery and every `invoke_sub_agent`. Values are strings kept verbatim
+  (JSON, `${...}` and whitespace are never interpreted); keys are exact
+  non-empty strings. Writing an existing key is an error, reading a missing
+  key is an error (an empty string is a real value); `list` returns metadata
+  (key, format `text|json`, UTF-8 size) in insertion order; deleting frees the
+  key; instances are independent and die with the task. `set_memory` still
+  writes persistent state to agent.db.
+- **Synthetic tools:** `working_memory_put/get/list/delete`. `get` loads the
+  full value into context on purpose. These calls are not stored again.
+- **Every MCP or synthetic tool result is stored** unchanged under
+  `tool.<uuid>` when the call finishes. The model sees JSON with `memory_key`,
+  `format`, `size_bytes`, `truncated`; up to 8 000 UTF-8 bytes the full string
+  is inlined, above that a 512-byte `preview` (never splitting a character).
+  The full result stays in the trace. The byte threshold is a heuristic.
+- **`invoke_sub_agent({ skills, prompt, input_refs? })`** puts the referenced
+  values into the child's first user message as data; the parent neither reads
+  nor rewrites the payload. A missing key fails before the child starts.
+  Without `skills` the `worker` skill is used; sub-agents do not delegate.
+- For Telegram signals the supervisor preloads recent history and stores the
+  full selected history as `telegram.history` for `input_refs`.
 
-Инварианты:
+## Open
 
-1. Значение — всегда строка, сохраняемая и возвращаемая без изменений.
-   JSON, пробелы, переводы строк и `${...}` не интерпретируются.
-2. Ключ — точная непустая строка. Точки, скобки и пробелы не имеют специального
-   смысла; регистр учитывается.
-3. Запись занятого ключа вызывает ошибку, даже если новое значение совпадает.
-   Прежние значение и метаданные сохраняются.
-4. Чтение отсутствующего ключа вызывает ошибку; пустая строка является
-   полноценным существующим значением.
-5. `format` — метка вызывающего кода: `text` по умолчанию или `json`.
-   Проверка корректности JSON остаётся обязанностью потребителя/адаптера.
-6. `list` возвращает только метаданные в порядке добавления. Размер считается
-   в UTF-8 байтах. Изменение полученного списка или его элементов не меняет store.
-7. Удаление затрагивает только точный ключ; возвращает `true`, если запись
-   существовала, иначе `false`. После удаления ключ можно использовать заново;
-   поэтому сам ключ не является вечным идентификатором версии данных.
-8. Экземпляры полностью независимы. Время жизни данных определяется владельцем
-   экземпляра; внешних ресурсов или глобального состояния у ядра нет.
+Requirements not yet met:
 
-Тесты сначала запускались на заглушке: 16 поведенческих проверок упали,
-одна проверка публичных типов прошла. Затем добавлена реализация:
-все 17 тестов прошли вместе с `pnpm typecheck`. При переносе добавлена проверка
-владения памятью в `SessionContext`; инварианты KV сохранены. Рендеринг окружения
-переименован в `renderContext` и не раскрывает содержимое рабочей памяти.
+1. **Selective reads.** `working_memory_get` returns all or nothing. Needed:
+   a part of a value (object field, list items, text slice by offset), with an
+   explicit "this is partial" marker and a way to continue.
+2. **Probes without reading.** Cheap approximate facts about a stored text, so
+   the agent can choose a strategy before paying to read it: size (chars,
+   estimated tokens), lines, "looks tabular?", language (`text_stats`);
+   `keyword_search(ref, terms)` returning matching lines/spans;
+   `vector_search(ref, query, k)` (chunk + embed + rank, reusing the embeddings
+   stack); `read_span(ref, range)`. These run in-process on the stored value
+   so the text never crosses MCP and never enters a prompt. (Carried over from
+   the retired text-processing-toolkit task, whose GAIA/planner framing is
+   gone. Decided there: do not build an opaque `text_process` ReAct tool;
+   retrieval primitives are deterministic tools, map/reduce is a pattern the
+   agent composes from sub-agents, tables are `code_agent`'s job. For a map
+   step, return `{found, quote, confidence}` and verify the quote is a real
+   substring of the chunk, with overlapping windows.)
+3. **Provenance.** A result produced from stored data gets a new ref and
+   records which refs it came from.
+4. **Direct workflow results** are not tied to the shared memory yet.
 
-## Подключение к AgentLoop
+Decide later: whether entries can be changed or appended (stage 1 only creates
+and deletes), whether content search is needed, whether data should outlive a
+task or a restart (the durable `agent-loop` carries working memory in its run
+context, so a restart already keeps it for a resumed loop).
 
-- `SessionContext` создаётся один раз на сигнал/задачу. Тот же экземпляр передаётся
-  в основной AgentLoop, recovery и `invoke_sub_agent`. Отдельный workflow runner
-  также передаёт его в свои `llm_agent`-шаги.
-- Synthetic tools: `working_memory_put`, `working_memory_get`,
-  `working_memory_list`, `working_memory_delete`. Контракт соответствует KV выше.
-  `get` явно загружает полное значение в контекст, даже если оно большое.
-- Каждый возвращённый результат MCP или обычного synthetic tool сохраняется
-  без изменений под новым ключом `tool.<uuid>`. Сохранение происходит по завершении
-  вызова, независимо от успеха параллельных соседей. Порядок tool messages сохраняется.
-- Ответ модели — JSON с `memory_key`, `format`, `size_bytes`, `truncated`.
-  При размере до 8 000 UTF-8 байт включительно в `content` передаётся полная строка;
-  выше порога — только `preview` до 512 байт, без разрыва Unicode-символа.
-  Исходный результат остаётся в trace. Байтовый порог — эвристика, не подсчёт токенов.
-- Операции `working_memory_*` возвращаются напрямую и повторно не сохраняются:
-  чтение не должно снова превращаться в ссылку, удаление — создавать новую запись.
-- `invoke_sub_agent({ skills, prompt, input_refs?: string[] })` загружает указанные
-  значения непосредственно в пользовательское сообщение дочернего цикла как данные.
-  Родитель не читает и не переписывает payload; дочерний цикл может записывать
-  обработанные данные в общую память. Отсутствующий ключ возвращает ошибку до запуска.
-- Входные схемы и аргументы MCP-инструментов не меняются. `set_memory` продолжает
-  писать постоянное состояние в SQLite; рабочая память освобождается вместе с задачей.
+## Acceptance
 
-Проверки интеграции: [`agent-loop.test.ts`](../../packages/agent/src/agent-loop.test.ts),
-порогов и сохранности данных: [`tool-results.test.ts`](../../packages/agent/src/tool-results.test.ts).
+- The agent reads a field, a list slice or a text range of a stored value and
+  is told when the result is partial.
+- A 1 MB fetched page can be probed (`text_stats`, `keyword_search`) and
+  searched without entering any prompt.
+- A derived result names its source refs.
+- A missing ref or range returns a clear error, distinct from an empty value.
 
-## Маршрутизация сигналов
-
-- `supervisor/module.ts` решает по `signal.source`. `scheduler` идёт в
-  `workflow.runForSignal` (compile → execute): тело cron-задачи известно заранее,
-  поэтому план дешевле и предсказуемее агентного цикла. Ошибка компиляции
-  (или исчерпанный replan) деградирует в AgentLoop на `base` в том же trace и
-  с тем же контекстом; ошибка выполнения не перезапускает задачу — предыдущие
-  шаги могли уже доставить результат — и уходит в recovery.
-- Остальные источники запускают основной цикл на `smart` без компиляции.
-  `orchestrator` и `routing` задают работу с данными и делегирование.
-- Только для `signal.source === "telegram"` supervisor до первого LLM-вызова
-  загружает последние 20 сообщений через MCP. История исходного чата/топика
-  добавляется к входу: недавняя часть до 8 000 UTF-8 байт, без повторения текущего
-  сообщения. Полная отобранная история хранится как `telegram.history` для
-  `input_refs`. Усечение отмечается явно; ошибка загрузки не блокирует ответ.
-  Scheduler и другие источники не получают историю автоматически.
-- Родитель может запускать несколько работников, передавая `input_refs`;
-  независимые задачи — параллельно. При отсутствии `skills` используется `worker`.
-  Подагенты не делегируют рекурсивно. Они возвращают полный финальный ответ,
-  а runtime сам выбирает content или ссылку/preview для родителя.
-- Обычные MCP-вызовы принимают обычные аргументы. Универсальной обёртки для
-  вызовов с памятью нет. Для передачи текста обычной тулзе родитель при
-  необходимости явно читает память; отправку можно явно поручить работнику.
-- Инструкции доменных skills согласованы с ReAct: при необходимости работник
-  может сам искать данные. Копировать большие входы в system_prompt не требуется.
-- Langfuse и локальная запись получают дерево: основной цикл → итерации/tools →
-  подагенты. Tool span содержит исходный output и метаданные memory_key/размера;
-  generation — снимок фактических messages, модель и usage. Ошибки отмечены ERROR.
-- Recovery разделяет память задачи и остаётся в том же trace. Бухгалтерские
-  отметки после доставки выполняются только после её успешного завершения.
-
-Проверено: 287 тестов пакета агента и `pnpm typecheck`. Реальный адаптер
-Langfuse/OTel проверен с перехватом экспорта без сетевой отправки.
-
-Отложено: выборочное чтение частей значений и связь прямых workflow-результатов
-с общей памятью. Workflow-инструмент внутри AgentLoop сейчас не нужен.
-
-## Цель
-
-Агент должен уметь работать с данными по ссылкам: хранить, передавать на
-обработку и использовать результаты, не помещая всё содержимое в свой
-LLM-контекст. При необходимости он может прочитать данные полностью или частично.
-
-## Требования
-
-1. **Сохранять данные.** Хранить строковые результаты инструментов, workflow и
-   подагентов. Структурированные значения передаются как JSON-строки;
-   сериализация и разбор выполняются потребителями.
-
-2. **Выдавать ссылку на сохранённое.** По ссылке можно повторно обратиться
-   к тем же данным. Сохранение нового результата не меняет старую ссылку
-   и её содержимое.
-
-3. **Показывать, что хранится.** Предоставлять список доступных результатов
-   и сведения о каждом: подпись, тип, размер, источник. Полное содержимое
-   для этого читать не требуется.
-
-4. **Позволять читать выборочно.** Возвращать всё значение или нужную часть:
-   поле объекта, элементы списка, фрагмент текста. Если возвращена только
-   часть данных, явно сообщать об этом и позволять получить продолжение.
-
-5. **Позволять передавать данные по ссылке.** Инструмент, workflow или подагент
-   может получить сохранённые данные как вход. Передающему агенту не нужно
-   сначала читать и переписывать их в своём контексте. Это требование к
-   совместной работе хранилища и вызывающего кода.
-
-6. **Сохранять результаты обработки отдельно.** Полученный результат доступен
-   по новой ссылке. Можно определить, из каких сохранённых данных он получен,
-   и повторно использовать как исходные данные, так и результат.
-
-7. **Сохранять данные между шагами одной задачи.** Данные доступны при следующих
-   ходах агента, перепланировании и вызовах workflow/подагентов в рамках задачи.
-   Для первой версии предлагаем срок жизни до завершения задачи, после чего
-   её оперативная память освобождается.
-
-8. **Явно сообщать о недоступных данных.** Несуществующая ссылка или отсутствующая
-   часть значения возвращает понятную ошибку. Это отличается от существующего
-   пустого списка, пустой строки или null.
-
-## Пример ожидаемого поведения
-
-```text
-Поиск новостей → сохранить новости → вернуть ссылку A и краткие сведения.
-Агент передаёт A подагенту без чтения новостей.
-Подагент составляет дайджест → сохранить результат → вернуть ссылку B.
-Агент при необходимости читает B или его часть.
-Агент поручает доставку подагенту, либо читает B и вызывает обычную тулзу отправки.
-```
-
-## Позже определить
-
-- Нужны ли изменение и дополнение записей; в первом этапе доступны создание
-  новой записи и явное удаление.
-- Нужен ли поиск по содержимому на первом этапе.
-- Нужно ли сохранять рабочие данные после завершения задачи или перезапуска.
-
-Связанные задачи: [[text-processing-toolkit]], [[unified-memory]].
+Related: `unified-memory` (done, `done/unified-memory.md`) is the persistent
+cross-session store; this is per-task scratch space.

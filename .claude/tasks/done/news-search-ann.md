@@ -2,7 +2,7 @@
 
 **Status:** done
 **Priority:** P1
-**Area:** mcp / news search (`services/news/core/repository.ts`)
+**Area:** mcp / news search (`crates/mcp/src/news.rs`)
 **Created:** 2026-10-14
 
 ## Context

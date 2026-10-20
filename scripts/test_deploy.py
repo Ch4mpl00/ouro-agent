@@ -21,7 +21,7 @@ class Selection(unittest.TestCase):
         self.assertEqual(deploy.arguments(["--apply", "/tmp/payload"]).apply, Path("/tmp/payload"))
 
     def test_tests_docs_and_specs_never_deploy(self):
-        paths = ["README.md", "CLAUDE.md", ".claude/tasks/native-deploy.md", "scripts/test.py",
+        paths = ["README.md", "CLAUDE.md", ".claude/tasks/README.md", "scripts/test.py",
                  "crates/mcp/tests/http_transport.rs", "crates/agent/tests/supervisor.rs",
                  "crates/mcp/specs/signal_queue.feature"]
         result = deploy.plan(paths)

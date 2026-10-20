@@ -5,7 +5,7 @@
 // server are separate instances on one database, so a wait here wakes through
 // the database's LISTEN (db.rs, wake-ups), not only an in-process Notify.
 //
-// A peer is trusted as the user (.claude/tasks/peer-messaging.md, P1). Who
+// A peer is trusted as the user (.claude/tasks/done/peer-messaging.md, P1). Who
 // wrote a row is the instance's actor; the name a peer gives itself is a label.
 //
 // Sections:

@@ -1,6 +1,6 @@
 // Unified memory: one memory every agent shares — the droplet supervisor,
 // Claude Code sessions, ChatGPT through the tunnel. Design and rationale in
-// .claude/tasks/unified-memory.md (the D-numbers below refer to it).
+// .claude/tasks/done/unified-memory.md (the D-numbers below refer to it).
 //
 // Two read models behind one search projection (D8): projects made of
 // markdown documents, and flat facts. Both feed `memory_index`, the only
