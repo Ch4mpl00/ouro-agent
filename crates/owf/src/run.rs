@@ -68,6 +68,12 @@ pub trait Functions: Send + Sync {
     fn unknown_outcome(&self, _name: &str, _args: &Value) -> Option<Value> {
         None
     }
+    /// Whether the function stops on the run's cancellation by itself and
+    /// finishes its own cleanup (its trace, its children): the run then waits
+    /// for it instead of dropping it, and stops at the next task.
+    fn cooperative(&self, _name: &str) -> bool {
+        false
+    }
 }
 
 /// One step of a run, keyed by task reference.
@@ -1110,16 +1116,25 @@ impl Run<'_> {
             self.writes.fetch_add(1, Ordering::SeqCst);
         }
         let info = CallInfo { run_id: self.run_id, reference, cancel: self.cancel, delivery };
+        let cooperative = self.host.functions.cooperative(name);
         if self.journal.is_none() {
+            if cooperative {
+                let result = self.host.functions.call(name, args, &info).await;
+                return if self.cancel.is_cancelled() { Err(Fault::Cancelled) } else { result.map_err(Fault::Error) };
+            }
             return tokio::select! {
                 _ = self.cancel.cancelled() => Err(Fault::Cancelled),
                 r = self.host.functions.call(name, args, &info) => r.map_err(Fault::Error),
             };
         }
-        let result = tokio::select! {
-            biased;
-            _ = self.cancel.cancelled() => return Err(Fault::Cancelled),
-            r = self.host.functions.invoke(name, args.clone(), &info) => r,
+        let result = if cooperative {
+            self.host.functions.invoke(name, args.clone(), &info).await
+        } else {
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Err(Fault::Cancelled),
+                r = self.host.functions.invoke(name, args.clone(), &info) => r,
+            }
         };
         let (state, result) = match result {
             Ok(value) => (CallState::Done(Ok(value.clone())), Ok(value)),
