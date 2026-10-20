@@ -1062,18 +1062,13 @@ async fn a_fresh_install_seeds_the_system_tasks_once() {
     ] {
         let (_dir, db) = store();
         let cancel = CancellationToken::new();
-        assert_eq!(schedule::initialize(&db, &mcp, &cancel).await.unwrap(), 3);
+        assert_eq!(schedule::initialize(&db, &mcp, &cancel).await.unwrap(), 1);
         let seeded: Vec<(String, Option<String>)> = tasks(&db).into_values().map(|t| (t.cron, t.source)).collect();
-        assert_eq!(
-            seeded,
-            [
-                ("0 9 * * *".to_owned(), None),
-                ("0 8 * * *".to_owned(), None),
-                ("0 4 * * *".to_owned(), Some("dreaming".to_owned())),
-            ]
-        );
-        db.delete(3).await.unwrap();
+        // Only the generic dreaming tick: user-specific tasks (digests) are not shipped.
+        assert_eq!(seeded, [("0 4 * * *".to_owned(), Some("dreaming".to_owned()))]);
+        let id = *tasks(&db).keys().next().unwrap();
+        db.delete(id).await.unwrap();
         assert_eq!(schedule::initialize(&db, &mcp, &cancel).await.unwrap(), 0, "a cancelled system task stays gone");
-        assert_eq!(tasks(&db).len(), 2);
+        assert!(tasks(&db).is_empty());
     }
 }

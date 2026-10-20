@@ -77,7 +77,9 @@ deletion.
    builds it from the same `TELEGRAM_DEFAULT_CHAT_ID` / `TELEGRAM_TOPICS_JSON`
    in its own env). Fire ids start above 10⁹, so `scheduler:<id>` never lands
    on an older MCP signal's trace. The first start imports the tasks MCP held
-   (`list_scheduled_tasks`, kept read-only for that) or seeds the system ones.
+   (`list_scheduled_tasks`, kept read-only for that) or seeds the system one
+   (the nightly `dreaming` tick). Digests are user-specific: they live in
+   agent.db once the user asks for them, never in the seed.
 3. The supervisor (`crates/agent/src/supervisor.rs`, composed in `main.rs`)
    loops on `get_next_signal`. With an empty queue it blocks on
    `wait_for_signal`, which MCP answers the moment a poller records a signal

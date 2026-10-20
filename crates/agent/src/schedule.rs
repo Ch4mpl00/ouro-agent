@@ -648,35 +648,16 @@ struct SystemTask {
     prompt: &'static str,
 }
 
-const SYSTEM_TASKS: &[SystemTask] = &[
-    SystemTask {
-        cron: "0 9 * * *",
-        source: None,
-        prompt: "Daily news-digest tick. Read posts from the user's subscribed \
-                 Telegram channels since the watermark in your session context, \
-                 filter to the four predefined categories (Одеса/Україна, ПМР/Молдова, \
-                 Конфликт РФ-Украина, Мир), and post a topical digest to Telegram.",
-    },
-    SystemTask {
-        cron: "0 8 * * *",
-        source: None,
-        prompt: "Daily tech-digest tick. Compose a personalized IT news digest \
-                 for the user (Hacker News, Habr) and post to Telegram. Query \
-                 the news store via search_news with topics matching the \
-                 interests in the system prompt — the pollers keep it fresh, \
-                 no need to fetch articles.",
-    },
-    SystemTask {
-        cron: "0 4 * * *",
-        source: Some("dreaming"),
-        prompt: "Daily dreaming tick. Review the signals processed since the \
-                 previous dreaming fire (see 'Previous fire' header above) and \
-                 consider whether any skill files deserve an edit based on \
-                 patterns, recurring user feedback, or failure modes you \
-                 observed. Use list_signals(since=<previous fire>) to scope \
-                 the review. Edit skills via write_skill when warranted.",
-    },
-];
+const SYSTEM_TASKS: &[SystemTask] = &[SystemTask {
+    cron: "0 4 * * *",
+    source: Some("dreaming"),
+    prompt: "Daily dreaming tick. Review the signals processed since the \
+             previous dreaming fire (see 'Previous fire' header above) and \
+             consider whether any skill files deserve an edit based on \
+             patterns, recurring user feedback, or failure modes you \
+             observed. Use list_signals(since=<previous fire>) to scope \
+             the review. Edit skills via write_skill when warranted.",
+}];
 
 // MCP's `list_scheduled_tasks` reply, as far as the import reads it.
 #[derive(Deserialize)]
@@ -724,8 +705,10 @@ async fn mcp_tasks(mcp: &dyn Mcp, cancel: &CancellationToken) -> anyhow::Result<
 
 // On the first start, the tasks MCP held move here with their last fire, so
 // nothing owed is lost and nothing fired is fired again; with none to move
-// (a fresh install), the system tasks are seeded. Never again after that: a
-// task the user cancelled stays cancelled. A failed import changes nothing
+// (a fresh install), the system tasks are seeded: only the generic dreaming
+// tick. User-specific tasks (the digests and their prompts) are not shipped;
+// they live in agent.db once the user asks the agent to schedule them. Never
+// again after that: a task the user cancelled stays cancelled. A failed import changes nothing
 // and is retried on the next start.
 pub async fn initialize(store: &dyn ScheduleStore, mcp: &dyn Mcp, cancel: &CancellationToken) -> anyhow::Result<usize> {
     let mut tasks = mcp_tasks(mcp, cancel).await?;
