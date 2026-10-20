@@ -157,6 +157,57 @@ async fn a_round_cut_by_a_restart_resumes_without_regenerating_or_resending() {
     assert!(seen.contains("search ok"), "the read has its reply: {seen}");
 }
 
+// A durable loop's sub-agent is a durable run of its own, keyed by the call
+// that started it. A restart in the middle of the sub-agent's round resumes
+// that run; the resumed parent joins it instead of starting a second worker,
+// and neither regenerates a turn nor resends the child's write.
+#[tokio::test]
+async fn a_sub_agent_cut_by_a_restart_is_resumed_and_joined_by_its_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
+    let stop = CancellationToken::new();
+
+    // The first process: the parent delegates; the worker reads and writes,
+    // and the write takes the process down.
+    let first = Arc::new(Scripted::new(vec![
+        calls(&[("invoke_sub_agent", json!({"prompt": "post it"}))]),
+        calls(&[("search", json!({"q": "a"})), ("send", json!({"q": "b"}))]),
+    ]));
+    let world = Arc::new(World { calls: Mutex::default(), stop: Some(stop.clone()) });
+    let engine1 = engine(first.clone(), world.clone());
+    let mut opts = LoopOptions::new("peer:4", task_context("peer:4"));
+    opts.skills = vec!["any".into()];
+    opts.include_engine_skills = false;
+    opts.cancel = stop.clone();
+    let input = engine1.start_loop(opts).await.unwrap().workflow_input("go").await;
+    let result =
+        create_durable_flows(engine1.clone(), db.clone()).run_loop("peer:4/loop", input, &scope(&engine1), &stop).await;
+    assert!(matches!(result, FlowResult::Interrupted { .. } | FlowResult::Waiting { .. }), "{result:?}");
+    let runs = RunStore::new(db.clone());
+    let child = "peer:4__sub1.0/loop";
+    assert!(runs.get(child).unwrap().unwrap().outcome.is_none());
+    assert!(runs.due().unwrap().contains(&child.to_owned()), "the stopped parent handed its worker back at once");
+
+    // The next process resumes both; the parent waits for its worker.
+    let second = Arc::new(Scripted::new(vec![assistant("worker result"), assistant("all done")]));
+    let world2 = Arc::new(World { calls: Mutex::default(), stop: None });
+    let engine2 = engine(second.clone(), world2.clone());
+    let resumed = create_durable_flows(engine2.clone(), db.clone()).recover_once(&CancellationToken::new()).await;
+    assert_eq!(resumed.unwrap(), 2);
+    assert_eq!(runs.get(child).unwrap().unwrap().outcome, Some(Status::Completed(json!("worker result"))));
+    assert_eq!(runs.get("peer:4/loop").unwrap().unwrap().outcome, Some(Status::Completed(json!("all done"))));
+
+    assert_eq!(first.seen.lock().unwrap().len(), 2);
+    let seen = second.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "no turn was generated again");
+    let worker = serde_json::to_string(&seen[0].messages).unwrap();
+    assert!(worker.contains("outcome unknown: send"), "the worker hears its write may have run: {worker}");
+    let parent = serde_json::to_string(&seen[1].messages).unwrap();
+    assert!(parent.contains("worker result"), "the parent has its worker's answer: {parent}");
+    assert_eq!(world.calls.lock().unwrap().iter().filter(|n| *n == "send").count(), 1);
+    assert!(!world2.calls.lock().unwrap().contains(&"send".to_owned()), "the write is never sent again");
+}
+
 // The agent may replace the loop: the version it activates under
 // `agent-loop` drives every loop started after, with no dry run needed.
 // LOOP_BREAKER faults in a row of that version put the built-in loop back.

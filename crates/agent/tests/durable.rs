@@ -387,3 +387,39 @@ do:
         }
     }
 }
+
+// The records of a long-finished run are swept; its row stays, so it still
+// reports its outcome and is never resumed. Unfinished runs and recently
+// finished ones keep theirs.
+#[test]
+fn a_swept_run_keeps_its_outcome_and_is_never_resumed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
+    let store = RunStore::new(db.clone());
+    let record = Record::Timer { deadline_ms: 1 };
+    for id in ["old", "recent", "waiting"] {
+        let lease = store.start(id, "w", "x", &json!({})).unwrap().unwrap();
+        lease.save("k", &record).unwrap();
+        lease
+            .finish(&if id == "waiting" {
+                Status::Waiting { wake_at_ms: i64::MAX }
+            } else {
+                Status::Completed(json!(id))
+            })
+            .unwrap();
+    }
+    db.conn().execute("UPDATE workflow_runs SET ended_ms = 0 WHERE id = 'old'", []).unwrap();
+    let kept = agent::durable::RECORDS_KEPT_MS;
+    assert_eq!(store.sweep(kept).unwrap(), 1);
+    assert_eq!(store.sweep(kept).unwrap(), 0);
+    let records = |id: &str| -> i64 {
+        db.conn().query_row("SELECT count(*) FROM workflow_records WHERE run_id = ?1", [id], |r| r.get(0)).unwrap()
+    };
+    assert_eq!((records("old"), records("recent"), records("waiting")), (0, 1, 1));
+    assert_eq!(store.get("old").unwrap().unwrap().outcome, Some(Status::Completed(json!("old"))));
+    assert!(store.claim("old").unwrap().is_none());
+    assert!(!store.due().unwrap().contains(&"old".to_owned()));
+    // Admitting it again (a redelivered signal) does not reopen it.
+    assert!(store.start("old", "w", "x", &json!({})).unwrap().is_none());
+    assert!(store.cancel("recent").is_ok_and(|changed| !changed));
+}

@@ -50,20 +50,31 @@ skill procedures (`skill-procedures.md`) a loop to embed.
 
 ## Still open
 
-- Workers are not durable inside: a restart during `invoke_sub_agent` gives
-  the parent "outcome unknown" for it. Next: the worker as a child run.
 - A provider outage (429) faults the run into recovery; it should back off
   as an interruption.
 - A resumed run that faults is only logged; it should get a recovery report.
 
-## Cleanup of finished runs
+## Sub-agents as child runs (done 2026-10-20)
 
-`workflow_records` of a terminal run (completed, failed, cancelled) are only
-evidence once the run has ended, and with the transcript in the context they
-are large. Plan: a sweep in the recovery worker deletes the records of runs
-that reached a terminal state more than 7 days ago (keeping the
-`workflow_runs` row with its outcome), plus a test that a terminal run
-without records still reports its outcome and is never resumed.
+In a durable loop, `invoke_sub_agent` starts the worker as a durable run of
+its own, `<parent loop id>__sub<i>.<index>/loop`, keyed by the parent's turn
+and the call's place in the round (the definition passes `i` and `index` to
+`tool`). That call is no longer at-most-once: a resumed parent calls it again
+and joins the child's run (or reads its outcome) instead of starting a second
+worker; the child's own writes are at-most-once in its run. The recovery
+worker may resume the child first; the parent then waits for its outcome
+(`flows::run_child`). A lease dropped before its attempt ended (a parent
+stopping with its worker in flight) is released at once, so the child is due
+on the next start rather than after the lease expires.
+
+## Cleanup of finished runs (done 2026-10-20)
+
+`workflow_records` of a terminal run are only evidence once it has ended,
+and with the transcript in the context they are large. `workflow_runs.ended_ms`
+(migration 0008) stamps the end; the recovery worker deletes the records of
+runs that ended more than `RECORDS_KEPT_MS` (7 days) ago, hourly, and keeps
+the row with its outcome, so a swept run still reports it and is never
+resumed.
 
 ## Acceptance
 
@@ -74,3 +85,4 @@ without records still reports its outcome and is never resumed.
 - Same traces as before for the judge and the activity journal
   (`agent_loop`, `iter-N`).
 - Finished runs' records are swept.
+- A restart during a sub-agent resumes the sub-agent's run; the parent joins it.

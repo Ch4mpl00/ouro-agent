@@ -303,6 +303,9 @@ fn arguments(mcp: &dyn Mcp, name: &str) -> Option<(Option<Vec<String>>, Vec<Stri
 struct Functions {
     engine: Arc<Engine>,
     spans: Arc<Spans>,
+    // The store of the durable run these functions serve: a loop's
+    // sub-agents become durable runs of their own in it.
+    runs: Option<crate::durable::RunStore>,
 }
 
 fn invalid(name: &str, detail: impl std::fmt::Display) -> WorkflowError {
@@ -368,8 +371,11 @@ impl owf::run::Functions for Functions {
         self.effect(name)
     }
 
+    // A durable sub-agent is the exception: calling it again joins its run.
     fn at_most_once(&self, name: &str, args: &Value) -> bool {
-        name == "tool" && self.effect_of(name, args) == Some(Effect::Write)
+        name == "tool"
+            && self.effect_of(name, args) == Some(Effect::Write)
+            && (self.runs.is_none() || crate::agent::child_key(args).is_none())
     }
 
     fn unknown_outcome(&self, name: &str, args: &Value) -> Option<Value> {
@@ -430,7 +436,7 @@ impl owf::run::Functions for Functions {
                 let engine = &self.engine;
                 match name {
                     "agent_turn" => crate::agent::loop_turn(engine, &args, &root, info.cancel).await,
-                    "tool" => crate::agent::loop_tool(engine, &args, &root, info.cancel).await,
+                    "tool" => crate::agent::loop_tool(engine, &args, &root, info.cancel, self.runs.as_ref()).await,
                     _ => crate::agent::loop_settle(engine, &args, &root, info.cancel).await,
                 }
                 .map_err(failed)
@@ -682,6 +688,8 @@ pub trait FlowRun: Send + Sync {
 
 // Runs the recovery worker resumes at once.
 const RECOVERY_CONCURRENCY: usize = 4;
+// How often the recovery worker deletes the records of long-finished runs.
+const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(3_600);
 
 pub struct Flows {
     engine: Arc<Engine>,
@@ -710,56 +718,60 @@ fn flow_result(status: RunStatus, effects_started: bool) -> FlowResult {
     }
 }
 
-impl Flows {
-    async fn execute_saved(
-        &self,
-        saved: crate::durable::SavedRun,
-        lease: crate::durable::Lease,
-        scope: &Scope,
-        cancel: &CancellationToken,
-    ) -> FlowResult {
-        let root = scope.span(SpanStart::new("runner", SpanKind::Chain).input(saved.input.clone()));
-        let mut stopped = false;
-        let status = match owf::model::parse_yaml(&saved.definition) {
-            Err(error) => (RunStatus::Interrupted(WorkflowError::validation(error.to_string())), true),
-            Ok(wf) => {
-                let host = host(&self.engine, &root, saved.name == crate::agent::AGENT_LOOP_NAME);
-                // Shutdown releases work for recovery; only explicit run
-                // cancellation is allowed to create a terminal Cancelled state.
-                let execution_cancel = CancellationToken::new();
-                let execution = owf::run::resume(&host, &wf, &saved.id, saved.input, &execution_cancel, &lease);
-                tokio::pin!(execution);
-                let mut heartbeat =
-                    tokio::time::interval(std::time::Duration::from_millis(crate::durable::HEARTBEAT_MS));
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => {
-                            stopped = true;
-                            break (RunStatus::Interrupted(WorkflowError::runtime("worker stopped")), true);
-                        }
-                        _ = heartbeat.tick() => if let Err(error) = lease.renew() {
-                            break (RunStatus::Interrupted(WorkflowError::runtime(error.to_string())), true);
-                        },
-                        outcome = &mut execution => break (outcome.status, outcome.effects_started),
+// Runs a claimed run to its next stop under `lease`, renewing it, and
+// stores how it ended (a stop of this process hands it back).
+async fn execute_saved(
+    engine: &Arc<Engine>,
+    runs: &crate::durable::RunStore,
+    saved: crate::durable::SavedRun,
+    lease: crate::durable::Lease,
+    scope: &Scope,
+    cancel: &CancellationToken,
+) -> FlowResult {
+    let root = scope.span(SpanStart::new("runner", SpanKind::Chain).input(saved.input.clone()));
+    let mut stopped = false;
+    let status = match owf::model::parse_yaml(&saved.definition) {
+        Err(error) => (RunStatus::Interrupted(WorkflowError::validation(error.to_string())), true),
+        Ok(wf) => {
+            let host = host(engine, &root, saved.name == crate::agent::AGENT_LOOP_NAME, Some(runs.clone()));
+            // Shutdown releases work for recovery; only explicit run
+            // cancellation is allowed to create a terminal Cancelled state.
+            let execution_cancel = CancellationToken::new();
+            let execution = owf::run::resume(&host, &wf, &saved.id, saved.input, &execution_cancel, &lease);
+            tokio::pin!(execution);
+            let mut heartbeat = tokio::time::interval(std::time::Duration::from_millis(crate::durable::HEARTBEAT_MS));
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        stopped = true;
+                        break (RunStatus::Interrupted(WorkflowError::runtime("worker stopped")), true);
                     }
+                    _ = heartbeat.tick() => if let Err(error) = lease.renew() {
+                        break (RunStatus::Interrupted(WorkflowError::runtime(error.to_string())), true);
+                    },
+                    outcome = &mut execution => break (outcome.status, outcome.effects_started),
                 }
             }
-        };
-        let (status, effects_started) = status;
-        let result = match if stopped { lease.release().map(|()| status) } else { lease.finish(&status) } {
-            Ok(status) => flow_result(status, effects_started),
-            Err(error) => FlowResult::Interrupted { error: WorkflowError::runtime(error.to_string()) },
-        };
-        root.end(match &result {
-            FlowResult::Completed(output) => SpanEnd::output(output.clone()),
-            FlowResult::Faulted { error, .. } | FlowResult::Interrupted { error } => SpanEnd::error(error.to_string()),
-            FlowResult::Waiting { wake_at_ms } => SpanEnd::output(json!({"waiting_until_ms":wake_at_ms})),
-            _ => SpanEnd::default(),
-        });
-        result
-    }
+        }
+    };
+    let (status, effects_started) = status;
+    let result = match if stopped { lease.release().map(|()| status) } else { lease.finish(&status) } {
+        Ok(status) => flow_result(status, effects_started),
+        Err(error) => FlowResult::Interrupted { error: WorkflowError::runtime(error.to_string()) },
+    };
+    root.end(match &result {
+        // Handed back for the next process to resume: not a failure.
+        FlowResult::Interrupted { .. } if stopped => SpanEnd::output(json!({"released":true})),
+        FlowResult::Completed(output) => SpanEnd::output(output.clone()),
+        FlowResult::Faulted { error, .. } | FlowResult::Interrupted { error } => SpanEnd::error(error.to_string()),
+        FlowResult::Waiting { wake_at_ms } => SpanEnd::output(json!({"waiting_until_ms":wake_at_ms})),
+        _ => SpanEnd::default(),
+    });
+    result
+}
 
+impl Flows {
     async fn run_durable(
         &self,
         runs: &crate::durable::RunStore,
@@ -792,7 +804,7 @@ impl Flows {
                 }
             },
         };
-        Ok(self.execute_saved(saved, lease, scope, cancel).await)
+        Ok(execute_saved(&self.engine, runs, saved, lease, scope, cancel).await)
     }
 
     // Claims up to `limit` runs that are due: a passed deadline or an
@@ -814,7 +826,13 @@ impl Flows {
         Ok(claimed)
     }
 
-    async fn resume(&self, saved: crate::durable::SavedRun, lease: crate::durable::Lease, cancel: &CancellationToken) {
+    async fn resume(
+        &self,
+        runs: &crate::durable::RunStore,
+        saved: crate::durable::SavedRun,
+        lease: crate::durable::Lease,
+        cancel: &CancellationToken,
+    ) {
         let id = saved.id.clone();
         let trace = self.engine.deps.tracer.trace(crate::tracing::TraceStart {
             id: uuid::Uuid::new_v4().to_string(),
@@ -827,7 +845,7 @@ impl Flows {
             .then(|| saved.input["loop"]["id"].as_str().map(str::to_owned))
             .flatten();
         let version = saved.input.get(OVERRIDE).and_then(Value::as_i64);
-        let result = self.execute_saved(saved, lease, &scope, cancel).await;
+        let result = execute_saved(&self.engine, runs, saved, lease, &scope, cancel).await;
         if let Some(id) = driven {
             loop_outcome(&self.engine, version, &result);
             self.engine.end_loop(&id).await;
@@ -843,7 +861,8 @@ impl Flows {
         let Some(runs) = &self.runs else { return Ok(0) };
         let claimed = self.claim_due(runs, RECOVERY_CONCURRENCY)?;
         let count = claimed.len();
-        futures::future::join_all(claimed.into_iter().map(|(saved, lease)| self.resume(saved, lease, cancel))).await;
+        futures::future::join_all(claimed.into_iter().map(|(saved, lease)| self.resume(runs, saved, lease, cancel)))
+            .await;
         Ok(count)
     }
 
@@ -855,6 +874,7 @@ impl Flows {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut running = futures::stream::FuturesUnordered::new();
+        let mut swept: Option<std::time::Instant> = None;
         loop {
             tokio::select! {
                 biased;
@@ -862,9 +882,15 @@ impl Flows {
                 Some(()) = running.next(), if !running.is_empty() => continue,
                 _ = tick.tick() => {}
             }
+            if swept.is_none_or(|at| at.elapsed() >= SWEEP_EVERY) {
+                swept = Some(std::time::Instant::now());
+                if let Err(error) = runs.sweep(crate::durable::RECORDS_KEPT_MS) {
+                    eprintln!("[durable] sweep: {error:#}");
+                }
+            }
             match self.claim_due(runs, RECOVERY_CONCURRENCY - running.len()) {
                 Ok(claimed) => {
-                    running.extend(claimed.into_iter().map(|(saved, lease)| self.resume(saved, lease, &cancel)))
+                    running.extend(claimed.into_iter().map(|(saved, lease)| self.resume(runs, saved, lease, &cancel)))
                 }
                 Err(error) => eprintln!("[durable] recovery: {error:#}"),
             }
@@ -958,7 +984,7 @@ impl FlowRun for Flows {
             Ok(wf) => {
                 let spans = Arc::new(Spans { root: root.clone(), open: Mutex::default() });
                 let host = Host {
-                    functions: Arc::new(Functions { engine: self.engine.clone(), spans: spans.clone() }),
+                    functions: Arc::new(Functions { engine: self.engine.clone(), spans: spans.clone(), runs: None }),
                     observer: spans,
                     clock: Arc::new(SystemClock),
                     limits: Limits::default(),
@@ -983,33 +1009,71 @@ impl FlowRun for Flows {
     }
 
     async fn run_loop(&self, id: &str, input: Value, scope: &Scope, cancel: &CancellationToken) -> FlowResult {
-        let Some(runs) = &self.runs else { return run_loop_here(&self.engine, id, input, scope, cancel).await };
-        let (definition, version) = loop_definition(&self.engine);
-        let input = with_override(input, version);
-        let claimed = (|| -> anyhow::Result<Option<(crate::durable::SavedRun, crate::durable::Lease)>> {
-            let lease = match runs.start(id, crate::agent::AGENT_LOOP_NAME, &definition, &input)? {
+        match &self.runs {
+            Some(runs) => run_loop_durable(&self.engine, runs, id, input, scope, cancel).await,
+            None => run_loop_here(&self.engine, id, input, scope, cancel).await,
+        }
+    }
+}
+
+/// Starts (or claims) the loop's run `id` and drives it here. `Waiting`
+/// when another worker holds it.
+pub async fn run_loop_durable(
+    engine: &Arc<Engine>,
+    runs: &crate::durable::RunStore,
+    id: &str,
+    input: Value,
+    scope: &Scope,
+    cancel: &CancellationToken,
+) -> FlowResult {
+    let (definition, version) = loop_definition(engine);
+    let input = with_override(input, version);
+    let claimed = (|| -> anyhow::Result<Option<(crate::durable::SavedRun, crate::durable::Lease)>> {
+        let lease = match runs.start(id, crate::agent::AGENT_LOOP_NAME, &definition, &input)? {
+            Some(lease) => lease,
+            None => match runs.claim(id)? {
                 Some(lease) => lease,
-                None => match runs.claim(id)? {
-                    Some(lease) => lease,
-                    // Another worker holds it, or it already ended.
-                    None => return Ok(None),
-                },
-            };
-            Ok(Some((runs.get(id)?.ok_or_else(|| anyhow::anyhow!("run {id} disappeared"))?, lease)))
-        })();
-        match claimed {
-            Err(error) => FlowResult::Interrupted { error: WorkflowError::runtime(error.to_string()) },
-            Ok(Some((saved, lease))) => {
-                let version = saved.input.get(OVERRIDE).and_then(Value::as_i64);
-                let result = self.execute_saved(saved, lease, scope, cancel).await;
-                loop_outcome(&self.engine, version, &result);
-                result
-            }
-            Ok(None) => match runs.get(id) {
-                Ok(Some(crate::durable::SavedRun { outcome: Some(status), .. })) => flow_result(status, true),
-                Ok(_) => FlowResult::Waiting { wake_at_ms: chrono::Utc::now().timestamp_millis() },
-                Err(error) => FlowResult::Interrupted { error: WorkflowError::runtime(error.to_string()) },
+                // Another worker holds it, or it already ended.
+                None => return Ok(None),
             },
+        };
+        Ok(Some((runs.get(id)?.ok_or_else(|| anyhow::anyhow!("run {id} disappeared"))?, lease)))
+    })();
+    match claimed {
+        Err(error) => FlowResult::Interrupted { error: WorkflowError::runtime(error.to_string()) },
+        Ok(Some((saved, lease))) => {
+            let version = saved.input.get(OVERRIDE).and_then(Value::as_i64);
+            let result = execute_saved(engine, runs, saved, lease, scope, cancel).await;
+            loop_outcome(engine, version, &result);
+            result
+        }
+        Ok(None) => match runs.get(id) {
+            Ok(Some(crate::durable::SavedRun { outcome: Some(status), .. })) => flow_result(status, true),
+            Ok(_) => FlowResult::Waiting { wake_at_ms: chrono::Utc::now().timestamp_millis() },
+            Err(error) => FlowResult::Interrupted { error: WorkflowError::runtime(error.to_string()) },
+        },
+    }
+}
+
+/// A sub-agent's run `id`, driven to its end: while the recovery worker
+/// holds it, or it waits out an interruption's backoff, this waits for it.
+pub async fn run_child(
+    engine: &Arc<Engine>,
+    runs: &crate::durable::RunStore,
+    id: &str,
+    input: Value,
+    scope: &Scope,
+    cancel: &CancellationToken,
+) -> FlowResult {
+    loop {
+        match run_loop_durable(engine, runs, id, input.clone(), scope, cancel).await {
+            FlowResult::Waiting { .. } | FlowResult::Interrupted { .. } if !cancel.is_cancelled() => {
+                tokio::select! {
+                    _ = cancel.cancelled() => return FlowResult::Cancelled,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                }
+            }
+            result => return result,
         }
     }
 }
@@ -1028,16 +1092,16 @@ const OVERRIDE: &str = "override_version";
 /// The host an `agent-loop` run executes on, traced under `root`: for a
 /// caller that owns the run's journal itself (a test injecting crashes).
 pub fn loop_host(engine: &Arc<Engine>, root: &Arc<dyn Span>) -> Host {
-    host(engine, root, true)
+    host(engine, root, true, None)
 }
 
-fn host(engine: &Arc<Engine>, root: &Arc<dyn Span>, agent_loop: bool) -> Host {
+fn host(engine: &Arc<Engine>, root: &Arc<dyn Span>, agent_loop: bool, runs: Option<crate::durable::RunStore>) -> Host {
     let spans = Arc::new(Spans { root: root.clone(), open: Mutex::default() });
     // A loop's generations and tool calls trace themselves; spans for its
     // turn/round/settle tasks would only repeat them.
     let observer: Arc<dyn owf::run::Observer> = if agent_loop { Arc::new(owf::run::Silent) } else { spans.clone() };
     Host {
-        functions: Arc::new(Functions { engine: engine.clone(), spans }),
+        functions: Arc::new(Functions { engine: engine.clone(), spans, runs }),
         observer,
         clock: Arc::new(SystemClock),
         limits: Limits::default(),
@@ -1127,7 +1191,7 @@ pub async fn run_loop_here(
         }
         Ok(wf) => {
             let outcome =
-                owf::run::run(&host(engine, &root, true), &wf, id, with_override(input, version), cancel).await;
+                owf::run::run(&host(engine, &root, true, None), &wf, id, with_override(input, version), cancel).await;
             flow_result(outcome.status, outcome.effects_started)
         }
     };
@@ -1638,7 +1702,7 @@ pub async fn try_draft(
     );
     let spans = Arc::new(Spans { root: root.clone(), open: Mutex::default() });
     let functions = Arc::new(DryRun {
-        functions: Functions { engine: engine.clone(), spans: spans.clone() },
+        functions: Functions { engine: engine.clone(), spans: spans.clone(), runs: None },
         writes: Mutex::default(),
     });
     let steps = Arc::new(DrySteps { spans, report: Mutex::default() });

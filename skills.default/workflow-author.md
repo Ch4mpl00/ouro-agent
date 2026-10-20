@@ -188,7 +188,9 @@ Every agent loop, the parent's and each worker's, runs the workflow
 built-in one until another is saved). Its context carries `loop`,
 `messages`, `memory` and the turn count `i`; `agent_turn`, `tool` (one call
 by name, a write sent at most once) and `agent_settle` (`finish`, the
-replies, the memory) are its functions. To change how loops work, save a
+replies, the memory) are its functions. Give `tool` the call's place too
+(`i` and the `for`'s `$index`): a sub-agent call with them runs as a durable
+run of its own, which a restart resumes; without them it runs in process. To change how loops work, save a
 new version under that name and activate it when the user agrees; it needs
 no dry run. Loops started after that run it, and three faults of it in a
 row put the built-in loop back.

@@ -8,13 +8,20 @@ use owf::{
 };
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 const LEASE_MS: i64 = 30_000;
 pub const HEARTBEAT_MS: u64 = 10_000;
 /// Interruptions in a row before a run is given up as failed. With the
 /// backoff below that is about 17 minutes of retries.
 pub const MAX_INTERRUPTIONS: i64 = 10;
+/// How long a finished run keeps its records. The run row (its outcome)
+/// stays; the records are only evidence once the run has ended, and an
+/// agent loop's carry its transcript in every one.
+pub const RECORDS_KEPT_MS: i64 = 7 * 24 * 3_600_000;
 
 fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -79,7 +86,7 @@ impl RunStore {
     pub fn start(&self, id: &str, name: &str, definition: &str, input: &Value) -> anyhow::Result<Option<Lease>> {
         let owner = uuid::Uuid::new_v4().to_string();
         let inserted = self.insert(id, name, definition, input, Some(&owner))?;
-        Ok(inserted.then(|| Lease { db: self.db.clone(), id: id.into(), owner }))
+        Ok(inserted.then(|| Lease { db: self.db.clone(), id: id.into(), owner, ended: AtomicBool::new(false) }))
     }
 
     fn insert(
@@ -122,17 +129,28 @@ impl RunStore {
                 OR (state = 'running' AND lease_until_ms <= ?4))",
             params![id, owner, time + LEASE_MS, time],
         )?;
-        Ok((changed == 1).then(|| Lease { db: self.db.clone(), id: id.into(), owner }))
+        Ok((changed == 1).then(|| Lease { db: self.db.clone(), id: id.into(), owner, ended: AtomicBool::new(false) }))
     }
 
     /// Explicit cancellation is terminal. Process shutdown instead releases
     /// the lease as Interrupted so that restart can resume the run.
     pub fn cancel(&self, id: &str) -> anyhow::Result<bool> {
         Ok(self.db.conn().execute(
-            "UPDATE workflow_runs SET state = 'cancelled', owner = NULL,
-            lease_until_ms = NULL, outcome = ?2 WHERE id = ?1 AND state IN ('ready', 'running', 'waiting')",
-            params![id, serde_json::to_string(&Status::Cancelled)?],
+            "UPDATE workflow_runs SET state = 'cancelled', owner = NULL, lease_until_ms = NULL,
+            outcome = ?2, ended_ms = ?3 WHERE id = ?1 AND state IN ('ready', 'running', 'waiting')",
+            params![id, serde_json::to_string(&Status::Cancelled)?, now()],
         )? == 1)
+    }
+
+    /// Deletes the records of runs that ended `kept_ms` or more ago and
+    /// returns how many it deleted. The run rows stay, so a finished run
+    /// still reports its outcome and is never resumed.
+    pub fn sweep(&self, kept_ms: i64) -> anyhow::Result<usize> {
+        Ok(self.db.conn().execute(
+            "DELETE FROM workflow_records WHERE run_id IN
+            (SELECT id FROM workflow_runs WHERE ended_ms <= ?1)",
+            [now() - kept_ms],
+        )?)
     }
 }
 
@@ -140,6 +158,19 @@ pub struct Lease {
     db: AgentDb,
     id: String,
     owner: String,
+    // Set once the attempt stored how it ended (finish or release).
+    ended: AtomicBool,
+}
+
+// An attempt dropped before it ended (its caller went away mid-run, say a
+// parent loop stopping with its sub-agent in flight) hands the run back at
+// once, as a release would, instead of holding it until the lease expires.
+impl Drop for Lease {
+    fn drop(&mut self) {
+        if !*self.ended.get_mut() {
+            let _ = self.release();
+        }
+    }
 }
 
 impl Lease {
@@ -172,6 +203,7 @@ impl Lease {
     /// MAX_INTERRUPTIONS in a row (a cause that never clears: a corrupt
     /// record, state from an incompatible version) it becomes a fault.
     pub fn finish(&self, outcome: &Status) -> anyhow::Result<Status> {
+        self.ended.store(true, Ordering::SeqCst);
         let mut conn = self.db.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.check(&tx)?;
@@ -199,8 +231,8 @@ impl Lease {
         let encoded = terminal.then(|| serde_json::to_string(&status)).transpose()?;
         tx.execute(
             "UPDATE workflow_runs SET state = ?2, wake_at_ms = ?3, outcome = ?4,
-            interruptions = ?5, owner = NULL, lease_until_ms = NULL WHERE id = ?1",
-            params![self.id, state, wake, encoded, interruptions],
+            interruptions = ?5, owner = NULL, lease_until_ms = NULL, ended_ms = ?6 WHERE id = ?1",
+            params![self.id, state, wake, encoded, interruptions, terminal.then(now)],
         )?;
         tx.commit()?;
         Ok(status)
@@ -209,6 +241,7 @@ impl Lease {
     /// Hands the run back as it is (the worker is stopping): not a failure,
     /// so it does not count towards MAX_INTERRUPTIONS.
     pub fn release(&self) -> anyhow::Result<()> {
+        self.ended.store(true, Ordering::SeqCst);
         let time = now();
         let changed = self.db.conn().execute(
             "UPDATE workflow_runs SET state = 'ready', wake_at_ms = ?3, owner = NULL, lease_until_ms = NULL

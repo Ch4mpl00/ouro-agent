@@ -23,6 +23,10 @@ do:
             with:
               loop: '${ $context.loop }'
               call: '${ $call }'
+              # Where the call is (turn, place in the round): a sub-agent's
+              # durable run is keyed by it, so a resumed round joins it.
+              i: '${ $context.i }'
+              index: '${ $index }'
               memory: '${ if ($call.name | startswith("working_memory_")) or $call.name == "invoke_sub_agent" then $context.memory else null end }'
   - settle:
       call: agent_settle
