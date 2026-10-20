@@ -347,6 +347,9 @@ pub struct Supervisor {
     cancel: CancellationToken,
     active: Arc<tokio::sync::Semaphore>,
     shutdown: tokio::sync::Mutex<bool>,
+    // Sources whose primary loop runs as a durable `agent-loop` run (`all`
+    // for every source): a restart resumes it instead of losing it.
+    durable_loops: Vec<String>,
 }
 pub fn create_supervisor(
     engine: Arc<Engine>,
@@ -354,7 +357,7 @@ pub fn create_supervisor(
     workflow: Arc<dyn WorkflowRun>,
     flows: Arc<dyn FlowRun>,
 ) -> Arc<Supervisor> {
-    create_supervisor_with_cancel(engine, env, workflow, flows, CancellationToken::new())
+    create_supervisor_with_cancel(engine, env, workflow, flows, CancellationToken::new(), Vec::new())
 }
 pub fn create_supervisor_with_cancel(
     engine: Arc<Engine>,
@@ -362,6 +365,7 @@ pub fn create_supervisor_with_cancel(
     workflow: Arc<dyn WorkflowRun>,
     flows: Arc<dyn FlowRun>,
     cancel: CancellationToken,
+    durable_loops: Vec<String>,
 ) -> Arc<Supervisor> {
     Arc::new(Supervisor {
         engine,
@@ -371,6 +375,7 @@ pub fn create_supervisor_with_cancel(
         cancel,
         active: Arc::new(tokio::sync::Semaphore::new(1)),
         shutdown: Default::default(),
+        durable_loops,
     })
 }
 impl Supervisor {
@@ -449,7 +454,7 @@ impl Supervisor {
             if let Some(env)=signal.env_context.as_ref().filter(|s|!s.is_empty()){prompts.push(env.clone());}
             if let Some(note)=handover{prompts.push(note);}
             let mut opts=LoopOptions::new(&id,session);opts.cancel=self.cancel.clone();opts.skills=if transport{vec![signal.source.clone()]}else{Vec::new()};opts.allow_skill_writes=signal.source=="dreaming";opts.system_prompt=Some(prompts.join("\n\n"));opts.preset=if signal.source=="scheduler"{crate::models::PresetName::Base}else{crate::models::PresetName::Smart};opts.trace_scope=Some(primary.clone());
-            let loaded_skills:Vec<_>=loaded.into_iter().chain(preselected_names).collect();let agent=self.engine.start_loop(opts).await?;loop_=Some(agent.clone());let output=agent.send(input).await?;primary.end(SpanEnd::output(output.clone()));trace.update(ContextUpdate{output:Some(json!(output)),metadata:Some(json!({"skills":loaded_skills}).as_object().unwrap().clone()),..Default::default()});Ok::<_,anyhow::Error>(output)
+            let loaded_skills:Vec<_>=loaded.into_iter().chain(preselected_names).collect();let agent=self.engine.start_loop(opts).await?;loop_=Some(agent.clone());let output=self.drive(&agent,&id,input,&primary).await?;primary.end(SpanEnd::output(output.clone()));trace.update(ContextUpdate{output:Some(json!(output)),metadata:Some(json!({"skills":loaded_skills}).as_object().unwrap().clone()),..Default::default()});Ok::<_,anyhow::Error>(output)
         }.await;
         if let Err(error) = &outcome {
             if let Some(span) = &span {
@@ -473,6 +478,35 @@ impl Supervisor {
         trace.end();
         check(&self.cancel)?;
         outcome
+    }
+    // Runs the primary loop: as a durable `agent-loop` run for the sources
+    // configured so, else in this process.
+    async fn drive(
+        &self,
+        agent: &Arc<AgentLoop>,
+        id: &str,
+        input: String,
+        primary: &Arc<dyn Span>,
+    ) -> anyhow::Result<String> {
+        let source = id.split(':').next().unwrap_or_default();
+        if !self.durable_loops.iter().any(|s| s == source || s == "all") {
+            return agent.send(input).await;
+        }
+        let scope: Scope = primary.clone();
+        let run = agent.workflow_input(&input).await;
+        match self.flows.run_loop(&format!("{id}/loop"), run, &scope, &self.cancel).await {
+            FlowResult::Completed(output) => {
+                Ok(output.as_str().map(str::to_owned).unwrap_or_else(|| output.to_string()))
+            }
+            FlowResult::Missing => agent.send(input).await,
+            FlowResult::Cancelled => Err(aborted()),
+            FlowResult::Faulted { error, .. } => Err(anyhow::anyhow!("{error}")),
+            // Released on shutdown or held elsewhere: the recovery worker resumes it.
+            FlowResult::Waiting { .. } | FlowResult::Interrupted { .. } => {
+                check(&self.cancel)?;
+                Ok(json!({"ok": true, "resumes": true}).to_string())
+            }
+        }
     }
     async fn recover(
         &self,

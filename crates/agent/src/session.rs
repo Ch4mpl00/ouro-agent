@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -26,8 +26,35 @@ pub struct EnvData {
     pub telegram_chat_id: Option<String>,
 }
 
+impl EnvData {
+    // As a durable run's input keeps it: `now` in epoch milliseconds.
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "now_ms": self.now.timestamp_millis(),
+            "timezone": self.timezone,
+            "user_email": self.user_email,
+            "news_last_read_at": self.news_last_read_at,
+            "tech_last_read_at": self.tech_last_read_at,
+            "telegram_chat_id": self.telegram_chat_id,
+        })
+    }
+
+    pub fn from_json(v: &Value) -> anyhow::Result<EnvData> {
+        let text = |key: &str| v.get(key).and_then(Value::as_str).map(str::to_owned);
+        let now = v["now_ms"].as_i64().and_then(DateTime::from_timestamp_millis);
+        Ok(EnvData {
+            now: now.ok_or_else(|| anyhow::anyhow!("env.now_ms must be epoch milliseconds"))?,
+            timezone: text("timezone").ok_or_else(|| anyhow::anyhow!("env.timezone is required"))?,
+            user_email: text("user_email"),
+            news_last_read_at: text("news_last_read_at"),
+            tech_last_read_at: text("tech_last_read_at"),
+            telegram_chat_id: text("telegram_chat_id"),
+        })
+    }
+}
+
 // A caller-supplied label; the store neither parses nor validates JSON.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Format {
     Text,
@@ -106,6 +133,19 @@ impl WorkingMemory {
         let before = entries.len();
         entries.retain(|(k, _, _)| k != key);
         entries.len() != before
+    }
+
+    // Every entry, for a durable run to carry: `[key, value, format]`.
+    pub fn snapshot(&self) -> Value {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        Value::Array(entries.iter().map(|(k, v, f)| serde_json::json!([k, v, f])).collect())
+    }
+
+    // Replaces every entry with a snapshot's.
+    pub fn restore(&self, snapshot: &Value) -> anyhow::Result<()> {
+        let restored = serde_json::from_value::<Vec<(String, String, Format)>>(snapshot.clone())?;
+        *self.entries.lock().unwrap_or_else(|e| e.into_inner()) = restored;
+        Ok(())
     }
 }
 

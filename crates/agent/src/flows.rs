@@ -343,13 +343,47 @@ fn failed(e: anyhow::Error) -> WorkflowError {
     WorkflowError::runtime(e.to_string())
 }
 
+// The built-in agent loop's functions (`agent::AGENT_LOOP`). Only that
+// definition runs them: saved workflows are checked against `effect`, which
+// does not know them.
+const LOOP_FUNCTIONS: &[&str] = &["agent_turn", "tool", "agent_settle"];
+
+fn loop_tool_name(args: &Value) -> &str {
+    args.get("call").and_then(|c| c.get("name")).and_then(Value::as_str).unwrap_or_default()
+}
+
 #[async_trait]
 impl owf::run::Functions for Functions {
     fn effect(&self, name: &str) -> Option<Effect> {
+        if LOOP_FUNCTIONS.contains(&name) {
+            return Some(Effect::Read);
+        }
         effect(&*self.engine.deps.mcp, name)
     }
 
+    fn effect_of(&self, name: &str, args: &Value) -> Option<Effect> {
+        if name == "tool" {
+            return Some(crate::agent::tool_effect(&self.engine, loop_tool_name(args)));
+        }
+        self.effect(name)
+    }
+
+    fn at_most_once(&self, name: &str, args: &Value) -> bool {
+        name == "tool" && self.effect_of(name, args) == Some(Effect::Write)
+    }
+
+    fn unknown_outcome(&self, name: &str, args: &Value) -> Option<Value> {
+        (name == "tool").then(|| crate::agent::unknown_tool_outcome(loop_tool_name(args)))
+    }
+
     async fn invoke(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
+        if LOOP_FUNCTIONS.contains(&name) {
+            // A tool reports its own failures in its reply; an error here
+            // (cancellation, a lost loop) leaves a write's outcome unknown.
+            return self.call(name, args, info).await.map_err(|error| {
+                if name == "tool" { CallFailure::Unknown(error) } else { CallFailure::Response(error) }
+            });
+        }
         if MODEL_FUNCTIONS.iter().any(|f| f.0 == name) {
             if info.delivery == Delivery::AtMostOnce && name != "set_memory" {
                 return Err(CallFailure::NotExecuted(WorkflowError::validation(
@@ -384,6 +418,17 @@ impl owf::run::Functions for Functions {
         let span = self.spans.scope(info.reference);
         let label = info.reference.rsplit('/').next().unwrap_or(name);
         match name {
+            "agent_turn" | "tool" | "agent_settle" => {
+                // A loop rebuilt after a restart is traced under the runner.
+                let root: Scope = self.spans.root.clone();
+                let engine = &self.engine;
+                match name {
+                    "agent_turn" => crate::agent::loop_turn(engine, &args, &root, info.cancel).await,
+                    "tool" => crate::agent::loop_tool(engine, &args, &root, info.cancel).await,
+                    _ => crate::agent::loop_settle(engine, &args, &root, info.cancel).await,
+                }
+                .map_err(failed)
+            }
             "hash_value" => {
                 let value = args.get("value").ok_or_else(|| invalid(name, "`value` is required"))?;
                 Ok(json!({"hash":crate::skills::hash_value(value)}))
@@ -620,6 +665,13 @@ pub trait FlowRun: Send + Sync {
         scope: &Scope,
         cancel: &CancellationToken,
     ) -> FlowResult;
+
+    /// Drives an agent loop as a run `id` of the built-in `agent-loop`
+    /// definition on `input` (`AgentLoop::workflow_input`). `Missing` when
+    /// this runner does not drive loops: the caller runs the loop itself.
+    async fn run_loop(&self, _id: &str, _input: Value, _scope: &Scope, _cancel: &CancellationToken) -> FlowResult {
+        FlowResult::Missing
+    }
 }
 
 // Runs the recovery worker resumes at once.
@@ -772,7 +824,13 @@ impl Flows {
             ..Default::default()
         });
         let scope: Scope = trace.clone();
+        let driven = (saved.name == crate::agent::AGENT_LOOP_NAME)
+            .then(|| saved.input["loop"]["id"].as_str().map(str::to_owned))
+            .flatten();
         let result = self.execute_saved(saved, lease, &scope, cancel).await;
+        if let Some(id) = driven {
+            self.engine.end_loop(&id).await;
+        }
         trace.end();
         if let FlowResult::Faulted { error, .. } | FlowResult::Interrupted { error } = result {
             eprintln!("[durable] {id}: {error}");
@@ -921,6 +979,57 @@ impl FlowRun for Flows {
             FlowResult::Missing => SpanEnd::default(),
         });
         result
+    }
+
+    async fn run_loop(&self, id: &str, input: Value, scope: &Scope, cancel: &CancellationToken) -> FlowResult {
+        let name = crate::agent::AGENT_LOOP_NAME;
+        let definition = crate::agent::AGENT_LOOP;
+        let Some(runs) = &self.runs else {
+            let root = scope.span(
+                SpanStart::new("runner", SpanKind::Chain).metadata(metadata(json!({"workflow":name,"engine":"owf"}))),
+            );
+            let wf = match owf::model::parse_yaml(definition) {
+                Ok(wf) => wf,
+                Err(error) => {
+                    return FlowResult::Faulted {
+                        error: WorkflowError::validation(error.to_string()),
+                        effects_started: false,
+                    };
+                }
+            };
+            let spans = Arc::new(Spans { root: root.clone(), open: Mutex::default() });
+            let host = Host {
+                functions: Arc::new(Functions { engine: self.engine.clone(), spans: spans.clone() }),
+                observer: spans,
+                clock: Arc::new(SystemClock),
+                limits: Limits::default(),
+                runtime: json!({"name":"agent-supervisor","version":env!("CARGO_PKG_VERSION")}),
+            };
+            let outcome = owf::run::run(&host, &wf, id, input, cancel).await;
+            let result = flow_result(outcome.status, outcome.effects_started);
+            root.end(SpanEnd::default());
+            return result;
+        };
+        let claimed = (|| -> anyhow::Result<Option<(crate::durable::SavedRun, crate::durable::Lease)>> {
+            let lease = match runs.start(id, name, definition, &input)? {
+                Some(lease) => lease,
+                None => match runs.claim(id)? {
+                    Some(lease) => lease,
+                    // Another worker holds it, or it already ended.
+                    None => return Ok(None),
+                },
+            };
+            Ok(Some((runs.get(id)?.ok_or_else(|| anyhow::anyhow!("run {id} disappeared"))?, lease)))
+        })();
+        match claimed {
+            Err(error) => FlowResult::Interrupted { error: WorkflowError::runtime(error.to_string()) },
+            Ok(Some((saved, lease))) => self.execute_saved(saved, lease, scope, cancel).await,
+            Ok(None) => match runs.get(id) {
+                Ok(Some(crate::durable::SavedRun { outcome: Some(status), .. })) => flow_result(status, true),
+                Ok(_) => FlowResult::Waiting { wake_at_ms: chrono::Utc::now().timestamp_millis() },
+                Err(error) => FlowResult::Interrupted { error: WorkflowError::runtime(error.to_string()) },
+            },
+        }
     }
 }
 

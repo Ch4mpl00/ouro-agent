@@ -454,6 +454,36 @@ async fn a_peer_signal_loads_its_skill_and_the_earlier_turns_of_its_thread() {
     assert!(!calls.iter().any(|(n, _)| n == "get_telegram_chat_history"));
     supervisor.shutdown().await;
 }
+// With durable loops on for `peer`, the same signal runs as an `agent-loop`
+// run: the same answer, the same trace for the judge and the journal, and a
+// completed run in agent.db.
+#[tokio::test]
+async fn a_peer_signal_with_durable_loops_runs_as_an_agent_loop_run() {
+    let model = Arc::new(Scripted::new(vec![assistant("done")]));
+    let mut f = fixture(model.clone(), &[], SKILLS);
+    let mcp = Arc::new(ContextMcp::default());
+    let deps = &mut Arc::get_mut(&mut f.engine).unwrap().deps;
+    deps.mcp = mcp.clone();
+    deps.skills = vec!["orchestrator".into(), "routing".into()];
+    let engine = f.engine.clone();
+    let supervisor = create_supervisor_with_cancel(
+        engine.clone(),
+        EnvDeps { mcp: mcp.clone(), memory: f.db.clone(), user_email: None, telegram_chat_id: None },
+        Arc::new(FakeWorkflow { stage: Stage::Success, called: AtomicUsize::new(0) }),
+        agent::flows::create_durable_flows(engine.clone(), (*f.db).clone()),
+        CancellationToken::new(),
+        vec!["peer".into()],
+    );
+    assert_eq!(supervisor.run_signal(&signal("peer", 42)).await.unwrap(), "done");
+    let run = agent::durable::RunStore::new((*f.db).clone()).get("peer:42/loop").unwrap().unwrap();
+    assert_eq!(run.outcome, Some(owf::run::Status::Completed(json!("done"))));
+    let (_, obs) = f.db.get_trace("peer:42").unwrap().unwrap();
+    let primary =
+        obs.iter().find(|o| o.meta("activity") == Some(&json!("primary_loop"))).expect("the primary loop span");
+    let turn = obs.iter().find(|o| o.name == "iter-0").expect("the first generation");
+    assert_eq!(turn.parent_observation_id.as_deref(), Some(primary.id.as_str()));
+    supervisor.shutdown().await;
+}
 // Jev for preselection: the telegram skill fits, nothing else does; `broken`
 // answers without scores.
 struct Jev {

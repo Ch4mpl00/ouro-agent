@@ -1,0 +1,37 @@
+document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '1.0.0' }
+# The ReAct loop as a durable workflow. The context carries the loop's spec,
+# its transcript (`messages`), its working memory and the turn count; every
+# task record is a checkpoint, so a restart resumes the loop where it was.
+input:
+  from: '${ . + { i: 0 } }'
+do:
+  - turn:
+      call: agent_turn
+      with: { loop: '${ $context.loop }', messages: '${ $context.messages }', memory: '${ $context.memory }', i: '${ $context.i }' }
+      export: { as: '${ $context + { messages: ($context.messages + [ .message ]), calls: .calls, i: ($context.i + 1) } }' }
+  - route:
+      switch:
+        - answered: { when: '${ .calls == [] }', then: answer }
+        - act: { then: round }
+  - round:
+      for: { each: call, in: '${ $context.calls }' }
+      metadata: { concurrency: 4 }
+      do:
+        - one:
+            call: tool
+            with:
+              loop: '${ $context.loop }'
+              call: '${ $call }'
+              memory: '${ if ($call.name | startswith("working_memory_")) or $call.name == "invoke_sub_agent" then $context.memory else null end }'
+  - settle:
+      call: agent_settle
+      with: { loop: '${ $context.loop }', calls: '${ $context.calls }', results: '${ . }', memory: '${ $context.memory }' }
+      export: { as: '${ $context + { messages: ($context.messages + .replies), memory: .memory } }' }
+  - next:
+      switch:
+        - finished: { when: '${ .finished }', then: end }
+        - more: { then: turn }
+  - answer:
+      set: '${ { output: .content } }'
+output:
+  as: '${ .output }'

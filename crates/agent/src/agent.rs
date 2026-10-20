@@ -1,6 +1,7 @@
 // Agent runtime: engine wiring, synthetic tools, and the ReAct loop. Shared
 // clients are injected once; each loop owns its conversation and cancellation.
-// Sections: 1. engine / skill scoping; 2. loop lifecycle; 3. dispatch / workers.
+// Sections: 1. engine / skill scoping; 2. loop lifecycle; 3. dispatch / workers;
+// 4. the loop as a workflow.
 use crate::{
     codex::{SharedCodex, code_agent},
     db::MemoryStore,
@@ -15,6 +16,7 @@ use crate::{
     tracing::{ContextUpdate, Metadata, Scope, Span, SpanEnd, SpanKind, SpanStart, Trace, TraceStart, Tracer},
 };
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -214,6 +216,9 @@ pub struct AgentLoop {
     skill_names: Vec<String>,
     sub_counter: AtomicUsize,
     observation_meta: Metadata,
+    // False for a loop rebuilt after a restart until a host function has
+    // put its working memory back from the run's context.
+    memory_restored: AtomicBool,
 }
 fn create_loop(
     engine: &Arc<Engine>,
@@ -274,6 +279,7 @@ fn create_loop(
         skill_names,
         sub_counter: AtomicUsize::new(0),
         observation_meta,
+        memory_restored: AtomicBool::new(true),
     }))
 }
 impl AgentLoop {
@@ -324,31 +330,15 @@ impl AgentLoop {
     }
     async fn run_until_settled(self: &Arc<Self>) -> anyhow::Result<String> {
         let engine = self.engine.upgrade().ok_or_else(aborted)?;
-        let provider = engine.resolve_provider(&self.model)?;
         let mut messages = self.messages.lock().await;
         if let Some(message) = messages.iter().find(|m| providers::role(m) == "user") {
             self.scope.update(ContextUpdate::input(message.get("content").cloned().unwrap_or(Value::Null)));
         }
         for iteration in 0..self.opts.max_iterations {
-            check(&self.cancel)?;
-            let mut tools: Vec<_> = crate::mcp::model_tools(&*engine.deps.mcp)
-                .into_iter()
-                .filter(|t| self.allowed.as_ref().is_none_or(|s| s.contains(&t.name)))
-                .collect();
-            tools.extend(synthetic_definitions().iter().filter(|t| self.visible(&t.name)).cloned());
-            let mut params = providers::CompletionParams {
-                model: self.model.clone(),
-                messages: &mut messages,
-                reasoning_effort: self.reasoning_effort,
-                tools,
-                response_format: None,
-                trace: None,
-                cancel: self.cancel.clone(),
-            };
-            let result = generation(&provider, &mut params, &self.scope, Observation { name: format!("iter-{iteration}"), model_parameters: Some(json!({"reasoning_effort": self.reasoning_effort.as_str(), "thinking": if self.reasoning_effort == crate::models::ReasoningEffort::Disabled {"disabled"} else {"enabled"}}).as_object().cloned().unwrap_or_default()), metadata: Some(self.observation_meta.clone()) }, self.opts.generation_timeout, describe_completion).await?;
-            let calls = providers::tool_calls(&result.message);
-            let content = providers::content(&result.message).unwrap_or_default().to_owned();
-            messages.push(result.message);
+            let message = self.generate(&engine, &mut messages, iteration).await?;
+            let calls = providers::tool_calls(&message);
+            let content = providers::content(&message).unwrap_or_default().to_owned();
+            messages.push(message);
             if calls.is_empty() {
                 self.scope.update(ContextUpdate::output(content.clone()));
                 return Ok(content);
@@ -369,47 +359,51 @@ impl AgentLoop {
             for (_, result) in results {
                 round.push(result?);
             }
-            // `finish` is the round's decision, taken once every call has
-            // answered: one finish, itself valid, with no other call failed,
-            // ends the session without another turn. Otherwise its reply says
-            // why not, and the loop goes on.
-            let finishes: Vec<usize> =
-                round.iter().enumerate().filter(|(_, r)| r.0.name == "finish").map(|(i, _)| i).collect();
-            let failed: Vec<&str> =
-                round.iter().filter(|r| r.0.name != "finish" && r.2).map(|r| r.0.name.as_str()).collect();
-            let mut finished = None;
-            if finishes.len() > 1 {
-                for &i in &finishes {
-                    round[i].1 = "[finish error] call finish once per round".into();
-                }
-            } else if let [i] = finishes[..]
-                && !round[i].2
-            {
-                if failed.is_empty() {
-                    finished = Some(round[i].3.clone());
-                } else {
-                    round[i].1 = format!(
-                        "[finish error] not finished: {} failed; read the errors and continue",
-                        failed.join(", ")
-                    );
-                }
-            }
+            let finished = settle_round(&mut round);
             for (call, presented, _, _) in round {
                 messages.push(providers::tool_reply(&call.id, &presented));
             }
             if let Some(output) = finished {
-                self.scope.update(ContextUpdate {
-                    output: Some(json!(output)),
-                    metadata: Some(json!({"finished_by": "finish"}).as_object().cloned().unwrap_or_default()),
-                    ..Default::default()
-                });
+                self.finished(&output);
                 return Ok(output);
             }
         }
         anyhow::bail!("session {} exceeded maxIterations={}", self.opts.id, self.opts.max_iterations)
     }
+    // The model's next message after `messages`, traced as `iter-{iteration}`.
+    async fn generate(
+        &self,
+        engine: &Arc<Engine>,
+        messages: &mut Vec<Message>,
+        iteration: usize,
+    ) -> anyhow::Result<Message> {
+        check(&self.cancel)?;
+        let provider = engine.resolve_provider(&self.model)?;
+        let mut tools: Vec<_> = crate::mcp::model_tools(&*engine.deps.mcp)
+            .into_iter()
+            .filter(|t| self.allowed.as_ref().is_none_or(|s| s.contains(&t.name)))
+            .collect();
+        tools.extend(synthetic_definitions().iter().filter(|t| self.visible(&t.name)).cloned());
+        let mut params = providers::CompletionParams {
+            model: self.model.clone(),
+            messages,
+            reasoning_effort: self.reasoning_effort,
+            tools,
+            response_format: None,
+            trace: None,
+            cancel: self.cancel.clone(),
+        };
+        let result = generation(&provider, &mut params, &self.scope, Observation { name: format!("iter-{iteration}"), model_parameters: Some(json!({"reasoning_effort": self.reasoning_effort.as_str(), "thinking": if self.reasoning_effort == crate::models::ReasoningEffort::Disabled {"disabled"} else {"enabled"}}).as_object().cloned().unwrap_or_default()), metadata: Some(self.observation_meta.clone()) }, self.opts.generation_timeout, describe_completion).await?;
+        Ok(result.message)
+    }
+    fn finished(&self, output: &str) {
+        self.scope.update(ContextUpdate {
+            output: Some(json!(output)),
+            metadata: Some(json!({"finished_by": "finish"}).as_object().cloned().unwrap_or_default()),
+            ..Default::default()
+        });
+    }
 
-    // ── 3. dispatch / workers ───────────────────────────────────────────────
     fn visible(&self, name: &str) -> bool {
         match name {
             "invoke_sub_agent" => self.opts.parent_id.is_none(),
@@ -432,6 +426,19 @@ impl AgentLoop {
         engine: Arc<Engine>,
         call: providers::ToolCall,
     ) -> anyhow::Result<(providers::ToolCall, String, bool, String)> {
+        let (span, raw) = self.start_call(&engine, &call).await?;
+        let presented = self.present(&call.name, &raw, Some(&span));
+        let failed = is_tool_error(&raw);
+        span.end(if failed { SpanEnd::error(raw.clone()).with_output(raw) } else { SpanEnd::output(raw) });
+        let finish = finish_result(&call);
+        Ok((call, presented, failed, finish))
+    }
+    // One call under its span, left open for the caller: the tool's raw reply.
+    async fn start_call(
+        self: &Arc<Self>,
+        engine: &Arc<Engine>,
+        call: &providers::ToolCall,
+    ) -> anyhow::Result<(Arc<dyn Span>, String)> {
         let mut metadata = self.observation_meta.clone();
         metadata.insert("tool".into(), call.name.clone().into());
         metadata.insert("tool_call_id".into(), call.id.clone().into());
@@ -440,36 +447,34 @@ impl AgentLoop {
                 .input(json!({"raw_arguments": call.arguments}))
                 .metadata(metadata),
         );
-        let mut finish_result = String::new();
         let raw = match serde_json::from_str::<Value>(if call.arguments.is_empty() { "{}" } else { &call.arguments }) {
             Ok(Value::Object(args)) => {
                 span.update(ContextUpdate::input(Value::Object(args.clone())));
-                if call.name == "finish" {
-                    finish_result = args.get("result").and_then(Value::as_str).unwrap_or_default().to_owned();
-                }
-                self.invoke(&engine, &call.name, args, span.clone()).await
+                self.invoke(engine, &call.name, args, span.clone()).await
             }
             _ => Ok("[tool error] arguments must be a JSON object".to_owned()),
         };
-        let raw = match raw {
-            Ok(raw) => raw,
+        match raw {
+            Ok(raw) => Ok((span, raw)),
             Err(error) => {
                 span.end(SpanEnd::error(error.to_string()));
-                return Err(error);
+                Err(error)
             }
-        };
-        // A dry run's report is bounded and read whole: storing it would
-        // only cost a turn to read it back.
-        let presented = if call.name.starts_with("working_memory_") || call.name == "try_workflow" {
-            raw.clone()
-        } else {
-            let stored = store_tool_result(&self.opts.session.memory, &raw);
+        }
+    }
+    // What the model sees of a reply: the reply itself for the working
+    // memory tools and a dry run's bounded report (storing those would only
+    // cost a turn to read them back), else the reply stored in working
+    // memory with its content or a preview.
+    fn present(&self, name: &str, raw: &str, span: Option<&Arc<dyn Span>>) -> String {
+        if name.starts_with("working_memory_") || name == "try_workflow" {
+            return raw.to_owned();
+        }
+        let stored = store_tool_result(&self.opts.session.memory, raw);
+        if let Some(span) = span {
             span.update(ContextUpdate::metadata(json!({"memory_key": stored.memory_key, "result_size_bytes": stored.size_bytes, "result_truncated": stored.truncated}).as_object().cloned().unwrap_or_default()));
-            stored.to_json().to_string()
-        };
-        let failed = is_tool_error(&raw);
-        span.end(if failed { SpanEnd::error(raw.clone()).with_output(raw) } else { SpanEnd::output(raw) });
-        Ok((call, presented, failed, finish_result))
+        }
+        stored.to_json().to_string()
     }
     async fn invoke(
         self: &Arc<Self>,
@@ -688,6 +693,39 @@ impl AgentLoop {
     }
 }
 
+// `finish` is the round's decision, taken once every call has answered: one
+// finish, itself valid, with no other call failed, ends the session without
+// another turn. Otherwise its reply says why not, and the loop goes on.
+// A round is (call, reply as presented, failed, finish's result).
+fn settle_round(round: &mut [(providers::ToolCall, String, bool, String)]) -> Option<String> {
+    let finishes: Vec<usize> = round.iter().enumerate().filter(|(_, r)| r.0.name == "finish").map(|(i, _)| i).collect();
+    let failed: Vec<&str> = round.iter().filter(|r| r.0.name != "finish" && r.2).map(|r| r.0.name.as_str()).collect();
+    if finishes.len() > 1 {
+        for &i in &finishes {
+            round[i].1 = "[finish error] call finish once per round".into();
+        }
+        return None;
+    }
+    let [i] = finishes[..] else { return None };
+    if round[i].2 {
+        return None;
+    }
+    if failed.is_empty() {
+        return Some(round[i].3.clone());
+    }
+    round[i].1 = format!("[finish error] not finished: {} failed; read the errors and continue", failed.join(", "));
+    None
+}
+fn finish_result(call: &providers::ToolCall) -> String {
+    if call.name != "finish" {
+        return String::new();
+    }
+    serde_json::from_str::<Value>(&call.arguments)
+        .ok()
+        .and_then(|args| args.get("result").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_default()
+}
+
 // Verbatim TS protocol descriptions and JSON schemas, captured as JSON so
 // future parity checks compare data rather than two hand-edited copies.
 static SYNTHETIC: LazyLock<Vec<ToolDef>> = LazyLock::new(|| {
@@ -732,4 +770,265 @@ fn string_array(args: &Map<String, Value>, name: &str) -> anyhow::Result<Option<
             })
             .collect::<anyhow::Result<_>>()?,
     ))
+}
+
+// ── 4. the loop as a workflow ───────────────────────────────────────────────
+// The built-in `agent-loop` definition drives a loop through three host
+// functions (flows.rs): `agent_turn`, `tool` and `agent_settle`. The transcript
+// and the working memory travel in the run's context, so the interpreter's
+// task records are the loop's checkpoints and a restart resumes it.
+pub const AGENT_LOOP: &str = include_str!("agent_loop.yaml");
+pub const AGENT_LOOP_NAME: &str = "agent-loop";
+
+// Synthetic tools that change something outside the run. Every other
+// synthetic tool reads, or changes only the working memory, which the run
+// carries itself.
+const SYNTHETIC_WRITES: &[&str] = &[
+    "set_memory",
+    "write_skill",
+    "save_workflow",
+    "activate_workflow",
+    "schedule_task",
+    "cancel_scheduled_task",
+    "invoke_sub_agent",
+];
+
+/// What a call of tool `name` from a loop does: a write is sent at most once.
+/// An MCP tool is a read only when the server marks it read-only; a name
+/// nobody knows counts as a write.
+pub fn tool_effect(engine: &Engine, name: &str) -> owf::run::Effect {
+    use owf::run::Effect;
+    if synthetic_definitions().iter().any(|t| t.name == name) {
+        return if SYNTHETIC_WRITES.contains(&name) { Effect::Write } else { Effect::Read };
+    }
+    if engine.deps.mcp.tools().iter().any(|t| t.name == name) && engine.deps.mcp.read_only(name) {
+        Effect::Read
+    } else {
+        Effect::Write
+    }
+}
+
+/// What rebuilds a loop after a restart. The system prompt is the first
+/// message of the transcript, so it is not repeated here.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LoopSpec {
+    pub id: String,
+    pub session: String,
+    pub env: Value,
+    pub skills: Vec<String>,
+    pub include_engine_skills: bool,
+    pub allow_skill_writes: bool,
+    pub tool_whitelist: Option<Vec<String>>,
+    pub preset: String,
+    pub max_iterations: usize,
+    pub max_concurrent_tools: usize,
+    pub parent_id: Option<String>,
+    pub session_id: Option<String>,
+}
+
+impl AgentLoop {
+    pub fn spec(&self) -> LoopSpec {
+        let opts = &self.opts;
+        let mut whitelist = opts.tool_whitelist.as_ref().map(|w| w.iter().cloned().collect::<Vec<_>>());
+        if let Some(w) = &mut whitelist {
+            w.sort();
+        }
+        LoopSpec {
+            id: opts.id.clone(),
+            session: opts.session.id.clone(),
+            env: opts.session.env.to_json(),
+            skills: opts.skills.clone(),
+            include_engine_skills: opts.include_engine_skills,
+            allow_skill_writes: opts.allow_skill_writes,
+            tool_whitelist: whitelist,
+            preset: opts.preset.as_str().into(),
+            max_iterations: opts.max_iterations,
+            max_concurrent_tools: opts.max_concurrent_tools,
+            parent_id: opts.parent_id.clone(),
+            session_id: opts.session_id.clone(),
+        }
+    }
+
+    /// The run's input for this loop, which has not run yet, and its first
+    /// user message.
+    pub async fn workflow_input(&self, text: &str) -> Value {
+        let mut messages = self.messages.lock().await.clone();
+        messages.push(providers::user(text));
+        json!({"loop": self.spec(), "messages": messages, "memory": self.opts.session.memory.snapshot()})
+    }
+
+    fn restore_memory(&self, memory: Option<&Value>) -> anyhow::Result<()> {
+        if let Some(memory) = memory.filter(|m| !m.is_null())
+            && !self.memory_restored.swap(true, Ordering::SeqCst)
+        {
+            self.opts.session.memory.restore(memory)?;
+        }
+        Ok(())
+    }
+}
+
+impl Engine {
+    /// The loop a run drives: the live one, or one rebuilt from its spec
+    /// after a restart, traced under `scope`.
+    pub async fn loop_for(
+        self: &Arc<Self>,
+        spec: &LoopSpec,
+        scope: &Scope,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<Arc<AgentLoop>> {
+        if let Some(live) = self.loops.lock().await.get(&spec.id).cloned() {
+            return Ok(live);
+        }
+        let env = crate::session::EnvData::from_json(&spec.env)?;
+        let mut opts = LoopOptions::new(&spec.id, crate::session::session(&spec.session, env));
+        opts.cancel = cancel.clone();
+        opts.skills = spec.skills.clone();
+        opts.include_engine_skills = spec.include_engine_skills;
+        opts.allow_skill_writes = spec.allow_skill_writes;
+        opts.tool_whitelist = spec.tool_whitelist.as_ref().map(|w| w.iter().cloned().collect());
+        opts.preset = match spec.preset.as_str() {
+            "compiler" => PresetName::Compiler,
+            name => PresetName::selectable(name).ok_or_else(|| anyhow::anyhow!("unknown preset {name}"))?,
+        };
+        opts.max_iterations = spec.max_iterations;
+        opts.max_concurrent_tools = spec.max_concurrent_tools;
+        opts.parent_id = spec.parent_id.clone();
+        opts.session_id = spec.session_id.clone();
+        opts.trace_scope = Some(scope.clone());
+        let rebuilt = self.start_loop(opts).await?;
+        rebuilt.memory_restored.store(false, Ordering::SeqCst);
+        Ok(rebuilt)
+    }
+}
+
+fn loop_spec(args: &Value) -> anyhow::Result<LoopSpec> {
+    Ok(serde_json::from_value(args.get("loop").cloned().unwrap_or(Value::Null))?)
+}
+
+/// `agent_turn { loop, messages, memory, i }`: the model's next message,
+/// with its calls as `{ id, name, arguments }`.
+pub async fn loop_turn(
+    engine: &Arc<Engine>,
+    args: &Value,
+    scope: &Scope,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Value> {
+    let spec = loop_spec(args)?;
+    let loop_ = engine.loop_for(&spec, scope, cancel).await?;
+    loop_.restore_memory(args.get("memory"))?;
+    let i = args.get("i").and_then(Value::as_u64).unwrap_or(0) as usize;
+    if i >= spec.max_iterations {
+        anyhow::bail!("session {} exceeded maxIterations={}", spec.id, spec.max_iterations);
+    }
+    let mut messages: Vec<Message> = serde_json::from_value(args.get("messages").cloned().unwrap_or(Value::Null))?;
+    if i == 0
+        && let Some(message) = messages.iter().find(|m| providers::role(m) == "user")
+    {
+        loop_.scope.update(ContextUpdate::input(message.get("content").cloned().unwrap_or(Value::Null)));
+    }
+    let message = loop_.generate(engine, &mut messages, i).await?;
+    let calls: Vec<Value> = providers::tool_calls(&message)
+        .into_iter()
+        .map(|c| json!({"id": c.id, "name": c.name, "arguments": c.arguments}))
+        .collect();
+    let content = providers::content(&message).unwrap_or_default().to_owned();
+    if calls.is_empty() {
+        loop_.scope.update(ContextUpdate::output(content.clone()));
+    }
+    Ok(json!({"message": message, "calls": calls, "content": content}))
+}
+
+fn tool_call(value: &Value) -> anyhow::Result<providers::ToolCall> {
+    let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
+    Ok(providers::ToolCall {
+        id: text("id").ok_or_else(|| anyhow::anyhow!("a call needs an id"))?,
+        name: text("name").ok_or_else(|| anyhow::anyhow!("a call needs a name"))?,
+        arguments: text("arguments").unwrap_or_default(),
+    })
+}
+
+/// `tool { loop, call, memory? }`: one call of the round, `{ raw, failed }`,
+/// plus the working-memory change it made (`op`), which `agent_settle`
+/// applies again, since a call that completed before a restart is not rerun.
+pub async fn loop_tool(
+    engine: &Arc<Engine>,
+    args: &Value,
+    scope: &Scope,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Value> {
+    let loop_ = engine.loop_for(&loop_spec(args)?, scope, cancel).await?;
+    loop_.restore_memory(args.get("memory"))?;
+    let call = tool_call(args.get("call").unwrap_or(&Value::Null))?;
+    let (span, raw) = loop_.start_call(engine, &call).await?;
+    let failed = is_tool_error(&raw);
+    span.end(if failed { SpanEnd::error(raw.clone()).with_output(raw.clone()) } else { SpanEnd::output(raw.clone()) });
+    let mut out = json!({"raw": raw, "failed": failed});
+    if !failed {
+        let parsed: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+        match call.name.as_str() {
+            "working_memory_put" => {
+                let format = parsed.get("format").and_then(Value::as_str).unwrap_or("text");
+                out["op"] = json!(["put", parsed["key"], parsed["value"], format]);
+            }
+            "working_memory_delete" => out["op"] = json!(["delete", parsed["key"]]),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// What a write that may have run before a restart answers the model.
+pub fn unknown_tool_outcome(name: &str) -> Value {
+    json!({"raw": format!("[tool error] outcome unknown: {name} was sent before a restart and its reply was lost, so it may or may not have run. Check its effect before repeating it."), "failed": true})
+}
+
+/// `agent_settle { loop, calls, results, memory }`: the round's replies as
+/// the model sees them, the working memory after the round, and whether
+/// `finish` ended the session (with its `output`).
+pub async fn loop_settle(
+    engine: &Arc<Engine>,
+    args: &Value,
+    scope: &Scope,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Value> {
+    let loop_ = engine.loop_for(&loop_spec(args)?, scope, cancel).await?;
+    // The round starts from the memory before it: what its calls changed is
+    // applied again from their results, then their replies are stored.
+    let memory = &loop_.opts.session.memory;
+    memory.restore(args.get("memory").unwrap_or(&json!([])))?;
+    loop_.memory_restored.store(true, Ordering::SeqCst);
+    let calls = args.get("calls").and_then(Value::as_array).cloned().unwrap_or_default();
+    let results = args.get("results").and_then(Value::as_array).cloned().unwrap_or_default();
+    anyhow::ensure!(calls.len() == results.len(), "a round settles one result per call");
+    let mut round = Vec::with_capacity(calls.len());
+    for (call, result) in calls.iter().zip(&results) {
+        let call = tool_call(call)?;
+        match result.get("op").and_then(Value::as_array).map(Vec::as_slice) {
+            Some([op, key, value, format]) if op == "put" => {
+                let format = if format == "json" { Format::Json } else { Format::Text };
+                let _ = memory.put(key.as_str().unwrap_or_default(), value.as_str().unwrap_or_default(), format);
+            }
+            Some([op, key]) if op == "delete" => {
+                memory.delete(key.as_str().unwrap_or_default());
+            }
+            _ => {}
+        }
+        let raw = result.get("raw").and_then(Value::as_str).unwrap_or_default();
+        let failed = result.get("failed").and_then(Value::as_bool).unwrap_or(true);
+        let presented = loop_.present(&call.name, raw, None);
+        let finish = finish_result(&call);
+        round.push((call, presented, failed, finish));
+    }
+    let finished = settle_round(&mut round);
+    let replies: Vec<Message> =
+        round.iter().map(|(call, presented, _, _)| providers::tool_reply(&call.id, presented)).collect();
+    if let Some(output) = &finished {
+        loop_.finished(output);
+    }
+    Ok(json!({
+        "replies": replies,
+        "memory": memory.snapshot(),
+        "finished": finished.is_some(),
+        "output": finished.unwrap_or_default(),
+    }))
 }
