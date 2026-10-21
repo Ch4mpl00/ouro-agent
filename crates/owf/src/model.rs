@@ -521,7 +521,10 @@ impl Parser {
             self.raise_task(r, &format!("{at}/raise"))
         } else if let Some(v) = m.get("listen") {
             for key in ["read", "foreach"] {
-                if m.contains_key(key) { self.fail(&format!("{at}/{key}"), "listen read/foreach is not supported"); return None; }
+                if m.contains_key(key) {
+                    self.fail(&format!("{at}/{key}"), "listen read/foreach is not supported");
+                    return None;
+                }
             }
             self.only(m, at, &[COMMON, &["listen"]].concat());
             self.listen(v, &format!("{at}/listen"))

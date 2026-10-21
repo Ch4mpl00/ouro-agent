@@ -27,4 +27,4 @@ Feature: The tools the agent sees
       """
       { "text": "Choose", "buttons": [[{ "text": "Confirm", "data": "" }]] }
       """
-    Then the call fails with "button data must be 1–64 bytes"
+    Then the call is rejected as invalid parameters

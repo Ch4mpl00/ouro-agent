@@ -477,5 +477,57 @@ fn events_survive_restart_consume_atomically_and_do_not_reopen_ended_runs() {
     lease.finish(&Status::Completed(json!({}))).unwrap();
     assert!(!store.deliver("yes", &json!({})).unwrap());
     store.sweep(-1).unwrap();
-    assert_eq!(db.conn().query_row("SELECT count(*) FROM workflow_events", [], |r| r.get::<_,i64>(0)).unwrap(), 0);
+    assert_eq!(db.conn().query_row("SELECT count(*) FROM workflow_events", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+}
+
+#[test]
+fn any_consumes_one_event_and_other_deliveries_do_not_spin_an_unrelated_wait() {
+    use owf::run::Events;
+    let db = AgentDb::open(":memory:").unwrap();
+    let store = RunStore::new(db);
+    let lease = store.start("r", "w", "x", &json!({})).unwrap().unwrap();
+    lease.register("r", &["yes".into(), "no".into()]).unwrap();
+    assert!(store.deliver("yes", &json!({"first":true})).unwrap());
+    assert!(store.deliver("no", &json!({"second":true})).unwrap());
+    let first = lease.take("r", "one#event", &["yes".into(), "no".into()]).unwrap().unwrap();
+    assert_eq!(first["type"], "yes");
+    lease.register("r", &["later".into()]).unwrap();
+    lease.finish(&Status::Waiting { wake_at_ms: i64::MAX }).unwrap();
+    assert!(store.due().unwrap().is_empty(), "an unmatched queued event does not spin the worker");
+    assert!(!store.deliver("yes", &json!({})).unwrap());
+    assert!(store.deliver("later", &json!({})).unwrap());
+    let lease = store.claim("r").unwrap().unwrap();
+    lease.register("r", &["no".into()]).unwrap();
+    let second = lease.take("r", "two#event", &["no".into()]).unwrap().unwrap();
+    assert_eq!(second["data"], json!({"second":true}), "any leaves other events for later listens");
+    lease.unregister("r", "later#event", &["later".into()]).unwrap();
+    assert!(!store.deliver("later", &json!({})).unwrap());
+    store.cancel("r").unwrap();
+    assert!(lease.register("r", &["late".into()]).is_err());
+    assert!(!store.deliver("late", &json!({})).unwrap());
+}
+
+#[test]
+fn a_concurrent_take_or_timeout_does_not_close_another_listener_of_the_same_type() {
+    use owf::run::Events;
+    let db = AgentDb::open(":memory:").unwrap();
+    let store = RunStore::new(db);
+    let lease = store.start("r", "w", "x", &json!({})).unwrap().unwrap();
+    let types = vec!["shared".into()];
+    lease.register("r", &types).unwrap();
+    assert_eq!(lease.take("r", "a#event", &types).unwrap(), None);
+    // Delivery between polling two concurrent listeners must not orphan A.
+    assert!(store.deliver("shared", &json!({"n":1})).unwrap());
+    lease.register("r", &types).unwrap();
+    assert!(lease.take("r", "b#event", &types).unwrap().is_some());
+    assert!(store.deliver("shared", &json!({"n":2})).unwrap());
+    assert_eq!(lease.take("r", "a#event", &types).unwrap().unwrap()["data"]["n"], 2);
+    assert!(!store.deliver("shared", &json!({})).unwrap());
+    lease.register("r", &types).unwrap();
+    assert_eq!(lease.take("r", "c#event", &types).unwrap(), None);
+    assert_eq!(lease.take("r", "d#event", &types).unwrap(), None);
+    lease.unregister("r", "c#event", &types).unwrap();
+    assert!(store.deliver("shared", &json!({"n":3})).unwrap());
+    assert!(lease.take("r", "d#event", &types).unwrap().is_some());
+    assert!(!store.deliver("shared", &json!({})).unwrap());
 }

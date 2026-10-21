@@ -160,6 +160,9 @@ impl Drop for TaskSpan<'_> {
 /// Registration is idempotent, including registration before a question is sent.
 pub trait Events: Send + Sync {
     fn register(&self, run_id: &str, types: &[String]) -> anyhow::Result<()>;
+    /// Close a timed-out wait. Delivered events remain available to a future
+    /// matching listen, but cannot keep an unrelated wait awake.
+    fn unregister(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<()>;
     fn take(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<Option<Value>>;
 }
 
@@ -915,15 +918,25 @@ impl Run<'_> {
         };
         self.observe(Event::TaskStarted { reference, parent, kind: task.kind.name(), input: &input });
         span.active = true;
-        let body = self.kind(task, reference, &input, ctx, scope, &desc);
         let (out, flow) = match limit {
-            None => body.await?,
-            Some(_) if self.record(&format!("{reference}#event")).is_some() => body.await?,
+            None => self.kind(task, reference, &input, ctx, scope, &desc).await?,
+            Some(_) if self.record(&format!("{reference}#event")).is_some() => {
+                self.kind(task, reference, &input, ctx, scope, &desc).await?
+            }
             Some(limit) => {
-                let (remaining, deadline) = self
-                    .remaining(limit, started_ms)
+                let remaining = self.remaining(limit, started_ms);
+                if remaining.is_err()
+                    && let Kind::Listen(filters) = &task.kind
+                    && let Some(events) = self.host.functions.events()
+                {
+                    let types = listen_types(filters, &input, &self.args(ctx, &input, &null, &desc, scope))?;
+                    events
+                        .unregister(self.run_id, &format!("{reference}#event"), &types)
+                        .map_err(|e| Fault::Storage(WorkflowError::runtime(e.to_string())))?;
+                }
+                let (remaining, deadline) = remaining
                     .map_err(|error| if self.has_unknown(reference) { self.unknown(reference) } else { error })?;
-                match tokio::time::timeout(remaining, body).await {
+                match tokio::time::timeout(remaining, self.kind(task, reference, &input, ctx, scope, &desc)).await {
                     Ok(Err(Fault::Waiting(wake))) => return Err(Fault::Waiting(wake.min(deadline))),
                     Ok(r) => r?,
                     Err(_) => {
@@ -1056,27 +1069,18 @@ impl Run<'_> {
                     .functions
                     .events()
                     .ok_or_else(|| WorkflowError::validation("events are not supported by this host"))?;
-                let types = filters
-                    .iter()
-                    .map(|v| {
-                        let v = expr::render(v, input, &args(ctx)).map_err(expression)?;
-                        v.as_str()
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_owned)
-                            .ok_or_else(|| expression("event type must be a non-empty string".into()))
-                    })
-                    .collect::<Result<Vec<_>, Fault>>()?;
+                let types = listen_types(filters, input, &args(ctx))?;
                 let storage = |e: anyhow::Error| Fault::Storage(WorkflowError::runtime(e.to_string()));
                 events.register(self.run_id, &types).map_err(storage)?;
-                if self.journal.is_none() {
-                    return Err(
-                        WorkflowError::runtime("listen requires a durable journal; cannot wait in a dry run").into()
-                    );
-                }
                 let key = format!("{reference}#event");
                 if let Some(event) = events.take(self.run_id, &key, &types).map_err(storage)? {
                     self.save(&key, Record::Event { event: event.clone() })?;
                     return Ok((json!([event]), None));
+                }
+                if self.journal.is_none() {
+                    return Err(
+                        WorkflowError::runtime("listen requires a durable journal; cannot wait in a dry run").into()
+                    );
                 }
                 Err(Fault::Waiting(253_402_300_799_000))
             }
@@ -1565,6 +1569,19 @@ impl Run<'_> {
             _ = tokio::time::sleep(d) => Ok(()),
         }
     }
+}
+
+fn listen_types(filters: &[Value], input: &Value, args: &Args) -> Result<Vec<String>, Fault> {
+    filters
+        .iter()
+        .map(|v| {
+            let v = expr::render(v, input, args).map_err(expression)?;
+            v.as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| expression("event type must be a non-empty string".into()))
+        })
+        .collect()
 }
 
 /// `when` must hold and `exceptWhen` must not.

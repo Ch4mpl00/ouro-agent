@@ -138,9 +138,14 @@ pub struct CallbackQuery {
     pub data: Option<String>,
 }
 #[derive(Debug, Deserialize)]
-pub struct InlineKeyboard { pub inline_keyboard: Vec<Vec<CallbackButton>> }
+pub struct InlineKeyboard {
+    pub inline_keyboard: Vec<Vec<CallbackButton>>,
+}
 #[derive(Debug, Deserialize)]
-pub struct CallbackButton { pub text: String, pub callback_data: Option<String> }
+pub struct CallbackButton {
+    pub text: String,
+    pub callback_data: Option<String>,
+}
 
 /// Rows of buttons. A press becomes a telegram_button signal or a workflow event.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -152,8 +157,12 @@ pub type Buttons = Vec<Vec<Button>>;
 
 fn check_buttons(buttons: Option<&Buttons>) -> Result<(), ErrorData> {
     for b in buttons.into_iter().flatten().flatten() {
-        if b.text.trim().is_empty() { return Err(invalid_params("button text must be non-empty")); }
-        if !(1..=64).contains(&b.data.len()) { return Err(invalid_params("button data must be 1–64 bytes")); }
+        if b.text.trim().is_empty() {
+            return Err(invalid_params("button text must be non-empty"));
+        }
+        if !(1..=64).contains(&b.data.len()) {
+            return Err(invalid_params("button data must be 1–64 bytes"));
+        }
     }
     Ok(())
 }
@@ -228,7 +237,13 @@ impl BotApi {
         self.send_message_buttons(chat_id, text, thread_id, None).await
     }
 
-    pub async fn send_message_buttons(&self, chat_id: &str, text: &str, thread_id: Option<i64>, buttons: Option<&Buttons>) -> Result<SentMessage, TelegramError> {
+    pub async fn send_message_buttons(
+        &self,
+        chat_id: &str,
+        text: &str,
+        thread_id: Option<i64>,
+        buttons: Option<&Buttons>,
+    ) -> Result<SentMessage, TelegramError> {
         self.call(
             "sendMessage",
             without_nulls(json!({ "chat_id": chat_id, "text": text, "message_thread_id": thread_id, "reply_markup": buttons.map(markup) })),
@@ -247,9 +262,19 @@ impl BotApi {
         self.edit_message_buttons(chat_id, message_id, text, None).await
     }
 
-    pub async fn edit_message_buttons(&self, chat_id: &str, message_id: i64, text: &str, buttons: Option<&Buttons>) -> Result<SentMessage, TelegramError> {
-        self.call("editMessageText", json!({ "chat_id": chat_id, "message_id": message_id, "text": text,
-            "reply_markup": markup(&buttons.cloned().unwrap_or_default()) })).await
+    pub async fn edit_message_buttons(
+        &self,
+        chat_id: &str,
+        message_id: i64,
+        text: &str,
+        buttons: Option<&Buttons>,
+    ) -> Result<SentMessage, TelegramError> {
+        self.call(
+            "editMessageText",
+            json!({ "chat_id": chat_id, "message_id": message_id, "text": text,
+            "reply_markup": markup(&buttons.cloned().unwrap_or_default()) }),
+        )
+        .await
     }
 
     pub async fn answer_callback_query(&self, id: &str) -> Result<(), TelegramError> {
@@ -886,12 +911,30 @@ pub async fn poll_once(
             if let Err(error) = bot.answer_callback_query(&callback.id).await {
                 tracing::warn!(%error, "could not answer button press");
             }
-            let text = msg.reply_markup.as_ref().into_iter().flat_map(|k| &k.inline_keyboard)
-                .flatten().find(|b| b.callback_data.as_ref() == Some(data)).map(|b| b.text.as_str());
-            store.record_message(msg.chat.id, msg.message_id, msg.message_thread_id,
-                &format!("[button] {}", text.unwrap_or(data))).await?;
-            store.record_signal("telegram_button", &json!({"chatId":msg.chat.id,
-                "messageThreadId":msg.message_thread_id,"messageId":msg.message_id,"data":data,"text":text}).to_string()).await?;
+            let text = msg
+                .reply_markup
+                .as_ref()
+                .into_iter()
+                .flat_map(|k| &k.inline_keyboard)
+                .flatten()
+                .find(|b| b.callback_data.as_ref() == Some(data))
+                .map(|b| b.text.as_str());
+            store
+                .record_message(
+                    msg.chat.id,
+                    msg.message_id,
+                    msg.message_thread_id,
+                    &format!("[button] {}", text.unwrap_or(data)),
+                )
+                .await?;
+            store
+                .record_signal(
+                    "telegram_button",
+                    &json!({"chatId":msg.chat.id,
+                "messageThreadId":msg.message_thread_id,"messageId":msg.message_id,"data":data,"text":text})
+                    .to_string(),
+                )
+                .await?;
         }
         store.set_last_update_id(update.update_id).await?;
     }
@@ -1005,8 +1048,15 @@ pub async fn send_long_message(
     send_long_message_buttons(bot, chat_id, text, thread_id, None).await
 }
 
-pub async fn send_long_message_buttons(bot: &BotApi, chat_id: &str, text: &str, thread_id: Option<i64>, buttons: Option<&Buttons>) -> Result<(Vec<String>, Vec<SentMessage>), SendError> {
-    let parts: Vec<_> = split_telegram_text(text, TELEGRAM_TEXT_LIMIT).into_iter().filter(|p| !p.trim().is_empty()).collect();
+pub async fn send_long_message_buttons(
+    bot: &BotApi,
+    chat_id: &str,
+    text: &str,
+    thread_id: Option<i64>,
+    buttons: Option<&Buttons>,
+) -> Result<(Vec<String>, Vec<SentMessage>), SendError> {
+    let parts: Vec<_> =
+        split_telegram_text(text, TELEGRAM_TEXT_LIMIT).into_iter().filter(|p| !p.trim().is_empty()).collect();
     let mut sent = Vec::new();
     for (i, part) in parts.iter().enumerate() {
         let keyboard = if i + 1 == parts.len() { buttons } else { None };
@@ -1132,16 +1182,19 @@ impl McpTools {
                     }
                     anyhow::Ok(())
                 };
-                let (parts, sent) = match send_long_message_buttons(&tg.bot, &target, &p.text, p.message_thread_id, p.buttons.as_ref()).await {
-                    Ok(result) => result,
-                    Err(SendError::Partial(err)) => {
-                        // The partial send is the story the model needs; a log
-                        // failure on top of it must not replace it.
-                        let _ = record(err.delivered.clone(), err.parts.clone()).await;
-                        return Err(err.into());
-                    }
-                    Err(SendError::Telegram(err)) => return Err(err.into()),
-                };
+                let (parts, sent) =
+                    match send_long_message_buttons(&tg.bot, &target, &p.text, p.message_thread_id, p.buttons.as_ref())
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(SendError::Partial(err)) => {
+                            // The partial send is the story the model needs; a log
+                            // failure on top of it must not replace it.
+                            let _ = record(err.delivered.clone(), err.parts.clone()).await;
+                            return Err(err.into());
+                        }
+                        Err(SendError::Telegram(err)) => return Err(err.into()),
+                    };
                 let Some(first) = sent.first().cloned() else {
                     anyhow::bail!("Nothing to send: the text is only whitespace.");
                 };
@@ -1626,8 +1679,14 @@ mod button_tests {
     use super::*;
     #[test]
     fn callback_data_limits_count_bytes_and_labels_are_required() {
-        for (text, data, valid) in [("Yes", "a".repeat(64), true), ("Yes", "a".repeat(65), false),
-            ("Yes", "🧾".repeat(16), true), ("Yes", "🧾".repeat(17), false), ("", "x".into(), false), ("Yes", "".into(), false)] {
+        for (text, data, valid) in [
+            ("Yes", "a".repeat(64), true),
+            ("Yes", "a".repeat(65), false),
+            ("Yes", "🧾".repeat(16), true),
+            ("Yes", "🧾".repeat(17), false),
+            ("", "x".into(), false),
+            ("Yes", "".into(), false),
+        ] {
             assert_eq!(check_buttons(Some(&vec![vec![Button { text: text.into(), data }]])).is_ok(), valid);
         }
     }

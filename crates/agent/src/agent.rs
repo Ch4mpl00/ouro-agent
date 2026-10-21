@@ -945,7 +945,8 @@ impl AgentLoop {
             w.sort();
         }
         LoopSpec {
-            confirm: opts.confirm.clone(),            id: opts.id.clone(),
+            confirm: opts.confirm.clone(),
+            id: opts.id.clone(),
             session: opts.session.id.clone(),
             env: opts.session.env.to_json(),
             skills: opts.skills.clone(),
@@ -1033,8 +1034,15 @@ impl AgentLoop {
         };
         let verdicts =
             crate::guard::judge(engine, &context, calls, &chain, call_count, &self.scope, &self.cancel).await?;
-        let labels: serde_json::Map<String,Value> = calls.iter().filter_map(|call| verdicts.iter()
-            .find(|(key,_)| key == &crate::guard::key(call)).map(|(_,v)| (call.id.clone(),json!(v.label)))).collect();
+        let labels: serde_json::Map<String, Value> = calls
+            .iter()
+            .filter_map(|call| {
+                verdicts
+                    .iter()
+                    .find(|(key, _)| key == &crate::guard::key(call))
+                    .map(|(_, v)| (call.id.clone(), json!(v.label)))
+            })
+            .collect();
         let output = json!({"verdicts":verdicts,"labels":labels});
         self.guard.lock().await.verdicts.extend(verdicts);
         Ok(output)
@@ -1145,12 +1153,20 @@ pub async fn loop_guard(
 }
 
 pub async fn loop_confirm_request(
-    engine: &Arc<Engine>, args: &Value, scope: &Scope, info: &owf::run::CallInfo<'_>,
-    runs: Option<&crate::durable::RunStore>, events: Option<&dyn owf::run::Events>,
+    engine: &Arc<Engine>,
+    args: &Value,
+    scope: &Scope,
+    info: &owf::run::CallInfo<'_>,
+    runs: Option<&crate::durable::RunStore>,
+    events: Option<&dyn owf::run::Events>,
 ) -> anyhow::Result<Value> {
     let loop_ = engine.loop_for(&loop_spec(args)?, scope, info.cancel).await?;
-    let Some((runs, events, target)) = runs.zip(events).zip(loop_.opts.confirm.as_ref())
-        .filter(|_| loop_.opts.parent_id.is_none()).map(|((r,e),t)| (r,e,t)) else {
+    let Some((runs, events, target)) = runs
+        .zip(events)
+        .zip(loop_.opts.confirm.as_ref())
+        .filter(|_| loop_.opts.parent_id.is_none())
+        .map(|((r, e), t)| (r, e, t))
+    else {
         return Ok(json!({"required":false}));
     };
     let call = tool_call(&args["call"])?;
@@ -1164,10 +1180,19 @@ pub async fn loop_confirm_request(
             return Ok(json!({"required":false}));
         };
         let context = state.context.as_ref().ok_or_else(|| anyhow::anyhow!("missing guard context"))?;
-        (v.guidance.clone(), if context.root_request.is_empty() { context.task.clone() } else { context.root_request.clone() })
+        (
+            v.guidance.clone(),
+            if context.root_request.is_empty() { context.task.clone() } else { context.root_request.clone() },
+        )
     };
-    crate::confirmation::request(runs.confirmations(), events, &*engine.deps.mcp,
-        crate::confirmation::Request { run:info.run_id,call:&call,target,guidance:&guidance,goal:&goal }, info.cancel).await
+    crate::confirmation::request(
+        runs.confirmations(),
+        events,
+        &*engine.deps.mcp,
+        crate::confirmation::Request { run: info.run_id, call: &call, target, guidance: &guidance, goal: &goal },
+        info.cancel,
+    )
+    .await
 }
 
 fn tool_call(value: &Value) -> anyhow::Result<providers::ToolCall> {
@@ -1197,19 +1222,48 @@ pub async fn loop_tool(
     let child = runs.zip(child_key(args)).map(|(runs, key)| ChildRun { runs, key });
     let worker_run = child.as_ref().map(|c| format!("{}/loop", child_loop_id(&loop_.opts.id, &c.key)));
     let _slot = loop_.slots.acquire().await?;
-    let outcome = if let Some(claimed) = args.get("outcome").and_then(Value::as_str) {
-        Some(if let Some((runs, id)) = runs.zip(run_id).filter(|_| loop_.opts.parent_id.is_none() && loop_.opts.confirm.is_some()) {
-            runs.confirmations().resolve(id, &crate::guard::key(&call), claimed)?
-        } else { "unverified".into() })
-    } else { None };
+    let pending = runs
+        .zip(run_id)
+        .map(|(runs, id)| runs.confirmations().get(id, &crate::guard::key(&call)))
+        .transpose()?
+        .flatten()
+        .is_some();
+    let claimed = args.get("outcome").and_then(Value::as_str);
+    // Once a card exists, omitting the workflow outcome cannot fall back to
+    // a fresh guard decision and bypass that pending human decision.
+    let outcome = if let Some(claimed) = claimed.or(pending.then_some("unverified")) {
+        Some(
+            if let Some((runs, id)) =
+                runs.zip(run_id).filter(|_| loop_.opts.parent_id.is_none() && loop_.opts.confirm.is_some())
+            {
+                runs.confirmations().resolve(id, &crate::guard::key(&call), claimed)?
+            } else {
+                "unverified".into()
+            },
+        )
+    } else {
+        None
+    };
     let verdict = if let Some(outcome) = &outcome {
         let (label, guidance) = match outcome.as_str() {
             "confirmed" => ("allow", "The user confirmed this exact call.".to_owned()),
-            "declined" => ("declined", format!("{} was not made: declined by the user. Do not retry it; ask the user what they want instead",call.name)),
-            "expired" => ("expired", format!("{} was not made: not confirmed within 24 h",call.name)),
-            _ => ("unverified_confirmation", format!("{} was not made: no consumed confirmation matches this exact call. Do not retry it",call.name)),
+            "declined" => (
+                "declined",
+                format!(
+                    "{} was not made: declined by the user. Do not retry it; ask the user what they want instead",
+                    call.name
+                ),
+            ),
+            "expired" => ("expired", format!("{} was not made: not confirmed within 24 h", call.name)),
+            _ => (
+                "unverified_confirmation",
+                format!(
+                    "{} was not made: no consumed confirmation matches this exact call. Do not retry it",
+                    call.name
+                ),
+            ),
         };
-        Some(crate::guard::Verdict { label:label.into(),guidance,unavailable:None })
+        Some(crate::guard::Verdict { label: label.into(), guidance, unavailable: None })
     } else if crate::guard::needs_guard(engine, &call) {
         let key = crate::guard::key(&call);
         let recorded = loop_.guard.lock().await.verdicts.remove(&key);
@@ -1236,10 +1290,11 @@ pub async fn loop_tool(
         v
     });
     let guard_call = loop_.guard.lock().await.record_call(&call, verdict.as_ref().is_some_and(|v| !v.allowed()));
-    let (span, raw) = loop_.start_call(engine, &call, child, runs, verdict.as_ref()).await?;
+    let dispatched = loop_.start_call(engine, &call, child, runs, verdict.as_ref()).await;
     if let Some((outcome, (runs, id))) = outcome.as_deref().zip(runs.zip(run_id)) {
         crate::confirmation::close_card(runs.confirmations(), &*engine.deps.mcp, id, &call, outcome, cancel).await;
     }
+    let (span, raw) = dispatched?;
     let failed = raw.starts_with("[guard] blocked:") || is_tool_error(&raw);
     let (mut presented, stored) = loop_.present(&call.name, &raw, &span);
     // A durable worker's run, for read_run: beside its answer, not in it,

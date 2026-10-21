@@ -136,3 +136,21 @@ on every resumption. `PROPERTY_RUNS` controls cases per property:
 ```sh
 PROPERTY_RUNS=256 cargo test --offline -p owf --test durable
 ```
+
+## Event waits
+
+Hosts may expose `run::Events` through `Functions::events`. `listen.to.one`
+and `listen.to.any` accept filters of the form `with: { type: ... }`, with
+literal or runtime-expression types. Their output is an array containing the
+first matching consumed event (`{ type, data, time }`). Other listen forms
+are explicitly unsupported. Hosts without this seam reject listens during
+validation. A dry run or ephemeral executor can consume an available event,
+but an empty listen faults rather than waiting without a journal.
+
+Registration is idempotent. The adapter takes an event and writes its
+`Record::Event` checkpoint in one fenced transaction; a crash before the
+enclosing task checkpoint cannot consume a second event. Without an event,
+the executor returns `Waiting` until the saved task timeout deadline (or the
+far future). Delivery wakes the run; expiry raises the standard catchable
+timeout. The agent stores registrations and deliveries in agent.db and
+preserves a delivery wake-up racing with suspension.

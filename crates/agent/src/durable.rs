@@ -53,7 +53,9 @@ impl RunStore {
         Self { db }
     }
 
-    pub fn confirmations(&self) -> &dyn crate::confirmation::Store { &self.db }
+    pub fn confirmations(&self) -> &dyn crate::confirmation::Store {
+        &self.db
+    }
 
     pub fn get(&self, id: &str) -> anyhow::Result<Option<SavedRun>> {
         let row = self
@@ -132,20 +134,27 @@ impl RunStore {
         Ok(inserted)
     }
 
-    /// One event belongs to one live run. Remove its registration on delivery,
-    /// so a double press cannot enqueue another copy before consumption.
+    /// One event belongs to one live run. A pending delivery excludes a second
+    /// copy; taking it removes its registration, closing double presses.
     pub fn deliver(&self, type_: &str, data: &Value) -> anyhow::Result<bool> {
         let mut conn = self.db.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let run: Option<String> = tx.query_row(
-            "SELECT a.run_id FROM workflow_awaits a JOIN workflow_runs r ON r.id = a.run_id
+        let run: Option<String> = tx
+            .query_row(
+                "SELECT a.run_id FROM workflow_awaits a JOIN workflow_runs r ON r.id = a.run_id
              WHERE a.type = ?1 AND r.ended_ms IS NULL AND r.state IN ('ready','running','waiting')
-             ORDER BY a.registered_at_ms, a.run_id LIMIT 1", [type_], |r| r.get(0)).optional()?;
+             AND NOT EXISTS (SELECT 1 FROM workflow_events e WHERE e.run_id = a.run_id AND e.type = a.type AND e.consumed_at_ms IS NULL)
+             ORDER BY a.registered_at_ms, a.run_id LIMIT 1",
+                [type_],
+                |r| r.get(0),
+            )
+            .optional()?;
         let Some(run) = run else { return Ok(false) };
-        tx.execute("INSERT INTO workflow_events (run_id,type,data,delivered_at_ms) VALUES (?1,?2,?3,?4)",
-            params![run,type_,serde_json::to_string(data)?,now()])?;
-        tx.execute("DELETE FROM workflow_awaits WHERE run_id = ?1 AND type = ?2", params![run,type_])?;
-        tx.execute("UPDATE workflow_runs SET wake_at_ms = ?2 WHERE id = ?1", params![run,now()])?;
+        tx.execute(
+            "INSERT INTO workflow_events (run_id,type,data,delivered_at_ms) VALUES (?1,?2,?3,?4)",
+            params![run, type_, serde_json::to_string(data)?, now()],
+        )?;
+        tx.execute("UPDATE workflow_runs SET wake_at_ms = ?2 WHERE id = ?1", params![run, now()])?;
         tx.commit()?;
         Ok(true)
     }
@@ -183,6 +192,7 @@ impl RunStore {
             params![id, serde_json::to_string(&Status::Cancelled)?, now()],
         )? == 1;
         tx.execute("DELETE FROM workflow_awaits WHERE run_id = ?1", [id])?;
+        tx.execute("DELETE FROM workflow_listeners WHERE run_id = ?1", [id])?;
         tx.commit()?;
         Ok(changed)
     }
@@ -193,11 +203,18 @@ impl RunStore {
     pub fn sweep(&self, kept_ms: i64) -> anyhow::Result<usize> {
         let mut conn = self.db.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute("DELETE FROM confirmations WHERE run_id IN (SELECT id FROM workflow_runs WHERE ended_ms <= ?1)", [now() - kept_ms])?;
-        tx.execute("DELETE FROM workflow_events WHERE run_id IN (SELECT id FROM workflow_runs WHERE ended_ms <= ?1)", [now() - kept_ms])?;
+        tx.execute(
+            "DELETE FROM confirmations WHERE run_id IN (SELECT id FROM workflow_runs WHERE ended_ms <= ?1)",
+            [now() - kept_ms],
+        )?;
+        tx.execute(
+            "DELETE FROM workflow_events WHERE run_id IN (SELECT id FROM workflow_runs WHERE ended_ms <= ?1)",
+            [now() - kept_ms],
+        )?;
         let deleted = tx.execute(
             "DELETE FROM workflow_records WHERE run_id IN (SELECT id FROM workflow_runs WHERE ended_ms <= ?1)",
-            [now() - kept_ms])?;
+            [now() - kept_ms],
+        )?;
         tx.commit()?;
         Ok(deleted)
     }
@@ -276,9 +293,16 @@ impl Lease {
                 }
             }
         };
-        let wake = if state == "waiting" && tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM workflow_events WHERE run_id = ?1 AND consumed_at_ms IS NULL)",
-            [&self.id], |r| r.get::<_, bool>(0))? { now() } else { wake };
+        let wake = if state == "waiting"
+            && tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_events e JOIN workflow_awaits a ON a.run_id = e.run_id AND a.type = e.type WHERE e.run_id = ?1 AND e.consumed_at_ms IS NULL)",
+                [&self.id],
+                |r| r.get::<_, bool>(0),
+            )? {
+            now()
+        } else {
+            wake
+        };
         let terminal = matches!(status, Status::Completed(_) | Status::Faulted(_) | Status::Cancelled);
         let encoded = terminal.then(|| serde_json::to_string(&status)).transpose()?;
         tx.execute(
@@ -286,7 +310,10 @@ impl Lease {
             interruptions = ?5, owner = NULL, lease_until_ms = NULL, ended_ms = ?6 WHERE id = ?1",
             params![self.id, state, wake, encoded, interruptions, terminal.then(now)],
         )?;
-        if terminal { tx.execute("DELETE FROM workflow_awaits WHERE run_id = ?1", [&self.id])?; }
+        if terminal {
+            tx.execute("DELETE FROM workflow_awaits WHERE run_id = ?1", [&self.id])?;
+            tx.execute("DELETE FROM workflow_listeners WHERE run_id = ?1", [&self.id])?;
+        }
         tx.commit()?;
         Ok(status)
     }
@@ -350,18 +377,28 @@ impl Journal for Lease {
 // ── 3. durable events ──────────────────────────────────────────────────────
 
 impl owf::run::Events for Lease {
+    fn unregister(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
+        anyhow::ensure!(run_id == self.id, "event run does not own this lease");
+        let mut conn = self.db.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.check(&tx)?;
+        tx.execute("DELETE FROM workflow_listeners WHERE run_id = ?1 AND key = ?2", params![run_id, key])?;
+        close_awaits(&tx, run_id, types)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn register(&self, run_id: &str, types: &[String]) -> anyhow::Result<()> {
         anyhow::ensure!(run_id == self.id, "event run does not own this lease");
         let mut conn = self.db.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.check(&tx)?;
         for t in types {
-            // Delivered or consumed tokens stay closed on replay. New loop
-            // invocations can reuse a type once the preceding event was taken.
-            tx.execute("INSERT INTO workflow_awaits (run_id,type,registered_at_ms)
-                SELECT ?1,?2,?3 WHERE NOT EXISTS (SELECT 1 FROM workflow_events
-                    WHERE run_id = ?1 AND type = ?2 AND consumed_at_ms IS NULL)
-                ON CONFLICT(run_id,type) DO NOTHING", params![run_id,t,now()])?;
+            tx.execute(
+                "INSERT INTO workflow_awaits (run_id,type,registered_at_ms) VALUES (?1,?2,?3)
+                ON CONFLICT(run_id,type) DO NOTHING",
+                params![run_id, t, now()],
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -371,31 +408,69 @@ impl owf::run::Events for Lease {
         let mut conn = self.db.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.check(&tx)?;
-        let saved: Option<String> = tx.query_row("SELECT record FROM workflow_records WHERE run_id = ?1 AND key = ?2",
-            params![run_id,key], |r| r.get(0)).optional()?;
+        let saved: Option<String> = tx
+            .query_row(
+                "SELECT record FROM workflow_records WHERE run_id = ?1 AND key = ?2",
+                params![run_id, key],
+                |r| r.get(0),
+            )
+            .optional()?;
         if let Some(saved) = saved {
-            let Record::Event { event } = serde_json::from_str(&saved)? else { anyhow::bail!("invalid event checkpoint") };
+            let Record::Event { event } = serde_json::from_str(&saved)? else {
+                anyhow::bail!("invalid event checkpoint")
+            };
             return Ok(Some(event));
         }
         let candidate = {
-            let mut stmt = tx.prepare("SELECT id,type,data,delivered_at_ms FROM workflow_events
-                WHERE run_id = ?1 AND consumed_at_ms IS NULL ORDER BY id")?;
-            stmt.query_map([run_id], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?, r.get::<_,i64>(3)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?.into_iter().find(|(_,t,_,_)| types.contains(t))
+            let mut stmt = tx.prepare(
+                "SELECT id,type,data,delivered_at_ms FROM workflow_events
+                WHERE run_id = ?1 AND consumed_at_ms IS NULL ORDER BY id",
+            )?;
+            stmt.query_map([run_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .find(|(_, t, _, _)| types.contains(t))
         };
-        let Some((id,t,data,time)) = candidate else { return Ok(None) };
+        let Some((id, t, data, time)) = candidate else {
+            // Several concurrent listens may share a type. Keep each empty
+            // invocation subscribed, so another listener's take cannot close it.
+            for t in types {
+                tx.execute(
+                    "INSERT INTO workflow_listeners (run_id,key,type) VALUES (?1,?2,?3) ON CONFLICT DO NOTHING",
+                    params![run_id, key, t],
+                )?;
+            }
+            tx.commit()?;
+            return Ok(None);
+        };
         let event = serde_json::json!({"type":t,"data":serde_json::from_str::<Value>(&data)?,
             "time":chrono::DateTime::from_timestamp_millis(time).ok_or_else(|| anyhow::anyhow!("invalid event time"))?.to_rfc3339()});
-        tx.execute("UPDATE workflow_events SET consumed_at_ms = ?2, consumed_key = ?3 WHERE id = ?1", params![id,now(),key])?;
-        for t in types {
-            tx.execute("DELETE FROM workflow_awaits WHERE run_id = ?1 AND type = ?2", params![run_id,t])?;
-            // Two competing buttons may both arrive before the first take.
-            // The loser must not keep waking a later, unrelated wait.
-            tx.execute("DELETE FROM workflow_events WHERE run_id = ?1 AND type = ?2 AND consumed_at_ms IS NULL", params![run_id,t])?;
-        }
-        tx.execute("INSERT INTO workflow_records (run_id,key,record) VALUES (?1,?2,?3)",
-            params![run_id,key,serde_json::to_string(&Record::Event { event: event.clone() })?])?;
+        tx.execute(
+            "UPDATE workflow_events SET consumed_at_ms = ?2, consumed_key = ?3 WHERE id = ?1",
+            params![id, now(), key],
+        )?;
+        tx.execute("DELETE FROM workflow_listeners WHERE run_id = ?1 AND key = ?2", params![run_id, key])?;
+        close_awaits(&tx, run_id, types)?;
+        tx.execute(
+            "INSERT INTO workflow_records (run_id,key,record) VALUES (?1,?2,?3)",
+            params![run_id, key, serde_json::to_string(&Record::Event { event: event.clone() })?],
+        )?;
         tx.commit()?;
         Ok(Some(event))
     }
+}
+
+// A run/type registration is shared by every unfinished listen of that type.
+// Closing one invocation must leave its concurrent siblings reachable.
+fn close_awaits(tx: &rusqlite::Transaction<'_>, run_id: &str, types: &[String]) -> anyhow::Result<()> {
+    for t in types {
+        tx.execute(
+            "DELETE FROM workflow_awaits WHERE run_id = ?1 AND type = ?2 AND NOT EXISTS
+            (SELECT 1 FROM workflow_listeners WHERE run_id = ?1 AND type = ?2)",
+            params![run_id, t],
+        )?;
+    }
+    Ok(())
 }
