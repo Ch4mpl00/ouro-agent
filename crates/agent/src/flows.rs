@@ -583,7 +583,8 @@ impl owf::run::Functions for Functions {
                                 Ok(None) | Err(_) => return Ok(json!({"run":null})),
                             }
                         };
-                        let definition = loop_definition(engine).0;
+                        let (definition, version) = loop_definition(engine);
+                        let input = with_override(input, version);
                         self.start_child(
                             runs,
                             events,
@@ -1095,6 +1096,8 @@ fn execute_saved<'a>(
     cancel: &'a CancellationToken,
 ) -> BoxFuture<'a, FlowResult> {
     async move {
+        let loop_run = saved.name == crate::agent::AGENT_LOOP_NAME;
+        let loop_version = saved.input.get(OVERRIDE).and_then(Value::as_i64);
         let guard_parent = if saved.name == "guard" {
             let parent = saved.parent_run.as_deref().map(|id| runs.get(id)).transpose().ok().flatten().flatten();
             let id = parent.and_then(|p| p.input["loop"]["id"].as_str().map(str::to_owned));
@@ -1149,10 +1152,19 @@ fn execute_saved<'a>(
             engine.end_loop(&id).await;
         }
         let (status, effects_started) = status;
+        // Publish the breaker's decision before completion wakes the parent;
+        // otherwise a fast parent can admit the next worker on a bad version.
+        if loop_run {
+            loop_outcome(engine, loop_version, &flow_result(status.clone(), effects_started));
+        }
+        let interrupted = matches!(status, RunStatus::Interrupted(_));
         let result = match if stopped { lease.release().map(|()| status) } else { lease.finish(&status) } {
             Ok(status) => flow_result(status, effects_started),
             Err(error) => FlowResult::Interrupted { error: WorkflowError::runtime(error.to_string()) },
         };
+        if loop_run && interrupted && matches!(result, FlowResult::Faulted { .. }) {
+            loop_outcome(engine, loop_version, &result);
+        }
         root.end(match &result {
             // Handed back for the next process to resume: not a failure.
             FlowResult::Interrupted { .. } if stopped => SpanEnd::output(json!({"released":true})),
@@ -1269,13 +1281,11 @@ impl Flows {
         }
         let scope: Scope = trace.clone();
         let driven = is_loop.then(|| saved.input["loop"]["id"].as_str().map(str::to_owned)).flatten();
-        let version = saved.input.get(OVERRIDE).and_then(Value::as_i64);
         let result = execute_saved(&self.engine, runs, saved, lease, &scope, cancel).await;
         if let FlowResult::Completed(output) = &result {
             trace.update(crate::tracing::ContextUpdate::output(output.clone()));
         }
         if let Some(id) = driven {
-            loop_outcome(&self.engine, version, &result);
             self.engine.end_loop(&id).await;
         }
         trace.end();
@@ -1489,12 +1499,7 @@ pub async fn run_loop_durable(
     })();
     match claimed {
         Err(error) => FlowResult::Interrupted { error: WorkflowError::runtime(error.to_string()) },
-        Ok(Some((saved, lease))) => {
-            let version = saved.input.get(OVERRIDE).and_then(Value::as_i64);
-            let result = execute_saved(engine, runs, saved, lease, scope, cancel).await;
-            loop_outcome(engine, version, &result);
-            result
-        }
+        Ok(Some((saved, lease))) => execute_saved(engine, runs, saved, lease, scope, cancel).await,
         Ok(None) => match runs.get(id) {
             Ok(Some(crate::durable::SavedRun { outcome: Some(status), .. })) => flow_result(status, true),
             Ok(_) => FlowResult::Waiting { wake_at_ms: chrono::Utc::now().timestamp_millis() },

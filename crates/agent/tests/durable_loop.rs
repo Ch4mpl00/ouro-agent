@@ -1068,3 +1068,38 @@ do:
     assert!(matches!(result, FlowResult::Completed(_)), "{result:?}");
     assert_eq!(*world.calls.lock().unwrap(), ["send"]);
 }
+
+#[tokio::test]
+async fn worker_children_keep_the_active_loop_version_and_its_breaker() {
+    let model = Arc::new(Scripted::new(vec![
+        calls(&[("invoke_sub_agent", json!({"prompt":"first"}))]),
+        calls(&[("invoke_sub_agent", json!({"prompt":"second"}))]),
+        calls(&[("invoke_sub_agent", json!({"prompt":"third"}))]),
+        calls(&[("invoke_sub_agent", json!({"prompt":"fourth"}))]),
+        assistant("worker recovered"),
+        assistant("done"),
+    ]));
+    let dir = tempfile::tempdir().unwrap();
+    let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
+    let engine =
+        engine_with(model.clone(), Arc::new(World { calls: Mutex::default(), stop: None }), Arc::new(db.clone()));
+    let admitted = input(&engine, "breaker-parent").await;
+    let runs = RunStore::new(db.clone());
+    runs.admit("breaker-parent/loop", "agent-loop", agent::agent::AGENT_LOOP, &admitted).unwrap();
+    let broken = "document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '2.0.0' }\ndo: [{ boom: { raise: { error: { type: 'https://example.com/boom', status: 500 } } } }, { guard: { call: start_child, with: { workflow: guard, calls: [], i: 1 } } }]";
+    let version = engine.deps.workflows.save("agent-loop", broken, None).unwrap();
+    engine.deps.workflows.activate("agent-loop", version.version).unwrap();
+    let result = create_durable_flows(engine.clone(), db)
+        .run_loop("breaker-parent/loop", admitted, &scope(&engine), &CancellationToken::new())
+        .await;
+    assert!(matches!(result,FlowResult::Completed(ref output) if output=="done"), "{result:?}");
+    for round in 1..=3 {
+        let child = runs.get(&format!("breaker-parent__sub{round}.0/loop")).unwrap().unwrap();
+        assert_eq!(child.input["override_version"], version.version);
+        assert!(matches!(child.outcome, Some(Status::Faulted(_))));
+    }
+    let recovered = runs.get("breaker-parent__sub4.0/loop").unwrap().unwrap();
+    assert!(recovered.input["override_version"].is_null());
+    assert_eq!(recovered.outcome, Some(Status::Completed(json!("worker recovered"))));
+    assert_eq!(model.seen.lock().unwrap().len(), 6);
+}
