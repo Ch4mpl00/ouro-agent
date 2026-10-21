@@ -855,6 +855,8 @@ pub enum FlowResult {
 
 #[async_trait]
 pub trait FlowRun: Send + Sync {
+    fn pending_confirmations(&self, _target: &crate::agent::ConfirmTarget) -> anyhow::Result<Value> { Ok(json!([])) }
+
     fn deliver_event(&self, _type: &str, _data: &Value) -> anyhow::Result<bool> { Ok(false) }
 
     async fn run(
@@ -1142,6 +1144,10 @@ pub fn check(mcp: &dyn Mcp, definition: &str) -> Result<owf::model::Workflow, St
 
 #[async_trait]
 impl FlowRun for Flows {
+    fn pending_confirmations(&self, target: &crate::agent::ConfirmTarget) -> anyhow::Result<Value> {
+        self.runs.as_ref().map_or(Ok(json!([])), |r| r.confirmations().pending(target))
+    }
+
     fn deliver_event(&self, type_: &str, data: &Value) -> anyhow::Result<bool> {
         self.runs.as_ref().map_or(Ok(false), |r| r.deliver(type_, data))
     }

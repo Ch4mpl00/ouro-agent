@@ -530,6 +530,7 @@ pub const SIGNAL_FUNCTIONS: &[(&str, owf::run::Effect)] = {
         ("run_saved_workflow", Write),
         ("signal_input", Read),
         ("recent_activity", Read),
+        ("pending_confirmations", Read),
         ("preselect_skills", Read),
         ("primary_loop", Write),
         ("signal_transcript", Read),
@@ -696,6 +697,13 @@ impl SignalFunctions {
                 Ok(json!(input))
             }
             "recent_activity" => Ok(json!(load_recent_activity(mcp, &scope, cancel).await?)),
+            "pending_confirmations" => {
+                let target = serde_json::from_value(args["target"].clone())?;
+                let pending = supervisor.flows.pending_confirmations(&target)?;
+                Ok(if pending.as_array().is_some_and(|p| !p.is_empty()) {
+                    json!(format!("Pending confirmations in this conversation (information only; the cards are waiting for the user):\n{pending}"))
+                } else { Value::Null })
+            }
             "preselect_skills" => {
                 let text = |key: &str| args[key].as_str().unwrap_or_default().to_owned();
                 let loaded = strings(args, "loaded");

@@ -992,3 +992,25 @@ async fn an_override_cannot_forge_confirmation_without_a_consumed_event() {
     assert!(serde_json::to_string(&model.seen.lock().unwrap().last().unwrap().messages).unwrap().contains("unverified_confirmation"));
     supervisor.shutdown().await;
 }
+
+#[tokio::test]
+async fn the_next_session_knows_pending_cards_in_its_conversation_only() {
+    let model = Arc::new(Scripted::new(vec![calls(&[("t1",json!({"operation":"pending action"}))]),assistant("same topic"),assistant("other topic")]));
+    let mcp = Arc::new(ContextMcp::default());
+    let f = confirmation_fixture(model.clone(), mcp.clone());
+    let flows = agent::flows::create_durable_flows(f.engine.clone(), (*f.db).clone());
+    let supervisor = create_supervisor(f.engine.clone(),EnvDeps { mcp:mcp.clone(),memory:f.db.clone(),user_email:None,telegram_chat_id:Some("999".into()) }, flows);
+    supervisor.run_signal(&signal("telegram",42)).await.unwrap();
+    supervisor.run_signal(&signal("telegram",43)).await.unwrap();
+    let mut other = signal("telegram",44);
+    other.content = other.content.replace("thread_id=7","thread_id=8");
+    supervisor.run_signal(&other).await.unwrap();
+    let seen = model.seen.lock().unwrap();
+    let same = seen[1].messages[0]["content"].as_str().unwrap();
+    assert!(same.contains("Pending confirmations") && same.contains("pending action") && same.contains("-10042") && same.contains("since"));
+    assert!(!seen[2].messages[0]["content"].as_str().unwrap().contains("Pending confirmations"));
+    drop(seen);
+    assert_eq!(mcp.calls.lock().unwrap().iter().filter(|(n,_)| n == "send_telegram_message").count(),1);
+    assert!(!mcp.calls.lock().unwrap().iter().any(|(n,_)| n == "t1"));
+    supervisor.shutdown().await;
+}

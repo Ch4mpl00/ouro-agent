@@ -18,12 +18,26 @@ pub struct Pending {
 }
 pub trait Store: Send + Sync {
     fn get(&self, run: &str, key: &str) -> anyhow::Result<Option<Pending>>;
+    fn pending(&self, target: &ConfirmTarget) -> anyhow::Result<Value>;
     fn insert(&self, pending: &Pending) -> anyhow::Result<()>;
     fn sent(&self, run: &str, key: &str, message: i64) -> anyhow::Result<()>;
     /// Resolves using a consumed event, never a YAML claim of approval.
     fn resolve(&self, run: &str, key: &str, claimed: &str) -> anyhow::Result<String>;
 }
 impl Store for AgentDb {
+    fn pending(&self, target: &ConfirmTarget) -> anyhow::Result<Value> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT c.card,c.chat_id,c.thread_id,c.message_id,c.created_at_ms
+            FROM confirmations c JOIN workflow_runs r ON r.id = c.run_id
+            WHERE c.outcome IS NULL AND c.message_id IS NOT NULL AND r.ended_ms IS NULL
+            AND c.chat_id = ?1 AND c.thread_id IS ?2 ORDER BY c.created_at_ms LIMIT 10")?;
+        let cards = stmt.query_map(params![target.chat_id,target.message_thread_id], |r| Ok(json!({
+            "call":clip(&r.get::<_,String>(0)?,500),"chatId":r.get::<_,String>(1)?,"messageThreadId":r.get::<_,Option<i64>>(2)?,
+            "messageId":r.get::<_,i64>(3)?,"since":r.get::<_,i64>(4)?
+        })))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(json!(cards))
+    }
+
     fn get(&self, run: &str, key: &str) -> anyhow::Result<Option<Pending>> {
         Ok(self.conn().query_row("SELECT yes_type,no_type,chat_id,thread_id,message_id,card FROM confirmations WHERE run_id = ?1 AND call_key = ?2",
             params![run,key], |r| Ok(Pending { run:run.into(),key:key.into(),yes:r.get(0)?,no:r.get(1)?,target:ConfirmTarget { chat_id:r.get(2)?, message_thread_id:r.get(3)? },message:r.get(4)?,card:r.get(5)? })).optional()?)

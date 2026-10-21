@@ -26,7 +26,14 @@ do:
         - after_saved:
             switch:
               - done: { when: '${ .done == true }', then: end }
-              - on: { then: input }
+              - on: { then: confirm_target }
+        - confirm_target:
+            set: >-
+                ${ if $context.signal.source == "telegram" or $context.signal.source == "telegram_button"
+                   then $context.conversation
+                   elif $context.default_chat != null then { chatId: $context.default_chat, messageThreadId: null }
+                   else null end }
+            export: { as: '${ $context + { confirm: . } }' }
         - input:
             call: signal_input
             export: { as: '${ $context + { input: . } }' }
@@ -34,6 +41,11 @@ do:
             if: '${ $context.signal.source == "telegram" or $context.signal.source == "telegram_button" or $context.signal.source == "peer" }'
             call: recent_activity
             export: { as: '${ $context + { activity: . } }' }
+        - pending_confirmations:
+            if: '${ $context.confirm != null }'
+            call: pending_confirmations
+            with: { target: '${ $context.confirm }' }
+            export: { as: '${ $context + { pending_confirmations: . } }' }
         - own_skills:
             # A transport source has a skill of its own; domain work is delegated.
             set: '${ if $context.signal.source == "peer" or $context.signal.source == "scheduler" then [ $context.signal.source ] else [] end }'
@@ -49,11 +61,7 @@ do:
             call: primary_loop
             with:
               input: '${ $context.input }'
-              confirm: >-
-                ${ if $context.signal.source == "telegram" or $context.signal.source == "telegram_button"
-                   then $context.conversation
-                   elif $context.default_chat != null then { chatId: $context.default_chat, messageThreadId: null }
-                   else null end }
+              confirm: '${ $context.confirm }'
               skills: '${ $context.own }'
               loaded: '${ $context.own + $context.engine_skills + ($context.preselected.names // []) }'
               preset: '${ if $context.signal.source == "scheduler" then "base" else "smart" end }'
@@ -62,6 +70,7 @@ do:
                 ${ [
                   $context.context,
                   $context.activity,
+                  $context.pending_confirmations,
                   ("Signal source: " + $context.signal.source),
                   "Call find_skills only when the task needs something specific that the skills already in your instructions don't cover; the source is only a hint. You own delivery.",
                   $context.preselected.block,
