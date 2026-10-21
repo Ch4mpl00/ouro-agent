@@ -397,8 +397,8 @@ ask for one.
    function catalog, and the reply lists every write the workflow would make.
 2. **Dry-run.** `try_workflow` runs a version once on today's data. Reads
    and model steps are real. Writes (messages, watermarks, journal entries)
-   are only recorded and answered with an explicit mock. The author fixes
-   what the run shows and describes the workflow to the user with a sample.
+   are only recorded. The author fixes what the run shows and describes the
+   workflow to the user with a sample.
    A loop, a route or a `signal` override is tried on a signal instead
    (`sandbox.rs`): `try_workflow(name, signal, drafts, confirm)` runs it as if
    it had arrived, through the dispatcher, the route, the loop, the guard and

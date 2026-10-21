@@ -43,8 +43,8 @@ re-planned on every fire.
    accepted reply names flows that are legal but usually a mistake: fix
    them too unless you meant exactly that.
 5. Try it: `try_workflow(name)` runs the saved draft now, on today's data,
-   as a scheduled fire would, except that its writes are only recorded and
-   answered with a mock. (A loop, a route or `signal` is tried on a signal
+   as a scheduled fire would, except that its writes are only recorded.
+   (A loop, a route or `signal` is tried on a signal
    instead: see "Trying a loop, a route or the dispatcher".)
    Read the report as the user would live with it:
    - it ended `completed`, and its `path` is the one you meant: every

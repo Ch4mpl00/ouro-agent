@@ -21,6 +21,7 @@ const LOOP: &str = include_str!("fixtures/agent-loop-telegram.yaml");
 const SKILLS: &[(&str, &str)] = &[
     ("telegram", "---\ntools: *\n---\nTELEGRAM"),
     ("worker", "---\ntools: *\n---\nWORKER"),
+    ("peer", "---\ntools: *\n---\nPEER"),
     ("recovery", "---\ntools: []\n---\nRECOVERY"),
     ("workflow-author", "---\ntools: []\n---\nAUTHOR"),
 ];
@@ -356,4 +357,26 @@ async fn a_jq_error_in_a_draft_names_the_expression_and_the_value_it_met() {
     assert!(!s.f.engine.deps.workflows.get("signal-telegram", Some(3)).unwrap().unwrap().tried);
     s.assert_nothing_kept();
     assert!(s.f.engine.deps.memory.get("signal_telegram.breaker").unwrap().is_none(), "its fault counts nowhere");
+}
+
+// The dispatcher itself can be a draft: a peer signal takes its default path,
+// on the draft, while the live `signal` stays the built-in one.
+#[tokio::test]
+async fn a_signal_override_draft_runs_in_place_of_the_built_in_dispatcher() {
+    let s = sandbox(vec![assistant("terse answer")], "allow");
+    let terse = agent::supervisor::SIGNAL
+        .replace(r#""Call find_skills only when"#, r#""Answer tersely.", "Call find_skills only when"#);
+    assert_ne!(terse, agent::supervisor::SIGNAL);
+    s.f.engine.deps.workflows.save("signal", &terse, None).unwrap();
+    let peer = "Message from claude-code, thread 3:\n\nwhat time is it?";
+    let report = s.try_signal(json!({"name":"signal","signal":{"source":"peer","content":peer}})).await.unwrap();
+    assert_eq!(report["status"], "completed", "{report:#}");
+    assert_eq!(report["output"], "terse answer");
+    assert_eq!(run(&report, "peer:0/signal")["version"], "draft v1");
+    assert_eq!(report["ended"]["by"], "answer");
+    let system = s.model.seen.lock().unwrap()[0].messages[0]["content"].as_str().unwrap().to_owned();
+    assert!(system.contains("Answer tersely."), "{system}");
+    assert!(s.f.engine.deps.workflows.get("signal", Some(1)).unwrap().unwrap().tried);
+    assert!(s.f.engine.deps.workflows.active("signal").unwrap().is_none(), "the built-in still handles signals");
+    s.assert_nothing_kept();
 }

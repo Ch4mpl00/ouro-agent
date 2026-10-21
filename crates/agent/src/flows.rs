@@ -2574,8 +2574,9 @@ struct DryRun {
     writes: Mutex<Vec<Value>>,
 }
 
-// The sandbox's mock, the same for every dry run.
-const DRY_WRITE_REPLY: &str = crate::sandbox::MOCK_REPLY;
+// Kept for the scheduled form: saved workflows (skill-index) check a write's
+// `ok`. A signal's dry run answers with the sandbox's explicit mock instead.
+const DRY_WRITE_REPLY: &str = r#"{"ok":true,"dryRun":true}"#;
 
 impl DryRun {
     fn intercept(&self, name: &str, args: &Value, reference: &str) -> Option<Value> {
