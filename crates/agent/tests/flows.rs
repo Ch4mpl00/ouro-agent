@@ -1060,8 +1060,8 @@ fn guard_is_reserved_readable_and_its_private_functions_are_not_in_the_catalog()
 
 #[tokio::test]
 async fn a_waiting_saved_child_recovers_in_its_parents_session() {
-    use agent::{durable::RunStore, flows::create_durable_flows};
-    let w = world(vec![]);
+    use agent::{db::TraceStore, durable::RunStore, flows::create_durable_flows};
+    let mut w = world(vec![]);
     w.activate(
         "child",
         r#"document: { dsl: '1.0.4', namespace: t, name: child, version: '1.0.0' }
@@ -1089,6 +1089,8 @@ do:
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("agent.db");
     let db = AgentDb::open(&path).unwrap();
+    w.tracer = Arc::new(agent::local_recorder::local_recorder_tracer(Arc::new(db.clone())));
+    Arc::get_mut(&mut w.engine).unwrap().deps.tracer = w.tracer.clone();
     let flows = create_durable_flows(w.engine.clone(), db.clone());
     let trace = w.tracer.trace(TraceStart {
         id: "parents-session".into(),
@@ -1108,14 +1110,41 @@ do:
     let db = AgentDb::open(&path).unwrap();
     let runs = RunStore::new(db.clone());
     assert!(runs.deliver("child-answer", &json!({})).unwrap());
-    let flows = create_durable_flows(w.engine.clone(), db);
+    let flows = create_durable_flows(w.engine.clone(), db.clone());
     assert_eq!(flows.recover_once(&cancel).await.unwrap(), 1);
     assert_eq!(flows.recover_once(&cancel).await.unwrap(), 1);
     assert_eq!(
         runs.get("test:2").unwrap().unwrap().outcome,
         Some(owf::run::Status::Completed(json!({"Completed":42})))
     );
-    let traces = w.written.all();
-    let child = traces.iter().find(|t| t.name == "resume:child").unwrap();
-    assert_eq!(child.session_id.as_deref(), Some("shared-session"));
+    let (trace, observations) = db.get_trace("parents-session").unwrap().unwrap();
+    assert_eq!(trace.session_id.as_deref(), Some("shared-session"));
+    assert_eq!(trace.output, json!({"Completed":42}));
+    assert_eq!(db.list_recent(20, None).unwrap().len(), 1);
+    let child = observations.iter().find(|o| o.name == "resume:child").unwrap();
+    let anchor_span = observations.iter().find(|o| Some(&o.id) == child.parent_observation_id.as_ref()).unwrap();
+    assert_eq!(anchor_span.name, "call:start");
+    assert!(observations.iter().any(|o| o.name == "resume:parent"));
+}
+
+#[tokio::test]
+async fn a_run_admitted_without_an_anchor_retains_its_separate_resume_trace() {
+    use agent::{db::TraceStore, durable::RunStore, flows::create_durable_flows};
+    let mut w = world(vec![]);
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(AgentDb::open(dir.path().join("agent.db")).unwrap());
+    Arc::get_mut(&mut w.engine).unwrap().deps.tracer =
+        Arc::new(agent::local_recorder::local_recorder_tracer(db.clone()));
+    let definition = "document: {dsl: '1.0.4', namespace: t, name: legacy, version: '1.0.0'}\ndo:\n  - done: {set: '${ \"finished\" }'}\n";
+    let runs = RunStore::new((*db).clone());
+    runs.admit("legacy", "legacy", definition, &json!({"__session_id":"original"})).unwrap();
+    assert!(runs.get("legacy").unwrap().unwrap().trace_anchor.is_none());
+    let flows = create_durable_flows(w.engine, (*db).clone());
+    assert_eq!(flows.recover_once(&CancellationToken::new()).await.unwrap(), 1);
+    let rows = db.list_recent(20, None).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].name, "resume:legacy");
+    let (trace, _) = db.get_trace(&rows[0].id).unwrap().unwrap();
+    assert_eq!(trace.session_id.as_deref(), Some("original"));
+    assert_eq!(trace.output, "finished");
 }

@@ -54,6 +54,7 @@ pub struct SavedRun {
     pub definition: String,
     pub input: Value,
     pub outcome: Option<Status>,
+    pub trace_anchor: Option<crate::tracing::TraceAnchor>,
 }
 
 impl RunStore {
@@ -70,7 +71,7 @@ impl RunStore {
             .db
             .conn()
             .query_row(
-                "SELECT name, definition, input, outcome, state, parent_run FROM workflow_runs WHERE id = ?1",
+                "SELECT name, definition, input, outcome, state, parent_run, trace_anchor FROM workflow_runs WHERE id = ?1",
                 [id],
                 |r| {
                     Ok((
@@ -80,15 +81,17 @@ impl RunStore {
                         r.get::<_, Option<String>>(3)?,
                         r.get::<_, String>(4)?,
                         r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
             .optional()?;
-        row.map(|(name, definition, input, outcome, state, parent_run)| {
+        row.map(|(name, definition, input, outcome, state, parent_run, trace_anchor)| {
             Ok(SavedRun {
                 id: id.into(),
                 name,
                 parent_run,
+                trace_anchor: trace_anchor.map(|s| serde_json::from_str(&s)).transpose()?,
                 state,
                 definition,
                 input: serde_json::from_str(&input)?,
@@ -115,15 +118,26 @@ impl RunStore {
     }
 
     pub fn admit(&self, id: &str, name: &str, definition: &str, input: &Value) -> anyhow::Result<()> {
-        self.insert(id, name, definition, input, None).map(|_| ())
+        self.insert(id, name, definition, input, None, None).map(|_| ())
     }
 
     /// Admits a new run already claimed, in one statement, so the recovery
     /// worker cannot take it between admission and claim. None when the run
     /// existed before.
     pub fn start(&self, id: &str, name: &str, definition: &str, input: &Value) -> anyhow::Result<Option<Lease>> {
+        self.start_anchored(id, name, definition, input, None)
+    }
+
+    pub fn start_anchored(
+        &self,
+        id: &str,
+        name: &str,
+        definition: &str,
+        input: &Value,
+        anchor: Option<&crate::tracing::TraceAnchor>,
+    ) -> anyhow::Result<Option<Lease>> {
         let owner = uuid::Uuid::new_v4().to_string();
-        let inserted = self.insert(id, name, definition, input, Some(&owner))?;
+        let inserted = self.insert(id, name, definition, input, Some(&owner), anchor)?;
         Ok(inserted.then(|| Lease { db: self.db.clone(), id: id.into(), owner, ended: AtomicBool::new(false) }))
     }
 
@@ -134,14 +148,24 @@ impl RunStore {
         definition: &str,
         input: &Value,
         owner: Option<&str>,
+        anchor: Option<&crate::tracing::TraceAnchor>,
     ) -> anyhow::Result<bool> {
         let conn = self.db.conn();
         let state = if owner.is_some() { "running" } else { "ready" };
         let lease = owner.map(|_| now() + LEASE_MS);
         let inserted = conn.execute(
-            "INSERT INTO workflow_runs (id, name, definition, input, state, owner, lease_until_ms)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO NOTHING",
-            params![id, name, definition, serde_json::to_string(input)?, state, owner, lease],
+            "INSERT INTO workflow_runs (id, name, definition, input, state, owner, lease_until_ms, trace_anchor)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(id) DO NOTHING",
+            params![
+                id,
+                name,
+                definition,
+                serde_json::to_string(input)?,
+                state,
+                owner,
+                lease,
+                anchor.map(serde_json::to_string).transpose()?
+            ],
         )? == 1;
         let original: String = conn.query_row("SELECT name FROM workflow_runs WHERE id = ?1", [id], |r| r.get(0))?;
         anyhow::ensure!(original == name, "run {id} already belongs to workflow {original}");
@@ -157,6 +181,19 @@ impl RunStore {
         definition: &str,
         input: &Value,
         link: ChildLink<'_>,
+    ) -> anyhow::Result<Option<Lease>> {
+        self.start_child_anchored(id, name, definition, input, link, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_child_anchored(
+        &self,
+        id: &str,
+        name: &str,
+        definition: &str,
+        input: &Value,
+        link: ChildLink<'_>,
+        anchor: Option<&crate::tracing::TraceAnchor>,
     ) -> anyhow::Result<Option<Lease>> {
         let mut conn = self.db.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -176,9 +213,9 @@ impl RunStore {
             params![link.parent, format!("child:{id}"), format!("done:{id}")],
         )?;
         let owner = uuid::Uuid::new_v4().to_string();
-        let inserted = tx.execute("INSERT INTO workflow_runs (id,name,definition,input,state,owner,lease_until_ms,parent_run,child_key,child_reference)
-            VALUES (?1,?2,?3,?4,'running',?5,?6,?7,?8,?9) ON CONFLICT DO NOTHING",
-            params![id,name,definition,serde_json::to_string(input)?,owner,now()+LEASE_MS,link.parent,link.key,link.reference])? == 1;
+        let inserted = tx.execute("INSERT INTO workflow_runs (id,name,definition,input,state,owner,lease_until_ms,parent_run,child_key,child_reference,trace_anchor)
+            VALUES (?1,?2,?3,?4,'running',?5,?6,?7,?8,?9,?10) ON CONFLICT DO NOTHING",
+            params![id,name,definition,serde_json::to_string(input)?,owner,now()+LEASE_MS,link.parent,link.key,link.reference,anchor.map(serde_json::to_string).transpose()?])? == 1;
         // Adopt workers admitted before child ownership existed. Their run id
         // and input stay unchanged, so an in-flight worker is never restarted.
         tx.execute(
@@ -248,16 +285,20 @@ impl RunStore {
     /// One event belongs to one live run. A pending delivery excludes a second
     /// copy; taking it removes its registration, closing double presses.
     pub fn deliver(&self, type_: &str, data: &Value) -> anyhow::Result<bool> {
+        Ok(self.deliver_to(type_, data)?.is_some())
+    }
+
+    pub fn deliver_to(&self, type_: &str, data: &Value) -> anyhow::Result<Option<String>> {
         let mut conn = self.db.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let Some(run) = deliver(&tx, type_, data, None)? else { return Ok(false) };
+        let Some(run) = deliver(&tx, type_, data, None)? else { return Ok(None) };
         tx.commit()?;
         if let Some(notify) =
             self.db.notifications.lock().unwrap_or_else(|e| e.into_inner()).get(&run).and_then(std::sync::Weak::upgrade)
         {
             notify.notify_waiters();
         }
-        Ok(true)
+        Ok(Some(run))
     }
 
     pub fn due(&self) -> anyhow::Result<Vec<String>> {

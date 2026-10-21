@@ -104,6 +104,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0011_event_listeners", include_str!("../migrations/0011_event_listeners.sql")),
     ("0012_child_runs", include_str!("../migrations/0012_child_runs.sql")),
     ("0013_guard_verdict_uses", include_str!("../migrations/0013_guard_verdict_uses.sql")),
+    ("0014_trace_continuation", include_str!("../migrations/0014_trace_continuation.sql")),
 ];
 
 pub struct Migration {
@@ -278,6 +279,11 @@ pub struct JudgementFilter<'a> {
 
 pub trait TraceStore: Send + Sync {
     fn write_trace(&self, t: &StoredTrace) -> anyhow::Result<()>;
+    // Segment sinks may keep each segment separately; the production mirror
+    // merges them atomically, including segments arriving before their root.
+    fn write_segment(&self, t: &StoredTrace, _continuation: bool) -> anyhow::Result<()> {
+        self.write_trace(t)
+    }
     // Read back in the canonical {trace, observations} shape, the same as a
     // Langfuse fetch.
     fn get_trace(&self, id: &str) -> anyhow::Result<Option<(Trace, Vec<Observation>)>>;
@@ -322,6 +328,54 @@ impl TraceStore for AgentDb {
                 t.started_at,
             ],
         )?;
+        Ok(())
+    }
+
+    fn write_segment(&self, t: &StoredTrace, continuation: bool) -> anyhow::Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let previous: Option<String> =
+            tx.query_row("SELECT observations FROM traces WHERE id=?1", [&t.id], |r| r.get(0)).optional()?;
+        let mut observations: Vec<Observation> =
+            previous.map(|s| serde_json::from_str(&s)).transpose()?.unwrap_or_default();
+        for observation in &t.observations {
+            match observations.iter_mut().find(|o| o.id == observation.id) {
+                Some(existing) => *existing = observation.clone(),
+                None => observations.push(observation.clone()),
+            }
+        }
+        // Original fields always come from the signal segment. A final root
+        // continuation wins over a late signal end's temporary `resumes` output.
+        tx.execute("INSERT INTO traces (id,name,source,skill,session_id,tags,input,output,metadata,observations,started_at,continued_output)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12 AND ?13)
+            ON CONFLICT(id) DO UPDATE SET
+              name=CASE WHEN ?12 THEN name ELSE excluded.name END,
+              source=CASE WHEN ?12 THEN source ELSE excluded.source END,
+              skill=coalesce(excluded.skill,skill),
+              session_id=CASE WHEN ?12 THEN session_id ELSE excluded.session_id END,
+              tags=CASE WHEN ?12 THEN tags ELSE excluded.tags END,
+              input=CASE WHEN ?12 THEN input ELSE excluded.input END,
+              metadata=CASE WHEN ?12 AND ?13 THEN json_patch(coalesce(metadata,'{}'),coalesce(excluded.metadata,'{}'))
+                WHEN ?12 THEN metadata
+                WHEN continued_output THEN json_patch(coalesce(excluded.metadata,'{}'),json_object('error',json_extract(metadata,'$.error')))
+                ELSE excluded.metadata END,
+              output=CASE WHEN (?12 OR NOT continued_output) AND ?13 THEN excluded.output ELSE output END,
+              continued_output=continued_output OR excluded.continued_output,
+              observations=excluded.observations,
+              started_at=min(started_at,excluded.started_at)",
+            params![t.id,t.name,t.source,t.skill,t.session_id,serde_json::to_string(&t.tags)?,json_column(t.input.as_ref()),json_column(t.output.as_ref()),t.metadata.as_ref().map(|m|Value::Object(m.clone()).to_string()),serde_json::to_string(&observations)?,t.started_at,continuation,t.output.is_some()])?;
+        // A terminal outcome becomes eligible for the activity journal only
+        // after the segment carrying its final runner span is in the mirror.
+        // This also covers a parent finishing concurrently with its child.
+        for o in &t.observations {
+            if let Some(m) = &o.metadata
+                && m.get("durable_terminal") == Some(&Value::Bool(true))
+                && let Some(run) = m.get("durable_run").and_then(Value::as_str)
+            {
+                tx.execute("UPDATE workflow_runs SET trace_recorded=1 WHERE id=?1 AND json_extract(trace_anchor,'$.trace_id')=?2 AND ended_ms IS NOT NULL",params![run,t.id])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -391,6 +445,8 @@ impl AgentDb {
                      LEFT JOIN judgements ON judgements.trace_id = traces.id
                        AND judgements.provider = ?1 AND judgements.prompt_version = ?2
                      WHERE judgements.trace_id IS NULL
+                       AND NOT EXISTS (SELECT 1 FROM workflow_runs r WHERE json_extract(r.trace_anchor,'$.trace_id')=traces.id
+                         AND (r.ended_ms IS NULL OR (r.trace_recorded=0 AND r.state!='cancelled')))
                      ORDER BY traces.started_at DESC LIMIT ?3",
                 )?
                 .query_map(params![provider, version, limit], map)?

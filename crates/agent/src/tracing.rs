@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub type Metadata = Map<String, Value>;
@@ -102,6 +103,7 @@ pub struct GenerationEnd {
 
 #[derive(Clone, Debug, Default)]
 pub struct ContextUpdate {
+    pub session_id: Option<String>,
     pub input: Option<Value>,
     pub output: Option<Value>,
     pub metadata: Option<Metadata>,
@@ -167,8 +169,20 @@ pub struct EventStart {
     pub level: Option<Level>,
 }
 
+// Host-owned address of a scope, persisted with durable runs rather than
+// exposed in their expression context. The trace id also addresses the mirror.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceAnchor {
+    pub trace_id: String,
+    pub parent_span_id: String,
+    pub session_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct TraceStart {
+    pub continuation: Option<TraceAnchor>,
+    // Forced root observation id for the secondary leg of a tee.
+    pub root_id: Option<String>,
     pub id: String,
     pub name: String,
     pub session_id: Option<String>,
@@ -184,6 +198,9 @@ pub trait Generation: Send + Sync {
 }
 
 pub trait TraceContext: Send + Sync {
+    fn anchor(&self) -> Option<TraceAnchor> {
+        None
+    }
     fn update(&self, data: ContextUpdate);
     fn generation(&self, opts: GenerationStart) -> Arc<dyn Generation>;
     fn span(&self, opts: SpanStart) -> Arc<dyn Span>;
@@ -276,7 +293,8 @@ struct TeeGeneration(Arc<dyn Generation>, Arc<dyn Generation>);
 
 impl Generation for TeeGeneration {
     fn id(&self) -> String {
-        self.0.id()
+        let id = self.0.id();
+        if id.is_empty() { self.1.id() } else { id }
     }
     fn end(&self, opts: GenerationEnd) {
         self.0.end(opts.clone());
@@ -286,19 +304,22 @@ impl Generation for TeeGeneration {
 
 fn fork_generation(a: &dyn TraceContext, b: &dyn TraceContext, opts: GenerationStart) -> Arc<dyn Generation> {
     let ga = a.generation(opts.clone());
-    let gb = b.generation(GenerationStart { id: Some(ga.id()), ..opts });
+    let gb = b.generation(GenerationStart { id: Some(ga.id()).filter(|id| !id.is_empty()), ..opts });
     Arc::new(TeeGeneration(ga, gb))
 }
 
 fn fork_span(a: &dyn TraceContext, b: &dyn TraceContext, opts: SpanStart) -> Arc<dyn Span> {
     let sa = a.span(opts.clone());
-    let sb = b.span(SpanStart { id: Some(sa.id()), ..opts });
+    let sb = b.span(SpanStart { id: Some(sa.id()).filter(|id| !id.is_empty()), ..opts });
     Arc::new(TeeSpan(sa, sb))
 }
 
 struct TeeSpan(Arc<dyn Span>, Arc<dyn Span>);
 
 impl TraceContext for TeeSpan {
+    fn anchor(&self) -> Option<TraceAnchor> {
+        self.0.anchor().or_else(|| self.1.anchor())
+    }
     fn update(&self, data: ContextUpdate) {
         self.0.update(data.clone());
         self.1.update(data);
@@ -317,7 +338,8 @@ impl TraceContext for TeeSpan {
 
 impl Span for TeeSpan {
     fn id(&self) -> String {
-        self.0.id()
+        let id = self.0.id();
+        if id.is_empty() { self.1.id() } else { id }
     }
     fn end(&self, opts: SpanEnd) {
         self.0.end(opts.clone());
@@ -328,6 +350,9 @@ impl Span for TeeSpan {
 struct TeeTrace(Arc<dyn Trace>, Arc<dyn Trace>);
 
 impl TraceContext for TeeTrace {
+    fn anchor(&self) -> Option<TraceAnchor> {
+        self.0.anchor().or_else(|| self.1.anchor())
+    }
     fn update(&self, data: ContextUpdate) {
         self.0.update(data.clone());
         self.1.update(data);
@@ -346,7 +371,8 @@ impl TraceContext for TeeTrace {
 
 impl Trace for TeeTrace {
     fn id(&self) -> String {
-        self.0.id()
+        let id = self.0.id();
+        if id.is_empty() { self.1.id() } else { id }
     }
     fn end(&self) {
         self.0.end();
@@ -367,7 +393,12 @@ pub fn tee_tracer(primary: Arc<dyn Tracer>, secondary: Arc<dyn Tracer>) -> TeeTr
 impl Tracer for TeeTracer {
     fn trace(&self, opts: TraceStart) -> Arc<dyn Trace> {
         let a = self.primary.trace(opts.clone());
-        let b = self.secondary.trace(TraceStart { id: a.id(), ..opts });
+        let id = a.id();
+        let b = self.secondary.trace(TraceStart {
+            id: if id.is_empty() { opts.id.clone() } else { id },
+            root_id: a.anchor().map(|a| a.parent_span_id),
+            ..opts
+        });
         Arc::new(TeeTrace(a, b))
     }
     async fn shutdown(&self) {

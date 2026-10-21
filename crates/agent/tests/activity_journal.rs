@@ -579,3 +579,44 @@ async fn the_background_worker_stops_during_its_idle_wait() {
     cancel.cancel();
     tokio::time::timeout(std::time::Duration::from_secs(2), task).await.unwrap().unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn an_anchored_request_is_projected_once_after_its_last_terminal_segment_is_recorded() {
+    use agent::{durable::RunStore, local_recorder::local_recorder_tracer, tracing::*};
+    let h = Harness::new();
+    let tracer = local_recorder_tracer(h.db.clone());
+    let first = tracer.trace(TraceStart {
+        id: "request".into(),
+        name: "signal:telegram".into(),
+        tags: Some(vec!["telegram".into()]),
+        metadata: Some(json!({"activity":"run"}).as_object().unwrap().clone()),
+        ..Default::default()
+    });
+    first.update(ContextUpdate::input("save this"));
+    let anchor = first.anchor().unwrap();
+    let runs = RunStore::new((*h.db).clone());
+    let lease = runs.start_anchored("run", "agent-loop", "definition", &json!({}), Some(&anchor)).unwrap().unwrap();
+    first.update(ContextUpdate::output(json!({"resumes":true})));
+    first.end();
+    assert_eq!(h.tick().await, 0);
+    assert!(h.db.list_recent(20, Some(("judge", "v1"))).unwrap().is_empty());
+    lease.finish(&owf::run::Status::Completed(json!("saved"))).unwrap();
+    // A committed run outcome alone is not enough: its final spans must land.
+    assert_eq!(h.tick().await, 0);
+    let resumed =
+        tracer.trace(TraceStart { name: "resume:agent-loop".into(), continuation: Some(anchor), ..Default::default() });
+    let runner = resumed.span(
+        SpanStart::new("runner", SpanKind::Chain)
+            .metadata(json!({"durable_run":"run","durable_terminal":true}).as_object().unwrap().clone()),
+    );
+    runner.end(SpanEnd::output("saved"));
+    resumed.update(ContextUpdate::output("saved"));
+    resumed.end();
+    assert_eq!(h.tick().await, 1);
+    assert_eq!(h.db.list_recent(20, Some(("judge", "v1"))).unwrap().len(), 1);
+    assert_eq!(h.tick().await, 0);
+    assert_eq!(h.generated(), 1);
+    let packets = h.notes.generated.lock().unwrap();
+    assert!(packets[0].to_string().contains("saved"));
+    assert_eq!(h.journal.appended.lock().unwrap().len(), 1);
+}

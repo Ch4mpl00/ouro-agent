@@ -28,7 +28,7 @@ use tokio::sync::Notify;
 
 use crate::tracing::{
     ContextUpdate, EventStart, Generation, GenerationEnd, GenerationStart, Level, Metadata, Span, SpanEnd, SpanKind,
-    SpanStart, Trace, TraceContext, TraceStart, Tracer,
+    SpanStart, Trace, TraceAnchor, TraceContext, TraceStart, Tracer,
 };
 
 const SCOPE_NAME: &str = "langfuse-sdk";
@@ -241,6 +241,7 @@ impl HttpExporter {
 struct LfSpan {
     sink: Arc<dyn SpanSink>,
     trace_id: String,
+    session_id: Mutex<Option<String>>,
     span_id: String,
     parent: Option<String>,
     name: String,
@@ -262,6 +263,7 @@ impl LfSpan {
         LfSpan {
             sink: sink.clone(),
             trace_id: trace_id.to_owned(),
+            session_id: Mutex::new(None),
             span_id: random_hex(8),
             parent: parent.map(str::to_owned),
             name: name.to_owned(),
@@ -304,6 +306,14 @@ impl LfSpan {
         });
     }
 
+    fn anchor(&self) -> TraceAnchor {
+        TraceAnchor {
+            trace_id: self.trace_id.clone(),
+            parent_span_id: self.span_id.clone(),
+            session_id: self.session_id.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        }
+    }
+
     fn child_generation(&self, opts: GenerationStart) -> Arc<dyn Generation> {
         Arc::new(LfGeneration(LfSpan::start(
             &self.sink,
@@ -322,7 +332,7 @@ impl LfSpan {
     }
 
     fn child_span(&self, opts: SpanStart) -> Arc<dyn Span> {
-        Arc::new(LfChild(LfSpan::start(
+        let child = LfSpan::start(
             &self.sink,
             &self.trace_id,
             Some(&self.span_id),
@@ -333,7 +343,9 @@ impl LfSpan {
                 metadata: opts.metadata.as_ref(),
                 ..ObservationAttrs::default()
             },
-        )))
+        );
+        *child.session_id.lock().unwrap_or_else(|e| e.into_inner()) = self.anchor().session_id;
+        Arc::new(LfChild(child))
     }
 
     // Events end the moment they start.
@@ -390,6 +402,9 @@ impl Generation for LfGeneration {
 struct LfChild(LfSpan);
 
 impl TraceContext for LfChild {
+    fn anchor(&self) -> Option<TraceAnchor> {
+        Some(self.0.anchor())
+    }
     fn update(&self, data: ContextUpdate) {
         self.0.apply(&data);
     }
@@ -425,7 +440,27 @@ impl Span for LfChild {
 struct LfTrace(LfSpan);
 
 impl TraceContext for LfTrace {
+    fn anchor(&self) -> Option<TraceAnchor> {
+        Some(self.0.anchor())
+    }
     fn update(&self, data: ContextUpdate) {
+        if let Some(session) = &data.session_id {
+            *self.0.session_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.clone());
+            self.0.set(vec![("session.id".into(), Attr::Str(session.clone()))]);
+        }
+        let mut trace_attrs = Vec::new();
+        for (key, value) in [("input", &data.input), ("output", &data.output)] {
+            if let Some(value) = value.as_ref().and_then(serialize) {
+                trace_attrs.push((format!("langfuse.trace.{key}"), Attr::Str(value)));
+            }
+        }
+        if data.output.is_some() {
+            trace_attrs.push((
+                format!("langfuse.observation.metadata.{}", crate::trace_model::TRACE_OUTPUT_META),
+                Attr::Str("true".into()),
+            ));
+        }
+        self.0.set(trace_attrs);
         self.0.apply(&data);
     }
     fn generation(&self, opts: GenerationStart) -> Arc<dyn Generation> {
@@ -531,18 +566,23 @@ impl LangfuseTracer {
 #[async_trait]
 impl Tracer for LangfuseTracer {
     fn trace(&self, opts: TraceStart) -> Arc<dyn Trace> {
-        // No parent: the observation becomes a root span, which Langfuse
-        // renders as the trace. `kind` badges the whole trace.
+        let trace_id = opts.continuation.as_ref().map(|a| a.trace_id.clone()).unwrap_or_else(|| random_hex(16));
         let root = LfSpan::start(
             &self.sink,
-            &random_hex(16),
-            None,
+            &trace_id,
+            opts.continuation.as_ref().map(|a| a.parent_span_id.as_str()),
             &opts.name,
             kind_name(opts.kind),
             ObservationAttrs { metadata: opts.metadata.as_ref(), ..ObservationAttrs::default() },
         );
-        let mut trace_attrs = vec![("langfuse.trace.name".to_owned(), Attr::Str(opts.name.clone()))];
-        if let Some(session) = &opts.session_id {
+        // A continuation names its observation, never the original trace.
+        let mut trace_attrs = Vec::new();
+        if opts.continuation.is_none() {
+            trace_attrs.push(("langfuse.trace.name".to_owned(), Attr::Str(opts.name.clone())));
+        }
+        let session_id = opts.session_id.or_else(|| opts.continuation.as_ref().and_then(|a| a.session_id.clone()));
+        *root.session_id.lock().unwrap_or_else(|e| e.into_inner()) = session_id.clone();
+        if let Some(session) = &session_id {
             trace_attrs.push(("session.id".to_owned(), Attr::Str(session.clone())));
         }
         if let Some(tags) = opts.tags.as_ref().filter(|t| !t.is_empty()) {

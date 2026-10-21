@@ -300,6 +300,7 @@ fn create_loop(
             tags: opts.tags.clone(),
             metadata: Some(metadata),
             kind: SpanKind::Agent,
+            ..Default::default()
         });
         let scope: Scope = trace.clone();
         (scope, Some(trace))
