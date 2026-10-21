@@ -48,6 +48,7 @@ pub enum PresetName {
     Smart,
     Smartest,
     Compiler,
+    Compose,
 }
 
 impl PresetName {
@@ -57,6 +58,7 @@ impl PresetName {
             PresetName::Smart => "smart",
             PresetName::Smartest => "smartest",
             PresetName::Compiler => "compiler",
+            PresetName::Compose => "compose",
         }
     }
 
@@ -68,6 +70,12 @@ impl PresetName {
             "smartest" => Some(PresetName::Smartest),
             _ => None,
         }
+    }
+
+    // An `llm_compose` step: the selectable presets, plus `compose` (the
+    // default) for a model that answers without tools.
+    pub fn for_compose(name: &str) -> Option<PresetName> {
+        if name == "compose" { Some(PresetName::Compose) } else { PresetName::selectable(name) }
     }
 }
 
@@ -87,6 +95,7 @@ pub struct Presets {
     pub smart: ModelPreset,
     pub smartest: ModelPreset,
     pub compiler: ModelPreset,
+    pub compose: ModelPreset,
 }
 
 impl Presets {
@@ -96,6 +105,7 @@ impl Presets {
             PresetName::Smart => &self.smart,
             PresetName::Smartest => &self.smartest,
             PresetName::Compiler => &self.compiler,
+            PresetName::Compose => &self.compose,
         }
     }
 }
@@ -105,17 +115,23 @@ fn preset(model: &str, reasoning_effort: ReasoningEffort) -> ModelPreset {
 }
 
 // Applied at startup when the AGENT_*_MODEL env overrides are absent.
-//   base     — non-thinking chat on OpenAI: recovery, simple workers, the
-//              workflow-path primary loop.
+//   base     — non-thinking chat: recovery, simple workers, the
+//              workflow-path primary loop, the activity journal.
 //   smart    — thinking on: the primary Telegram loop and editorial work.
 //   smartest — a reserve high-end preset, selectable by sub-agents.
 //   compiler — the workflow compiler: one structured plan per signal.
+//   compose  — `llm_compose` steps by default: one generation, no tools.
+// MiMo (via OpenRouter) is the workhorse with tools. gpt-6.1-sol writes
+// text only: its Chat Completions endpoint takes no tool calls, so it never
+// backs a loop.
+const WORKHORSE: &str = "openrouter/xiaomi/mimo-v2.6-pro";
 pub fn default_presets() -> Presets {
     Presets {
-        base: preset("gpt-5.4-mini", ReasoningEffort::Disabled),
-        smart: preset("gemini-3.7-flash", ReasoningEffort::Medium),
-        smartest: preset("gpt-5.4", ReasoningEffort::Max),
-        compiler: preset("gpt-5.4", ReasoningEffort::Medium),
+        base: preset(WORKHORSE, ReasoningEffort::Disabled),
+        smart: preset(WORKHORSE, ReasoningEffort::Medium),
+        smartest: preset(WORKHORSE, ReasoningEffort::Max),
+        compiler: preset(WORKHORSE, ReasoningEffort::Medium),
+        compose: preset("gpt-6.1-sol", ReasoningEffort::Medium),
     }
 }
 

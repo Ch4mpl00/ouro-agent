@@ -86,6 +86,7 @@ fn configuration() -> anyhow::Result<Config> {
         (&mut presets.smart, "AGENT_SMART_MODEL"),
         (&mut presets.smartest, "AGENT_SMARTEST_MODEL"),
         (&mut presets.compiler, "AGENT_COMPILER_MODEL"),
+        (&mut presets.compose, "AGENT_COMPOSE_MODEL"),
     ] {
         if let Ok(model) = std::env::var(name) {
             preset.model = model;

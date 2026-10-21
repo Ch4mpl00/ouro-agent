@@ -74,6 +74,7 @@ fn engine_with(llm: Arc<Scripted>, mcp: Arc<World>, memory: Arc<dyn agent::db::M
             smart: p("gpt-5.4"),
             smartest: p("gpt-5.4"),
             compiler: p("gpt-5.4"),
+            compose: p("gpt-5.4"),
         },
         skills: Vec::new(),
         skill_store: Arc::new(AnySkill),

@@ -131,7 +131,7 @@ impl Sandbox {
         let engine = create_engine(EngineDeps {
             providers: Providers { openai: llm.clone(), gemini: llm.clone(), deepseek: llm.clone(), openrouter: None },
             mcp: Arc::new(MarkedMemory(mcp)),
-            presets: Presets { base: p(), smart: p(), smartest: p(), compiler: p() },
+            presets: Presets { base: p(), smart: p(), smartest: p(), compiler: p(), compose: p() },
             skills: vec![],
             skill_store: skills.clone(),
             memory: Arc::new(db.clone()),

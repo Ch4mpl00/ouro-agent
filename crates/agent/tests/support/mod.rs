@@ -39,6 +39,7 @@ pub struct Seen {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDef>,
     pub model: String,
+    pub reasoning_effort: agent::models::ReasoningEffort,
 }
 pub struct Scripted {
     pub script: Mutex<VecDeque<Message>>,
@@ -59,6 +60,7 @@ impl ChatProvider for Scripted {
             messages: p.messages.clone(),
             tools: p.tools.clone(),
             model: p.model.clone(),
+            reasoning_effort: p.reasoning_effort,
         });
         let message = self.script.lock().unwrap().pop_front().ok_or_else(|| anyhow::anyhow!("script exhausted"))?;
         Ok(CompletionResult { message, finish_reason: Some("stop".into()), usage: None })
@@ -136,8 +138,8 @@ pub fn fixture(provider: Arc<dyn ChatProvider>, definitions: &[&str], skills: &[
         providers: Providers {
             openai: provider.clone(),
             gemini: provider.clone(),
-            deepseek: provider,
-            openrouter: None,
+            deepseek: provider.clone(),
+            openrouter: Some(provider),
         },
         mcp: mcp.clone(),
         presets: default_presets(),
@@ -442,8 +444,8 @@ impl Harness {
             providers: Providers {
                 openai: provider.clone(),
                 gemini: provider.clone(),
-                deepseek: provider,
-                openrouter: None,
+                deepseek: provider.clone(),
+                openrouter: Some(provider),
             },
             mcp: mcp.clone(),
             presets: default_presets(),

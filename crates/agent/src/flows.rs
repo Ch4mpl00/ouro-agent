@@ -681,7 +681,7 @@ impl owf::run::Functions for Functions {
                 crate::skills::catalog_snapshot(&*self.engine.deps.skill_store).await.map_err(failed)
             }
             "llm_compose" => {
-                let preset = text(&args, name, "preset")?.unwrap_or("base");
+                let preset = text(&args, name, "preset")?.unwrap_or("compose");
                 let skill = text(&args, name, "skill")?;
                 let mut parts = Vec::new();
                 if let Some(prompt) = text(&args, name, "prompt")? {
@@ -850,7 +850,7 @@ pub async fn compose(
     let preset = engine
         .deps
         .presets
-        .get(PresetName::selectable(preset).ok_or_else(|| anyhow::anyhow!("unknown preset"))?)
+        .get(PresetName::for_compose(preset).ok_or_else(|| anyhow::anyhow!("unknown preset"))?)
         .clone();
     let provider = engine.resolve_provider(&preset.model)?;
     let base = engine.deps.skill_store.read_skill("composer").await?.map(|s| s.body);

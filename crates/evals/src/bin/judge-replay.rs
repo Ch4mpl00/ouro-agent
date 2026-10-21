@@ -135,7 +135,7 @@ async fn test_compose(
 // orchestration is identical; only the three composer axes differ. Judge is
 // gpt-5.4, a different family from both generators.
 
-const JUDGE_MODEL: &str = "gpt-5.4";
+const JUDGE_MODEL: &str = "gpt-6.1-sol";
 
 // How many B samples to swap-judge. Each pair costs TWO gpt-5.4 calls over the
 // full candidate set (~150k chars), so this is the expensive knob — generation

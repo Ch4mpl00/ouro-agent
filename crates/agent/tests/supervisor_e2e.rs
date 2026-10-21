@@ -45,6 +45,7 @@ fn presets() -> Presets {
         smart: p("m-smart", ReasoningEffort::Medium),
         smartest: p("m-smartest", ReasoningEffort::Max),
         compiler: p("m-compiler", ReasoningEffort::Medium),
+        compose: p("m-compiler", ReasoningEffort::Medium),
     }
 }
 
@@ -364,8 +365,8 @@ async fn run(plans: &[(i64, Plan)]) -> Run {
         providers: Providers {
             openai: provider.clone(),
             gemini: provider.clone(),
-            deepseek: provider,
-            openrouter: None,
+            deepseek: provider.clone(),
+            openrouter: Some(provider),
         },
         mcp: mcp.clone(),
         presets: presets(),

@@ -48,7 +48,7 @@ async fn sandbox(live: bool) {
     };
     let (tracer, _) = recording();
     let engine = create_engine(EngineDeps {
-        providers: Providers { openai: llm.clone(), deepseek: llm.clone(), gemini: llm, openrouter: None },
+        providers: Providers { openai: llm.clone(), deepseek: llm.clone(), gemini: llm.clone(), openrouter: Some(llm) },
         mcp: mcp.clone(),
         presets: default_presets(),
         skills: vec![],

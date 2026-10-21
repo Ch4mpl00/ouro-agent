@@ -7,7 +7,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 
-pub const JUDGE_MODEL: &str = "gpt-5.4";
+pub const JUDGE_MODEL: &str = "gpt-6.1-sol";
 // Per-node rubrics (n2). Supersedes the whole-run v3 prompt: each generative
 // node is scored against its OWNER contract, so the signal pins to one skill.
 // n2: planner `process` axis hardened to penalize unresolved referential

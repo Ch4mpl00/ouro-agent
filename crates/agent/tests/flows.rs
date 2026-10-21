@@ -152,6 +152,7 @@ fn world_with(replies: Vec<&str>, decisions: Option<Arc<agent::decisions::Decisi
             smart: p("gpt-5.4"),
             smartest: p("gpt-5.4"),
             compiler: p("gpt-5.4"),
+            compose: p("gpt-5.4"),
         },
         skills: Vec::new(),
         skill_store: Arc::new(AnySkill),

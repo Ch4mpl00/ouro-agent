@@ -162,7 +162,12 @@ async fn signals_without_saved_workflows_run_the_primary_loop_with_the_source_co
         assert!(system.contains("Default Telegram chat id: 999."));
         assert!(system.contains("ORCHESTRATOR"));
         assert_eq!(system.contains("SCHEDULER"), source == "scheduler");
-        assert_eq!(seen[0].model, if source == "scheduler" { "gpt-5.4-mini" } else { "gemini-3.7-flash" });
+        let presets = agent::models::default_presets();
+        let preset = if source == "scheduler" { presets.base } else { presets.smart };
+        assert_eq!(
+            (seen[0].model.as_str(), seen[0].reasoning_effort),
+            (preset.model.as_str(), preset.reasoning_effort)
+        );
         assert!(!system.contains("TELEGRAM"), "communication rules are discovered, never autoloaded");
         assert!(system.contains("Call find_skills only when the task needs something specific"));
         assert!(!system.contains("Skills selected for this request"), "no decision client, nothing preselected");

@@ -140,8 +140,9 @@ judge. Build the pipeline the task needs from these parts, no more:
 - **Synthesis.** Text for a person → `llm_compose`. A model step sees its
   prompt and its `input`, nothing else: not this conversation, not the
   user's messages, not other steps. Write the user's rules for the text
-  into its prompt in full, and pass the data in `input`. `preset: smart`
-  for what the user reads, `base` for mechanical reshaping.
+  into its prompt in full, and pass the data in `input`. Leave `preset`
+  out for what the user reads (the default `compose`, the writing model);
+  `base` for mechanical reshaping.
 - **Delivery.** `send_telegram_message` to
   `$workflow.input.env.telegramChatId` unless the user named another chat;
   never write a chat id into the definition.
@@ -329,8 +330,8 @@ Functions besides the ones `workflow_functions` lists from the tools:
 
 - `llm_compose { skill?, prompt?, input?, preset?, json? }` — one generation
   (with `skill`'s instructions when one is named); `input` is an object
-  shown to the model as tagged sections; `preset` is `base` (default),
-  `smart` or `smartest`. Returns the reply, parsed when it is JSON. With
+  shown to the model as tagged sections; `preset` is `compose` (default,
+  the writing model), `base`, `smart` or `smartest`. Returns the reply, parsed when it is JSON. With
   `json: true` the model must answer one JSON object (describe its fields
   in the prompt); any other reply faults the step instead of flowing on as
   text.
@@ -431,7 +432,6 @@ do:
   - write:
       call: llm_compose
       with:
-        preset: smart
         prompt: |
           Summarise the records for the user, in Russian. Leave out what
           input.sent already reported; nothing left → an empty reply.

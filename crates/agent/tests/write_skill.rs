@@ -75,8 +75,8 @@ fn engine(model: Model, tools: &[&str], store: Arc<FsSkillStore>) -> Arc<agent::
         providers: Providers {
             openai: provider.clone(),
             gemini: provider.clone(),
-            deepseek: provider,
-            openrouter: None,
+            deepseek: provider.clone(),
+            openrouter: Some(provider),
         },
         mcp: Arc::new(TimezoneOnly(
             tools.iter().map(|n| ToolDef::new(n, n, json!({"type":"object","properties":{}}))).collect(),
