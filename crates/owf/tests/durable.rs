@@ -72,6 +72,8 @@ impl Functions for World {
             "unknown" => Err(CallFailure::Unknown(error())),
             "not_sent" if before == 0 => Err(CallFailure::NotExecuted(error())),
             "flaky" if !info.reference.contains("try[2]") => Err(CallFailure::Response(error())),
+            // A stop of the host during its first call: recovery calls it again.
+            "stopped" if before == 0 => Err(CallFailure::Interrupted(error())),
             _ => Ok(args),
         }
     }
@@ -107,6 +109,7 @@ use:
     wrap: { call: echo, with: { n: '${ .n }' } }
 do:
   - init: { set: { n: 0 }, export: { as: '${ . }' } }
+  - turn: { call: stopped, with: { turn: 1 } }
   - loop:
       for: { each: x, in: [1, 2] }
       do:
@@ -210,6 +213,77 @@ async fn unknown_bypasses_catch_but_proven_non_dispatch_can_retry() {
             assert_eq!(calls.len(), 2);
         }
     }
+}
+
+#[tokio::test]
+async fn an_interrupted_call_is_not_recorded_and_is_called_again_on_resume() {
+    use owf::durable::CallState;
+    let wf = workflow(
+        r#"do:
+  - first: { call: echo, with: { step: 1 } }
+  - turn: { call: stopped, with: { step: 2 } }
+  - last: { call: echo, with: { step: 3 } }
+"#,
+    );
+    let world = Arc::new(World::default());
+    let time = Arc::new(Time(AtomicI64::new(1_000)));
+    let h = host(world.clone(), time.clone());
+    let store = Store::default();
+    let stopped = run::resume(&h, &wf, "run", json!({}), &CancellationToken::new(), &store).await;
+    assert!(matches!(stopped.status, Status::Interrupted(_)), "{:?}", stopped.status);
+    {
+        // Nothing is saved for the call or its task, and the run is not terminal.
+        let records = store.records.lock().unwrap();
+        assert!(matches!(records.get("/do/1/turn#call"), Some(Record::Call { state: CallState::Pending, .. })));
+        assert!(matches!(records.get("/do/1/turn#task"), Some(Record::Task { result: None, .. })));
+        assert!(!records.contains_key("finished"));
+    }
+    let resumed = run::resume(&h, &wf, "run", json!({}), &CancellationToken::new(), &store).await;
+    assert_eq!(resumed.status, Status::Completed(json!({"step":3})));
+    // The completed call is not made again; the interrupted one is, once.
+    let calls: Vec<_> = world.0.lock().unwrap().iter().map(|(_, r)| r.clone()).collect();
+    assert_eq!(calls, ["/do/0/first", "/do/1/turn", "/do/1/turn", "/do/2/last"]);
+}
+
+#[tokio::test]
+async fn an_interrupted_at_most_once_call_is_an_unknown_outcome() {
+    let wf = workflow("do: [ { send: { call: stopped, metadata: { delivery: at_most_once } } } ]");
+    let world = Arc::new(World::default());
+    let time = Arc::new(Time(AtomicI64::new(1_000)));
+    let result = drive(&host(world.clone(), time.clone()), &time, &wf, &Store::default()).await;
+    assert!(matches!(result, Status::Faulted(ref e) if e.is("outcome_unknown")), "{result:?}");
+    assert_eq!(world.0.lock().unwrap().len(), 1, "a stop does not make the call re-sendable");
+}
+
+#[tokio::test]
+async fn explicit_cancellation_wins_over_an_interrupted_call() {
+    // A cooperative function sees the run's cancellation and stops: the run
+    // was cancelled, not interrupted, so it ends Cancelled and terminal.
+    struct Stops;
+    #[async_trait]
+    impl Functions for Stops {
+        fn effect(&self, _: &str) -> Option<Effect> {
+            Some(Effect::Read)
+        }
+        fn cooperative(&self, _: &str) -> bool {
+            true
+        }
+        async fn call(&self, _: &str, _: Value, _: &CallInfo<'_>) -> Result<Value, WorkflowError> {
+            unreachable!("durable runs invoke")
+        }
+        async fn invoke(&self, _: &str, _: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
+            info.cancel.cancel();
+            Err(CallFailure::Interrupted(WorkflowError::runtime("aborted")))
+        }
+    }
+    let wf = workflow("do: [ { turn: { call: model } } ]");
+    let time = Arc::new(Time(AtomicI64::new(1_000)));
+    let mut h = host(Arc::new(World::default()), time);
+    h.functions = Arc::new(Stops);
+    let store = Store::default();
+    let outcome = run::resume(&h, &wf, "run", json!({}), &CancellationToken::new(), &store).await;
+    assert_eq!(outcome.status, Status::Cancelled);
+    assert!(matches!(store.records.lock().unwrap().get("finished"), Some(Record::Finished { .. })));
 }
 
 #[tokio::test]
@@ -333,8 +407,15 @@ async fn a_timeout_cannot_turn_an_unknown_dispatch_into_a_catchable_retry() {
 
 // Reuse the interpreter's shrinkable DSL generator. Only the crash schedule,
 // delivery policies and durable assertions belong to this test target.
+// `interrupts`: the invocations (counted from 0 over the whole recovery)
+// the host stops instead of answering, as a shutdown cuts a model turn short.
 #[derive(Default)]
-struct PropertyWorld(Mutex<Vec<(String, owf::durable::Delivery)>>);
+struct PropertyWorld {
+    calls: Mutex<Vec<(String, owf::durable::Delivery)>>,
+    interrupts: Vec<usize>,
+    invocations: AtomicUsize,
+    interrupted: AtomicUsize,
+}
 
 #[async_trait]
 impl Functions for PropertyWorld {
@@ -342,12 +423,18 @@ impl Functions for PropertyWorld {
         support::host::effect(name)
     }
     async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError> {
-        self.0.lock().unwrap().push((info.reference.into(), info.delivery));
+        self.calls.lock().unwrap().push((info.reference.into(), info.delivery));
         // Stable responses isolate recovery from changing external data.
         // "flaky" succeeds here; down/reject still return real DSL errors.
         support::host::behave(name, &args, 2)
     }
     async fn invoke(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
+        if self.interrupts.contains(&self.invocations.fetch_add(1, Ordering::SeqCst)) {
+            // Counted as dispatched: a stop is no proof the call did nothing.
+            self.calls.lock().unwrap().push((info.reference.into(), info.delivery));
+            self.interrupted.fetch_add(1, Ordering::SeqCst);
+            return Err(CallFailure::Interrupted(WorkflowError::runtime("the host stopped")));
+        }
         self.call(name, args, info).await.map_err(CallFailure::Response)
     }
 }
@@ -357,19 +444,21 @@ struct Recovered {
     status: Status,
     completed: BTreeMap<String, owf::durable::TaskResult>,
     crashes: usize,
+    interrupted: usize,
 }
 
 fn recover_generated(
     wf: &model::Workflow,
     input: Value,
     crashes: &[(u8, bool)],
+    interrupts: &[usize],
     cancelled: bool,
 ) -> Result<Recovered, String> {
     use owf::durable::{CallState, Delivery};
     let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
     rt.block_on(async {
         let time = Arc::new(Time(AtomicI64::new(1_000)));
-        let world = Arc::new(PropertyWorld::default());
+        let world = Arc::new(PropertyWorld { interrupts: interrupts.to_vec(), ..Default::default() });
         let mut store = Store::default();
         let mut next_crash = 0;
         let mut armed = false;
@@ -379,7 +468,8 @@ fn recover_generated(
                 store.after_commit = after;
                 armed = true;
             }
-            let before = world.0.lock().unwrap().len();
+            let before = world.calls.lock().unwrap().len();
+            let stops = world.interrupted.load(Ordering::SeqCst);
             let saved = store.load().unwrap();
             let host = Host {
                 functions: world.clone(),
@@ -393,7 +483,7 @@ fn recover_generated(
                 cancel.cancel();
             }
             let status = run::resume(&host, wf, "property-run", input.clone(), &cancel, &store).await.status;
-            let calls = world.0.lock().unwrap().clone();
+            let calls = world.calls.lock().unwrap().clone();
             for (reference, _) in &calls[before..] {
                 if matches!(
                     saved.get(&format!("{reference}#call")),
@@ -411,12 +501,15 @@ fn recover_generated(
             match status {
                 Status::Waiting { wake_at_ms } => time.0.store(wake_at_ms, Ordering::SeqCst),
                 Status::Interrupted(ref error) => {
-                    if !armed || store.saves.load(Ordering::SeqCst) != store.fail_at.load(Ordering::SeqCst) {
-                        return Err(format!("unexpected storage interruption: {error}"));
+                    let crashed = armed && store.saves.load(Ordering::SeqCst) == store.fail_at.load(Ordering::SeqCst);
+                    if !crashed && world.interrupted.load(Ordering::SeqCst) == stops {
+                        return Err(format!("unexpected interruption: {error}"));
                     }
-                    next_crash += 1;
-                    armed = false;
-                    store.fail_at.store(0, Ordering::SeqCst);
+                    if crashed {
+                        next_crash += 1;
+                        armed = false;
+                        store.fail_at.store(0, Ordering::SeqCst);
+                    }
                 }
                 terminal => {
                     let saves = store.saves.load(Ordering::SeqCst);
@@ -430,7 +523,7 @@ fn recover_generated(
                         let replay = run::resume(&host, wf, "property-run", input.clone(), &cancel, &store).await;
                         if replay.status != terminal
                             || store.saves.load(Ordering::SeqCst) != saves
-                            || *world.0.lock().unwrap() != calls
+                            || *world.calls.lock().unwrap() != calls
                         {
                             return Err(format!("terminal run changed: {terminal:?} -> {replay:?}"));
                         }
@@ -444,7 +537,8 @@ fn recover_generated(
                             _ => None,
                         })
                         .collect();
-                    return Ok(Recovered { status: terminal, completed, crashes: next_crash });
+                    let interrupted = world.interrupted.load(Ordering::SeqCst);
+                    return Ok(Recovered { status: terminal, completed, crashes: next_crash, interrupted });
                 }
             }
             // A new worker sees only serialized state, not the old Run/Host
@@ -491,18 +585,31 @@ fn generated_workflows_preserve_output_context_and_errors_across_multiple_crashe
     use support::program::{Profile, input, program};
     // Sequential deterministic programs give an exact output/context oracle.
     // Fork scheduling and mixed delivery are exercised by the safety property.
+    // Host interruptions (a stopped call, called again on resume) join the
+    // crashes; every call here is at least once, so the oracle is unchanged.
     let profile = Profile { wait: true, ..Profile::CORE };
-    let strategy = (program(profile), input(), prop::collection::vec((1u8..=16, any::<bool>()), 1..=8));
+    let strategy = (
+        program(profile),
+        input(),
+        prop::collection::vec((1u8..=16, any::<bool>()), 0..=8),
+        prop::collection::vec(0usize..12, 0..=3),
+    );
+    let witnessed = AtomicUsize::new(0);
     TestRunner::new(support::host::config(64, file!()))
-        .run(&strategy, |(p, input, crashes)| {
+        .run(&strategy, |(p, input, crashes, interrupts)| {
             let wf = support::host::workflow(&p);
-            let baseline = recover_generated(&wf, input.clone(), &[], false).map_err(TestCaseError::fail)?;
-            let recovered = recover_generated(&wf, input, &crashes, false).map_err(TestCaseError::fail)?;
-            prop_assert_eq!(recovered.status, baseline.status);
+            let baseline = recover_generated(&wf, input.clone(), &[], &[], false).map_err(TestCaseError::fail)?;
+            let recovered = recover_generated(&wf, input, &crashes, &interrupts, false).map_err(TestCaseError::fail)?;
+            prop_assert_eq!(&recovered.status, &baseline.status);
             prop_assert_eq!(recovered.completed, baseline.completed);
+            if recovered.interrupted > 0 && matches!(recovered.status, Status::Completed(_)) {
+                witnessed.fetch_add(1, Ordering::SeqCst);
+            }
             Ok(())
         })
         .unwrap();
+    // The interrupted path was exercised: a run stopped mid-call, then completed.
+    assert!(witnessed.load(Ordering::SeqCst) > 0, "no generated run was interrupted and then completed");
 }
 
 #[test]
@@ -518,15 +625,17 @@ fn generated_forks_and_mixed_delivery_never_repeat_protected_calls_or_reopen_ter
         input(),
         prop::collection::vec((1u8..=16, any::<bool>()), 1..=8),
         prop::collection::vec(any::<bool>(), 1..=16),
+        prop::collection::vec(0usize..12, 0..=3),
         prop::bool::weighted(0.1),
     );
     TestRunner::new(support::host::config(64, file!()))
-        .run(&strategy, |(p, input, crashes, policies, cancelled)| {
+        .run(&strategy, |(p, input, crashes, policies, interrupts, cancelled)| {
             let mut definition = support::program::definition(&p);
             delivery_policies(&mut definition, &policies, &mut 0);
             let wf = model::parse(definition).unwrap();
             run::validate(&wf, &support::host::Known).unwrap();
-            let result = recover_generated(&wf, input, &crashes, cancelled).map_err(TestCaseError::fail)?;
+            let result =
+                recover_generated(&wf, input, &crashes, &interrupts, cancelled).map_err(TestCaseError::fail)?;
             if cancelled {
                 prop_assert_eq!(result.status, Status::Cancelled);
             }
@@ -547,7 +656,7 @@ fn repeated_crashes_can_hit_the_same_pending_checkpoint_before_progress() {
     };
     let wf = support::host::workflow(&p);
     let crashes = [(1, false), (1, true), (1, false), (1, true), (1, false), (1, true)];
-    let result = recover_generated(&wf, json!({"n":0}), &crashes, false).unwrap();
+    let result = recover_generated(&wf, json!({"n":0}), &crashes, &[], false).unwrap();
     assert_eq!(result.crashes, crashes.len());
     assert_eq!(result.status, Status::Completed(json!({"n":1})));
 }
@@ -594,7 +703,10 @@ impl Functions for Tools {
     }
     async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError> {
         self.invoke(name, args, info).await.map_err(|failure| match failure {
-            CallFailure::NotExecuted(e) | CallFailure::Response(e) | CallFailure::Unknown(e) => e,
+            CallFailure::NotExecuted(e)
+            | CallFailure::Response(e)
+            | CallFailure::Unknown(e)
+            | CallFailure::Interrupted(e) => e,
         })
     }
     async fn invoke(&self, name: &str, args: Value, _: &CallInfo<'_>) -> Result<Value, CallFailure> {

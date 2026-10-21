@@ -84,6 +84,9 @@
 //!     call's result for a reader that reconciles it (a model told the call
 //!     may have run); the call is still never sent again. Cancellation, a timeout or
 //!     dropping a losing fork branch does not prove an in-flight effect stopped.
+//!     For the same reason an interrupted at-most-once call (`CallFailure::Interrupted`)
+//!     is unknown; an interrupted at-least-once call keeps its pending record
+//!     and is called again on recovery.
 //!
 //! ## Waiting and completion
 //!
@@ -127,6 +130,12 @@ pub enum CallFailure {
     NotExecuted(WorkflowError),
     Response(WorkflowError),
     Unknown(WorkflowError),
+    /// A stop of the host (its process or the call's owner going away), not
+    /// an answer: nothing is saved for the call, the run ends `Interrupted`
+    /// and recovery calls it again. For a call that has no external effect
+    /// of its own (a model turn). Explicit cancellation of the run still
+    /// ends it `Cancelled`, and an at-most-once call's outcome is unknown.
+    Interrupted(WorkflowError),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
