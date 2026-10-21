@@ -1068,18 +1068,28 @@ impl Flows {
         cancel: &CancellationToken,
     ) {
         let id = saved.id.clone();
+        let is_loop = saved.name == crate::agent::AGENT_LOOP_NAME;
+        // A resumed loop (after a restart or a confirmation press) joins the
+        // session of the signal that started it, with that signal's request
+        // as input, so Langfuse shows both halves of one conversation.
+        let session = is_loop.then(|| saved.input["loop"]["session"].as_str().map(str::to_owned)).flatten();
         let trace = self.engine.deps.tracer.trace(crate::tracing::TraceStart {
             id: uuid::Uuid::new_v4().to_string(),
             name: format!("resume:{}", saved.name),
-            session_id: Some(id.clone()),
+            session_id: Some(session.unwrap_or_else(|| id.clone())),
+            metadata: Some(json!({"run": id}).as_object().expect("object").clone()),
             ..Default::default()
         });
+        if let Some(task) = saved.input["guard_context"]["task"].as_str().filter(|_| is_loop) {
+            trace.update(crate::tracing::ContextUpdate::input(task));
+        }
         let scope: Scope = trace.clone();
-        let driven = (saved.name == crate::agent::AGENT_LOOP_NAME)
-            .then(|| saved.input["loop"]["id"].as_str().map(str::to_owned))
-            .flatten();
+        let driven = is_loop.then(|| saved.input["loop"]["id"].as_str().map(str::to_owned)).flatten();
         let version = saved.input.get(OVERRIDE).and_then(Value::as_i64);
         let result = execute_saved(&self.engine, runs, saved, lease, &scope, cancel).await;
+        if let FlowResult::Completed(output) = &result {
+            trace.update(crate::tracing::ContextUpdate::output(output.clone()));
+        }
         if let Some(id) = driven {
             loop_outcome(&self.engine, version, &result);
             self.engine.end_loop(&id).await;

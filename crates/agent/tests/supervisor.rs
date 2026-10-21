@@ -1001,7 +1001,10 @@ async fn confirmation_holds_exact_call_frees_supervisor_and_resumes_after_press_
         let resumed_trace =
             f.db.list_recent(20, None).unwrap().into_iter().find(|t| t.name == "resume:agent-loop").unwrap();
         let (trace, observations) = f.db.get_trace(&resumed_trace.id).unwrap().unwrap();
-        assert_eq!(trace.session_id.as_deref(), Some("telegram:42/loop"));
+        // The same session as the signal that started it, with its request.
+        assert_eq!(trace.session_id.as_deref(), Some("telegram:42"));
+        assert!(trace.input.to_string().contains("Telegram message"), "{}", trace.input);
+        assert_eq!(trace.output, json!("after confirmation"));
         assert!(observations.iter().any(|o| o.name == "iter-1"));
         assert_eq!(
             mcp.calls.lock().unwrap().iter().filter(|(n, _)| n == "send_telegram_message").count(),
