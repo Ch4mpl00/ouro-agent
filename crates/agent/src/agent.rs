@@ -423,7 +423,7 @@ impl AgentLoop {
             .collect();
         tools.extend(synthetic_definitions().iter().filter(|t| self.visible(&t.name)).cloned());
         if let Some(tool) = tools.iter_mut().find(|t| t.name == "invoke_sub_agent") {
-            tool.description.get_or_insert_default().push_str(&format!("\nActive loops (optional loop argument; otherwise the first skill's loop preference, then agent-loop):\n{}",
+            tool.description.get_or_insert_default().push_str(&format!("\nActive loops (optional loop argument; otherwise the first declared skill loop preference, then agent-loop):\n{}",
                 crate::flows::loop_catalog(&*engine.deps.workflows)?));
         }
         let mut params = providers::CompletionParams {
@@ -1478,7 +1478,17 @@ pub async fn loop_tool_at(
 ) -> anyhow::Result<Value> {
     let loop_ = engine.loop_for(&loop_spec(args)?, scope, cancel).await?;
     loop_.restore_memory(args.get("memory"))?;
-    let call = tool_call(args.get("call").unwrap_or(&Value::Null))?;
+    let mut call = tool_call(args.get("call").unwrap_or(&Value::Null))?;
+    // In-process children have no durable run to carry the YAML selection.
+    // Pass that selection to the same worker adapter used by tool arguments.
+    if call.name == "invoke_sub_agent"
+        && runs.is_none()
+        && let Some(name) = args["worker_loop"].as_str().filter(|name| *name != AGENT_LOOP_NAME)
+    {
+        let mut arguments: Map<String, Value> = serde_json::from_str(&call.arguments)?;
+        arguments.insert("loop".into(), json!(name));
+        call.arguments = serde_json::to_string(&arguments)?;
+    }
     let child = runs.zip(child_key(args)).map(|(runs, key)| ChildRun { runs, key });
     let worker_run = child.as_ref().map(|c| format!("{}/loop", child_loop_id(&loop_.opts.id, &c.key)));
     let _slot = loop_.slots.acquire().await?;
@@ -1582,17 +1592,17 @@ pub async fn loop_tool_at(
     if !failed {
         let parsed: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
         let delivery: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-        let chat = delivery["chatId"].as_str().or_else(|| parsed["chatId"].as_str()).or(loop_
-            .opts
-            .session
-            .env
-            .telegram_chat_id
-            .as_deref());
+        let chat = match delivery.get("chatId").or_else(|| parsed.get("chatId")) {
+            Some(Value::String(chat)) => Some(chat.clone()),
+            Some(Value::Number(chat)) => Some(chat.to_string()),
+            Some(Value::Null) | None => loop_.opts.session.env.telegram_chat_id.clone(),
+            _ => None,
+        };
         let thread = delivery.get("messageThreadId").unwrap_or(&parsed["messageThreadId"]).as_i64();
         if call.name == "send_telegram_message"
             && delivery["delivered"] == true
             && let Some(target) = &loop_.opts.conversation
-            && chat == Some(target.chat_id.as_str())
+            && chat.as_deref() == Some(target.chat_id.as_str())
             && thread == target.message_thread_id
             && let Some(text) = parsed["text"].as_str()
         {

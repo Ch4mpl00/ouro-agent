@@ -713,9 +713,17 @@ impl SignalFunctions {
                         span.end(SpanEnd::default());
                         Err(aborted())
                     }
+                    FlowResult::Faulted { error, .. } => {
+                        span.end(SpanEnd::error(error.to_string()));
+                        // Preserve the original typed host error across both YAML
+                        // catches, including aborts and the primary failure detail.
+                        Err(self.errors.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_else(|| {
+                            anyhow::anyhow!(error.detail.unwrap_or_else(|| error.title.unwrap_or_default()))
+                        }))
+                    }
                     other => {
                         span.end(SpanEnd::error(format!("{other:?}")));
-                        anyhow::bail!("signal route {name} failed: {other:?}")
+                        anyhow::bail!("signal route {name} did not end: {other:?}")
                     }
                 }
             }

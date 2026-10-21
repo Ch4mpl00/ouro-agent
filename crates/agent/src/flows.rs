@@ -574,7 +574,7 @@ impl owf::run::Functions for Functions {
                             .zip(crate::agent::child_key(&args))
                             .map(|((r, e), k)| (r, e, k))
                         else {
-                            return Ok(json!({"run":null}));
+                            return Ok(json!({"run":null,"loop":args["worker_loop"]}));
                         };
                         let expected = format!("{}__sub{key}/loop", spec.id);
                         let (id, input, worker_scope) = if let Some(saved) = runs.get(&expected).map_err(failed)? {
@@ -591,7 +591,7 @@ impl owf::run::Functions for Functions {
                         let input = with_override(input, version);
                         self.start_child(runs, events, &id, &name, &definition, input, &key, info, &worker_scope)
                             .await?;
-                        Ok(json!({"run":id}))
+                        Ok(json!({"run":id,"loop":name}))
                     }
                     "confirm_request" => {
                         crate::agent::loop_confirm_request(

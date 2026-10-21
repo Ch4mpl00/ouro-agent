@@ -30,7 +30,7 @@ do:
                     if: '${ $entry.value.name == "invoke_sub_agent" }'
                     call: start_child
                     with: { workflow: agent-loop, call: '${ $entry.value }', i: '${ $context.i }', index: '${ $entry.key }', memory: '${ $context.memory }' }
-                    export: { as: '${ $context + { worker: .run } }' }
+                    export: { as: '${ $context + { worker: .run, worker_loop: .loop } }' }
                 - wait_worker:
                     if: '${ $context.worker != null }'
                     listen:
@@ -49,6 +49,7 @@ do:
                       call: '${ $entry.value }'
                       guard_run: null
                       worker_run: '${ $context.worker // null }'
+                      worker_loop: '${ $context.worker_loop // null }'
                       i: '${ $context.i }'
                       index: '${ $entry.key }'
                       memory: '${ if ($entry.value.name | startswith("working_memory_")) or $entry.value.name == "invoke_sub_agent" then $context.memory else null end }'
