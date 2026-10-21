@@ -230,7 +230,8 @@ pub enum Status {
     Waiting {
         wake_at_ms: i64,
     },
-    /// Persistence failed or ownership was lost. Leave the run recoverable.
+    /// Persistence failed, ownership was lost or the host interrupted a call
+    /// (`CallFailure::Interrupted`). Leave the run recoverable.
     Interrupted(WorkflowError),
 }
 
@@ -333,7 +334,9 @@ enum Fault {
     Fatal(WorkflowError),
     Cancelled,
     Waiting(i64),
-    Storage(WorkflowError),
+    /// Persistence failed, ownership was lost or the host interrupted a
+    /// call: the run stops where it is and stays recoverable.
+    Interrupted(WorkflowError),
 }
 
 impl From<WorkflowError> for Fault {
@@ -565,10 +568,10 @@ async fn execute(
         Err(Fault::Error(e) | Fault::Fatal(e)) => Status::Faulted(e),
         Err(Fault::Cancelled) => Status::Cancelled,
         Err(Fault::Waiting(wake_at_ms)) => Status::Waiting { wake_at_ms },
-        Err(Fault::Storage(e)) => Status::Interrupted(e),
+        Err(Fault::Interrupted(e)) => Status::Interrupted(e),
     };
     if matches!(status, Status::Completed(_) | Status::Faulted(_) | Status::Cancelled)
-        && let Err(Fault::Storage(error)) = run.save("finished", Record::Finished { status: status.clone() })
+        && let Err(Fault::Interrupted(error)) = run.save("finished", Record::Finished { status: status.clone() })
     {
         status = Status::Interrupted(error);
     }
@@ -605,11 +608,11 @@ impl Run<'_> {
         if let Some(journal) = self.journal {
             if let Some(old) = self.record(key) {
                 durable::check_transition(&old, &record)
-                    .map_err(|e| Fault::Storage(WorkflowError::runtime(e.to_string())))?;
+                    .map_err(|e| Fault::Interrupted(WorkflowError::runtime(e.to_string())))?;
             }
             journal
                 .save(key, &record)
-                .map_err(|e| Fault::Storage(WorkflowError::runtime(format!("checkpoint {key}: {e}"))))?;
+                .map_err(|e| Fault::Interrupted(WorkflowError::runtime(format!("checkpoint {key}: {e}"))))?;
             self.records.lock().unwrap_or_else(|e| e.into_inner()).insert(key.to_owned(), record);
         }
         Ok(())
@@ -858,7 +861,7 @@ impl Run<'_> {
             if let Err(Fault::Waiting(wake_at_ms)) = &result {
                 self.observe(Event::TaskSuspended { reference, wake_at_ms: *wake_at_ms });
             }
-            if !matches!(result, Err(Fault::Cancelled | Fault::Storage(_))) {
+            if !matches!(result, Err(Fault::Cancelled | Fault::Interrupted(_))) {
                 span.active = false;
             }
             let result = match result {
@@ -948,7 +951,7 @@ impl Run<'_> {
                     let types = listen_types(filters, &input, &self.args(ctx, &input, &null, &desc, scope))?;
                     events
                         .unregister(self.run_id, &format!("{reference}#event"), &types)
-                        .map_err(|e| Fault::Storage(WorkflowError::runtime(e.to_string())))?;
+                        .map_err(|e| Fault::Interrupted(WorkflowError::runtime(e.to_string())))?;
                 }
                 let (remaining, deadline) = remaining
                     .map_err(|error| if self.has_unknown(reference) { self.unknown(reference) } else { error })?;
@@ -1097,7 +1100,7 @@ impl Run<'_> {
                     .events()
                     .ok_or_else(|| WorkflowError::validation("events are not supported by this host"))?;
                 let types = listen_types(filters, input, &args(ctx))?;
-                let storage = |e: anyhow::Error| Fault::Storage(WorkflowError::runtime(e.to_string()));
+                let storage = |e: anyhow::Error| Fault::Interrupted(WorkflowError::runtime(e.to_string()));
                 events.register(self.run_id, &types).map_err(storage)?;
                 let key = format!("{reference}#event");
                 if self.journal.is_none() {
@@ -1199,7 +1202,7 @@ impl Run<'_> {
                 _ => {}
             }
         } else if prior.is_some() {
-            return Err(Fault::Storage(WorkflowError::runtime("invalid call record")));
+            return Err(Fault::Interrupted(WorkflowError::runtime("invalid call record")));
         }
         let effect = self
             .host
@@ -1265,6 +1268,18 @@ impl Run<'_> {
                 }
                 // A transient transport failure remains retryable, including after restart.
                 return Err(Fault::Error(error));
+            }
+            // A stop, not an answer: the pending record stays, so recovery
+            // calls it again. Explicit cancellation of the run still wins,
+            // and a stop is no proof that an at-most-once call did nothing.
+            Err(CallFailure::Interrupted(error)) => {
+                if self.cancel.is_cancelled() {
+                    return Err(Fault::Cancelled);
+                }
+                if delivery == Delivery::AtMostOnce {
+                    return self.unknown_call(&key, logical, name, args, reference);
+                }
+                return Err(Fault::Interrupted(error));
             }
         };
         self.save(&key, Record::Call { logical, function: name.into(), arguments: args, effect, delivery, state })?;
@@ -1337,7 +1352,7 @@ impl Run<'_> {
             return Err(self.unknown(reference));
         };
         let Some(Record::Call { effect, .. }) = self.record(key) else {
-            return Err(Fault::Storage(WorkflowError::runtime("missing call record")));
+            return Err(Fault::Interrupted(WorkflowError::runtime("missing call record")));
         };
         self.save(
             key,
@@ -1387,7 +1402,7 @@ impl Run<'_> {
                     Ok(value) => output[i] = value,
                     Err(Fault::Waiting(deadline)) => wake = Some(wake.map_or(deadline, |old| old.min(deadline))),
                     Err(error) => {
-                        if self.has_unknown(fork) && !matches!(error, Fault::Storage(_)) {
+                        if self.has_unknown(fork) && !matches!(error, Fault::Interrupted(_)) {
                             return Err(self.unknown(fork));
                         }
                         return Err(error);
@@ -1496,7 +1511,7 @@ impl Run<'_> {
             let decision_key = format!("{reference}#retry-decision[{attempt}]");
             let delay = match self.record(&decision_key) {
                 Some(Record::Retry { delay_ms }) => delay_ms.map(Duration::from_millis),
-                Some(_) => return Err(Fault::Storage(WorkflowError::runtime("invalid retry record"))),
+                Some(_) => return Err(Fault::Interrupted(WorkflowError::runtime("invalid retry record"))),
                 None => {
                     let safe = if self.journal.is_some() {
                         !self.blocks_retry(&attempt_ref)
@@ -1610,7 +1625,7 @@ impl Run<'_> {
         if self.journal.is_some() {
             let deadline_ms = match self.record(key) {
                 Some(Record::Timer { deadline_ms }) => deadline_ms,
-                Some(_) => return Err(Fault::Storage(WorkflowError::runtime("invalid timer record"))),
+                Some(_) => return Err(Fault::Interrupted(WorkflowError::runtime("invalid timer record"))),
                 None => {
                     let deadline_ms = self
                         .host

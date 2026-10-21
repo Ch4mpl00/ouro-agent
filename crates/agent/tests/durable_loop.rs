@@ -64,6 +64,14 @@ fn engine(llm: Arc<Scripted>, mcp: Arc<World>) -> Arc<Engine> {
 }
 
 fn engine_with(llm: Arc<Scripted>, mcp: Arc<World>, memory: Arc<dyn agent::db::MemoryStore>) -> Arc<Engine> {
+    engine_on(llm, mcp, memory)
+}
+
+fn engine_on(
+    llm: agent::providers::SharedProvider,
+    mcp: Arc<World>,
+    memory: Arc<dyn agent::db::MemoryStore>,
+) -> Arc<Engine> {
     let p = |model: &str| ModelPreset { model: model.into(), reasoning_effort: ReasoningEffort::Disabled };
     let (tracer, _) = recording();
     create_engine(EngineDeps {
@@ -236,6 +244,137 @@ async fn a_sub_agent_cut_by_a_restart_is_resumed_and_joined_by_its_parent() {
     assert!(parent.contains("worker result"), "the parent has its worker's answer: {parent}");
     assert_eq!(world.calls.lock().unwrap().iter().filter(|n| *n == "send").count(), 1);
     assert!(!world2.calls.lock().unwrap().contains(&"send".to_owned()), "the write is never sent again");
+}
+
+// The process stops while a durable worker's model turn is in flight.
+// Shutdown cancels every live loop first, so the worker's turn aborts before
+// its parent is released and reaches the worker's own execution: that abort
+// is a stop, not the turn's answer. The worker's run is interrupted (nothing
+// recorded for the turn, no `done:` for the parent) instead of faulting, the
+// next process asks that turn again and only that one, and the parent gets
+// the worker's real answer, not "sub-agent crashed".
+#[tokio::test]
+async fn a_worker_turn_aborted_by_shutdown_is_asked_again_not_reported_as_a_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
+    let runs = RunStore::new(db.clone());
+    let stop = CancellationToken::new();
+    let in_flight = Arc::new(tokio::sync::Notify::new());
+    let notify = in_flight.clone();
+    let first = support::Turns::new(vec![
+        support::turn(|_| calls(&[("invoke_sub_agent", json!({"prompt": "look it up"}))])),
+        support::turn(|_| calls(&[("search", json!({"q": "a"}))])),
+        // The worker's second turn: an HTTP call cut short by its token.
+        support::turn_async(move |p| async move {
+            notify.notify_one();
+            p.cancel.cancelled().await;
+            Err(agent::errors::aborted())
+        }),
+    ]);
+    let world = Arc::new(World { calls: Mutex::default(), stop: None });
+    let engine1 = engine_on(first.clone(), world.clone(), Arc::new(PersistLog::default()));
+    let mut opts = LoopOptions::new("peer:9", task_context("peer:9"));
+    opts.skills = vec!["any".into()];
+    opts.include_engine_skills = false;
+    opts.cancel = stop.clone();
+    let input = engine1.start_loop(opts).await.unwrap().workflow_input("go").await;
+    let flows1 = create_durable_flows(engine1.clone(), db.clone());
+    let parent = tokio::spawn({
+        let (engine1, stop) = (engine1.clone(), stop.clone());
+        async move { flows1.run_loop("peer:9/loop", input, &scope(&engine1), &stop).await }
+    });
+    in_flight.notified().await;
+    engine1.shutdown().await;
+    let child = "peer:9__sub1.0/loop";
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while runs.get(child).unwrap().unwrap().state == "running" {
+        assert!(tokio::time::Instant::now() < deadline, "the worker's attempt never ended");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // Then the supervisor stops and releases the parent.
+    stop.cancel();
+    let result = parent.await.unwrap();
+    assert!(matches!(result, FlowResult::Interrupted { .. }), "{result:?}");
+    let worker = runs.get(child).unwrap().unwrap();
+    assert_eq!(worker.outcome, None, "the worker is not terminal");
+    assert_eq!(worker.state, "ready");
+    assert!(runs.get("peer:9/loop").unwrap().unwrap().outcome.is_none());
+    assert!(
+        runs.records(child).unwrap().iter().all(|r| !matches!(
+            r,
+            owf::durable::Record::Call { function, state: owf::durable::CallState::Done(Err(_)), .. }
+                if function == "agent_turn"
+        )),
+        "the aborted turn is not recorded as the turn's result"
+    );
+    // The first interruption's backoff: due 2 s later, at once for the
+    // recovery worker of a process that took longer to come back.
+    let wake: i64 =
+        db.conn().query_row("SELECT wake_at_ms FROM workflow_runs WHERE id = ?1", [child], |r| r.get(0)).unwrap();
+    assert!(wake <= chrono::Utc::now().timestamp_millis() + 2_000, "{wake}");
+    db.conn().execute("UPDATE workflow_runs SET wake_at_ms = 0 WHERE id = ?1", [child]).unwrap();
+
+    // The next process: the worker's cut turn is asked again, then the
+    // parent's next turn sees the worker's answer.
+    let second = support::Turns::new(vec![
+        support::turn(|_| assistant("worker result")),
+        support::turn(|_| assistant("all done")),
+    ]);
+    let world2 = Arc::new(World { calls: Mutex::default(), stop: None });
+    let engine2 = engine_on(second.clone(), world2.clone(), Arc::new(PersistLog::default()));
+    let resumed = create_durable_flows(engine2.clone(), db.clone()).recover_once(&CancellationToken::new()).await;
+    assert_eq!(resumed.unwrap(), 2);
+    assert_eq!(runs.get(child).unwrap().unwrap().outcome, Some(Status::Completed(json!("worker result"))));
+    assert_eq!(runs.get("peer:9/loop").unwrap().unwrap().outcome, Some(Status::Completed(json!("all done"))));
+
+    assert_eq!(first.requests.lock().unwrap().len(), 3);
+    let requests = second.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "only the cut turn was asked again");
+    let worker = serde_json::to_string(&requests[0]).unwrap();
+    assert!(worker.contains("search ok"), "the worker's earlier round stands: {worker}");
+    let parent = serde_json::to_string(&requests[1]).unwrap();
+    assert!(parent.contains("worker result"), "the parent has its worker's answer: {parent}");
+    assert!(!parent.contains("crashed"), "{parent}");
+    assert_eq!(*world.calls.lock().unwrap(), ["search"]);
+    assert!(world2.calls.lock().unwrap().is_empty(), "the worker's read is not made again");
+}
+
+// Explicit cancellation stays terminal: a run cancelled while its turn is in
+// flight ends Cancelled when the turn then aborts, and recovery leaves it.
+#[tokio::test]
+async fn an_explicitly_cancelled_run_stays_cancelled_when_its_turn_aborts() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
+    let runs = RunStore::new(db.clone());
+    let in_flight = Arc::new(tokio::sync::Notify::new());
+    let notify = in_flight.clone();
+    let llm = support::Turns::new(vec![support::turn_async(move |p| async move {
+        notify.notify_one();
+        p.cancel.cancelled().await;
+        Err(agent::errors::aborted())
+    })]);
+    let engine1 = engine_on(
+        llm.clone(),
+        Arc::new(World { calls: Mutex::default(), stop: None }),
+        Arc::new(PersistLog::default()),
+    );
+    let input = input(&engine1, "peer:10").await;
+    let flows1 = create_durable_flows(engine1.clone(), db.clone());
+    let run = tokio::spawn({
+        let engine1 = engine1.clone();
+        async move { flows1.run_loop("peer:10/loop", input, &scope(&engine1), &CancellationToken::new()).await }
+    });
+    in_flight.notified().await;
+    assert!(runs.cancel("peer:10/loop").unwrap());
+    engine1.shutdown().await;
+    let result = run.await.unwrap();
+    assert!(!matches!(result, FlowResult::Completed(_) | FlowResult::Faulted { .. }), "{result:?}");
+    assert_eq!(runs.get("peer:10/loop").unwrap().unwrap().outcome, Some(Status::Cancelled));
+    let engine2 = engine(Arc::new(Scripted::new(vec![])), Arc::new(World { calls: Mutex::default(), stop: None }));
+    let resumed = create_durable_flows(engine2, db.clone()).recover_once(&CancellationToken::new()).await;
+    assert_eq!(resumed.unwrap(), 0);
+    assert_eq!(runs.get("peer:10/loop").unwrap().unwrap().outcome, Some(Status::Cancelled));
+    assert_eq!(llm.requests.lock().unwrap().len(), 1);
 }
 
 // The agent may replace the loop: the version it activates under

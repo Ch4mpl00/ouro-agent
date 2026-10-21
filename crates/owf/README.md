@@ -13,7 +13,8 @@ already claimed. Its recovery worker picks up due waits and expired leases,
 up to four runs at once and alongside the supervisor's current signal.
 Shutdown releases unfinished work for recovery; `RunStore::cancel` is
 explicit, terminal cancellation. Any other interruption (a storage error,
-state the interpreter rejects) is retried with backoff from 2 s and fails
+state the interpreter rejects, a host call cut short by a stop the
+executor did not see first) is retried with backoff from 2 s and fails
 the run after `MAX_INTERRUPTIONS` (10) in a row, so a cause that never
 clears cannot retry forever. An interrupted run sends no failure report:
 it is still recoverable.
@@ -38,9 +39,19 @@ intent and dispatch can therefore lose execution. Retry is safe only when
 the host proves non-execution and that evidence is durably saved.
 
 Host adapters implement `Functions::invoke`, classifying failures as
-`NotExecuted`, `Response` or `Unknown`. They must not internally retry
-ambiguous dispatches. The agent's MCP adapter uses `call_tool_once` for
+`NotExecuted`, `Response`, `Unknown` or `Interrupted`. They must not internally
+retry ambiguous dispatches. The agent's MCP adapter uses `call_tool_once` for
 durable calls. Third-party tools require no changes.
+
+`Interrupted` is a stop of the host, not an answer: the process or the call's
+owner went away while the call ran (the agent's model turn aborted by
+shutdown). Nothing is saved for the call; its record stays pending and the
+run ends `Interrupted`, so recovery replays to the same call and makes it
+again (the model is asked for that turn once more; completed calls are not).
+It is for calls with no external effect of their own. If the run's own
+cancellation token fired, the run ends `Cancelled` instead; an interrupted
+at-most-once call is an unknown outcome like any other, so a write is never
+made re-sendable by it.
 
 A host may classify one invocation by its arguments
 (`Functions::effect_of`, `Functions::at_most_once`): the agent's `tool`

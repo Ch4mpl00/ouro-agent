@@ -853,7 +853,9 @@ impl AgentLoop {
                 "[invoke_sub_agent error] sub-agent crashed: {}",
                 error.detail.clone().unwrap_or_else(|| error.to_string())
             )),
-            crate::flows::FlowResult::Cancelled => Err(aborted()),
+            // This loop was not stopped (checked above): the run was
+            // cancelled explicitly, a failure of the call rather than a stop.
+            crate::flows::FlowResult::Cancelled => anyhow::bail!("sub-agent {child_id} was cancelled"),
             other => anyhow::bail!("sub-agent {child_id} did not end: {other:?}"),
         }
     }
@@ -1612,7 +1614,9 @@ pub async fn loop_tool_at(
                 "[invoke_sub_agent error] sub-agent crashed: {}",
                 e.detail.clone().unwrap_or_else(|| e.to_string())
             ),
-            owf::run::Status::Cancelled => return Err(aborted()),
+            // Cancelled explicitly (`RunStore::cancel`): a failure of this
+            // call, not a stop of the parent, which would resume it forever.
+            owf::run::Status::Cancelled => anyhow::bail!("sub-agent {id} was cancelled"),
             _ => anyhow::bail!("worker has not ended"),
         };
         Ok((loop_.scope.span(SpanStart::new("invoke_sub_agent:result", SpanKind::Tool)), raw))

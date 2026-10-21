@@ -10,7 +10,7 @@ use agent::{
 use async_trait::async_trait;
 use futures::{future::BoxFuture, poll};
 use owf::{
-    durable::{Journal, Record},
+    durable::{CallFailure, CallState, Journal, Record},
     run::{self, Clock, Events, Functions, Host, Limits, Silent, Status, WorkflowError},
 };
 use proptest::{
@@ -485,6 +485,43 @@ fn listen_hold_delivery_timeout_and_every_checkpoint_crash() {
     w.finish();
 }
 
+// Runs a child whose one task is a model turn once under `lease`. With
+// `stop`, a stop (shutdown aborting the model call) cuts the turn short.
+fn turn_run(lease: &Lease, id: &str, stop: bool) -> Status {
+    struct Turn(bool);
+    #[async_trait]
+    impl Functions for Turn {
+        fn effect(&self, _: &str) -> Option<run::Effect> {
+            Some(run::Effect::Read)
+        }
+        fn cooperative(&self, _: &str) -> bool {
+            true
+        }
+        async fn call(&self, _: &str, _: Value, _: &run::CallInfo<'_>) -> Result<Value, WorkflowError> {
+            unreachable!("durable runs invoke")
+        }
+        async fn invoke(&self, _: &str, _: Value, _: &run::CallInfo<'_>) -> Result<Value, CallFailure> {
+            if self.0 {
+                return Err(CallFailure::Interrupted(WorkflowError::runtime("This operation was aborted")));
+            }
+            Ok(json!("turn answer"))
+        }
+    }
+    let host = Host {
+        functions: Arc::new(Turn(stop)),
+        observer: Arc::new(Silent),
+        clock: Arc::new(run::SystemClock),
+        limits: Limits::default(),
+        runtime: json!({}),
+    };
+    let wf = owf::model::parse_yaml(
+        "document: { dsl: '1.0.4', namespace: t, name: worker, version: '1.0.0' }\ndo: [ { turn: { call: agent_turn } } ]",
+    )
+    .unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(run::resume(&host, &wf, id, json!({}), &CancellationToken::new(), lease)).status
+}
+
 fn child_link<'a>(parent: &'a str, key: &'a str) -> ChildLink<'a> {
     ChildLink { parent, key, reference: "/start" }
 }
@@ -536,6 +573,33 @@ fn child_case(order: Vec<(u8, bool)>, cancel: bool, w: &Witnesses) {
                 assert!(child.take(&id, "input", &[format!("input:{id}")]).unwrap().is_some());
                 w.hit("child waiting then done");
                 Status::Completed(json!("resumed child"))
+            }
+            5 => {
+                // A stop cuts the child's model turn short (`CallFailure::Interrupted`).
+                let status = turn_run(&child, &id, true);
+                assert!(matches!(status, Status::Interrupted(_)), "{status:?}");
+                child.finish(&status).unwrap();
+                for (key, kind) in [("stopped-waiting", "waiting"), ("stopped-done", "done")] {
+                    assert!(
+                        parent.take("p", &format!("{key}{i}"), &[format!("{kind}:{id}")]).unwrap().is_none(),
+                        "a stop is no lifecycle event: the parent keeps waiting"
+                    );
+                }
+                assert!(runs.get(&id).unwrap().unwrap().outcome.is_none());
+                assert!(
+                    runs.records(&id).unwrap().iter().any(|r| matches!(
+                        r,
+                        Record::Call { function, state: CallState::Pending, .. } if function == "agent_turn"
+                    )),
+                    "the cut turn has no result"
+                );
+                expired(&db, &id);
+                child = runs.claim(&id).unwrap().unwrap();
+                // Recovery asks the turn again and the child completes.
+                let status = turn_run(&child, &id, false);
+                assert_eq!(status, Status::Completed(json!("turn answer")));
+                w.hit("interrupted during a turn, then completed");
+                status
             }
             4 => {
                 child.finish(&Status::Interrupted(WorkflowError::runtime("temporary"))).unwrap();
@@ -617,6 +681,7 @@ fn children_join_once_replay_and_cascade_without_stranding_parents() {
         "parent cancellation",
         "child waiting then done",
         "interruption without waiting",
+        "interrupted during a turn, then completed",
         "joined stored child outcome",
         "parent completes and cancels descendants",
     ]);
@@ -628,7 +693,7 @@ fn children_join_once_replay_and_cascade_without_stranding_parents() {
         ))),
         ..Config::default()
     })
-    .run(&(prop::collection::vec((0u8..5, any::<bool>()), 5..9), any::<bool>()), |(ops, cancel)| {
+    .run(&(prop::collection::vec((0u8..6, any::<bool>()), 5..9), any::<bool>()), |(ops, cancel)| {
         child_case(ops, cancel, &w);
         Ok(())
     })
