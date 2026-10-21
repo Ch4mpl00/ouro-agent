@@ -1676,6 +1676,7 @@ impl Functions {
                         info.run_id,
                         &call,
                         &outcome,
+                        &crate::confirmation::Card::load(&*self.engine.deps.memory),
                         info.cancel,
                     )
                     .await;

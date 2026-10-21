@@ -1013,13 +1013,14 @@ async fn confirmation_holds_exact_call_frees_supervisor_and_resumes_after_press_
             "card not sent twice"
         );
         let edit = mcp.calls.lock().unwrap().iter().find(|(n, _)| n == "edit_telegram_message").unwrap().1.clone();
-        let label = if mode == "restart" || mode == "confirmed" {
-            "Confirmed"
+        let defaults = agent::confirmation::Card::default();
+        let label = defaults.outcome(if mode == "restart" || mode == "confirmed" {
+            "confirmed"
         } else if mode == "declined" {
-            "Declined"
+            "declined"
         } else {
-            "Expired"
-        };
+            "expired"
+        });
         assert!(edit["text"].as_str().unwrap().ends_with(label), "{mode}: {edit:?}");
         assert!(edit.get("buttons").is_none());
         assert!(!store.deliver(card["buttons"][0][0]["data"].as_str().unwrap(), &json!({})).unwrap());

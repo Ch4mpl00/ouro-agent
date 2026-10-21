@@ -1,10 +1,77 @@
 // User confirmation: 1. pending cards and the SQLite store; 2. host-rendered
 // requests and resolution. Tokens authorize one exact call in one durable run.
+use crate::db::MemoryStore;
 use crate::{agent::ConfirmTarget, db::AgentDb, mcp::Mcp, providers::ToolCall};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use tokio_util::sync::CancellationToken;
+
+// What the user sees: the card, its buttons and the line a press leaves on
+// it. The agent may reword it when the user asks (`set_memory` of CARD_KEY,
+// a guarded write; fields it leaves out keep their defaults). Whatever the
+// wording, the card shows the exact call: a text without `{name}` and
+// `{arguments}` gets them appended. `{guidance}` and `{goal}` are optional.
+pub const CARD_KEY: &str = "confirmation.card";
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(default)]
+pub struct Card {
+    pub text: String,
+    pub confirm: String,
+    pub decline: String,
+    pub outcomes: HashMap<String, String>,
+}
+impl Default for Card {
+    fn default() -> Self {
+        Card {
+            text: "Confirm action: {name}\n{arguments}\n\n{guidance}\n\nYour goal: {goal}".into(),
+            confirm: "Confirm".into(),
+            decline: "Decline".into(),
+            outcomes: [
+                ("confirmed", "Confirmed"),
+                ("declined", "Declined"),
+                ("expired", "Expired"),
+                ("other", "Not confirmed"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect(),
+        }
+    }
+}
+impl Card {
+    /// The stored wording over the defaults; an unreadable one is ignored.
+    pub fn load(memory: &dyn MemoryStore) -> Card {
+        let defaults = Card::default();
+        let Some(mut card) =
+            memory.get(CARD_KEY).ok().flatten().and_then(|raw| serde_json::from_str::<Card>(&raw).ok())
+        else {
+            return defaults;
+        };
+        if !card.text.contains("{name}") || !card.text.contains("{arguments}") {
+            card.text = format!("{}\n\n{{name}}\n{{arguments}}", card.text.trim_end());
+        }
+        let label = |l: &str| !l.trim().is_empty() && l.chars().count() <= 32;
+        if !label(&card.confirm) || !label(&card.decline) || card.confirm == card.decline {
+            (card.confirm, card.decline) = (defaults.confirm, defaults.decline);
+        }
+        for (k, v) in defaults.outcomes {
+            card.outcomes.entry(k).or_insert(v);
+        }
+        card
+    }
+    pub fn outcome(&self, outcome: &str) -> &str {
+        self.outcomes.get(outcome).or_else(|| self.outcomes.get("other")).map_or("", String::as_str)
+    }
+    fn render(&self, name: &str, arguments: &str, guidance: &str, goal: &str) -> String {
+        self.text
+            .replace("{name}", name)
+            .replace("{arguments}", arguments)
+            .replace("{guidance}", guidance)
+            .replace("{goal}", goal)
+    }
+}
 
 // ── 1. store ───────────────────────────────────────────────────────────────
 #[derive(Clone, Debug)]
@@ -150,6 +217,7 @@ pub struct Request<'a> {
     pub target: &'a ConfirmTarget,
     pub guidance: &'a str,
     pub goal: &'a str,
+    pub card: &'a Card,
 }
 pub async fn request(
     store: &dyn Store,
@@ -174,12 +242,11 @@ pub async fn request(
             no: token(),
             target: req.target.clone(),
             message: None,
-            card: format!(
-                "Confirm action: {}\n{}\n\n{}\n\nYour goal: {}",
-                clip(&req.call.name, 128),
-                clip(&pretty, 1000),
-                clip(req.guidance, 300),
-                clip(req.goal, 400)
+            card: req.card.render(
+                &clip(&req.call.name, 128),
+                &clip(&pretty, 1000),
+                &clip(req.guidance, 300),
+                &clip(req.goal, 400),
             ),
         };
         store.insert(&p)?;
@@ -188,7 +255,7 @@ pub async fn request(
             .call_tool_once(
                 "send_telegram_message",
                 json!({"chatId":p.target.chat_id,"messageThreadId":p.target.message_thread_id,
-            "text":p.card,"buttons":[[{"text":"Confirm","data":p.yes},{"text":"Decline","data":p.no}]]})
+            "text":p.card,"buttons":[[{"text":req.card.confirm,"data":p.yes},{"text":req.card.decline,"data":p.no}]]})
                 .as_object()
                 .unwrap()
                 .clone(),
@@ -213,18 +280,14 @@ pub async fn close_card(
     run: &str,
     call: &ToolCall,
     outcome: &str,
+    card: &Card,
     cancel: &CancellationToken,
 ) {
     let edit = async {
         if let Some(p) = store.get(run, &crate::guard::key(call))?
             && let Some(message) = p.message
         {
-            let label = match outcome {
-                "confirmed" => "Confirmed",
-                "declined" => "Declined",
-                "expired" => "Expired",
-                _ => "Not confirmed",
-            };
+            let label = card.outcome(outcome);
             let raw = mcp
                 .call_tool_once(
                     "edit_telegram_message",
@@ -251,6 +314,19 @@ pub async fn close_card(
 mod tests {
     use super::*;
     use owf::run::Events;
+    #[test]
+    fn a_stored_card_rewords_but_always_shows_the_call() {
+        let db = AgentDb::open(":memory:").unwrap();
+        assert_eq!(Card::load(&db).confirm, "Confirm");
+        db.set(CARD_KEY, r#"{"text":"Апрувни","confirm":"Да","decline":"Да","outcomes":{"declined":"Нет"}}"#).unwrap();
+        let card = Card::load(&db);
+        assert_eq!(card.render("update_fact", "{\"id\":19}", "g", "x"), "Апрувни\n\nupdate_fact\n{\"id\":19}");
+        // Two identical buttons can't tell yes from no: both fall back.
+        assert_eq!((card.confirm.as_str(), card.decline.as_str()), ("Confirm", "Decline"));
+        assert_eq!((card.outcome("declined"), card.outcome("expired")), ("Нет", "Expired"));
+        db.set(CARD_KEY, "not json").unwrap();
+        assert_eq!(Card::load(&db).text, Card::default().text);
+    }
     #[test]
     fn approval_is_bound_to_run_exact_call_and_card_and_spent_once() {
         for foreign in [false, true] {

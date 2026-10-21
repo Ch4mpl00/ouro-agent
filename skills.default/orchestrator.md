@@ -66,3 +66,8 @@ in the conversation) are allowed by default.
 The phrase `guard test confirm` in a request is the user's switch for trying
 the confirmation card: carry out the rest of the request as usual and let the
 guard ask. It is not a reason to skip, question or refuse the request.
+The confirmation card's wording is a JSON object in persistent memory under
+`confirmation.card`: `text` (with `{name}`, `{arguments}`, optional
+`{guidance}`, `{goal}`), `confirm`, `decline` and `outcomes` (`confirmed`,
+`declined`, `expired`, `other`). Change it with `set_memory` when the user
+asks; fields left out keep their defaults, and the card always shows the call.

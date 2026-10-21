@@ -1241,6 +1241,7 @@ pub async fn guard_confirmation(
             target,
             guidance: &verdict.guidance,
             goal: if context.root_request.is_empty() { &context.task } else { &context.root_request },
+            card: &crate::confirmation::Card::load(&*engine.deps.memory),
         },
         info.cancel,
     )
@@ -1301,7 +1302,14 @@ pub async fn loop_confirm_request(
         runs.confirmations(),
         events,
         &*engine.deps.mcp,
-        crate::confirmation::Request { run: info.run_id, call: &call, target, guidance: &guidance, goal: &goal },
+        crate::confirmation::Request {
+            run: info.run_id,
+            call: &call,
+            target,
+            guidance: &guidance,
+            goal: &goal,
+            card: &crate::confirmation::Card::load(&*engine.deps.memory),
+        },
         info.cancel,
     )
     .await
@@ -1495,7 +1503,16 @@ pub async fn loop_tool_at(
         loop_.start_call(engine, &call, child, runs, verdict.as_ref()).await
     };
     if let Some((outcome, (runs, id))) = outcome.as_deref().zip(runs.zip(run_id)) {
-        crate::confirmation::close_card(runs.confirmations(), &*engine.deps.mcp, id, &call, outcome, cancel).await;
+        crate::confirmation::close_card(
+            runs.confirmations(),
+            &*engine.deps.mcp,
+            id,
+            &call,
+            outcome,
+            &crate::confirmation::Card::load(&*engine.deps.memory),
+            cancel,
+        )
+        .await;
     }
     let (span, raw) = dispatched?;
     let failed = raw.starts_with("[guard] blocked:") || is_tool_error(&raw);
