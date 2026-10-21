@@ -702,6 +702,7 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
                 answer("summary")
             }),
             turn(|_| answer("done")),
+            turn(|_| answer("done")),
         ],
         &history.to_string(),
         tracer,
@@ -718,7 +719,7 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
     assert_eq!(fetch.kind, ObservationType::Tool);
     assert_eq!(fetch.meta("automatic"), Some(&json!(true)));
     assert_eq!(fetch.meta("memory_key"), Some(&json!("telegram.history")));
-    assert_eq!(trace.observations.iter().filter(|o| o.kind == ObservationType::Generation).count(), 3);
+    assert_eq!(trace.observations.iter().filter(|o| o.kind == ObservationType::Generation).count(), 4);
 }
 
 #[tokio::test]
@@ -734,6 +735,7 @@ async fn guard_gets_only_preloaded_user_messages_and_raw_signal_for_parent_and_w
             turn(|_| call("set_memory", json!({"key":"worker_notes","value":"summary"}))),
             turn(|_| answer("notes ready")),
             turn(|_| call("set_memory", json!({"key":"parent_notes","value":"summary"}))),
+            turn(|_| answer("done")),
             turn(|_| answer("done")),
         ],
         &history.to_string(),
@@ -790,7 +792,7 @@ async fn runs_a_signal_directly_and_records_parent_worker_tool_io_memory_referen
     assert_eq!(trace.tags, ["telegram", "agent-loop"]);
     let agent = find(&trace.observations, "agent_loop");
     assert_eq!(agent.meta("preset"), Some(&json!("smart")));
-    assert_eq!(agent.meta("skills"), Some(&json!(["orchestrator"])));
+    assert_eq!(agent.meta("skills"), Some(&json!(["telegram", "orchestrator"])));
     let worker = find(&trace.observations, "invoke_sub_agent");
     let search = find(&trace.observations, "search_news");
     let generations: Vec<_> = trace

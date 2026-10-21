@@ -82,7 +82,7 @@ impl ServerHandler for Server {
                 if self.0.fail_send {
                     return Ok(CallToolResult::error(vec![ContentBlock::text("partial delivery")]).into());
                 }
-                json!({"message_id":1})
+                json!({"delivered":true,"chatId":"42","messageThreadId":null,"messageId":1})
             }
             _ => json!({"ok":true}),
         };
@@ -308,7 +308,7 @@ async fn binary_journal_records_one_completed_run_without_creating_recursive_tra
     assert_eq!(entries[0]["metadata"]["trace_id"], trace.id);
     assert_eq!(entries[0]["metadata"]["source"], "telegram");
     assert!(entries[0]["body"].as_str().unwrap().contains("Sent a message"));
-    assert_eq!(f.state.requests.lock().unwrap().len(), 3);
+    assert_eq!(f.state.requests.lock().unwrap().len(), 2, "one reply turn and one journal composition");
     for export in f.state.exports.lock().unwrap().iter() {
         for span in export["resourceSpans"][0]["scopeSpans"][0]["spans"].as_array().unwrap() {
             assert_eq!(span["traceId"], trace.id);

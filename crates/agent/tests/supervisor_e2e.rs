@@ -123,7 +123,12 @@ fn expected(id: i64, p: &Plan) -> Expected {
         let mut texts = Vec::new();
         for (i, act) in acts.iter().enumerate() {
             match act {
-                Act::Send(true) => texts.push(send_text(id, i, true)),
+                Act::Send(true) => {
+                    texts.push(send_text(id, i, true));
+                    if p.source() == "telegram" {
+                        break;
+                    }
+                }
                 Act::Send(false) => {}
                 Act::Crash => {
                     texts.push(recovery_text(id));
@@ -310,6 +315,7 @@ impl ChatProvider for ScriptedModel {
             Plan::Telegram(acts) | Plan::Domain { acts, .. } | Plan::Scheduler(acts) => acts,
         };
         match acts.get(turn) {
+            None if p.source() == "telegram" && matches!(acts.last(), Some(Act::Answer)) => Ok(answer("done")),
             None => anyhow::bail!("scripted model: signal {id} has no turn {turn}"),
             Some(Act::Crash) => anyhow::bail!("400 invalid request: scripted crash"),
             Some(Act::Answer) => Ok(answer("done")),
@@ -357,10 +363,10 @@ async fn run(plans: &[(i64, Plan)]) -> Run {
     let provider: Arc<dyn ChatProvider> =
         Arc::new(ScriptedModel { world: world.clone(), plans: plans.iter().cloned().collect() });
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let skill_store = Arc::new(FsSkillStore {
-        live_dir: dir.path().join("no-live-skills"),
-        defaults_dir: repo.join("skills.default"),
-    });
+    let live_dir = dir.path().join("skills");
+    std::fs::create_dir(&live_dir).unwrap();
+    std::fs::write(live_dir.join("telegram.md"), "---\ntools: *\n---\nFixture Telegram transport rules.\n").unwrap();
+    let skill_store = Arc::new(FsSkillStore { live_dir, defaults_dir: repo.join("skills.default") });
     let engine = create_engine(EngineDeps {
         providers: Providers {
             openai: provider.clone(),
