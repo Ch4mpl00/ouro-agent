@@ -534,20 +534,87 @@ impl Supervisor {
 pub const SIGNAL: &str = include_str!("../workflows/signal.yaml");
 pub const SIGNAL_NAME: &str = "signal";
 /// The signal workflow's functions and their effects.
-pub const SIGNAL_FUNCTIONS: &[(&str, owf::run::Effect)] = {
+pub const SIGNAL_FUNCTIONS: &[crate::flows::HostFunction] = {
+    use crate::flows::host_function;
     use owf::run::Effect::{Read, Write};
     &[
-        ("signal_session", Read),
-        ("deliver_event", Write),
-        ("run_saved_workflow", Write),
-        ("signal_input", Read),
-        ("recent_activity", Read),
-        ("pending_confirmations", Read),
-        ("preselect_skills", Read),
-        ("primary_loop", Write),
-        ("route_signal", Write),
-        ("signal_transcript", Read),
-        ("recovery_loop", Write),
+        host_function(
+            "signal_session",
+            Read,
+            &[],
+            &[],
+            "Open the incoming signal's session. Returns context, engine_skills, conversation {chatId, messageThreadId} or null, and default_chat. The dispatcher already did this before entering a matching route.",
+        ),
+        host_function(
+            "deliver_event",
+            Write,
+            &["type", "data"],
+            &["type"],
+            "Deliver an incoming event to waiting durable runs. Returns delivered and output. The dispatcher offers button events before opening the session or selecting a route.",
+        ),
+        host_function(
+            "run_saved_workflow",
+            Write,
+            &["name"],
+            &["name"],
+            "Run the active saved workflow named by a scheduled signal, after signal_session. Returns done and output, or handover for the primary loop when a missing or failed workflow made no writes. The dispatcher does this before routing.",
+        ),
+        host_function(
+            "signal_input",
+            Read,
+            &[],
+            &[],
+            "Prepare the incoming message with its source history after signal_session. Returns the input string for primary_loop; preloads Telegram history into working memory and captures conversation evidence.",
+        ),
+        host_function(
+            "recent_activity",
+            Read,
+            &[],
+            &[],
+            "Read recent activity-journal notes as a context string, or null when unavailable. Pass it in primary_loop's system array when useful.",
+        ),
+        host_function(
+            "pending_confirmations",
+            Read,
+            &["target"],
+            &["target"],
+            "Read pending confirmation cards for target {chatId, messageThreadId}. Returns an informational string or null; it does not answer or consume a card.",
+        ),
+        host_function(
+            "preselect_skills",
+            Read,
+            &["request", "context", "loaded"],
+            &[],
+            "Select relevant skills for this signal. request and context are strings, loaded is an array of already loaded skill names. Returns names and block, or null; pass block in primary_loop's system array.",
+        ),
+        host_function(
+            "primary_loop",
+            Write,
+            &["input", "loop", "confirm", "skills", "loaded", "preset", "allow_skill_writes", "system"],
+            &["input"],
+            "Run the signal's primary agent after signal_session. input is a string; loop selects a named variant (default agent-loop); confirm is {chatId, messageThreadId} or null; skills/loaded and system are string arrays. preset defaults to smart; allow_skill_writes defaults to false. Returns output. A route inherits the dispatcher's session.",
+        ),
+        host_function(
+            "route_signal",
+            Write,
+            &["context"],
+            &["context"],
+            "Dispatch the incoming signal to the most specific active metadata.route match by source and top-level payload fields. Pass context: $context after session setup; the route inherits it as input. Returns routed and output when matched, or routed:false. Dispatcher only: a matching route cannot dispatch routes again.",
+        ),
+        host_function(
+            "signal_transcript",
+            Read,
+            &[],
+            &[],
+            "Read the bounded JSON transcript string of this signal's primary loop for recovery. Returns [] as a string when no primary loop was started.",
+        ),
+        host_function(
+            "recovery_loop",
+            Write,
+            &["error", "prompt", "skills", "preset", "max_iterations", "system"],
+            &["prompt", "max_iterations"],
+            "Run one failure-reporting agent after signal_session. prompt is a string, max_iterations a positive integer; skills and system are string arrays, preset defaults to base, error supplies detail for tracing. Returns output or error; skips cancellation and aborts. Keep the catch's final raise to preserve the original signal failure.",
+        ),
     ]
 };
 
@@ -913,7 +980,7 @@ impl SignalFunctions {
 #[async_trait::async_trait]
 impl owf::run::Functions for SignalFunctions {
     fn effect(&self, name: &str) -> Option<owf::run::Effect> {
-        SIGNAL_FUNCTIONS.iter().find(|f| f.0 == name).map(|f| f.1)
+        SIGNAL_FUNCTIONS.iter().find(|f| f.name == name).map(|f| f.effect)
     }
     // Each stops on the supervisor's cancellation and ends its own spans.
     fn cooperative(&self, _name: &str) -> bool {

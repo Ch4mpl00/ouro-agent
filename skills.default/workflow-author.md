@@ -399,8 +399,9 @@ instead of the active one, in this run only; name every draft of the chain
 you changed (the route and the loop it selects, say).
 
 - **The signal.** Model it on a real one; never invent its shape.
-  `try_workflow(name, signal: {})` runs nothing and lists the signal types
-  this agent receives, each with its latest real signal: copy its form (a
+  `try_workflow(name: "signal", signal: {})` succeeds without a draft or a
+  run: `status: "signal_types"`, with the types and latest real examples in
+  `signal_types`. Copy a matching example's form (a
   Telegram signal's header line with the chat and thread, a peer's
   "Message from …, thread N"), change only the text. A source that is not
   one of them is refused.

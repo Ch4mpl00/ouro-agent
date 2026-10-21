@@ -252,6 +252,27 @@ impl WorkflowStore for MemoryWorkflows {
 // effect, the arguments it takes and the ones it needs.
 type ModelFunction = (&'static str, Effect, &'static [&'static str], &'static [&'static str]);
 
+/// Host functions need an admitted signal or loop. Keep their author-facing
+/// contract with the registry execution uses, so discovery cannot omit them.
+#[derive(Clone, Copy)]
+pub struct HostFunction {
+    pub name: &'static str,
+    pub effect: Effect,
+    pub takes: &'static [&'static str],
+    pub needs: &'static [&'static str],
+    pub description: &'static str,
+}
+
+pub(crate) const fn host_function(
+    name: &'static str,
+    effect: Effect,
+    takes: &'static [&'static str],
+    needs: &'static [&'static str],
+    description: &'static str,
+) -> HostFunction {
+    HostFunction { name, effect, takes, needs, description }
+}
+
 const MODEL_FUNCTIONS: &[ModelFunction] = &[
     (
         "start_child",
@@ -281,14 +302,11 @@ fn mcp_tool(mcp: &dyn Mcp, name: &str) -> Option<ToolDef> {
 // What `name` does, or None when a workflow cannot call it. An MCP tool not
 // marked read-only counts as a write.
 pub fn effect(mcp: &dyn Mcp, name: &str) -> Option<Effect> {
-    if name == "confirm_request" {
-        return Some(Effect::Write);
+    if let Some(function) = LOOP_FUNCTIONS.iter().find(|f| f.name == name) {
+        return Some(function.effect);
     }
-    if LOOP_FUNCTIONS.contains(&name) {
-        return Some(Effect::Read);
-    }
-    if let Some((_, effect)) = crate::supervisor::SIGNAL_FUNCTIONS.iter().find(|f| f.0 == name) {
-        return Some(*effect);
+    if let Some(function) = crate::supervisor::SIGNAL_FUNCTIONS.iter().find(|f| f.name == name) {
+        return Some(function.effect);
     }
     if let Some((_, effect, _, _)) = MODEL_FUNCTIONS.iter().find(|f| f.0 == name) {
         return Some(*effect);
@@ -403,7 +421,67 @@ fn failed(e: anyhow::Error) -> WorkflowError {
 // `guard` and `confirm_request` remain executable for immutable runs admitted
 // before guard children. Remove them after those runs have drained. New
 // definitions cannot call confirm_request; only the reserved guard can.
-const LOOP_FUNCTIONS: &[&str] = &["agent_turn", "guard", "confirm_request", "start_worker", "tool", "agent_settle"];
+const LOOP_FUNCTIONS: &[HostFunction] = &[
+    host_function(
+        "agent_turn",
+        Effect::Read,
+        &["loop", "messages", "memory", "i", "extra_turn"],
+        &["messages"],
+        "Generate the next model message in an admitted loop. Pass messages, working-memory snapshot and zero-based turn i; extra_turn allows one additional turn. Returns message, calls and content. Preserve the host's loop spec.",
+    ),
+    host_function(
+        "guard",
+        Effect::Read,
+        &["loop", "calls"],
+        &["calls"],
+        "Legacy round review. New loops start the reserved guard child with start_child and join it with listen; copy agent-loop's guarded round.",
+    ),
+    host_function(
+        "confirm_request",
+        Effect::Write,
+        &["loop", "call"],
+        &["call"],
+        "Reserved confirmation function; supported only for existing admitted definitions.",
+    ),
+    host_function(
+        "start_worker",
+        Effect::Read,
+        &["loop", "call", "i", "index", "memory", "worker_loop"],
+        &["call"],
+        "Legacy worker start in an admitted loop. New loops use start_child with the model's invoke_sub_agent call, then listen and tool; returns run and loop.",
+    ),
+    host_function(
+        "tool",
+        Effect::Read,
+        &["loop", "call", "guard_run", "worker_run", "worker_loop", "i", "index", "memory", "outcome"],
+        &["call"],
+        "Execute one admitted loop call under the host-verified guard verdict. Pass its round i and index, guard_run and any joined worker_run/worker_loop. Returns presented, failed, result and working-memory updates for agent_settle. Its actual effect depends on the called tool; keep the base loop's guard and worker joins.",
+    ),
+    host_function(
+        "agent_settle",
+        Effect::Read,
+        &["loop", "calls", "results", "memory"],
+        &["calls", "results"],
+        "Settle ordered tool results into the admitted loop's transcript and working memory. Returns replies, memory, finished, output and outcomes: {name, arguments, ok, result}. Use these facts in workflow exit rules.",
+    ),
+];
+
+fn is_loop_function(name: &str) -> bool {
+    LOOP_FUNCTIONS.iter().any(|f| f.name == name)
+}
+
+fn runtime_functions() -> impl Iterator<Item = (HostFunction, &'static str)> {
+    MODEL_FUNCTIONS
+        .iter()
+        .map(|&(name, effect, takes, needs)| {
+            (
+                host_function(name, effect, takes, needs, "A step of the workflow runtime; the skill describes it."),
+                "workflow",
+            )
+        })
+        .chain(LOOP_FUNCTIONS.iter().filter(|f| f.name != "confirm_request").map(|f| (*f, "agent-loop")))
+        .chain(crate::supervisor::SIGNAL_FUNCTIONS.iter().map(|f| (*f, "signal")))
+}
 
 fn loop_tool_name(args: &Value) -> &str {
     args.get("call").and_then(|c| c.get("name")).and_then(Value::as_str).unwrap_or_default()
@@ -460,7 +538,7 @@ impl owf::run::Functions for Functions {
     // A loop's turn and calls stop on its cancellation and end their spans
     // and child loops first.
     fn cooperative(&self, name: &str) -> bool {
-        LOOP_FUNCTIONS.contains(&name) || name == "start_child" || self.guard_only
+        is_loop_function(name) || name == "start_child" || self.guard_only
     }
 
     async fn invoke(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
@@ -468,7 +546,7 @@ impl owf::run::Functions for Functions {
             return self.guard_step(name, args, info).await.map_err(CallFailure::Response);
         }
         if self.loop_only
-            && !LOOP_FUNCTIONS.contains(&name)
+            && !is_loop_function(name)
             && (self.effect(name) != Some(Effect::Read)
                 || (self.engine.deps.mcp.tools().iter().any(|t| t.name == name)
                     && self.engine.deps.mcp.open_world(name)))
@@ -478,10 +556,10 @@ impl owf::run::Functions for Functions {
                 "agent-loop guarded calls must use tool so the host guard reviews them",
             )));
         }
-        if crate::supervisor::SIGNAL_FUNCTIONS.iter().any(|f| f.0 == name) {
+        if crate::supervisor::SIGNAL_FUNCTIONS.iter().any(|f| f.name == name) {
             return Err(CallFailure::NotExecuted(invalid(name, "only the signal workflow calls it")));
         }
-        if LOOP_FUNCTIONS.contains(&name) {
+        if is_loop_function(name) {
             // A tool reports its own failures in its reply; an error here
             // (cancellation, a lost loop) leaves a write's outcome unknown.
             return self.call(name, args, info).await.map_err(|error| {
@@ -523,7 +601,7 @@ impl owf::run::Functions for Functions {
             return self.guard_step(name, args, info).await;
         }
         if self.loop_only
-            && !LOOP_FUNCTIONS.contains(&name)
+            && !is_loop_function(name)
             && (self.effect(name) != Some(Effect::Read)
                 || (self.engine.deps.mcp.tools().iter().any(|t| t.name == name)
                     && self.engine.deps.mcp.open_world(name)))
@@ -2471,10 +2549,20 @@ pub fn functions(engine: &Engine, args: &Map<String, Value>) -> anyhow::Result<S
         _ => "write",
     };
     if let Some(name) = args.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()) {
-        if let Some((_, _, takes, needs)) = MODEL_FUNCTIONS.iter().find(|f| f.0 == name) {
-            return Ok(json!({"name": name, "effect": effect_of(name), "takes": takes, "needs": needs,
-                "description": "A step of the workflow runtime; the skill describes it."})
-            .to_string());
+        if let Some((function, context)) = runtime_functions().find(|(f, _)| f.name == name) {
+            let properties: Map<String, Value> = function.takes.iter().map(|n| ((*n).to_owned(), json!({}))).collect();
+            let mut reply = json!({
+                "name": name, "effect": effect_of(name), "takes": function.takes, "needs": function.needs,
+                "description": function.description, "context": context,
+                "parameters": {"type": "object", "properties": properties, "required": function.needs,
+                    "additionalProperties": false},
+            });
+            if context != "workflow" {
+                reply["probe"] = json!(
+                    "Requires an admitted runtime context; test it through try_workflow with signal and drafts instead of probe_function."
+                );
+            }
+            return Ok(reply.to_string());
         }
         let tool = tools.iter().find(|t| t.name == name).ok_or_else(|| anyhow::anyhow!("no function `{name}`"))?;
         return Ok(json!({"name": name, "effect": effect_of(name), "description": tool.description,
@@ -2483,14 +2571,16 @@ pub fn functions(engine: &Engine, args: &Map<String, Value>) -> anyhow::Result<S
     }
     let mut lines = vec![
         "One line per function: name(arguments; `?` optional) effect — summary. \
-        workflow_functions(name) gives one in full."
+        workflow_functions(name) gives one in full. Signal and agent-loop host functions \
+        require their admitted runtime context; test them with try_workflow(signal: ...)."
             .to_owned(),
     ];
-    for (name, effect, takes, needs) in MODEL_FUNCTIONS {
+    for (function, context) in runtime_functions() {
+        let HostFunction { name, takes, needs, description, .. } = function;
         let args: Vec<String> =
             takes.iter().map(|a| if needs.contains(a) { a.to_string() } else { format!("{a}?") }).collect();
-        let effect = if *effect == Effect::Read { "read" } else { "write" };
-        lines.push(format!("{name}({}) {effect} — a runtime step; see the skill", args.join(", ")));
+        let summary = first_sentence(description);
+        lines.push(format!("{name}({}) {} — [{context}] {summary}", args.join(", "), effect_of(name)));
     }
     for tool in &tools {
         let schema = &tool.parameters;
@@ -2519,6 +2609,10 @@ pub async fn probe(engine: &Engine, args: &Map<String, Value>, cancel: &Cancella
     let mcp = &*engine.deps.mcp;
     let name = args.get("name").and_then(Value::as_str).filter(|n| !n.is_empty());
     let name = name.ok_or_else(|| anyhow::anyhow!("name: Expected nonempty string"))?;
+    anyhow::ensure!(
+        !is_loop_function(name) && !crate::supervisor::SIGNAL_FUNCTIONS.iter().any(|f| f.name == name),
+        "`{name}` requires an admitted runtime context; test it through try_workflow with signal and drafts instead"
+    );
     if name == "skill_catalog_snapshot" || name == "hash_value" {
         crate::errors::check(cancel)?;
         let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));

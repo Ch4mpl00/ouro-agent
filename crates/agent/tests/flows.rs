@@ -488,6 +488,60 @@ async fn the_author_sees_the_functions_and_probes_only_reads() {
     assert!(cut.len() < 7_000 && cut.contains("20000 characters in all"), "{}", cut.len());
 }
 
+#[tokio::test]
+async fn the_author_can_inspect_signal_and_loop_hosts_but_probes_cannot_execute_them() {
+    use agent::flows::{functions, probe};
+    let w = world(vec![]);
+    let catalog = functions(&w.engine, &Map::new()).unwrap();
+    // Follow the definitions an author actually copies, rather than a second
+    // list of expected names that could omit the next host function too.
+    for definition in [agent::supervisor::SIGNAL, agent::agent::AGENT_LOOP] {
+        let wf = owf::model::parse_yaml(definition).unwrap();
+        for site in owf::model::call_sites(&wf) {
+            let name = &site.function;
+            assert!(catalog.lines().any(|line| line.starts_with(&format!("{name}("))), "missing {name}");
+            let detail: Value =
+                serde_json::from_str(&functions(&w.engine, json!({"name":name}).as_object().unwrap()).unwrap())
+                    .unwrap();
+            let properties = detail["parameters"]["properties"].as_object().unwrap();
+            for argument in site.with.as_ref().and_then(Value::as_object).into_iter().flat_map(|a| a.keys()) {
+                assert!(properties.contains_key(argument), "{name}: undocumented argument {argument}");
+            }
+        }
+    }
+    for function in agent::supervisor::SIGNAL_FUNCTIONS {
+        let detail: Value =
+            serde_json::from_str(&functions(&w.engine, json!({"name":function.name}).as_object().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(detail["context"], "signal");
+        assert!(!detail["description"].as_str().unwrap().is_empty());
+        assert_eq!(detail["parameters"]["required"], json!(function.needs));
+        let error = probe(&w.engine, json!({"name":function.name}).as_object().unwrap(), &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("try_workflow"), "{error}");
+    }
+    let route: Value =
+        serde_json::from_str(&functions(&w.engine, json!({"name":"route_signal"}).as_object().unwrap()).unwrap())
+            .unwrap();
+    assert_eq!(route["needs"], json!(["context"]));
+    assert!(route["description"].as_str().unwrap().contains("Dispatcher only"));
+    let primary: Value =
+        serde_json::from_str(&functions(&w.engine, json!({"name":"primary_loop"}).as_object().unwrap()).unwrap())
+            .unwrap();
+    assert!(primary["parameters"]["properties"].get("loop").is_some());
+    for name in ["agent_turn", "tool", "agent_settle"] {
+        assert!(
+            probe(&w.engine, json!({"name":name}).as_object().unwrap(), &CancellationToken::new())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("try_workflow")
+        );
+    }
+    assert!(w.calls().is_empty(), "inspecting host contracts must not execute anything");
+}
+
 // A dry run runs a draft's reads and model steps on the session's input and
 // only records its writes: nothing is sent, no watermark moves, and a wait
 // does not sleep.

@@ -528,6 +528,17 @@ pub async fn try_signal(
 ) -> anyhow::Result<String> {
     let name = args.get("name").and_then(Value::as_str).filter(|n| !n.is_empty());
     let name = name.ok_or_else(|| anyhow::anyhow!("name: Expected nonempty string"))?;
+    let signal =
+        args.get("signal").and_then(Value::as_object).ok_or_else(|| anyhow::anyhow!("signal: Expected an object"))?;
+    // Discovery is a read, not a failed run. It must work before any draft
+    // exists and must not mark drafts tried or start a model/guard session.
+    if signal.is_empty() {
+        return Ok(json!({
+            "status": "signal_types", "signal_types": signal_types(&*engine.deps.mcp, cancel).await?,
+            "next": "Copy a real signal's shape, replace its message, then call try_workflow with signal.source, signal.content and any drafts of the chain.",
+        })
+        .to_string());
+    }
     let version = match args.get("version") {
         None | Some(Value::Null) => None,
         Some(v) => {
@@ -560,8 +571,6 @@ pub async fn try_signal(
         check(&*engine.deps.mcp, &saved.definition).map_err(|e| anyhow::anyhow!("`{draft}`: {e}"))?;
         drafts.insert(draft.clone(), saved);
     }
-    let signal =
-        args.get("signal").and_then(Value::as_object).ok_or_else(|| anyhow::anyhow!("signal: Expected an object"))?;
     let types = signal_types(&*engine.deps.mcp, cancel).await?;
     let source = signal.get("source").and_then(Value::as_str).unwrap_or_default();
     if !types.iter().any(|t| t["source"] == source) {

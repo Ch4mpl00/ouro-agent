@@ -415,7 +415,7 @@
     "type": "function",
     "function": {
       "name": "workflow_functions",
-      "description": "The functions a saved workflow can call, one line each: name, arguments (`?` optional), read or write, a one-line summary. With `name`, that one function in full: its description and argument schema.",
+      "description": "The functions a workflow can call, including signal/route and agent-loop host functions: name, arguments (`?` optional), read or write, context and summary. With `name`, returns that function's full description and argument schema. Host functions require an admitted signal or loop; test them through try_workflow with signal and drafts.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -470,7 +470,7 @@
           },
           "signal": {
             "type": "object",
-            "description": "The signal to run as if it arrived, modelled on the latest real signal of its type.",
+            "description": "The signal to run as if it arrived, modelled on the latest real signal of its type. Pass {} to discover types without running anything: returns status=signal_types and signal_types with latest examples, even before a draft exists. A nonempty signal needs source and content.",
             "properties": {
               "source": {
                 "type": "string"

@@ -302,9 +302,29 @@ async fn a_worker_inside_runs_dry_and_is_nested_in_the_trace() {
 }
 
 #[tokio::test]
+async fn an_empty_signal_discovers_types_without_a_draft_or_a_run() {
+    let s = sandbox(vec![], "allow");
+    let report = s.try_signal(json!({"name":"not-saved-yet","signal":{},"drafts":["also-not-saved"]})).await.unwrap();
+    assert_eq!(report["status"], "signal_types");
+    let types = report["signal_types"].as_array().unwrap();
+    let telegram = types.iter().find(|t| t["source"] == "telegram").unwrap();
+    assert!(telegram["latest"]["content"].as_str().unwrap().contains("thread_id=7"));
+    assert!(telegram["latest"]["content"].as_str().unwrap().contains("latest"));
+    assert!(types.iter().any(|t| t["source"] == "peer"));
+    assert!(types.iter().any(|t| t["source"] == "scheduler"));
+    assert!(report.get("runs").is_none());
+    assert!(s.model.seen.lock().unwrap().is_empty());
+    assert_eq!(s.world.names(), ["list_signals"]);
+    for name in ["signal-telegram", "agent-loop-telegram"] {
+        assert!(!s.f.engine.deps.workflows.get(name, Some(2)).unwrap().unwrap().tried);
+    }
+    s.assert_nothing_kept();
+}
+
+#[tokio::test]
 async fn a_signal_type_is_one_this_agent_receives() {
     let s = sandbox(vec![calls(&[("try_workflow", json!({"name":"signal","signal":{}}))]), assistant("seen")], "allow");
-    for signal in [json!({"source":"carrier-pigeon","content":"hi"}), json!({})] {
+    for signal in [json!({"source":"carrier-pigeon","content":"hi"}), json!({"content":"missing source"})] {
         let error = s.try_signal(json!({"name":"signal","signal":signal})).await.unwrap_err().to_string();
         assert!(error.contains("is not a signal type") || error.contains("is missing"), "{error}");
         // The latest real signal of each source, and the agent's own scheduler.
@@ -335,7 +355,10 @@ async fn a_signal_type_is_one_this_agent_receives() {
     assert_eq!(author.send("try it".into()).await.unwrap(), "seen");
     let seen = s.model.seen.lock().unwrap();
     let reply = seen[1].messages.last().unwrap()["content"].as_str().unwrap();
-    assert!(reply.contains("try_workflow error") && reply.contains("scheduler"), "{reply}");
+    assert!(
+        !reply.contains("try_workflow error") && reply.contains("signal_types") && reply.contains("scheduler"),
+        "{reply}"
+    );
 }
 
 #[tokio::test]
