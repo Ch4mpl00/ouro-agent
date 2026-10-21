@@ -211,15 +211,16 @@ async fn openrouter_strips_our_routing_prefix_from_the_model_it_sends() {
         .unwrap();
     assert_eq!(
         body(&api, 0),
-        json!({ "model": "anthropic/claude-sonnet-5.5", "messages": [{ "role": "user", "content": "x" }] })
+        json!({ "model": "anthropic/claude-sonnet-5.5", "messages": [{ "role": "user", "content": "x" }],
+            "reasoning": { "enabled": false } })
     );
 }
 
 #[tokio::test]
-async fn openrouter_disabled_effort_omits_reasoning() {
+async fn openrouter_disabled_effort_turns_reasoning_off() {
     let (p, api) = fake(ProviderKind::Openrouter, openai_usage());
     Call::new("openrouter/qwen/qwen3", Effort::Disabled).run(&p).await.unwrap();
-    assert!(body(&api, 0).get("reasoning").is_none());
+    assert_eq!(body(&api, 0)["reasoning"], json!({ "enabled": false }));
     assert!(body(&api, 0).get("reasoning_effort").is_none());
 }
 

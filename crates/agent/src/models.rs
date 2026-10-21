@@ -117,20 +117,22 @@ fn preset(model: &str, reasoning_effort: ReasoningEffort) -> ModelPreset {
 // Applied at startup when the AGENT_*_MODEL env overrides are absent.
 //   base     — non-thinking chat: recovery, simple workers, the
 //              workflow-path primary loop, the activity journal.
-//   smart    — thinking on: the primary Telegram loop and editorial work.
+//   smart    — the primary Telegram loop and editorial work.
 //   smartest — a reserve high-end preset, selectable by sub-agents.
 //   compiler — the workflow compiler: one structured plan per signal.
 //   compose  — `llm_compose` steps by default: one generation, no tools.
-// MiMo (via OpenRouter) is the workhorse with tools. gpt-6.1-sol writes
+// DeepSeek V4.1 Flash (via OpenRouter) is the workhorse with tools. gpt-6.1-sol writes
 // text only: its Chat Completions endpoint takes no tool calls, so it never
 // backs a loop.
-const WORKHORSE: &str = "openrouter/xiaomi/mimo-v2.6-pro";
+const WORKHORSE: &str = "openrouter/deepseek/deepseek-v4.1-flash";
 pub fn default_presets() -> Presets {
     Presets {
         base: preset(WORKHORSE, ReasoningEffort::Disabled),
-        smart: preset(WORKHORSE, ReasoningEffort::Medium),
+        // Without reasoning: the loop's turns stay fast (MiMo at medium
+        // thought for four minutes over one workflow edit).
+        smart: preset(WORKHORSE, ReasoningEffort::Disabled),
         smartest: preset(WORKHORSE, ReasoningEffort::Max),
-        compiler: preset(WORKHORSE, ReasoningEffort::Medium),
+        compiler: preset(WORKHORSE, ReasoningEffort::Disabled),
         compose: preset("gpt-6.1-sol", ReasoningEffort::Medium),
     }
 }

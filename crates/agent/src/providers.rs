@@ -359,12 +359,15 @@ impl ChatProvider for ApiProvider {
                 }
             },
             // OpenRouter's unified field, translated per upstream; it tops out
-            // at "high".
+            // at "high". Disabled says so: a model that reasons by default
+            // (MiMo) would otherwise think for minutes on every turn.
             ProviderKind::Openrouter => {
-                if thinking {
-                    let effort = if effort == ReasoningEffort::Max { "high" } else { effort.as_str() };
-                    body.insert("reasoning".into(), json!({ "effort": effort }));
-                }
+                let reasoning = if thinking {
+                    json!({ "effort": if effort == ReasoningEffort::Max { "high" } else { effort.as_str() } })
+                } else {
+                    json!({ "enabled": false })
+                };
+                body.insert("reasoning".into(), reasoning);
             }
         }
         let raw = self.api.post("chat/completions", Value::Object(body), &p.cancel).await?;
