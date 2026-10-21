@@ -1587,7 +1587,12 @@ impl Functions {
         let root: Scope = self.spans.root.clone();
         let workflow = args["workflow"].as_str().unwrap_or_default().to_owned();
         if workflow != "guard" {
-            args["worker_loop"] = args.get("loop").filter(|v| v.is_string()).cloned().unwrap_or(json!(workflow));
+            args["worker_loop"] = args
+                .get("loop")
+                .filter(|v| v.is_string())
+                .cloned()
+                .or_else(|| (workflow != crate::agent::AGENT_LOOP_NAME).then(|| json!(workflow)))
+                .unwrap_or(Value::Null);
             // Same worker preparation and id scheme as legacy durable_worker.
             return owf::run::Functions::call(self, "start_worker", args, info).await;
         }

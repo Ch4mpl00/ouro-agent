@@ -1402,7 +1402,7 @@ pub async fn loop_worker_input(
     let worker_scope =
         loop_.scope.span(SpanStart::new("invoke_sub_agent", SpanKind::Agent).input(json!(arguments)).metadata(meta));
     let (mut opts, prompt) = loop_.worker_options(&arguments, worker_scope.clone(), Some(&key)).await?;
-    if let Some(name) = args["worker_loop"].as_str().filter(|name| *name != AGENT_LOOP_NAME) {
+    if let Some(name) = args["worker_loop"].as_str() {
         opts.workflow = name.to_owned();
     }
     let id = format!("{}/loop", opts.id);
@@ -1483,7 +1483,7 @@ pub async fn loop_tool_at(
     // Pass that selection to the same worker adapter used by tool arguments.
     if call.name == "invoke_sub_agent"
         && runs.is_none()
-        && let Some(name) = args["worker_loop"].as_str().filter(|name| *name != AGENT_LOOP_NAME)
+        && let Some(name) = args["worker_loop"].as_str()
     {
         let mut arguments: Map<String, Value> = serde_json::from_str(&call.arguments)?;
         arguments.insert("loop".into(), json!(name));

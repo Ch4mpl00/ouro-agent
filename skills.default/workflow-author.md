@@ -204,7 +204,8 @@ rename `document.name`, and give its metadata a description.
 accepts the same optional argument; without it the first worker skill that
 declares `loop: <name>` in frontmatter supplies the default, else `agent-loop`.
 Its description lists active loops. A worker's `start_child` can select a
-variant by `loop:` too (or its `workflow` name). A worker inherits the
+variant by `loop:` too (or its `workflow` name). An explicit `loop:` there
+overrides tool/skill preferences, including `loop: agent-loop`. A worker inherits the
 confirmation target, but has no conversation: conversation reply rules do
 not fire there. Give `tool` the call's place (`i`, `index`): workers then run
 as owned durable children, joined with `listen`, and survive restarts.

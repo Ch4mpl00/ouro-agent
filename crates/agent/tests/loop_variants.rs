@@ -334,3 +334,44 @@ async fn an_in_process_worker_start_child_respects_the_yaml_loop_selection() {
     let seen = model.seen.lock().unwrap();
     assert!(seen[2].messages.last().unwrap()["content"].as_str().unwrap().contains("research: worker answer"));
 }
+
+#[tokio::test]
+async fn an_explicit_base_loop_in_yaml_overrides_a_skills_variant_preference() {
+    for durable in [false, true] {
+        let model = Arc::new(Scripted::new(vec![
+            calls(&[("invoke_sub_agent", json!({"prompt":"research","skills":["research"]}))]),
+            assistant("worker answer"),
+            assistant("done"),
+        ]));
+        let f = fixture(
+            model.clone(),
+            &[],
+            &[
+                ("worker", "---\ntools: *\n---\nworker"),
+                ("research", "---\ntools: *\nloop: research-loop\n---\nresearch"),
+            ],
+        );
+        activate(
+            &f,
+            "research-loop",
+            &variant("research-loop").replace("output: .content", "output: (\"research: \" + .content)"),
+        );
+        let parent = AGENT_LOOP
+            .replace("with: { workflow: agent-loop, call:", "with: { workflow: agent-loop, loop: agent-loop, call:");
+        activate(&f, "agent-loop", &parent);
+        if durable {
+            assert!(
+                matches!(run(&f,"explicit-base","agent-loop",false).await,FlowResult::Completed(ref v) if v=="done")
+            );
+            let runs = agent::durable::RunStore::new((*f.db).clone());
+            assert_eq!(runs.get("explicit-base__sub1.0/loop").unwrap().unwrap().name, "agent-loop");
+        } else {
+            let mut opts = LoopOptions::new("explicit-base", context());
+            opts.skills = vec!["worker".into()];
+            assert_eq!(f.engine.start_loop(opts).await.unwrap().send("research".into()).await.unwrap(), "done");
+        }
+        let seen = model.seen.lock().unwrap();
+        let reply = seen[2].messages.last().unwrap()["content"].as_str().unwrap();
+        assert!(reply.contains("worker answer") && !reply.contains("research: worker answer"), "{reply}");
+    }
+}
