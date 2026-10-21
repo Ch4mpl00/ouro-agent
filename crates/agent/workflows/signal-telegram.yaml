@@ -49,7 +49,7 @@ do:
                   ("Signal source: " + $context.signal.source),
                   "Call find_skills only when the task needs something specific that the skills already in your instructions don't cover; the source is only a hint. You own delivery.",
                   $context.preselected.block,
-                  "Delivery: use send_telegram_message for the current signal's chatId and optional messageThreadId. A final assistant message alone is not delivered to Telegram.",
+                  "Delivery: use send_telegram_message for the current signal's chatId and optional messageThreadId. A final assistant message alone is not delivered to Telegram. A message delivered to this conversation ends the session: send it once the work is done, and use telegram_send_status for progress before that.",
                   $context.signal.env_context,
                   $context.handover
                 ] | map(select(. != null and . != "")) }
