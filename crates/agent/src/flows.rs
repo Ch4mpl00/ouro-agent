@@ -273,6 +273,9 @@ fn mcp_tool(mcp: &dyn Mcp, name: &str) -> Option<ToolDef> {
 // What `name` does, or None when a workflow cannot call it. An MCP tool not
 // marked read-only counts as a write.
 pub fn effect(mcp: &dyn Mcp, name: &str) -> Option<Effect> {
+    if name == "confirm_request" {
+        return Some(Effect::Write);
+    }
     if LOOP_FUNCTIONS.contains(&name) {
         return Some(Effect::Read);
     }
@@ -314,6 +317,7 @@ struct Functions {
     runs: Option<crate::durable::RunStore>,
     loop_only: bool,
     loop_input: Option<Value>,
+    events: Option<Arc<dyn owf::run::Events>>,
 }
 
 fn invalid(name: &str, detail: impl std::fmt::Display) -> WorkflowError {
@@ -360,7 +364,7 @@ fn failed(e: anyhow::Error) -> WorkflowError {
 // The agent loop's functions (`agent::AGENT_LOOP`): a turn, one tool call
 // by name, a round's settlement. They take the loop from the run's context,
 // so they belong to an `agent-loop` definition.
-const LOOP_FUNCTIONS: &[&str] = &["agent_turn", "guard", "tool", "agent_settle"];
+const LOOP_FUNCTIONS: &[&str] = &["agent_turn", "guard", "confirm_request", "tool", "agent_settle"];
 
 fn loop_tool_name(args: &Value) -> &str {
     args.get("call").and_then(|c| c.get("name")).and_then(Value::as_str).unwrap_or_default()
@@ -368,6 +372,9 @@ fn loop_tool_name(args: &Value) -> &str {
 
 #[async_trait]
 impl owf::run::Functions for Functions {
+    fn events(&self) -> Option<&dyn owf::run::Events> {
+        self.events.as_deref()
+    }
     fn effect(&self, name: &str) -> Option<Effect> {
         effect(&*self.engine.deps.mcp, name)
     }
@@ -381,9 +388,11 @@ impl owf::run::Functions for Functions {
 
     // A durable sub-agent is the exception: calling it again joins its run.
     fn at_most_once(&self, name: &str, args: &Value) -> bool {
-        name == "tool"
-            && self.effect_of(name, args) == Some(Effect::Write)
-            && (self.runs.is_none() || crate::agent::child_key(args).is_none())
+        name == "confirm_request"
+            || (name == "tool"
+                && (self.effect_of(name, args) == Some(Effect::Write)
+                    || args.get("outcome").is_some_and(|v| !v.is_null()))
+                && (self.runs.is_none() || crate::agent::child_key(args).is_none()))
     }
 
     fn unknown_outcome(&self, name: &str, args: &Value) -> Option<Value> {
@@ -460,7 +469,7 @@ impl owf::run::Functions for Functions {
         let span = self.spans.scope(info.reference);
         let label = info.reference.rsplit('/').next().unwrap_or(name);
         match name {
-            "agent_turn" | "guard" | "tool" | "agent_settle" => {
+            "agent_turn" | "guard" | "confirm_request" | "tool" | "agent_settle" => {
                 // A loop rebuilt after a restart is traced under the runner.
                 let root: Scope = self.spans.root.clone();
                 let engine = &self.engine;
@@ -486,8 +495,39 @@ impl owf::run::Functions for Functions {
                 args["loop"] = admitted["loop"].clone();
                 match name {
                     "agent_turn" => crate::agent::loop_turn(engine, &args, &root, info.cancel).await,
-                    "guard" => crate::agent::loop_guard(engine, &args, &root, info.cancel).await,
-                    "tool" => crate::agent::loop_tool(engine, &args, &root, info.cancel, self.runs.as_ref()).await,
+                    "guard" => {
+                        let mut output =
+                            crate::agent::loop_guard(engine, &args, &root, info.cancel).await.map_err(failed)?;
+                        output["confirmable"] = json!(
+                            self.runs.is_some()
+                                && self.events.is_some()
+                                && spec.parent_id.is_none()
+                                && spec.confirm.is_some()
+                        );
+                        Ok(output)
+                    }
+                    "confirm_request" => {
+                        crate::agent::loop_confirm_request(
+                            engine,
+                            &args,
+                            &root,
+                            info,
+                            self.runs.as_ref(),
+                            self.events.as_deref(),
+                        )
+                        .await
+                    }
+                    "tool" => {
+                        crate::agent::loop_tool(
+                            engine,
+                            &args,
+                            &root,
+                            info.cancel,
+                            self.runs.as_ref(),
+                            Some(info.run_id),
+                        )
+                        .await
+                    }
                     _ => crate::agent::loop_settle(engine, &args, &root, info.cancel).await,
                 }
                 .map_err(failed)
@@ -847,6 +887,14 @@ pub enum FlowResult {
 
 #[async_trait]
 pub trait FlowRun: Send + Sync {
+    fn pending_confirmations(&self, _target: &crate::agent::ConfirmTarget) -> anyhow::Result<Value> {
+        Ok(json!([]))
+    }
+
+    fn deliver_event(&self, _type: &str, _data: &Value) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     async fn run(
         &self,
         name: &str,
@@ -906,16 +954,24 @@ async fn execute_saved(
     scope: &Scope,
     cancel: &CancellationToken,
 ) -> FlowResult {
+    let lease = Arc::new(lease);
     let root = scope.span(SpanStart::new("runner", SpanKind::Chain).input(saved.input.clone()));
     let mut stopped = false;
     let status = match owf::model::parse_yaml(&saved.definition) {
         Err(error) => (RunStatus::Interrupted(WorkflowError::validation(error.to_string())), true),
         Ok(wf) => {
-            let host = host(engine, &root, saved.name == crate::agent::AGENT_LOOP_NAME, Some(runs.clone()), None);
+            let host = host(
+                engine,
+                &root,
+                saved.name == crate::agent::AGENT_LOOP_NAME,
+                Some(runs.clone()),
+                None,
+                Some(lease.clone()),
+            );
             // Shutdown releases work for recovery; only explicit run
             // cancellation is allowed to create a terminal Cancelled state.
             let execution_cancel = CancellationToken::new();
-            let execution = owf::run::resume(&host, &wf, &saved.id, saved.input, &execution_cancel, &lease);
+            let execution = owf::run::resume(&host, &wf, &saved.id, saved.input, &execution_cancel, &*lease);
             tokio::pin!(execution);
             let mut heartbeat = tokio::time::interval(std::time::Duration::from_millis(crate::durable::HEARTBEAT_MS));
             loop {
@@ -1084,6 +1140,9 @@ impl Flows {
 pub fn check(mcp: &dyn Mcp, definition: &str) -> Result<owf::model::Workflow, String> {
     struct Known<'a>(&'a dyn Mcp);
     impl owf::model::Catalog for Known<'_> {
+        fn events(&self) -> bool {
+            true
+        }
         fn has(&self, name: &str) -> bool {
             effect(self.0, name).is_some()
         }
@@ -1130,6 +1189,14 @@ pub fn check(mcp: &dyn Mcp, definition: &str) -> Result<owf::model::Workflow, St
 
 #[async_trait]
 impl FlowRun for Flows {
+    fn pending_confirmations(&self, target: &crate::agent::ConfirmTarget) -> anyhow::Result<Value> {
+        self.runs.as_ref().map_or(Ok(json!([])), |r| r.confirmations().pending(target))
+    }
+
+    fn deliver_event(&self, type_: &str, data: &Value) -> anyhow::Result<bool> {
+        self.runs.as_ref().map_or(Ok(false), |r| r.deliver(type_, data))
+    }
+
     async fn run(
         &self,
         name: &str,
@@ -1168,6 +1235,7 @@ impl FlowRun for Flows {
                         runs: None,
                         loop_only: false,
                         loop_input: None,
+                        events: None,
                     }),
                     observer: spans,
                     clock: Arc::new(SystemClock),
@@ -1278,7 +1346,7 @@ const OVERRIDE: &str = "override_version";
 /// The host an `agent-loop` run executes on, traced under `root`: for a
 /// caller that owns the run's journal itself (a test injecting crashes).
 pub fn loop_host(engine: &Arc<Engine>, root: &Arc<dyn Span>, input: Value) -> Host {
-    host(engine, root, true, None, Some(input))
+    host(engine, root, true, None, Some(input), None)
 }
 
 fn host(
@@ -1287,13 +1355,21 @@ fn host(
     agent_loop: bool,
     runs: Option<crate::durable::RunStore>,
     loop_input: Option<Value>,
+    events: Option<Arc<dyn owf::run::Events>>,
 ) -> Host {
     let spans = Arc::new(Spans { root: root.clone(), open: Mutex::default() });
     // A loop's generations and tool calls trace themselves; spans for its
     // turn/round/settle tasks would only repeat them.
     let observer: Arc<dyn owf::run::Observer> = if agent_loop { Arc::new(owf::run::Silent) } else { spans.clone() };
     Host {
-        functions: Arc::new(Functions { engine: engine.clone(), spans, runs, loop_only: agent_loop, loop_input }),
+        functions: Arc::new(Functions {
+            engine: engine.clone(),
+            spans,
+            runs,
+            loop_only: agent_loop,
+            loop_input,
+            events,
+        }),
         observer,
         clock: Arc::new(SystemClock),
         limits: Limits::default(),
@@ -1407,7 +1483,7 @@ pub async fn run_loop_here(
         }
         Ok(wf) => {
             let outcome = owf::run::run(
-                &host(engine, &root, true, None, Some(input.clone())),
+                &host(engine, &root, true, None, Some(input.clone()), None),
                 &wf,
                 id,
                 with_override(input, version),
@@ -1941,6 +2017,7 @@ pub async fn try_draft(
             runs: None,
             loop_only: false,
             loop_input: None,
+            events: None,
         },
         writes: Mutex::default(),
     });

@@ -1037,3 +1037,149 @@ fn concurrency_is_validated_as_for_metadata() {
     assert!(parse(&format!("{{ {each}, while: '.go', metadata: {{ concurrency: 2 }} }}")).is_err());
     assert!(parse("{ call: echo, metadata: { concurrency: 2 } }").is_err());
 }
+
+// The event adapter shares the journal transaction: a crash can occur after
+// consuming, before the enclosing task checkpoint, without losing the reply.
+#[derive(Default)]
+struct Inbox {
+    journal: Arc<Store>,
+    queued: Mutex<Vec<Value>>,
+    registered: Mutex<Vec<String>>,
+}
+impl run::Events for Inbox {
+    fn unregister(&self, _: &str, _: &str, types: &[String]) -> anyhow::Result<()> {
+        self.registered.lock().unwrap().retain(|t| !types.contains(t));
+        Ok(())
+    }
+
+    fn register(&self, _: &str, types: &[String]) -> anyhow::Result<()> {
+        self.registered.lock().unwrap().extend_from_slice(types);
+        Ok(())
+    }
+    fn take(&self, _: &str, key: &str, types: &[String]) -> anyhow::Result<Option<Value>> {
+        let mut records = self.journal.records.lock().unwrap();
+        if let Some(Record::Event { event }) = records.get(key) {
+            return Ok(Some(event.clone()));
+        }
+        let mut queued = self.queued.lock().unwrap();
+        let found = queued.iter().position(|e| types.iter().any(|t| e["type"] == *t));
+        Ok(found.map(|i| {
+            let event = queued.remove(i);
+            records.insert(key.into(), Record::Event { event: event.clone() });
+            event
+        }))
+    }
+}
+#[async_trait]
+impl Functions for Inbox {
+    fn effect(&self, _: &str) -> Option<Effect> {
+        None
+    }
+    fn events(&self) -> Option<&dyn run::Events> {
+        Some(self)
+    }
+    async fn call(&self, _: &str, _: Value, _: &CallInfo<'_>) -> Result<Value, WorkflowError> {
+        unreachable!()
+    }
+}
+fn event_host(inbox: Arc<Inbox>, time: Arc<Time>) -> Host {
+    Host { functions: inbox, clock: time, observer: Arc::new(Silent), limits: Limits::default(), runtime: json!({}) }
+}
+fn delivered(t: &str) -> Value {
+    json!({"type":t,"data":{"answer":42},"time":"2026-10-21T00:00:00Z"})
+}
+
+#[tokio::test]
+async fn listen_early_late_any_and_replay_after_consumption() {
+    let wf = workflow(
+        "do:\n - wait: { listen: { to: { any: [ { with: { type: '${ .yes }' } }, { with: { type: no } } ] } }, timeout: { after: PT24H } }\n",
+    );
+    for early in [false, true] {
+        let inbox = Arc::new(Inbox::default());
+        let time = Arc::new(Time(AtomicI64::new(1_000)));
+        let h = event_host(inbox.clone(), time.clone());
+        run::validate(&wf, &*h.functions).unwrap();
+        if early {
+            inbox.queued.lock().unwrap().push(delivered("no"));
+        }
+        // Keep the token alive across the future.
+        let token = CancellationToken::new();
+        let first = run::resume(&h, &wf, "run", json!({"yes":"yes"}), &token, &*inbox.journal).await.status;
+        if !early {
+            assert_eq!(first, Status::Waiting { wake_at_ms: 86_401_000 });
+            inbox.queued.lock().unwrap().push(delivered("no"));
+        } else {
+            assert_eq!(first, Status::Completed(json!([delivered("no")])));
+        }
+        // Inject failure on the task checkpoint, AFTER the atomic take.
+        if !early {
+            inbox.journal.fail_at.store(inbox.journal.saves.load(Ordering::SeqCst) + 3, Ordering::SeqCst);
+            let crashed = run::resume(&h, &wf, "run", json!({"yes":"yes"}), &token, &*inbox.journal).await;
+            assert!(matches!(crashed.status, Status::Interrupted(_)), "{crashed:?}");
+            assert!(inbox.journal.records.lock().unwrap().values().any(|r| matches!(r, Record::Event { .. })));
+        }
+        inbox.queued.lock().unwrap().push(delivered("yes"));
+        time.0.store(100_000_000, Ordering::SeqCst);
+        assert_eq!(
+            run::resume(&h, &wf, "run", json!({"yes":"yes"}), &token, &*inbox.journal).await.status,
+            Status::Completed(json!([delivered("no")]))
+        );
+        assert_eq!(*inbox.queued.lock().unwrap(), vec![delivered("yes")]);
+    }
+}
+
+#[tokio::test]
+async fn listen_timeout_is_caught_and_iterations_consume_separately() {
+    let inbox = Arc::new(Inbox::default());
+    let time = Arc::new(Time(AtomicI64::new(1_000)));
+    let h = event_host(inbox.clone(), time.clone());
+    let wf = workflow(
+        "do:\n - t:\n     try: [ { w: { listen: { to: { one: { with: { type: x } } } }, timeout: { after: PT1S } } } ]\n     catch: { errors: { with: { status: 408 } }, do: [ { expired: { set: { expired: true } } } ] }\n",
+    );
+    let token = CancellationToken::new();
+    assert_eq!(
+        run::resume(&h, &wf, "run", json!({}), &token, &*inbox.journal).await.status,
+        Status::Waiting { wake_at_ms: 2000 }
+    );
+    time.0.store(2000, Ordering::SeqCst);
+    assert_eq!(
+        run::resume(&h, &wf, "run", json!({}), &token, &*inbox.journal).await.status,
+        Status::Completed(json!({"expired":true}))
+    );
+    assert!(!inbox.registered.lock().unwrap().contains(&"x".to_owned()));
+    let inbox = Arc::new(Inbox::default());
+    inbox.queued.lock().unwrap().extend([delivered("x"), delivered("x")]);
+    let h = event_host(inbox.clone(), time);
+    let wf = workflow(
+        "do:\n - loop: { for: { in: [1, 2] }, do: [ { w: { listen: { to: { one: { with: { type: x } } } } } } ] }\n",
+    );
+    assert!(matches!(
+        run::resume(&h, &wf, "run", json!({}), &token, &*inbox.journal).await.status,
+        Status::Completed(_)
+    ));
+    assert!(inbox.queued.lock().unwrap().is_empty());
+    assert_eq!(inbox.journal.records.lock().unwrap().values().filter(|r| matches!(r, Record::Event { .. })).count(), 2);
+    let h = event_host(Arc::new(Inbox::default()), Arc::new(Time(AtomicI64::new(1000))));
+    let error = run::run(&h, &wf, "dry", json!({}), &token).await.status;
+    assert!(
+        matches!(error, Status::Faulted(ref e) if e.detail.as_deref().unwrap().contains("durable journal")),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn ephemeral_listen_consumes_an_available_event_but_never_waits() {
+    let inbox = Arc::new(Inbox::default());
+    inbox.queued.lock().unwrap().push(delivered("x"));
+    let h = event_host(inbox, Arc::new(Time(AtomicI64::new(1000))));
+    let wf = workflow("do: [ { w: { listen: { to: { one: { with: { type: x } } } } } } ]\n");
+    assert_eq!(
+        run::run(&h, &wf, "early", json!({}), &CancellationToken::new()).await.status,
+        Status::Completed(json!([delivered("x")]))
+    );
+    let h = event_host(Arc::new(Inbox::default()), Arc::new(Time(AtomicI64::new(1000))));
+    assert!(matches!(
+        run::run(&h, &wf, "empty", json!({}), &CancellationToken::new()).await.status,
+        Status::Faulted(_)
+    ));
+}

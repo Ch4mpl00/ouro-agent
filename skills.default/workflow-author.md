@@ -201,7 +201,8 @@ How a signal is handled is the workflow `signal` the same way: which path
 runs (a scheduled task's saved workflow or the primary loop), the
 context gathered first, the primary loop's skills, preset and system prompt.
 Its functions are `signal_session`, `run_saved_workflow`,
-`signal_input`, `recent_activity`, `preselect_skills`, `primary_loop`,
+`signal_input`, `recent_activity`, `pending_confirmations`, `deliver_event`,
+`preselect_skills`, `primary_loop`,
 `signal_transcript` (the primary loop's bounded transcript tail) and
 `recovery_loop`; `read_workflow("signal")` shows each one's use. It is
 replaced, activated and guarded the same way as `agent-loop`.
@@ -215,10 +216,32 @@ original error. Keep the final `raise` so a reported failure stays a failed
 signal for tracing and the breaker. An override without a catch deliberately
 gets no recovery report; Rust does not add one afterwards.
 
+The built-in loop keeps the guard's verdicts and sends a host-rendered card
+for a call needing confirmation, then listens for its Confirm/Decline event.
+The host verifies the consumed event against that exact call; setting an
+outcome in YAML cannot authorize it. Keep `call: guard` in loop overrides;
+omitting the confirmation branch keeps blocking. Workers report proposals
+to the main agent rather than waiting for confirmation themselves.
+
+`signal` routes `telegram_button` presses through `deliver_event` first.
+Unmatched presses enter the primary loop with Telegram history. Its
+`primary_loop.confirm` option chooses the Telegram chat/thread: the signal's
+conversation for Telegram, the default chat for other sources. A null target
+keeps blocking. `pending_confirmations` adds information about existing cards
+to a later session without taking action.
+
 ## The language
 
+`listen: { to: { one: { with: { type: <literal or expression> } } } }`
+consumes one matching event. Use `any: [ { with: { type: ... } }, ... ]`
+instead of `one` to accept the first event of several types. Output is an
+array of `{ type, data, time }`. Durable runs suspend without holding a
+worker; `timeout: { after: PT24H }` raises the standard catchable timeout.
+Dry runs fail on an empty listen. `all`, `until`, correlation, read and
+foreach listen options are unsupported.
+
 A subset of the Open Workflow Specification 1.0, in YAML. Anything not
-listed here is rejected (`listen`, `emit`, `run`, `schedule`, catalogs,
+listed here is rejected (`emit`, `run`, `schedule`, catalogs,
 secrets, authentication).
 
 ```
@@ -241,6 +264,7 @@ A task is a map with exactly one of these keys:
 | `try` | `try: [ tasks ]`, `catch: { errors: { with: { status: 503 } }?, as: e?, when?, exceptWhen?, retry: { delay: PT5S, backoff: { exponential: {} }, limit: { attempt: { count: 3 } } }?, do: [ tasks ]?, then: <flow>? }` | the body's, or the handler's |
 | `raise` | `raise: { error: { type: <uri>, status: 400, title?, detail? } }` | — (fails the run unless caught) |
 | `wait` | `wait: PT10M` or `wait: { minutes: 10 }` | its input |
+| `listen` | `listen: { to: { one: { with: { type: event } } } }` (or `any: [filters]`) | array containing the consumed event |
 
 And any of: `if: '${ … }'` (false → skipped, its input passes on),
 `input: { from: '${ … }' }` (what the task sees), `output: { as: '${ … }' }`

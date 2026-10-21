@@ -4,8 +4,8 @@
 //! # Invariants
 //!
 //! The interpreter and Journal host jointly enforce the run/call contract.
-//! Event-specific requirements remain for the future event integration;
-//! the current DSL supports deadline waits. `Effect` alone never determines
+//! Event waits use the same invocation identities and checkpoints.
+//! `Effect` alone never determines
 //! retry safety.
 //!
 //! ## Run identity and replay
@@ -96,6 +96,12 @@
 //!     duplicate events cannot resolve it twice. Early events remain available
 //!     for matching. Terminal run states are durable and cannot be reopened by
 //!     recovery or late events; cancellation does not undo external effects.
+//! 17. Taking an event and saving its `Record::Event` are one fenced atomic
+//!     commit in the event adapter. A crash before the task checkpoint restores
+//!     the same event, even after its deadline; it never consumes another one.
+//!     Each loop iteration has a distinct event key. Registration is idempotent;
+//!     terminal runs cannot receive events. A host must preserve a delivery's
+//!     wake-up when the executor concurrently releases its worker as waiting.
 use crate::{
     model::Flow,
     run::{Effect, WorkflowError},
@@ -166,6 +172,9 @@ pub enum Record {
         effect: Effect,
         delivery: Delivery,
         state: CallState,
+    },
+    Event {
+        event: Value,
     },
     Timer {
         deadline_ms: i64,

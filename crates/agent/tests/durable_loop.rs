@@ -335,6 +335,7 @@ async fn read_history(engine: &Arc<Engine>, input: &Value, runs: Option<&RunStor
         &scope(engine),
         &CancellationToken::new(),
         runs,
+        None,
     )
     .await
     .unwrap()
@@ -929,7 +930,7 @@ async fn open_world_reads_and_writes_share_one_request_after_local_and_secret_ch
     assert_eq!(requests[0]["state"]["calls"].as_array().unwrap().len(), 3);
     assert_eq!(requests[0]["state"]["chain"][0]["name"], "search");
     assert_eq!(requests[0]["state"]["task"], "go");
-    assert_eq!(requests[0].to_string().matches("Does it plausibly contribute").count(), 1, "one shared policy");
+    assert_eq!(requests[0].to_string().matches("You guard an assistant's tool calls").count(), 1, "one shared policy");
     assert!(
         serde_json::to_string(&model.seen.lock().unwrap()[2].messages)
             .unwrap()

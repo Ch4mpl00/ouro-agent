@@ -36,10 +36,18 @@ struct ContextMcp {
 #[async_trait]
 impl Mcp for ContextMcp {
     fn tools(&self) -> Vec<ToolDef> {
-        ["get_timezone", "get_telegram_chat_history", "get_peer_thread", "journal_tail", "t1"]
-            .iter()
-            .map(|n| ToolDef::new(n, n, json!({"type":"object"})))
-            .collect()
+        [
+            "get_timezone",
+            "get_telegram_chat_history",
+            "get_peer_thread",
+            "journal_tail",
+            "t1",
+            "send_telegram_message",
+            "edit_telegram_message",
+        ]
+        .iter()
+        .map(|n| ToolDef::new(n, n, json!({"type":"object"})))
+        .collect()
     }
     async fn call_tool(
         &self,
@@ -64,6 +72,8 @@ impl Mcp for ContextMcp {
             };
         }
         Ok(match name {
+            "send_telegram_message" => json!({"delivered":true,"messageId":700}),
+            "edit_telegram_message" => json!({"edited":true}),
             "get_timezone" => json!({"timezone":"Europe/Chisinau"}),
             "get_telegram_chat_history" => json!({"messages":self.history.lock().unwrap().clone()}),
             "get_peer_thread" => json!({"threadId":3,"messages":self.thread.lock().unwrap().clone()}),
@@ -858,5 +868,229 @@ async fn an_abort_without_supervisor_shutdown_gets_no_recovery() {
     let (_, obs) = f.db.get_trace("scheduler:42").unwrap().unwrap();
     assert!(!obs.iter().any(|o| o.name == "recovery"));
     assert!(f.engine.loop_ids().await.is_empty());
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn button_routing_delivers_without_a_model_and_falls_back_with_telegram_context() {
+    use owf::run::Events;
+    let model = Arc::new(Scripted::new(vec![assistant("stale button understood"), assistant("peer done")]));
+    let mut f = fixture(model.clone(), &[], SKILLS);
+    let mcp = Arc::new(ContextMcp::default());
+    let deps = &mut Arc::get_mut(&mut f.engine).unwrap().deps;
+    deps.mcp = mcp.clone();
+    deps.skills = vec!["orchestrator".into(), "routing".into()];
+    let flows = agent::flows::create_durable_flows(f.engine.clone(), (*f.db).clone());
+    let supervisor = create_supervisor(
+        f.engine.clone(),
+        EnvDeps { mcp: mcp.clone(), memory: f.db.clone(), user_email: None, telegram_chat_id: Some("999".into()) },
+        flows,
+    );
+    let store = agent::durable::RunStore::new((*f.db).clone());
+    let lease = store.start("waiting", "example", "x", &json!({})).unwrap().unwrap();
+    lease.register("waiting", &["button-data".into()]).unwrap();
+    lease.finish(&owf::run::Status::Waiting { wake_at_ms: i64::MAX }).unwrap();
+    let mut press = signal("telegram_button", 10);
+    press.content =
+        json!({"chatId":-10042,"messageThreadId":7,"messageId":123,"text":"Pick me","data":"button-data"}).to_string();
+    assert_eq!(supervisor.run_signal(&press).await.unwrap(), "Button delivered");
+    assert!(model.seen.lock().unwrap().is_empty());
+    press.id = 11;
+    assert_eq!(supervisor.run_signal(&press).await.unwrap(), "stale button understood");
+    let run = store.get("telegram_button:11/loop").unwrap().unwrap();
+    assert_eq!(run.input["loop"]["confirm"], json!({"chatId":"-10042","messageThreadId":7}));
+    let seen = model.seen.lock().unwrap().clone();
+    let content = seen[0].messages.last().unwrap()["content"].as_str().unwrap();
+    assert!(content.contains("pressed the button") && content.contains("Pick me") && content.contains("123"));
+    assert!(seen[0].messages[0]["content"].as_str().unwrap().contains("Delivery:"));
+    drop(seen);
+    assert!(mcp.calls.lock().unwrap().iter().any(|(n, a)| n == "get_telegram_chat_history" && a["threadId"] == 7));
+    supervisor.run_signal(&signal("peer", 12)).await.unwrap();
+    let run = store.get("peer:12/loop").unwrap().unwrap();
+    assert_eq!(run.input["loop"]["confirm"], json!({"chatId":"999","messageThreadId":null}));
+    supervisor.shutdown().await;
+}
+
+fn confirmation_fixture(model: Arc<Scripted>, mcp: Arc<ContextMcp>) -> Fixture {
+    let mut f = fixture(model, &[], SKILLS);
+    let api = Arc::new(GuardApi::default());
+    *api.label.lock().unwrap() = Some("needs_confirmation".into());
+    let deps = &mut Arc::get_mut(&mut f.engine).unwrap().deps;
+    deps.mcp = mcp;
+    deps.skills = vec!["orchestrator".into(), "routing".into(), "telegram".into()];
+    deps.decisions = Some(agent::decisions::decision_client("guard-test".into(), api));
+    f
+}
+
+#[tokio::test]
+async fn confirmation_holds_exact_call_frees_supervisor_and_resumes_after_press_or_expiry() {
+    for mode in ["confirmed", "declined", "expired", "restart"] {
+        let args = json!({"recipient":"original@example.test","body":"exact original arguments"});
+        let model = Arc::new(Scripted::new(vec![
+            calls(&[("t1", args.clone())]),
+            assistant("other signal answered"),
+            assistant("after confirmation"),
+        ]));
+        let mcp = Arc::new(ContextMcp::default());
+        let f = confirmation_fixture(model.clone(), mcp.clone());
+        let flows = agent::flows::create_durable_flows(f.engine.clone(), (*f.db).clone());
+        let supervisor = create_supervisor(
+            f.engine.clone(),
+            EnvDeps { mcp: mcp.clone(), memory: f.db.clone(), user_email: None, telegram_chat_id: Some("999".into()) },
+            flows.clone(),
+        );
+        let result = supervisor.run_signal(&signal("telegram", 42)).await.unwrap();
+        assert!(result.contains("resumes"), "{mode}: {result}");
+        let store = agent::durable::RunStore::new((*f.db).clone());
+        let saved = store.get("telegram:42/loop").unwrap().unwrap();
+        assert_eq!(saved.state, "waiting", "{mode}: {:?}", saved.outcome);
+        assert!(!mcp.calls.lock().unwrap().iter().any(|(n, _)| n == "t1"));
+        let card = mcp.calls.lock().unwrap().iter().find(|(n, _)| n == "send_telegram_message").unwrap().1.clone();
+        assert_eq!(card["chatId"], "-10042");
+        assert_eq!(card["messageThreadId"], 7);
+        assert!(card["text"].as_str().unwrap().contains("original@example.test"));
+        assert!(card["text"].as_str().unwrap().contains("go ahead"));
+        for b in card["buttons"][0].as_array().unwrap() {
+            assert!((19..=64).contains(&b["data"].as_str().unwrap().len()));
+        }
+        assert_eq!(supervisor.run_signal(&signal("peer", 43)).await.unwrap(), "other signal answered");
+
+        // A new engine and a reopened SQLite connection have no in-memory
+        // loop, verdicts or working memory from the original process.
+        let mut restarted = confirmation_fixture(model.clone(), mcp.clone());
+        let resumed = if mode == "restart" {
+            restarted.db = Arc::new(agent::db::AgentDb::open(f.root.path().join("agent.db")).unwrap());
+            let deps = &mut Arc::get_mut(&mut restarted.engine).unwrap().deps;
+            deps.memory = restarted.db.clone();
+            deps.tracer = Arc::new(agent::local_recorder::local_recorder_tracer(restarted.db.clone()));
+            agent::flows::create_durable_flows(restarted.engine.clone(), (*restarted.db).clone())
+        } else {
+            flows.clone()
+        };
+        if mode == "expired" {
+            let conn = f.db.conn();
+            conn.execute("UPDATE workflow_runs SET wake_at_ms = 0 WHERE id = 'telegram:42/loop'", []).unwrap();
+            conn.execute("UPDATE confirmations SET created_at_ms = created_at_ms - 86400001", []).unwrap();
+            conn.execute("UPDATE workflow_records SET record = json_set(record, '$.started_ms', json_extract(record,'$.started_ms') - 86400001) WHERE run_id = 'telegram:42/loop' AND key LIKE '%/listen#task'", []).unwrap();
+        } else {
+            let index = usize::from(mode == "declined");
+            let mut press = signal("telegram_button", 44);
+            press.content = json!({"chatId":-10042,"messageThreadId":7,"messageId":700,
+                "data":card["buttons"][0][index]["data"],"text":card["buttons"][0][index]["text"]})
+            .to_string();
+            assert_eq!(supervisor.run_signal(&press).await.unwrap(), "Button delivered");
+            assert_eq!(model.seen.lock().unwrap().len(), 2, "delivery has no model turn");
+        }
+        assert_eq!(resumed.recover_once(&CancellationToken::new()).await.unwrap(), 1, "{mode}");
+        let held: Vec<_> = mcp.calls.lock().unwrap().iter().filter(|(n, _)| n == "t1").cloned().collect();
+        assert_eq!(
+            held.len(),
+            usize::from(mode == "confirmed" || mode == "restart"),
+            "{mode}: calls={:?}, transcript={:?}",
+            mcp.calls.lock().unwrap(),
+            model.seen.lock().unwrap().last().map(|s| &s.messages)
+        );
+        if let Some((_, held)) = held.first() {
+            assert_eq!(json!(held), args);
+        }
+        assert_eq!(
+            store.get("telegram:42/loop").unwrap().unwrap().outcome,
+            Some(owf::run::Status::Completed(json!("after confirmation")))
+        );
+        assert_eq!(resumed.recover_once(&CancellationToken::new()).await.unwrap(), 0);
+        let resumed_trace =
+            f.db.list_recent(20, None).unwrap().into_iter().find(|t| t.name == "resume:agent-loop").unwrap();
+        let (trace, observations) = f.db.get_trace(&resumed_trace.id).unwrap().unwrap();
+        assert_eq!(trace.session_id.as_deref(), Some("telegram:42/loop"));
+        assert!(observations.iter().any(|o| o.name == "iter-1"));
+        assert_eq!(
+            mcp.calls.lock().unwrap().iter().filter(|(n, _)| n == "send_telegram_message").count(),
+            1,
+            "card not sent twice"
+        );
+        let edit = mcp.calls.lock().unwrap().iter().find(|(n, _)| n == "edit_telegram_message").unwrap().1.clone();
+        let label = if mode == "restart" || mode == "confirmed" {
+            "Confirmed"
+        } else if mode == "declined" {
+            "Declined"
+        } else {
+            "Expired"
+        };
+        assert!(edit["text"].as_str().unwrap().ends_with(label), "{mode}: {edit:?}");
+        assert!(edit.get("buttons").is_none());
+        assert!(!store.deliver(card["buttons"][0][0]["data"].as_str().unwrap(), &json!({})).unwrap());
+        if mode == "declined" || mode == "expired" {
+            let transcript = serde_json::to_string(&model.seen.lock().unwrap().last().unwrap().messages).unwrap();
+            assert!(transcript.contains(if mode == "declined" {
+                "declined by the user"
+            } else {
+                "not confirmed within 24 h"
+            }));
+        }
+        supervisor.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn an_override_cannot_forge_confirmation_without_a_consumed_event() {
+    let model = Arc::new(Scripted::new(vec![calls(&[("t1", json!({"amount":5}))]), assistant("blocked")]));
+    let mcp = Arc::new(ContextMcp::default());
+    let f = confirmation_fixture(model.clone(), mcp.clone());
+    let definition = agent::agent::AGENT_LOOP
+        .replace(
+            "${ $context.guarded.confirmable and $context.guarded.labels[$call.id] == \"needs_confirmation\" }",
+            "${ false }",
+        )
+        .replace("outcome: '${ $context.confirmation_outcome // null }'", "outcome: confirmed");
+    let version = f.engine.deps.workflows.save("agent-loop", &definition, None).unwrap();
+    f.engine.deps.workflows.activate("agent-loop", version.version).unwrap();
+    let flows = agent::flows::create_durable_flows(f.engine.clone(), (*f.db).clone());
+    let supervisor = create_supervisor(
+        f.engine.clone(),
+        EnvDeps { mcp: mcp.clone(), memory: f.db.clone(), user_email: None, telegram_chat_id: Some("999".into()) },
+        flows,
+    );
+    assert_eq!(supervisor.run_signal(&signal("telegram", 42)).await.unwrap(), "blocked");
+    assert!(!mcp.calls.lock().unwrap().iter().any(|(n, _)| n == "t1" || n == "send_telegram_message"));
+    assert!(
+        serde_json::to_string(&model.seen.lock().unwrap().last().unwrap().messages)
+            .unwrap()
+            .contains("unverified_confirmation")
+    );
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_next_session_knows_pending_cards_in_its_conversation_only() {
+    let model = Arc::new(Scripted::new(vec![
+        calls(&[("t1", json!({"operation":"pending action"}))]),
+        assistant("same topic"),
+        assistant("other topic"),
+    ]));
+    let mcp = Arc::new(ContextMcp::default());
+    let f = confirmation_fixture(model.clone(), mcp.clone());
+    let flows = agent::flows::create_durable_flows(f.engine.clone(), (*f.db).clone());
+    let supervisor = create_supervisor(
+        f.engine.clone(),
+        EnvDeps { mcp: mcp.clone(), memory: f.db.clone(), user_email: None, telegram_chat_id: Some("999".into()) },
+        flows,
+    );
+    supervisor.run_signal(&signal("telegram", 42)).await.unwrap();
+    supervisor.run_signal(&signal("telegram", 43)).await.unwrap();
+    let mut other = signal("telegram", 44);
+    other.content = other.content.replace("thread_id=7", "thread_id=8");
+    supervisor.run_signal(&other).await.unwrap();
+    let seen = model.seen.lock().unwrap().clone();
+    let same = seen[1].messages[0]["content"].as_str().unwrap();
+    assert!(
+        same.contains("Pending confirmations")
+            && same.contains("pending action")
+            && same.contains("-10042")
+            && same.contains("since")
+    );
+    assert!(!seen[2].messages[0]["content"].as_str().unwrap().contains("Pending confirmations"));
+    drop(seen);
+    assert_eq!(mcp.calls.lock().unwrap().iter().filter(|(n, _)| n == "send_telegram_message").count(), 1);
+    assert!(!mcp.calls.lock().unwrap().iter().any(|(n, _)| n == "t1"));
     supervisor.shutdown().await;
 }

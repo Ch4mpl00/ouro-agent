@@ -127,6 +127,35 @@ fn unavailable(signal: &PendingSignal) -> String {
         signal.content
     )
 }
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TelegramButton {
+    chat_id: i64,
+    message_thread_id: Option<i64>,
+    message_id: i64,
+    data: String,
+    text: Option<String>,
+}
+fn button(signal: &PendingSignal) -> Option<TelegramButton> {
+    (signal.source == "telegram_button").then(|| serde_json::from_str(&signal.content).ok()).flatten()
+}
+fn conversation(signal: &PendingSignal) -> Option<crate::agent::ConfirmTarget> {
+    if let Some(b) = button(signal) {
+        return Some(crate::agent::ConfirmTarget {
+            chat_id: b.chat_id.to_string(),
+            message_thread_id: b.message_thread_id,
+        });
+    }
+    if signal.source != "telegram" {
+        return None;
+    }
+    let h = TELEGRAM_HEADER.captures(&signal.content)?;
+    Some(crate::agent::ConfirmTarget {
+        chat_id: h[1].to_owned(),
+        message_thread_id: h.get(2).and_then(|m| m.as_str().parse().ok()),
+    })
+}
+
 pub async fn prepare_telegram_input(
     signal: &PendingSignal,
     context: &Session,
@@ -442,7 +471,7 @@ impl Supervisor {
         };
         let input = json!({"signal": {
             "id": signal.id, "source": signal.source, "content": signal.content,
-            "env_context": signal.env_context, "workflow": signal.saved_workflow(),
+            "env_context": signal.env_context, "workflow": signal.saved_workflow(), "button":button(signal),
         }});
         let run_id = format!("{}:{}/signal", signal.source, signal.id);
         let outcome = owf::run::run(&host, &wf, &run_id, input, &self.cancel).await;
@@ -505,9 +534,11 @@ pub const SIGNAL_FUNCTIONS: &[(&str, owf::run::Effect)] = {
     use owf::run::Effect::{Read, Write};
     &[
         ("signal_session", Read),
+        ("deliver_event", Write),
         ("run_saved_workflow", Write),
         ("signal_input", Read),
         ("recent_activity", Read),
+        ("pending_confirmations", Read),
         ("preselect_skills", Read),
         ("primary_loop", Write),
         ("signal_transcript", Read),
@@ -554,11 +585,19 @@ impl SignalFunctions {
         let scope: Scope = trace.clone();
         let mcp = engine.deps.mcp.as_ref();
         match name {
+            "deliver_event" => {
+                let type_ = args["type"].as_str().ok_or_else(|| anyhow::anyhow!("type: Required"))?;
+                Ok(
+                    json!({"delivered":supervisor.flows.deliver_event(type_, &args["data"])?,"output":"Button delivered"}),
+                )
+            }
             "signal_session" => {
                 let session = session(&id, gather_env_data(&supervisor.env, cancel).await?);
                 let context = render_context(&session.env)?;
+                let default_chat = session.env.telegram_chat_id.clone();
                 self.state().session = Some(session);
-                Ok(json!({"context": context, "engine_skills": engine.deps.skills}))
+                Ok(json!({"context": context, "engine_skills": engine.deps.skills,
+                    "conversation":conversation(signal),"default_chat":default_chat}))
             }
             // A saved workflow that failed before changing anything hands its task to the agent loop.
             "run_saved_workflow" => {
@@ -633,7 +672,24 @@ impl SignalFunctions {
             }
             "signal_input" => {
                 let session = self.session()?;
-                let input = if signal.source == PEER_SOURCE {
+                let input = if let Some(b) = button(signal) {
+                    let mut telegram = signal.clone();
+                    telegram.source = "telegram".into();
+                    let pressed = format!("[button] {}", b.text.as_deref().unwrap_or(&b.data));
+                    let thread =
+                        b.message_thread_id.map(|t| format!(" (forum topic thread_id={t})")).unwrap_or_default();
+                    telegram.content =
+                        format!("Telegram message in chat {}{thread}.\nText: {}", b.chat_id, json!(pressed));
+                    let history = prepare_telegram_input(&telegram, &session, mcp, &scope, cancel).await?;
+                    format!(
+                        "{history}\n\nThe user pressed the button {} with data {} under message {} (chatId={}, messageThreadId={:?}).",
+                        json!(b.text),
+                        json!(b.data),
+                        b.message_id,
+                        b.chat_id,
+                        b.message_thread_id
+                    )
+                } else if signal.source == PEER_SOURCE {
                     // Peer history currently survives only as rendered text.
                     prepare_peer_input(signal, mcp, &scope, cancel).await?
                 } else {
@@ -641,7 +697,7 @@ impl SignalFunctions {
                 };
                 // Capture structured Telegram user messages immediately after host
                 // preload, before any loop can change the working-memory copy.
-                if signal.source == "telegram" {
+                if matches!(signal.source.as_str(), "telegram" | "telegram_button") {
                     let history = session
                         .memory
                         .get(TELEGRAM_HISTORY_KEY)
@@ -659,6 +715,17 @@ impl SignalFunctions {
                 Ok(json!(input))
             }
             "recent_activity" => Ok(json!(load_recent_activity(mcp, &scope, cancel).await?)),
+            "pending_confirmations" => {
+                let target = serde_json::from_value(args["target"].clone())?;
+                let pending = supervisor.flows.pending_confirmations(&target)?;
+                Ok(if pending.as_array().is_some_and(|p| !p.is_empty()) {
+                    json!(format!(
+                        "Pending confirmations in this conversation (information only; the cards are waiting for the user):\n{pending}"
+                    ))
+                } else {
+                    Value::Null
+                })
+            }
             "preselect_skills" => {
                 let text = |key: &str| args[key].as_str().unwrap_or_default().to_owned();
                 let loaded = strings(args, "loaded");
@@ -743,6 +810,11 @@ impl SignalFunctions {
                 let mut opts = LoopOptions::new(&id, self.session()?);
                 opts.cancel = cancel.clone();
                 opts.guard_request = Some(signal.content.clone());
+                opts.confirm = args
+                    .get("confirm")
+                    .filter(|v| !v.is_null())
+                    .map(|v| serde_json::from_value(v.clone()))
+                    .transpose()?;
                 opts.earlier_user_messages = self.state().earlier_user_messages.clone();
                 let selected = self.state().selected_skill_text.clone();
                 if strings(args, "system").iter().any(|part| part.contains(&selected)) {

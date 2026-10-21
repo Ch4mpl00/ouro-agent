@@ -119,6 +119,7 @@ pub struct Update {
     pub message: Option<UpdateMessage>,
     pub edited_message: Option<UpdateMessage>,
     pub channel_post: Option<UpdateMessage>,
+    pub callback_query: Option<CallbackQuery>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,6 +128,47 @@ pub struct UpdateMessage {
     pub chat: UpdateChat,
     pub text: Option<String>,
     pub message_thread_id: Option<i64>,
+    pub reply_markup: Option<InlineKeyboard>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CallbackQuery {
+    pub id: String,
+    pub message: Option<UpdateMessage>,
+    pub data: Option<String>,
+}
+#[derive(Debug, Deserialize)]
+pub struct InlineKeyboard {
+    pub inline_keyboard: Vec<Vec<CallbackButton>>,
+}
+#[derive(Debug, Deserialize)]
+pub struct CallbackButton {
+    pub text: String,
+    pub callback_data: Option<String>,
+}
+
+/// Rows of buttons. A press becomes a telegram_button signal or a workflow event.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Button {
+    pub text: String,
+    pub data: String,
+}
+pub type Buttons = Vec<Vec<Button>>;
+
+fn check_buttons(buttons: Option<&Buttons>) -> Result<(), ErrorData> {
+    for b in buttons.into_iter().flatten().flatten() {
+        if b.text.trim().is_empty() {
+            return Err(invalid_params("button text must be non-empty"));
+        }
+        if !(1..=64).contains(&b.data.len()) {
+            return Err(invalid_params("button data must be 1–64 bytes"));
+        }
+    }
+    Ok(())
+}
+fn markup(buttons: &Buttons) -> Value {
+    json!({"inline_keyboard":buttons.iter().map(|row| row.iter().map(|b|
+        json!({"text":b.text,"callback_data":b.data})).collect::<Vec<_>>()).collect::<Vec<_>>()})
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -192,9 +234,19 @@ impl BotApi {
         text: &str,
         thread_id: Option<i64>,
     ) -> Result<SentMessage, TelegramError> {
+        self.send_message_buttons(chat_id, text, thread_id, None).await
+    }
+
+    pub async fn send_message_buttons(
+        &self,
+        chat_id: &str,
+        text: &str,
+        thread_id: Option<i64>,
+        buttons: Option<&Buttons>,
+    ) -> Result<SentMessage, TelegramError> {
         self.call(
             "sendMessage",
-            without_nulls(json!({ "chat_id": chat_id, "text": text, "message_thread_id": thread_id })),
+            without_nulls(json!({ "chat_id": chat_id, "text": text, "message_thread_id": thread_id, "reply_markup": buttons.map(markup) })),
         )
         .await
     }
@@ -207,7 +259,26 @@ impl BotApi {
         message_id: i64,
         text: &str,
     ) -> Result<SentMessage, TelegramError> {
-        self.call("editMessageText", json!({ "chat_id": chat_id, "message_id": message_id, "text": text })).await
+        self.edit_message_buttons(chat_id, message_id, text, None).await
+    }
+
+    pub async fn edit_message_buttons(
+        &self,
+        chat_id: &str,
+        message_id: i64,
+        text: &str,
+        buttons: Option<&Buttons>,
+    ) -> Result<SentMessage, TelegramError> {
+        self.call(
+            "editMessageText",
+            json!({ "chat_id": chat_id, "message_id": message_id, "text": text,
+            "reply_markup": markup(&buttons.cloned().unwrap_or_default()) }),
+        )
+        .await
+    }
+
+    pub async fn answer_callback_query(&self, id: &str) -> Result<(), TelegramError> {
+        self.call::<Value>("answerCallbackQuery", json!({"callback_query_id":id})).await.map(drop)
     }
 
     // A bot may only delete its own messages, within 48h.
@@ -229,7 +300,7 @@ impl BotApi {
         let body = without_nulls(json!({
             "offset": offset,
             "timeout": timeout,
-            "allowed_updates": timeout.map(|_| ["message", "edited_message"]),
+            "allowed_updates": timeout.map(|_| ["message", "edited_message", "callback_query"]),
         }));
         self.call("getUpdates", body).await
     }
@@ -832,6 +903,39 @@ pub async fn poll_once(
                 tracing::info!(message = msg.message_id, thread = ?msg.message_thread_id, "stored message + signal queued");
             }
         }
+        if let Some(callback) = &update.callback_query
+            && let Some(msg) = &callback.message
+            && msg.chat.id == allowed_chat
+            && let Some(data) = &callback.data
+        {
+            if let Err(error) = bot.answer_callback_query(&callback.id).await {
+                tracing::warn!(%error, "could not answer button press");
+            }
+            let text = msg
+                .reply_markup
+                .as_ref()
+                .into_iter()
+                .flat_map(|k| &k.inline_keyboard)
+                .flatten()
+                .find(|b| b.callback_data.as_ref() == Some(data))
+                .map(|b| b.text.as_str());
+            store
+                .record_message(
+                    msg.chat.id,
+                    msg.message_id,
+                    msg.message_thread_id,
+                    &format!("[button] {}", text.unwrap_or(data)),
+                )
+                .await?;
+            store
+                .record_signal(
+                    "telegram_button",
+                    &json!({"chatId":msg.chat.id,
+                "messageThreadId":msg.message_thread_id,"messageId":msg.message_id,"data":data,"text":text})
+                    .to_string(),
+                )
+                .await?;
+        }
         store.set_last_update_id(update.update_id).await?;
     }
     Ok(updates.len())
@@ -941,7 +1045,28 @@ pub async fn send_long_message(
     text: &str,
     thread_id: Option<i64>,
 ) -> Result<(Vec<String>, Vec<SentMessage>), SendError> {
-    send_parts(text, |part| async move { bot.send_message(chat_id, &part, thread_id).await }).await
+    send_long_message_buttons(bot, chat_id, text, thread_id, None).await
+}
+
+pub async fn send_long_message_buttons(
+    bot: &BotApi,
+    chat_id: &str,
+    text: &str,
+    thread_id: Option<i64>,
+    buttons: Option<&Buttons>,
+) -> Result<(Vec<String>, Vec<SentMessage>), SendError> {
+    let parts: Vec<_> =
+        split_telegram_text(text, TELEGRAM_TEXT_LIMIT).into_iter().filter(|p| !p.trim().is_empty()).collect();
+    let mut sent = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        let keyboard = if i + 1 == parts.len() { buttons } else { None };
+        match bot.send_message_buttons(chat_id, part, thread_id, keyboard).await {
+            Ok(message) => sent.push(message),
+            Err(cause) if sent.is_empty() => return Err(cause.into()),
+            Err(cause) => return Err(PartialSendError { delivered: sent, parts, cause }.into()),
+        }
+    }
+    Ok((parts, sent))
 }
 
 // The same with the sender injected (tests).
@@ -1003,6 +1128,7 @@ fn check_text(text: &str, allow_empty: bool) -> Result<(), ErrorData> {
 #[serde(rename_all = "camelCase")]
 struct SendParams {
     text: String,
+    buttons: Option<Buttons>,
     /// Telegram chat id. Falls back to TELEGRAM_DEFAULT_CHAT_ID if omitted.
     chat_id: Option<ChatId>,
     /// Forum topic thread_id. Required to reply inside a topic; omit for non-topic chats or the General topic.
@@ -1026,9 +1152,10 @@ impl McpTools {
             stays in sync.\n\n\
             A text over Telegram's 4096-character limit is sent as several \
             consecutive messages, split at blank lines where possible; \
-            `messageIds` lists them all and `messageId` is the first."
+            `messageIds` lists them all and `messageId` is the first. Optional buttons are rows of {text,data}; data is 1–64 bytes. Buttons appear on the last part. A press becomes a telegram_button signal or resumes a workflow waiting on that data."
     )]
     async fn send_telegram_message(&self, Parameters(p): Parameters<SendParams>) -> ToolResult {
+        check_buttons(p.buttons.as_ref())?;
         let len = p.text.encode_utf16().count();
         if len == 0 || len > MAX_SEND_CHARS {
             return Err(invalid_params("text must be 1–16384 characters"));
@@ -1055,16 +1182,19 @@ impl McpTools {
                     }
                     anyhow::Ok(())
                 };
-                let (parts, sent) = match send_long_message(&tg.bot, &target, &p.text, p.message_thread_id).await {
-                    Ok(result) => result,
-                    Err(SendError::Partial(err)) => {
-                        // The partial send is the story the model needs; a log
-                        // failure on top of it must not replace it.
-                        let _ = record(err.delivered.clone(), err.parts.clone()).await;
-                        return Err(err.into());
-                    }
-                    Err(SendError::Telegram(err)) => return Err(err.into()),
-                };
+                let (parts, sent) =
+                    match send_long_message_buttons(&tg.bot, &target, &p.text, p.message_thread_id, p.buttons.as_ref())
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(SendError::Partial(err)) => {
+                            // The partial send is the story the model needs; a log
+                            // failure on top of it must not replace it.
+                            let _ = record(err.delivered.clone(), err.parts.clone()).await;
+                            return Err(err.into());
+                        }
+                        Err(SendError::Telegram(err)) => return Err(err.into()),
+                    };
                 let Some(first) = sent.first().cloned() else {
                     anyhow::bail!("Nothing to send: the text is only whitespace.");
                 };
@@ -1099,6 +1229,7 @@ impl McpTools {
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct EditParams {
+    buttons: Option<Buttons>,
     /// Telegram chat id (the one the original message was sent to).
     chat_id: ChatId,
     /// messageId returned by send_telegram_message.
@@ -1160,15 +1291,16 @@ impl McpTools {
         title = "Edit Telegram message",
         description = "Edit a previously-sent Telegram message in place. Use to update a bill \
             notification when status changes (e.g. mark as PAID). messageId is the value \
-            returned by send_telegram_message; chatId is the same chat the message was sent to."
+            returned by send_telegram_message; chatId is the same chat the message was sent to. Optional buttons are rows of {text,data}; data is 1–64 bytes. Omitting buttons removes the keyboard. A press becomes a telegram_button signal or resumes a workflow waiting on that data."
     )]
     async fn edit_telegram_message(&self, Parameters(p): Parameters<EditParams>) -> ToolResult {
         check_text(&p.text, false)?;
+        check_buttons(p.buttons.as_ref())?;
         let tg = &self.deps.telegram;
         let chat_id = p.chat_id.into_string();
         respond(
             async {
-                let edited = tg.bot.edit_message_text(&chat_id, p.message_id, &p.text).await?;
+                let edited = tg.bot.edit_message_buttons(&chat_id, p.message_id, &p.text, p.buttons.as_ref()).await?;
                 let mut reply = json!({
                     "edited": true,
                     "chatId": chat_id,
@@ -1539,5 +1671,23 @@ mod split_tests {
             panic!("the original error")
         };
         assert!(err.to_string().contains("Too Many Requests"));
+    }
+}
+
+#[cfg(test)]
+mod button_tests {
+    use super::*;
+    #[test]
+    fn callback_data_limits_count_bytes_and_labels_are_required() {
+        for (text, data, valid) in [
+            ("Yes", "a".repeat(64), true),
+            ("Yes", "a".repeat(65), false),
+            ("Yes", "🧾".repeat(16), true),
+            ("Yes", "🧾".repeat(17), false),
+            ("", "x".into(), false),
+            ("Yes", "".into(), false),
+        ] {
+            assert_eq!(check_buttons(Some(&vec![vec![Button { text: text.into(), data }]])).is_ok(), valid);
+        }
     }
 }

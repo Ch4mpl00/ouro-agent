@@ -21,3 +21,10 @@ Feature: The tools the agent sees
       { "text": "hello" }
       """
     Then the call fails with "No chat target"
+
+  Scenario: Telegram buttons validate callback byte limits before sending
+    When I call "send_telegram_message" with:
+      """
+      { "text": "Choose", "buttons": [[{ "text": "Confirm", "data": "" }]] }
+      """
+    Then the call is rejected as invalid parameters
