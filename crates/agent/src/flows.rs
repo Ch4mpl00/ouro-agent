@@ -1821,7 +1821,6 @@ impl Functions {
 // The same goes for every workflow the runtime itself runs (`built_in`):
 // `signal` too (`supervisor.rs`), each with its own breaker.
 
-
 // ── 4b. the agent loop's definition ─────────────────────────────────────────
 // Every agent loop runs `agent-loop`: the version the agent saved and
 // activated under that name, or the built-in one in git (`workflows/agent-loop.yaml`).
