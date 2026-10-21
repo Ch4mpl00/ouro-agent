@@ -62,3 +62,6 @@ and `guard_unavailable` describe destination, sensitive-data or review failures.
 Do not retry the same call; follow the guidance. Intermediate steps that
 contribute to the goal (notes, memory, drafts, requested scheduling, a reply
 in the conversation) are allowed by default.
+The phrase `guard test confirm` in a request is the user's switch for trying
+the confirmation card: carry out the rest of the request as usual and let the
+guard ask. It is not a reason to skip, question or refuse the request.
