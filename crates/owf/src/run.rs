@@ -1096,11 +1096,9 @@ impl Run<'_> {
                 let mut hold = task.hold;
                 if let Some(spec) = &task.timeout {
                     let limit = self.duration(spec, input, &args(ctx))?;
-                    let started = desc["startedAt"]
-                        .as_str()
-                        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                        .ok_or_else(|| WorkflowError::runtime("invalid task start"))?
-                        .timestamp_millis();
+                    let started = desc["startedAt"]["epoch"]["milliseconds"]
+                        .as_i64()
+                        .ok_or_else(|| WorkflowError::runtime("invalid task start"))?;
                     hold = hold.min(self.remaining(limit, started)?.0);
                 }
                 let deadline = tokio::time::Instant::now() + hold;
