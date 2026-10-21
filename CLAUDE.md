@@ -91,10 +91,10 @@ deletion.
    may activate its own version, with the same breaker as `agent-loop`), which
    dispatches routes declared in `document.metadata.route.when`: source and
    top-level payload fields, with the most specific match winning (ties need
-   distinct priorities at activation). After button delivery and session
-   setup, `signal-telegram` gathers Telegram context, always loads its live
-   transport skill and selects `agent-loop-telegram`; unmatched signals use
-   the default path below. A `scheduler` signal whose payload names a saved workflow (`{"workflow": …}`, set by
+   distinct priorities at activation). Routes run after button delivery and
+   session setup. Telegram uses the default path below unless the agent
+   saves and activates a matching route; no Telegram route or loop is built in.
+   A `scheduler` signal whose payload names a saved workflow (`{"workflow": …}`, set by
    `schedule_task(workflow: …)`) runs its active version (`flows.rs` over `crates/owf`, no
    model deciding the steps); all other signals run the primary agent loop.
    Scheduler signals use the `scheduler` skill and `base` preset. Recurring
@@ -102,8 +102,8 @@ deletion.
    Every agent loop (primary, worker, recovery)
    is a run of a named OWF loop (`document.metadata.loop`), `agent-loop` by
    default; `primary_loop(loop: …)`, worker arguments or skill frontmatter
-   choose variants. `agent-loop-telegram` ends on a successful conversation
-   reply and nudges once before a silent end; workers have no conversation.
+   choose variants. The host supplies ordered tool outcomes and the incoming
+   conversation identity; YAML decides exit rules. Workers have no conversation.
    Host functions live in `agent.rs` §4. The primary loop is durable, so a
    restart resumes it from its last round. Durable runs persist a private trace anchor: resumed
    segments nest under their original span in the signal trace, and the primary
@@ -129,9 +129,10 @@ deletion.
    instead of being retried. Writes are the MCP tools without `readOnlyHint` (plus `set_memory`). The agent-loop path loads:
    - `skills/orchestrator.md` + `skills/routing.md` — always; how to use
      working memory and when to delegate to a domain skill.
-   - `skills/<signal.source>.md` (with `skills.default/` fallback) — only for
-     transport sources (`telegram`, `peer`, `scheduler`); domain work is delegated to
-     a sub-agent with that source's skill.
+   - `skills/<signal.source>.md` (with `skills.default/` fallback) — for `peer`
+     and `scheduler` on the default path. Telegram rules can be preselected or
+     loaded by an activated route; domain work is delegated to a sub-agent
+     with that source's skill.
 
    The built-in `signal` workflow's `try`/`catch` requests a recovery report
    through `recovery_loop`, then raises the signal failure again. Its prompt,
@@ -194,10 +195,9 @@ mcp-tools/
     │   ├── src/agent.rs                    the engine, the loop's turn/tool/settle, synthetic tools
     │   ├── src/guard.rs                    loop write/open-world policy, deterministic rules, batched verdicts
     │   ├── guard/                          compiled guard instructions and reason data (git-owned)
-    │   ├── workflows/                      the built-in OWF workflows in git: agent-loop.yaml
-    │   │                                   and agent-loop-telegram.yaml (loop variants),
-    │   │                                   signal.yaml (dispatcher), signal-telegram.yaml (route),
-    │   │                                   guard.yaml (reserved round review and confirmation)
+    │   ├── workflows/                      built-in OWF: agent-loop.yaml, signal.yaml (dispatcher),
+    │   │                                   guard.yaml (reserved round review and confirmation);
+    │   │                                   agents may activate their own loop variants and routes
     │   ├── src/activity.rs                 traces → ouro/activity journal notes (background
     │   │                                   task inside the supervisor)
     │   ├── src/providers.rs                ChatProviders: openai, gemini, deepseek, openrouter
@@ -504,7 +504,7 @@ volume — written by the `dreaming` skill when it self-revises).
 - `routing`, `orchestrator`, `worker` — always loaded on the agent-loop path
   (`worker` is the default skill for a sub-agent with no domain skill).
 - `composer` — the base prompt of saved workflows' `llm_compose` steps.
-- `workflow-author` — a worker skill (on `smart` at least): drafts a saved
+- `workflow-author` — a worker skill (always `smartest`, maximum reasoning): drafts a saved
   workflow with `save_workflow`, dry-runs it with `try_workflow` (real reads
   and model steps, writes only recorded) and describes it in words with a
   sample; the parent activates it once the user confirms.
