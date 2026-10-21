@@ -447,3 +447,35 @@ fn history_reads_do_not_claim_or_modify_runs_and_prefixes_are_literal() {
     db.conn().execute("UPDATE workflow_records SET record = 'broken'", []).unwrap();
     assert!(runs.records("a_%/child").is_err(), "corrupt evidence is an error, not an empty history");
 }
+
+#[test]
+fn events_survive_restart_consume_atomically_and_do_not_reopen_ended_runs() {
+    use owf::run::Events;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.db");
+    let db = AgentDb::open(&path).unwrap();
+    let store = RunStore::new(db.clone());
+    let lease = store.start("r", "w", "x", &json!({})).unwrap().unwrap();
+    lease.register("r", &["yes".into(), "no".into()]).unwrap();
+    lease.register("r", &["yes".into(), "no".into()]).unwrap();
+    assert!(!store.deliver("foreign", &json!({})).unwrap());
+    assert!(store.deliver("yes", &json!({"original":true})).unwrap());
+    assert!(!store.deliver("yes", &json!({"original":false})).unwrap());
+    // Delivery during the active execution wins over its subsequent suspension.
+    lease.finish(&Status::Waiting { wake_at_ms: i64::MAX }).unwrap();
+    assert_eq!(store.due().unwrap(), ["r"]);
+    drop((lease, store, db));
+    let db = AgentDb::open(&path).unwrap();
+    let store = RunStore::new(db.clone());
+    let lease = store.claim("r").unwrap().unwrap();
+    let event = lease.take("r", "listen#event", &["yes".into(), "no".into()]).unwrap().unwrap();
+    assert_eq!(event["data"], json!({"original":true}));
+    assert_eq!(lease.take("r", "listen#event", &["yes".into()]).unwrap(), Some(event.clone()));
+    assert_eq!(lease.load().unwrap()["listen#event"], Record::Event { event });
+    assert!(!store.deliver("yes", &json!({})).unwrap());
+    assert!(!store.deliver("no", &json!({})).unwrap());
+    lease.finish(&Status::Completed(json!({}))).unwrap();
+    assert!(!store.deliver("yes", &json!({})).unwrap());
+    store.sweep(-1).unwrap();
+    assert_eq!(db.conn().query_row("SELECT count(*) FROM workflow_events", [], |r| r.get::<_,i64>(0)).unwrap(), 0);
+}

@@ -98,6 +98,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0006_workflow_tried", include_str!("../migrations/0006_workflow_tried.sql")),
     ("0007_system_skill_index", include_str!("../migrations/0007_system_skill_index.sql")),
     ("0008_run_ended", include_str!("../migrations/0008_run_ended.sql")),
+    ("0009_workflow_events", include_str!("../migrations/0009_workflow_events.sql")),
 ];
 
 pub struct Migration {
