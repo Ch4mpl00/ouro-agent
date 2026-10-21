@@ -929,18 +929,28 @@ async fn confirmation_holds_exact_call_frees_supervisor_and_resumes_after_press_
         let model = Arc::new(Scripted::new(vec![
             calls(&[("t1", args.clone())]),
             assistant("other signal answered"),
+            calls(&[(
+                "send_telegram_message",
+                json!({"chatId":"-10042","messageThreadId":7,"text":"confirmation handled"}),
+            )]),
             assistant("after confirmation"),
         ]));
         let mcp = Arc::new(ContextMcp::default());
-        let f = confirmation_fixture(model.clone(), mcp.clone());
+        let mut f = confirmation_fixture(model.clone(), mcp.clone());
+        let api = Arc::new(GuardApi::default());
+        *api.label.lock().unwrap() = Some("needs_confirmation".into());
+        Arc::get_mut(&mut f.engine).unwrap().deps.decisions =
+            Some(agent::decisions::decision_client("guard-test".into(), api.clone()));
         let flows = agent::flows::create_durable_flows(f.engine.clone(), (*f.db).clone());
         let supervisor = create_supervisor(
             f.engine.clone(),
             EnvDeps { mcp: mcp.clone(), memory: f.db.clone(), user_email: None, telegram_chat_id: Some("999".into()) },
             flows.clone(),
         );
+        f.db.activity_cutoff(chrono::Utc::now() - chrono::TimeDelta::minutes(1)).unwrap();
         let result = supervisor.run_signal(&signal("telegram", 42)).await.unwrap();
         assert!(result.contains("resumes"), "{mode}: {result}");
+        assert!(!f.db.due_activity(20, chrono::Utc::now()).unwrap().iter().any(|t| t.trace_id == "telegram:42"));
         let store = agent::durable::RunStore::new((*f.db).clone());
         let saved = store.get("telegram:42/loop").unwrap().unwrap();
         assert_eq!(saved.state, "waiting", "{mode}: {:?}", saved.outcome);
@@ -957,7 +967,10 @@ async fn confirmation_holds_exact_call_frees_supervisor_and_resumes_after_press_
 
         // A new engine and a reopened SQLite connection have no in-memory
         // loop, verdicts or working memory from the original process.
+        *api.label.lock().unwrap() = Some("allow".into());
         let mut restarted = confirmation_fixture(model.clone(), mcp.clone());
+        Arc::get_mut(&mut restarted.engine).unwrap().deps.decisions =
+            Some(agent::decisions::decision_client("guard-test".into(), api));
         let resumed = if mode == "restart" {
             restarted.db = Arc::new(agent::db::AgentDb::open(f.root.path().join("agent.db")).unwrap());
             let deps = &mut Arc::get_mut(&mut restarted.engine).unwrap().deps;
@@ -982,6 +995,7 @@ async fn confirmation_holds_exact_call_frees_supervisor_and_resumes_after_press_
             assert_eq!(model.seen.lock().unwrap().len(), 2, "delivery has no model turn");
         }
         assert_eq!(resumed.recover_once(&CancellationToken::new()).await.unwrap(), 1, "{mode}: guard resumes");
+        assert!(!f.db.due_activity(20, chrono::Utc::now()).unwrap().iter().any(|t| t.trace_id == "telegram:42"));
         assert_eq!(resumed.recover_once(&CancellationToken::new()).await.unwrap(), 1, "{mode}: parent resumes");
         let held: Vec<_> = mcp.calls.lock().unwrap().iter().filter(|(n, _)| n == "t1").cloned().collect();
         assert_eq!(
@@ -999,16 +1013,53 @@ async fn confirmation_holds_exact_call_frees_supervisor_and_resumes_after_press_
             Some(owf::run::Status::Completed(json!("after confirmation")))
         );
         assert_eq!(resumed.recover_once(&CancellationToken::new()).await.unwrap(), 0);
-        let resumed_trace =
-            f.db.list_recent(20, None).unwrap().into_iter().find(|t| t.name == "resume:agent-loop").unwrap();
-        let (trace, observations) = f.db.get_trace(&resumed_trace.id).unwrap().unwrap();
+        let (trace, observations) = f.db.get_trace("telegram:42").unwrap().unwrap();
+        assert_eq!(trace.name, "signal:telegram");
+        assert!(!f.db.list_recent(20, None).unwrap().iter().any(|t| t.name.starts_with("resume:")));
+        for run in ["telegram:42/loop", "telegram:42/loop/guard/1"] {
+            let anchor = store.get(run).unwrap().unwrap().trace_anchor.unwrap();
+            assert_eq!(anchor.trace_id, trace.id);
+            let parent = observations.iter().find(|o| o.id == anchor.parent_span_id).unwrap();
+            assert_eq!(parent.name, if run.ends_with("/guard/1") { "guard" } else { "agent_loop" });
+            let resumed = observations
+                .iter()
+                .find(|o| o.name == format!("resume:{}", store.get(run).unwrap().unwrap().name))
+                .unwrap();
+            assert_eq!(resumed.parent_observation_id.as_deref(), Some(anchor.parent_span_id.as_str()));
+        }
+        assert!(observations.iter().any(|o| o.name == "guard"));
+        assert!(observations.iter().any(|o| o.name == "call:confirm"));
+        if mode != "expired" {
+            assert!(observations.iter().any(|o| o.name.starts_with("event:") && o.input["text"].is_string()));
+            let (press_trace, _) = f.db.get_trace("telegram_button:44").unwrap().unwrap();
+            assert_eq!(press_trace.session_id, trace.session_id);
+        }
         // The same session as the signal that started it, with its request.
         assert_eq!(trace.session_id.as_deref(), Some("telegram:42"));
         assert!(trace.input.to_string().contains("Telegram message"), "{}", trace.input);
         assert_eq!(trace.output, json!("after confirmation"));
+        assert!(f.db.due_activity(20, chrono::Utc::now()).unwrap().iter().any(|t| t.trace_id == "telegram:42"));
+        f.db.activity_done("telegram:42", Some(1)).unwrap();
+        assert!(!f.db.due_activity(20, chrono::Utc::now()).unwrap().iter().any(|t| t.trace_id == "telegram:42"));
+        if mode != "expired" {
+            assert!(
+                observations.iter().any(|o| o.name == "listen:listen" && o.output.to_string().contains("messageId"))
+            );
+        }
+        if mode == "confirmed" || mode == "restart" {
+            assert!(observations.iter().any(|o| o.name == "t1"));
+        }
         assert!(observations.iter().any(|o| o.name == "iter-1"));
+        assert!(
+            observations.iter().any(|o| o.name == "send_telegram_message" && o.input["text"] == "confirmation handled")
+        );
         assert_eq!(
-            mcp.calls.lock().unwrap().iter().filter(|(n, _)| n == "send_telegram_message").count(),
+            mcp.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(n, a)| n == "send_telegram_message" && a.contains_key("buttons"))
+                .count(),
             1,
             "card not sent twice"
         );
@@ -1139,7 +1190,9 @@ async fn a_worker_confirmation_sleeps_its_parent_and_survives_restart() {
         let mut restarted = confirmation_fixture(model.clone(), mcp.clone());
         let resumed = if restart {
             restarted.db = Arc::new(agent::db::AgentDb::open(f.root.path().join("agent.db")).unwrap());
-            Arc::get_mut(&mut restarted.engine).unwrap().deps.memory = restarted.db.clone();
+            let deps = &mut Arc::get_mut(&mut restarted.engine).unwrap().deps;
+            deps.memory = restarted.db.clone();
+            deps.tracer = Arc::new(agent::local_recorder::local_recorder_tracer(restarted.db.clone()));
             agent::flows::create_durable_flows(restarted.engine.clone(), (*restarted.db).clone())
         } else {
             flows
@@ -1163,6 +1216,12 @@ async fn a_worker_confirmation_sleeps_its_parent_and_survives_restart() {
         assert_eq!(json!(held[0].1), args);
         assert_eq!(mcp.calls.lock().unwrap().iter().filter(|(n, _)| n == "send_telegram_message").count(), 1);
         assert_eq!(resumed.recover_once(&CancellationToken::new()).await.unwrap(), 0);
+        let (trace, observations) = f.db.get_trace("telegram:42").unwrap().unwrap();
+        assert_eq!(trace.output, "parent answer");
+        for name in ["invoke_sub_agent", "resume:guard", "resume:agent-loop"] {
+            assert!(observations.iter().any(|o| o.name == name), "missing {name}");
+        }
+        assert_eq!(observations.iter().filter(|o| o.name == "resume:agent-loop").count(), 2);
         supervisor.shutdown().await;
     }
 }
@@ -1209,5 +1268,9 @@ async fn confirmation_during_the_hold_finishes_without_any_saved_waiting_state()
     assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(2), future).await.unwrap().unwrap(), "done");
     assert_eq!(f.db.conn().query_row("SELECT count(*) FROM waiting_saved", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
     assert_eq!(mcp.calls.lock().unwrap().iter().filter(|(n, _)| n == "t1").count(), 1);
+    let (trace, observations) = f.db.get_trace("telegram:42").unwrap().unwrap();
+    assert_eq!(trace.output, "done");
+    assert!(!observations.iter().any(|o| o.name.starts_with("resume:")));
+    assert_eq!(f.db.list_recent(20, None).unwrap().len(), 1);
     supervisor.shutdown().await;
 }

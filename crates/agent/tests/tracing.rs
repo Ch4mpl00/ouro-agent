@@ -131,6 +131,7 @@ async fn tee_forces_primary_ids_and_records_nested_spans_usage_and_merged_metada
         session_id: Some("telegram:42".into()),
         tags: Some(vec!["telegram".into()]),
         metadata: Some(json!({"skills":["telegram"],"signal_source":"telegram"}).as_object().unwrap().clone()),
+        ..Default::default()
     });
     trace.update(ContextUpdate::input("user input"));
     let generation =
@@ -202,4 +203,149 @@ async fn error_and_retry_event_attributes_match_local_records() {
     assert_eq!(tool.level, "ERROR");
     assert_eq!(tool.status_message.as_deref(), Some("failure"));
     assert_eq!(tool.output, "[tool error] failure");
+}
+
+#[test]
+fn continuation_keeps_langfuse_trace_identity_parent_name_and_final_output() {
+    let sink = Arc::new(Sink::default());
+    let tracer = LangfuseTracer::with_sink(sink.clone());
+    let first = tracer.trace(TraceStart {
+        name: "signal:telegram".into(),
+        session_id: Some("telegram:42".into()),
+        ..Default::default()
+    });
+    let parent = first.span(SpanStart::new("agent_loop", SpanKind::Chain));
+    let anchor = parent.anchor().unwrap();
+    parent.end(SpanEnd::default());
+    first.update(ContextUpdate::output(json!({"resumes":true})));
+    first.end();
+    let resumed = tracer.trace(TraceStart {
+        name: "resume:agent-loop".into(),
+        continuation: Some(anchor.clone()),
+        ..Default::default()
+    });
+    resumed.update(ContextUpdate::output("final answer"));
+    resumed.end();
+    let spans = sink.0.lock().unwrap();
+    let segment = spans.iter().find(|s| s.name == "resume:agent-loop").unwrap();
+    assert_eq!(segment.trace_id, first.id());
+    assert_eq!(segment.parent_span_id.as_deref(), Some(anchor.parent_span_id.as_str()));
+    assert!(!segment.attributes.iter().any(|(k, _)| k == "langfuse.trace.name"));
+    assert!(segment.attributes.contains(&("langfuse.trace.output".into(), Attr::Str("final answer".into()))));
+    assert!(segment.attributes.contains(&("session.id".into(), Attr::Str("telegram:42".into()))));
+    assert_eq!(spans.iter().filter(|s| s.attributes.iter().any(|(k, _)| k == "langfuse.trace.name")).count(), 1);
+}
+
+#[test]
+fn mirror_merges_segments_even_before_the_signal_ends_and_across_connections() {
+    for late_signal in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(AgentDb::open(dir.path().join("agent.db")).unwrap());
+        let sink = Arc::new(Sink::default());
+        let tracer = tee_tracer(Arc::new(LangfuseTracer::with_sink(sink)), Arc::new(local_recorder_tracer(db.clone())));
+        let first = tracer.trace(TraceStart {
+            id: "signal".into(),
+            name: "signal:telegram".into(),
+            session_id: Some("telegram:42".into()),
+            tags: Some(vec!["telegram".into()]),
+            metadata: Some(json!({"activity":"run"}).as_object().unwrap().clone()),
+            ..Default::default()
+        });
+        first.update(ContextUpdate::input("request"));
+        let parent = first.span(SpanStart::new("guard", SpanKind::Tool));
+        let anchor = parent.anchor().unwrap();
+        parent.event(EventStart { name: "card".into(), ..Default::default() });
+        parent.end(SpanEnd::default());
+        first.update(ContextUpdate::output(json!({"resumes":true})));
+        if !late_signal {
+            first.end();
+        }
+        let reopened = Arc::new(AgentDb::open(dir.path().join("agent.db")).unwrap());
+        let recorder = local_recorder_tracer(reopened);
+        let resumed = recorder.trace(TraceStart {
+            name: "resume:agent-loop".into(),
+            continuation: Some(anchor.clone()),
+            ..Default::default()
+        });
+        resumed.event(EventStart { name: "consumed".into(), ..Default::default() });
+        resumed.update(ContextUpdate::output("final answer"));
+        resumed.end();
+        // Repeated persistence must not duplicate observations.
+        resumed.end();
+        if late_signal {
+            first.end();
+        }
+        let (trace, observations) = db.get_trace(&first.id()).unwrap().unwrap();
+        assert_eq!(trace.name, "signal:telegram");
+        assert_eq!(trace.input, "request");
+        assert_eq!(trace.output, "final answer");
+        assert_eq!(trace.tags, ["telegram"]);
+        assert_eq!(trace.session_id.as_deref(), Some("telegram:42"));
+        assert_eq!(trace.metadata.unwrap()["activity"], "run");
+        assert_eq!(observations.len(), 5);
+        assert_eq!(
+            observations.iter().find(|o| o.name == "resume:agent-loop").unwrap().parent_observation_id.as_deref(),
+            Some(parent.id().as_str())
+        );
+        assert!(
+            observations
+                .iter()
+                .all(|o| o.parent_observation_id.as_ref().is_none_or(|p| observations.iter().any(|a| a.id == *p)))
+        );
+        assert_eq!(db.list_recent(20, None).unwrap().len(), 1);
+        let legacy =
+            recorder.trace(TraceStart { id: "legacy".into(), name: "resume:guard".into(), ..Default::default() });
+        legacy.end();
+        assert_eq!(db.list_recent(20, None).unwrap().len(), 2);
+    }
+}
+
+#[test]
+fn a_null_primary_keeps_local_trace_and_observation_anchors() {
+    let store = Arc::new(CaptureStore::default());
+    let tracer = tee_tracer(Arc::new(NullTracer), Arc::new(local_recorder_tracer(store.clone())));
+    let trace = tracer.trace(TraceStart { id: "local".into(), ..Default::default() });
+    let span = trace.span(SpanStart::new("loop", SpanKind::Chain));
+    assert_eq!(trace.id(), "local");
+    assert_eq!(span.anchor().unwrap().trace_id, "local");
+    assert!(!span.id().is_empty());
+    assert_eq!(span.anchor().unwrap().parent_span_id, span.id());
+    trace.end();
+    assert_eq!(store.0.lock().unwrap()[0].id, "local");
+}
+
+#[test]
+fn simultaneous_segments_do_not_lose_each_others_observations() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("agent.db");
+    let db = Arc::new(AgentDb::open(&path).unwrap());
+    let first = local_recorder_tracer(db.clone()).trace(TraceStart {
+        id: "concurrent".into(),
+        name: "signal".into(),
+        ..Default::default()
+    });
+    let anchor = first.anchor().unwrap();
+    let gate = std::sync::Barrier::new(8);
+    std::thread::scope(|threads| {
+        for i in 0..8 {
+            let (path, anchor, gate) = (&path, &anchor, &gate);
+            threads.spawn(move || {
+                let recorder = local_recorder_tracer(Arc::new(AgentDb::open(path).unwrap()));
+                let segment = recorder.trace(TraceStart {
+                    name: format!("resume:{i}"),
+                    continuation: Some(anchor.clone()),
+                    ..Default::default()
+                });
+                segment.event(EventStart { name: format!("event:{i}"), ..Default::default() });
+                gate.wait();
+                segment.end();
+            });
+        }
+    });
+    first.update(ContextUpdate::output("answer"));
+    first.end();
+    let (trace, observations) = db.get_trace("concurrent").unwrap().unwrap();
+    assert_eq!(trace.name, "signal");
+    assert_eq!(trace.output, "answer");
+    assert_eq!(observations.len(), 17);
 }

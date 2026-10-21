@@ -251,6 +251,7 @@ impl WorkflowStore for MemoryWorkflows {
 // generation, the decision classifier's filter, a watermark): the name, the
 // effect, the arguments it takes and the ones it needs.
 type ModelFunction = (&'static str, Effect, &'static [&'static str], &'static [&'static str]);
+
 const MODEL_FUNCTIONS: &[ModelFunction] = &[
     (
         "start_child",
@@ -336,6 +337,7 @@ struct Children {
     cancel: CancellationToken,
     slots: Arc<tokio::sync::Semaphore>,
 }
+
 impl Default for Children {
     fn default() -> Self {
         Self {
@@ -345,6 +347,7 @@ impl Default for Children {
         }
     }
 }
+
 impl Children {
     async fn close(&self) {
         self.cancel.cancel();
@@ -801,6 +804,7 @@ pub struct WorkflowSignal {
     #[serde(rename = "envContext")]
     pub env_context: Option<String>,
 }
+
 pub fn signal_input(signal: &WorkflowSignal, env: &EnvData) -> Map<String, Value> {
     let local_now = match env.timezone.parse::<chrono_tz::Tz>() {
         Ok(zone) => env.now.with_timezone(&zone).to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
@@ -821,6 +825,7 @@ pub fn render_input_xml(input: &Map<String, Value>) -> String {
         .collect::<Vec<_>>()
         .join("\n\n")
 }
+
 pub fn parse_tool_json(raw: &str) -> Value {
     if raw.starts_with(['{', '[']) { serde_json::from_str(raw).unwrap_or_else(|_| json!(raw)) } else { json!(raw) }
 }
@@ -1036,6 +1041,10 @@ pub trait FlowRun: Send + Sync {
         Ok(false)
     }
 
+    fn deliver_event_in(&self, type_: &str, data: &Value, _scope: &Scope) -> anyhow::Result<bool> {
+        self.deliver_event(type_, data)
+    }
+
     async fn run(
         &self,
         name: &str,
@@ -1110,7 +1119,8 @@ fn execute_saved<'a>(
         };
         let children = Arc::new(Children::default());
         let lease = Arc::new(lease);
-        let root = scope.span(SpanStart::new("runner", SpanKind::Chain).input(saved.input.clone()));
+        let root = scope.span(SpanStart::new("runner", SpanKind::Chain).input(saved.input.clone())
+            .metadata(metadata(json!({"durable_run":saved.id,"durable_workflow":saved.name}))));
         let mut stopped = false;
         let status = match owf::model::parse_yaml(&saved.definition) {
             Err(error) => (RunStatus::Interrupted(WorkflowError::validation(error.to_string())), true),
@@ -1165,6 +1175,7 @@ fn execute_saved<'a>(
         if loop_run && interrupted && matches!(result, FlowResult::Faulted { .. }) {
             loop_outcome(engine, loop_version, &result);
         }
+        root.update(crate::tracing::ContextUpdate::metadata(metadata(json!({"durable_terminal": matches!(result, FlowResult::Completed(_) | FlowResult::Faulted { .. } | FlowResult::Cancelled)}))));
         root.end(match &result {
             // Handed back for the next process to resume: not a failure.
             FlowResult::Interrupted { .. } if stopped => SpanEnd::output(json!({"released":true})),
@@ -1199,7 +1210,7 @@ impl Flows {
             // Recovery of named child workflows joins the admitted session,
             // including callers whose session differs from the signal's id.
             input["__session_id"] = json!(session.id);
-            started = runs.start(&id, name, &saved.definition, &input)?;
+            started = runs.start_anchored(&id, name, &saved.definition, &input, scope.anchor().as_ref())?;
         }
         let saved = runs.get(&id)?.ok_or_else(|| anyhow::anyhow!("run {id} disappeared"))?;
         anyhow::ensure!(saved.name == name, "run {id} belongs to another workflow");
@@ -1246,9 +1257,8 @@ impl Flows {
     ) {
         let id = saved.id.clone();
         let is_loop = saved.name == crate::agent::AGENT_LOOP_NAME;
-        // A resumed loop (after a restart or a confirmation press) joins the
-        // session of the signal that started it, with that signal's request
-        // as input, so Langfuse shows both halves of one conversation.
+        // Pre-anchor runs retain their fresh-trace/session-only recovery.
+        // New runs attach an execution segment to their original scope.
         let admitted_session = |run: &crate::durable::SavedRun| {
             let value = if run.name == crate::agent::AGENT_LOOP_NAME {
                 &run.input["loop"]["session"]
@@ -1269,21 +1279,37 @@ impl Flows {
             session = admitted_session(&run);
             parent = run.parent_run;
         }
+        let anchored = saved.trace_anchor.is_some();
+        let owns_output = !anchored || saved.parent_run.is_none();
         let trace = self.engine.deps.tracer.trace(crate::tracing::TraceStart {
+            continuation: saved.trace_anchor.clone(),
             id: uuid::Uuid::new_v4().to_string(),
             name: format!("resume:{}", saved.name),
-            session_id: Some(session.unwrap_or(session_run)),
+            session_id: saved
+                .trace_anchor
+                .as_ref()
+                .and_then(|a| a.session_id.clone())
+                .or(Some(session.unwrap_or(session_run))),
             metadata: Some(json!({"run": id}).as_object().expect("object").clone()),
             ..Default::default()
         });
-        if let Some(task) = saved.input["guard_context"]["task"].as_str().filter(|_| is_loop) {
+        if let Some(task) = saved.input["guard_context"]["task"].as_str().filter(|_| is_loop && !anchored) {
             trace.update(crate::tracing::ContextUpdate::input(task));
         }
         let scope: Scope = trace.clone();
         let driven = is_loop.then(|| saved.input["loop"]["id"].as_str().map(str::to_owned)).flatten();
         let result = execute_saved(&self.engine, runs, saved, lease, &scope, cancel).await;
-        if let FlowResult::Completed(output) = &result {
-            trace.update(crate::tracing::ContextUpdate::output(output.clone()));
+        if owns_output {
+            match &result {
+                FlowResult::Completed(output) => trace.update(crate::tracing::ContextUpdate::output(output.clone())),
+                FlowResult::Faulted { error, .. } => trace.update(crate::tracing::ContextUpdate {
+                    output: Some(json!({"error":error.to_string()})),
+                    metadata: Some(metadata(json!({"error":true}))),
+                    ..Default::default()
+                }),
+                FlowResult::Cancelled => trace.update(crate::tracing::ContextUpdate::output(json!({"cancelled":true}))),
+                _ => {}
+            }
         }
         if let Some(id) = driven {
             self.engine.end_loop(&id).await;
@@ -1398,7 +1424,29 @@ impl FlowRun for Flows {
     }
 
     fn deliver_event(&self, type_: &str, data: &Value) -> anyhow::Result<bool> {
-        self.runs.as_ref().map_or(Ok(false), |r| r.deliver(type_, data))
+        self.deliver_event_in(type_, data, &crate::tracing::null_scope())
+    }
+
+    fn deliver_event_in(&self, type_: &str, data: &Value, scope: &Scope) -> anyhow::Result<bool> {
+        let Some(runs) = &self.runs else { return Ok(false) };
+        let Some(id) = runs.deliver_to(type_, data)? else { return Ok(false) };
+        if let Some(anchor) = runs.get(&id)?.and_then(|r| r.trace_anchor) {
+            scope.update(crate::tracing::ContextUpdate { session_id: anchor.session_id.clone(), ..Default::default() });
+            let trace = self.engine.deps.tracer.trace(crate::tracing::TraceStart {
+                name: "delivery".into(),
+                session_id: anchor.session_id.clone(),
+                continuation: Some(anchor),
+                ..Default::default()
+            });
+            trace.event(crate::tracing::EventStart {
+                name: format!("event:{type_}"),
+                input: Some(data.clone()),
+                metadata: Some(metadata(json!({"run":id}))),
+                ..Default::default()
+            });
+            trace.end();
+        }
+        Ok(true)
     }
 
     async fn run(
@@ -1487,7 +1535,13 @@ pub async fn run_loop_durable(
     let (definition, version) = loop_definition(engine);
     let input = with_override(input, version);
     let claimed = (|| -> anyhow::Result<Option<(crate::durable::SavedRun, crate::durable::Lease)>> {
-        let lease = match runs.start(id, crate::agent::AGENT_LOOP_NAME, &definition, &input)? {
+        let lease = match runs.start_anchored(
+            id,
+            crate::agent::AGENT_LOOP_NAME,
+            &definition,
+            &input,
+            scope.anchor().as_ref(),
+        )? {
             Some(lease) => lease,
             None => match runs.claim(id)? {
                 Some(lease) => lease,
@@ -1578,6 +1632,7 @@ impl Functions {
         let id = format!("{}/guard/{round}", info.run_id);
         // Freeze history before independent calls in this round can run.
         let input = json!({"calls":args["calls"],"round":round,"history":live.guard_history().await});
+        let guard_scope = self.spans.root.span(SpanStart::new("guard", SpanKind::Chain).input(input.clone()));
         self.start_child(
             runs,
             events,
@@ -1587,7 +1642,7 @@ impl Functions {
             input,
             &key,
             info,
-            &self.spans.root,
+            &guard_scope,
         )
         .await?;
         let guarded: Vec<_> = calls
@@ -1712,12 +1767,13 @@ impl Functions {
         let permit = self.children.slots.clone().acquire_owned().await.map_err(|e| invalid("start_child", e))?;
         events.register(info.run_id, &[format!("done:{id}"), format!("waiting:{id}")]).map_err(failed)?;
         let lease = runs
-            .start_child(
+            .start_child_anchored(
                 id,
                 workflow,
                 definition,
                 &input,
                 crate::durable::ChildLink { parent: info.run_id, key, reference: info.reference },
+                scope.anchor().as_ref(),
             )
             .map_err(failed)?;
         let lease = match lease {
@@ -1730,12 +1786,13 @@ impl Functions {
                 (self.engine.clone(), runs.clone(), scope.clone(), self.children.cancel.child_token());
             self.children.tasks.lock().await.spawn(async move {
                 let _permit = permit;
+                let saved_guard = saved.name == "guard";
                 let loop_id = (saved.name == crate::agent::AGENT_LOOP_NAME)
                     .then(|| saved.input["loop"]["id"].as_str().map(str::to_owned))
                     .flatten();
                 let execution_scope: Scope = scope.clone();
                 let result = execute_saved(&engine, &runs, saved, lease, &execution_scope, &cancel).await;
-                if loop_id.is_some() {
+                if loop_id.is_some() || saved_guard {
                     scope.end(match result {
                         FlowResult::Completed(output) => SpanEnd::output(output),
                         FlowResult::Faulted { error, .. } | FlowResult::Interrupted { error } => {
@@ -1748,10 +1805,22 @@ impl Functions {
                     engine.end_loop(&id).await;
                 }
             });
+        } else if workflow == "guard" || workflow == crate::agent::AGENT_LOOP_NAME {
+            scope.end(SpanEnd::default());
         }
         Ok(())
     }
 }
+
+// ── 4b. the agent loop's definition ─────────────────────────────────────────
+// Every agent loop runs `agent-loop`: the version the agent saved and
+// activated under that name, or the built-in one in git (`workflows/agent-loop.yaml`).
+// A circuit breaker guards the agent's version: LOOP_BREAKER faults in a row
+// and loops go back to the built-in one until another version is activated.
+
+// The same goes for every workflow the runtime itself runs (`built_in`):
+// `signal` too (`supervisor.rs`), each with its own breaker.
+
 
 // ── 4b. the agent loop's definition ─────────────────────────────────────────
 // Every agent loop runs `agent-loop`: the version the agent saved and
@@ -1966,9 +2035,13 @@ const PROBE_MAX_CHARS: usize = 6000;
 // cut to this, at most this many steps and path entries, a write's argument
 // cut to that; the whole run stopped after this long.
 const DRY_STEP_MAX_CHARS: usize = 400;
+
 const DRY_MAX_STEPS: usize = 40;
+
 const DRY_MAX_PATH: usize = 120;
+
 const DRY_WRITE_MAX_CHARS: usize = 5000;
+
 const DRY_RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 fn effect_name(mcp: &dyn Mcp, wf: &owf::model::Workflow, function: &str) -> &'static str {

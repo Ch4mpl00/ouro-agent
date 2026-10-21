@@ -12,6 +12,36 @@ use agent::trace_model::{Observation, Trace};
 use base64::Engine;
 use serde_json::{Map, Value};
 
+// The observations endpoint can arrive in any order. Trace identity comes
+// from the earliest root; final output may be on a nested resumed segment.
+pub fn trace_from_observations(id: &str, observations: Vec<Observation>) -> (Trace, Vec<Observation>) {
+    let root = observations.iter().filter(|o| o.parent_observation_id.is_none()).min_by_key(|o| &o.start_time);
+    let output = observations
+        .iter()
+        .filter(|o| {
+            o.meta(agent::trace_model::TRACE_OUTPUT_META)
+                .is_some_and(|v| v == &Value::Bool(true) || v.as_str() == Some("true"))
+        })
+        // An initial signal can end after a fast continuation; its temporary
+        // output must not replace the completed continuation's answer.
+        .max_by_key(|o| (o.parent_observation_id.is_some(), &o.end_time))
+        .or(root);
+    let trace = Trace {
+        id: id.to_owned(),
+        name: root.map_or_else(|| id.to_owned(), |r| r.name.clone()),
+        session_id: None,
+        timestamp: root.map(|r| r.start_time.clone()).unwrap_or_default(),
+        input: root.map(|r| r.input.clone()).unwrap_or(Value::Null),
+        output: output.map(|r| r.output.clone()).unwrap_or(Value::Null),
+        metadata: root.and_then(|r| r.metadata.clone()),
+        observations: observations.clone(),
+        latency: 0.0,
+        total_cost: 0.0,
+        tags: Vec::new(),
+    };
+    (trace, observations)
+}
+
 #[derive(Clone)]
 pub struct Langfuse {
     client: reqwest::Client,
@@ -98,21 +128,7 @@ impl Langfuse {
             // trace-list fields (tags, cost).
             Err(_) => {
                 let observations = self.observations_by_trace(id).await?;
-                let root = observations.iter().find(|o| o.parent_observation_id.is_none()).or(observations.first());
-                let trace = Trace {
-                    id: id.to_owned(),
-                    name: root.map_or_else(|| id.to_owned(), |r| r.name.clone()),
-                    session_id: None,
-                    timestamp: root.map(|r| r.start_time.clone()).unwrap_or_default(),
-                    input: root.map(|r| r.input.clone()).unwrap_or(Value::Null),
-                    output: root.map(|r| r.output.clone()).unwrap_or(Value::Null),
-                    metadata: root.and_then(|r| r.metadata.clone()),
-                    observations: observations.clone(),
-                    latency: 0.0,
-                    total_cost: 0.0,
-                    tags: Vec::new(),
-                };
-                Ok((trace, observations))
+                Ok(trace_from_observations(id, observations))
             }
         }
     }

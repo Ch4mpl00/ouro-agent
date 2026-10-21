@@ -13,7 +13,7 @@ use crate::db::{StoredTrace, TraceStore};
 use crate::trace_model::{Observation, ObservationType, Usage, resolve_skill};
 use crate::tracing::{
     ContextUpdate, EventStart, Generation, GenerationEnd, GenerationStart, Metadata, Span, SpanEnd, SpanKind,
-    SpanStart, Trace, TraceContext, TraceStart, Tracer,
+    SpanStart, Trace, TraceAnchor, TraceContext, TraceStart, Tracer,
 };
 
 pub fn now_iso() -> String {
@@ -166,6 +166,10 @@ struct LocalSpan {
 }
 
 impl TraceContext for LocalSpan {
+    fn anchor(&self) -> Option<TraceAnchor> {
+        let s = lock(&self.state);
+        Some(TraceAnchor { trace_id: s.id.clone(), parent_span_id: self.id.clone(), session_id: s.session_id.clone() })
+    }
     fn update(&self, data: ContextUpdate) {
         with_obs(&self.state, &self.id, |obs| {
             if let Some(input) = data.input {
@@ -216,11 +220,35 @@ struct LocalTrace {
     state: Shared,
     root: String,
     store: Arc<dyn TraceStore>,
+    continuation: bool,
 }
 
 impl TraceContext for LocalTrace {
+    fn anchor(&self) -> Option<TraceAnchor> {
+        let s = lock(&self.state);
+        Some(TraceAnchor {
+            trace_id: s.id.clone(),
+            parent_span_id: self.root.clone(),
+            session_id: s.session_id.clone(),
+        })
+    }
     fn update(&self, data: ContextUpdate) {
+        with_obs(&self.state, &self.root, |obs| {
+            if let Some(input) = &data.input {
+                obs.input = input.clone();
+            }
+            if let Some(output) = &data.output {
+                obs.output = output.clone();
+                obs.metadata
+                    .get_or_insert_default()
+                    .insert(crate::trace_model::TRACE_OUTPUT_META.into(), Value::Bool(true));
+            }
+            obs.metadata = merge_meta(obs.metadata.take(), data.metadata.clone());
+        });
         let mut s = lock(&self.state);
+        if let Some(session) = data.session_id {
+            s.session_id = Some(session);
+        }
         if let Some(input) = data.input {
             s.input = Some(input);
         }
@@ -249,6 +277,7 @@ impl Trace for LocalTrace {
     }
 
     fn end(&self) {
+        with_obs(&self.state, &self.root, |obs| obs.end_time = now_iso());
         let s = lock(&self.state);
         let stored = StoredTrace {
             id: s.id.clone(),
@@ -264,7 +293,7 @@ impl Trace for LocalTrace {
             started_at: s.started_at.clone(),
         };
         drop(s);
-        if let Err(err) = self.store.write_trace(&stored) {
+        if let Err(err) = self.store.write_segment(&stored, self.continuation) {
             eprintln!("[local-recorder] writing trace {} failed: {err:#}", stored.id);
         }
     }
@@ -283,13 +312,21 @@ impl Tracer for LocalRecorderTracer {
     fn trace(&self, opts: TraceStart) -> Arc<dyn Trace> {
         // The root observation mirrors the trace; the judge skips it (it
         // matches trace.name with a null parent) but it keeps the tree whole.
-        let mut root = new_observation(None, &opts.name, kind_to_type(opts.kind));
+        let continuation = opts.continuation.is_some();
+        let mut root = new_observation(
+            opts.continuation.as_ref().map(|a| a.parent_span_id.clone()),
+            &opts.name,
+            kind_to_type(opts.kind),
+        );
+        if let Some(id) = opts.root_id {
+            root.id = id;
+        }
         root.metadata = opts.metadata.clone();
         let root_id = root.id.clone();
         let state = RunState {
-            id: opts.id,
+            id: opts.continuation.as_ref().map(|a| a.trace_id.clone()).unwrap_or(opts.id),
             name: opts.name,
-            session_id: opts.session_id,
+            session_id: opts.session_id.or_else(|| opts.continuation.and_then(|a| a.session_id)),
             tags: opts.tags.unwrap_or_default(),
             metadata: opts.metadata,
             input: None,
@@ -297,7 +334,12 @@ impl Tracer for LocalRecorderTracer {
             started_at: now_iso(),
             observations: vec![root],
         };
-        Arc::new(LocalTrace { state: Arc::new(Mutex::new(state)), root: root_id, store: self.store.clone() })
+        Arc::new(LocalTrace {
+            state: Arc::new(Mutex::new(state)),
+            root: root_id,
+            store: self.store.clone(),
+            continuation,
+        })
     }
 
     // Writes happen on trace.end() — nothing buffered.

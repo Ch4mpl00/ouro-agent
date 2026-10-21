@@ -98,7 +98,13 @@ deletion.
    Every agent loop (primary, worker, recovery)
    is a run of the OWF workflow `agent-loop` (`workflows/agent-loop.yaml`, its host
    functions in `agent.rs` §4): the primary one durable, so a restart resumes
-   it from its last round. The agent may activate its own version of
+   it from its last round. Durable runs persist a private trace anchor: resumed
+   segments nest under their original span in the signal trace, and the primary
+   run's final output updates that trace. Delivered events are recorded there;
+   the delivery signal keeps its own trace in the request's session. Old runs
+   without anchors retain separate resume traces. The activity journal waits
+   for every anchored run to end and its final spans to reach the mirror, then
+   projects the request once. The agent may activate its own version of
    `agent-loop`; three faults of it in a row fall back to the built-in one
    (`flows.rs` §4b). A worker of the durable primary loop is a durable run of
    its own, started immediately as an owned child. The parent joins it with

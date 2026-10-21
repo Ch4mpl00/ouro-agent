@@ -31,6 +31,7 @@ pub struct Providers {
     pub gemini: SharedProvider,
     pub openrouter: Option<SharedProvider>,
 }
+
 pub struct EngineDeps {
     pub providers: Providers,
     pub mcp: SharedMcp,
@@ -44,15 +45,18 @@ pub struct EngineDeps {
     pub workflows: Arc<dyn crate::flows::WorkflowStore>,
     pub schedule: Arc<dyn crate::schedule::ScheduleStore>,
 }
+
 pub struct Engine {
     pub deps: EngineDeps,
     loops: tokio::sync::Mutex<HashMap<String, Arc<AgentLoop>>>,
     stopping: AtomicBool,
     shutdown: tokio::sync::Mutex<bool>,
 }
+
 pub fn create_engine(deps: EngineDeps) -> Arc<Engine> {
     Arc::new(Engine { deps, loops: Default::default(), stopping: AtomicBool::new(false), shutdown: Default::default() })
 }
+
 impl Engine {
     pub fn resolve_provider(&self, model: &str) -> anyhow::Result<SharedProvider> {
         let providers = &self.deps.providers;
@@ -202,6 +206,7 @@ pub struct LoopOptions {
     pub metadata: Metadata,
     pub trace_scope: Option<Scope>,
 }
+
 impl LoopOptions {
     pub fn new(id: impl Into<String>, session: Session) -> Self {
         Self {
@@ -230,6 +235,7 @@ impl LoopOptions {
         }
     }
 }
+
 pub struct AgentLoop {
     engine: Weak<Engine>,
     pub opts: LoopOptions,
@@ -254,6 +260,7 @@ pub struct AgentLoop {
     // The round's calls running at once: at most max_concurrent_tools.
     slots: tokio::sync::Semaphore,
 }
+
 fn create_loop(
     engine: &Arc<Engine>,
     mut opts: LoopOptions,
@@ -300,6 +307,7 @@ fn create_loop(
             tags: opts.tags.clone(),
             metadata: Some(metadata),
             kind: SpanKind::Agent,
+            ..Default::default()
         });
         let scope: Scope = trace.clone();
         (scope, Some(trace))
@@ -326,6 +334,7 @@ fn create_loop(
         guard: Default::default(),
     }))
 }
+
 impl AgentLoop {
     fn end_trace(&self) {
         if !self.trace_ended.swap(true, Ordering::SeqCst)
@@ -818,6 +827,7 @@ fn settle_round(round: &mut [(providers::ToolCall, String, bool, String)]) -> Op
     round[i].1 = format!("[finish error] not finished: {} failed; read the errors and continue", failed.join(", "));
     None
 }
+
 fn finish_result(call: &providers::ToolCall) -> String {
     if call.name != "finish" {
         return String::new();
@@ -842,9 +852,11 @@ static SYNTHETIC: LazyLock<Vec<ToolDef>> = LazyLock::new(|| {
         })
         .collect()
 });
+
 pub fn synthetic_definitions() -> &'static [ToolDef] {
     &SYNTHETIC
 }
+
 fn string_arg<'a>(args: &'a Map<String, Value>, name: &str, nonempty: bool) -> anyhow::Result<&'a str> {
     let value = args.get(name).ok_or_else(|| anyhow::anyhow!("{name}: Required"))?;
     let text = value.as_str().ok_or_else(|| anyhow::anyhow!("{name}: Expected string"))?;
@@ -853,9 +865,11 @@ fn string_arg<'a>(args: &'a Map<String, Value>, name: &str, nonempty: bool) -> a
     }
     Ok(text)
 }
+
 fn optional_string<'a>(args: &'a Map<String, Value>, name: &str) -> anyhow::Result<Option<&'a str>> {
     if args.contains_key(name) { string_arg(args, name, false).map(Some) } else { Ok(None) }
 }
+
 fn string_array(args: &Map<String, Value>, name: &str) -> anyhow::Result<Option<Vec<String>>> {
     let Some(value) = args.get(name) else { return Ok(None) };
     let values = value.as_array().ok_or_else(|| anyhow::anyhow!("{name}: Expected array"))?;
@@ -880,6 +894,7 @@ fn string_array(args: &Map<String, Value>, name: &str) -> anyhow::Result<Option<
 // and the working memory travel in the run's context, so the interpreter's
 // task records are the loop's checkpoints and a restart resumes it.
 pub const AGENT_LOOP: &str = include_str!("../workflows/agent-loop.yaml");
+
 pub const AGENT_LOOP_NAME: &str = "agent-loop";
 
 // Synthetic tools that change something outside the run. Every other

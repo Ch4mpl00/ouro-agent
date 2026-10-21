@@ -78,6 +78,9 @@ pub struct Trace {
 // the per-node judge classifies by an explicit contract, not by names.
 pub const JUDGE_NODE_META: &str = "judge_node";
 
+// A trace handle updated its output here (including a root continuation).
+pub const TRACE_OUTPUT_META: &str = "trace_output";
+
 // Activity-journal contract: "run" on the trace of a production signal (the
 // only traces the journal reads), "primary_loop" on the span whose input is
 // exactly what the primary loop was given.

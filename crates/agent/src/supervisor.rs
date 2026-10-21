@@ -424,7 +424,7 @@ impl Supervisor {
     async fn run_active(self: &Arc<Self>, signal: &PendingSignal) -> anyhow::Result<String> {
         let id = format!("{}:{}", signal.source, signal.id);
         let saved = signal.saved_workflow();
-        let trace=self.engine.deps.tracer.trace(TraceStart{id:id.clone(),name:format!("signal:{}",signal.source),kind:SpanKind::Agent,session_id:Some(id.clone()),tags:Some(vec![signal.source.clone(),if saved.is_some(){"saved-workflow"}else{"agent-loop"}.into()]),metadata:Some(json!({"signal_id":signal.id,"signal_source":signal.source,"signal_created_at":signal.created_at,"activity":"run"}).as_object().unwrap().clone())});
+        let trace=self.engine.deps.tracer.trace(TraceStart{id:id.clone(),name:format!("signal:{}",signal.source),kind:SpanKind::Agent,session_id:Some(id.clone()),tags:Some(vec![signal.source.clone(),if saved.is_some(){"saved-workflow"}else{"agent-loop"}.into()]),metadata:Some(json!({"signal_id":signal.id,"signal_source":signal.source,"signal_created_at":signal.created_at,"activity":"run"}).as_object().unwrap().clone()),..Default::default()});
         trace.update(ContextUpdate::input(signal.content.clone()));
         let state = Arc::new(std::sync::Mutex::new(SignalState::default()));
         let outcome = self.handle(signal, &trace, &state).await;
@@ -588,7 +588,7 @@ impl SignalFunctions {
             "deliver_event" => {
                 let type_ = args["type"].as_str().ok_or_else(|| anyhow::anyhow!("type: Required"))?;
                 Ok(
-                    json!({"delivered":supervisor.flows.deliver_event(type_, &args["data"])?,"output":"Button delivered"}),
+                    json!({"delivered":supervisor.flows.deliver_event_in(type_, &args["data"], &scope)?,"output":"Button delivered"}),
                 )
             }
             "signal_session" => {
