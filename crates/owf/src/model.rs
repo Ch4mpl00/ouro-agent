@@ -520,6 +520,9 @@ impl Parser {
             self.only(m, at, &[COMMON, &["raise"]].concat());
             self.raise_task(r, &format!("{at}/raise"))
         } else if let Some(v) = m.get("listen") {
+            for key in ["read", "foreach"] {
+                if m.contains_key(key) { self.fail(&format!("{at}/{key}"), "listen read/foreach is not supported"); return None; }
+            }
             self.only(m, at, &[COMMON, &["listen"]].concat());
             self.listen(v, &format!("{at}/listen"))
         } else if let Some(w) = m.get("wait") {
@@ -576,14 +579,18 @@ impl Parser {
             return None;
         };
         if filters.is_empty() {
-            self.fail(at, "listen requires at least one event type");
+            self.fail(at, "listening without an event type is not supported");
         }
         let mut types = Vec::new();
         for filter in filters {
             let f = self.object(filter, at)?;
-            self.only(f, at, &["with"]);
+            for key in f.keys().filter(|k| k.as_str() != "with") {
+                self.fail(&format!("{at}/{key}"), "event filter option not supported");
+            }
             let with = self.object(f.get("with").unwrap_or(&Value::Null), at)?;
-            self.only(with, at, &["type"]);
+            for key in with.keys().filter(|k| k.as_str() != "type") {
+                self.fail(&format!("{at}/{key}"), "event filter option not supported");
+            }
             let t = self.required_string(with, "type", at);
             if t.is_empty() {
                 self.fail(at, "event type must not be empty");
