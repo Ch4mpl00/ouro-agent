@@ -4,17 +4,45 @@ tools: []
 
 # Authoring saved workflows
 
-A saved workflow is a recurring task written down once as a definition and
-then run on a schedule without an agent deciding what to do next. Only its
-explicit `llm_compose` and `filter_relevant` steps call a model. Write one when the
-user wants something done regularly ("присылай каждое утро …", "раз в
-неделю проверяй …"), or when an existing scheduled task should stop being
-re-planned on every fire.
+Author and change workflows for the agent's own loops, signal handling and
+routes selecting different loops by source or payload, as well as scheduled
+tasks. Use for requests to change the agent cycle, action order, exit rules
+or recurring work.
+
+The runtime exposes its own control flow as editable Open Workflow
+Specification definitions. You can author:
+
+- **Loop variants** (`document.metadata.loop`): how model turns, guarded tool
+  rounds and workers proceed, and when a cycle continues or ends. Start from
+  `read_workflow(name: "agent-loop")`.
+- **Signal routes** (`document.metadata.route`): how matching incoming signals
+  are handled, including explicit actions before or after the primary loop,
+  context gathering and which loop `primary_loop(loop: ...)` selects. Start
+  from `read_workflow(name: "signal")` and retain the relevant handling body.
+- **A dispatcher override** named `signal`: change dispatch itself when the
+  request requires it. For source-specific handling, add a matching route.
+- **Scheduled pipelines**: fixed steps run when their scheduled task fires;
+  model adapters such as `llm_compose` and `filter_relevant` provide judgement.
+
+The user can describe the desired behavior without naming workflows or OWF.
+"Fix the Telegram cycle", "show a status before the first model turn", and
+"use another cycle for peer signals" are workflow-authoring requests.
+Choose the workflow kind from the behavior requested. Skills provide model
+instructions; explicit workflow steps and switches establish execution order
+and exit conditions. Loops, routes and dispatcher overrides need no cron task.
+
+For a runtime change, follow the shared procedure below and the sections
+"The agent loop is a workflow too" and "Trying a loop, a route or the
+dispatcher". The scheduled-pipeline design advice applies to scheduled work.
 
 ## Procedure
 
-1. For a requested time today, compare it with the current local time. If it
-   already passed, ask what time/date to use; never silently move it to tomorrow.
+1. Identify whether the request needs a scheduled pipeline, a loop variant,
+   a signal route, a dispatcher override or a combination. For runtime work,
+   pin down which signals match, the required sequence, exit conditions and
+   behavior on errors. For a requested time today, compare it with the current
+   local time. If it already passed, ask what time/date to use; never silently
+   move it to tomorrow.
    Pin down the ask: what the user wants to receive or have done, from
    which data, how often, and what counts as new or relevant. Ask the
    parent back only when a choice would change what the user gets.
@@ -22,10 +50,13 @@ re-planned on every fire.
    a workflow can call; `workflow_functions(name)` shows one in full. The
    user's ask is the whole specification: every rule they gave (what to
    take, what to drop, the order, the format, the tone) goes into the
-   definition itself, word for word where it matters. Do not build on
-   other skills, and use `llm_compose`'s `skill` only for one the user
-   names.
-3. Call every read function the workflow will call with `probe_function`,
+   definition itself, word for word where it matters. Inspect existing saved
+   definitions with `list_workflows` and `read_workflow`; for loops and routes,
+   also read the built-in bases named above and preserve their host contracts.
+   A runtime route may load relevant transport/domain skills. For scheduled
+   pipelines, put the user's rules in the definition and use `llm_compose`'s
+   `skill` only for one the user names.
+3. Call the data-reading functions the workflow will use with `probe_function`,
    with the arguments the workflow will pass, and build each expression from
    the fields you saw in the reply. Do not skip this: `save_workflow`
    checks argument names, not the fields of replies, so a wrong field is
@@ -35,17 +66,20 @@ re-planned on every fire.
    A probe shows the shape of the data, not the data a run will see: never
    write the values it happened to return (texts, names, ids, amounts)
    into the definition; judge what matters by criteria (`filter_relevant`) or
-   by fields, never by the sample's words.
+   by fields, never by the sample's words. Runtime host functions such as
+   `agent_turn` and `primary_loop` need an admitted run; inspect their use in
+   the base definitions and test them through a signal dry run instead.
 4. Design it with the principles below, write the definition and call
    `save_workflow(name, definition)`. It checks the definition against the
    language, the functions and their argument names. Fix every reported
    problem and save again until it is accepted; a `warnings` list in the
    accepted reply names flows that are legal but usually a mistake: fix
    them too unless you meant exactly that.
-5. Try it: `try_workflow(name)` runs the saved draft now, on today's data,
-   as a scheduled fire would, except that its writes are only recorded.
-   (A loop, a route or `signal` is tried on a signal
-   instead: see "Trying a loop, a route or the dispatcher".)
+5. Try it: for a scheduled pipeline, `try_workflow(name)` runs the saved draft
+   on today's data as a scheduled fire would, with writes recorded. For a
+   loop, route or `signal`, use `try_workflow` with `signal` and every changed
+   draft in the chain, as described below. Inspect both routing and the loop;
+   a completed run of the wrong route or base loop does not test your change.
    Read the report as the user would live with it:
    - it ended `completed`, and its `path` is the one you meant: every
      task that ran, in order; a task of another branch in it (the "nothing
@@ -71,27 +105,32 @@ re-planned on every fire.
    data to test with.
 6. Return to the parent, in Russian, a description the user can check
    without reading a definition, in plain words:
-   - what they get and when, on their clock;
+   - what they get and what triggers it (matching signals or scheduled times
+     on their clock); for runtime work, which route selects which loop and
+     what steps or exit rules change;
    - where it comes from, named the way the user knows it, not by
      function names;
    - how it picks what matters, what it does when there is nothing new,
      and what it changes besides sending (what it remembers between
      runs);
+   - the dry run's route, loop, action order and completion rule for runtime
+     work, and whether every intended draft actually ran;
    - the message the dry run would have sent, quoted as it is, as a
      sample ("Вот что пришло бы сейчас: …"), or that today was
      quiet;
    - anything the user should know or decide (a source that was empty,
      a choice you made for them).
    No definition, YAML, JSON, function names or task paths. End with one
-   line for the parent: the workflow's name, its version and the cron
-   you propose. Do not activate and do not schedule: the user confirms
-   first, and the parent does both after they agree.
+   line for the parent listing every workflow's name, kind and tried version,
+   the activation order (loop before the route selecting it), and the cron
+   only for scheduled work. Do not activate or schedule: the parent activates
+   after the user confirms, and schedules only work that needs a timer.
 
 To change a workflow: `read_workflow`, edit, `save_workflow` (a new
 version), and the same dry run and confirmation. Schedules name the workflow, not a
 version, so they run whatever version is active.
 
-## Designing one
+## Designing scheduled pipelines
 
 A workflow is a fixed pipeline; its model steps are the only places that
 judge. Build the pipeline the task needs from these parts, no more:
@@ -189,7 +228,59 @@ nothing, so keep each `try` narrow, around the call it retries, with the
 Every agent loop, the parent's and each worker's, runs a named workflow.
 The built-in default is `agent-loop`. You can write and activate variants
 with their own exit rules, including ending after a successful conversation
-reply or reminding the model once before a silent end.
+reply or reminding the model once before a silent end. Saving and activating
+a version named `agent-loop` overrides that default; a differently named
+variant is selected explicitly by a route, worker call or skill frontmatter.
+
+### From a request to a signal-specific cycle
+
+1. Inspect `list_workflows`, then read any existing matching route and the
+   loop it selects. Read `signal` and `agent-loop` as bases. Decide which
+   layer needs to change: an explicit action before the first model turn
+   belongs in the signal route; turn/tool sequencing and exit rules belong
+   in the loop. A route can use the default loop, and several routes can
+   share one variant. Create both only when both layers need changes.
+2. For a new loop, copy the base, give it its own `document.name` (for
+   example `chat-loop`), and declare `document.metadata.loop` as below.
+   Preserve the guarded round, worker joins, transcript, working memory and
+   output contract. Change the requested steps or switches and
+   `save_workflow(name: "chat-loop", definition: ...)`.
+3. For a new route, copy the relevant handling body from `signal`, give it
+   its own name (for example `chat-route`), and declare
+   `document.metadata.route.when: { source: telegram }`. Retain context and
+   recovery, remove the dispatcher's already-completed setup and route
+   dispatch, and set `loop: chat-loop` on its `primary_loop` call. Keep the
+   other arguments from that call, including input, skills, system context
+   and confirmation target. Save the route with `save_workflow` too.
+4. To send peer signals through a different cycle, create another route
+   with `when: { source: peer }` and choose its variant on `primary_loop`.
+   Source names and payload fields come from actual signals; the matching
+   rules below also allow lists of sources and more specific payload matches.
+   Activating a loop makes it selectable; the route supplies the selection.
+5. Ask `try_workflow(name: "signal", signal: {})` for real signal examples.
+   Copy a matching signal's shape and replace its message with a test request.
+   Then call `try_workflow(name: "signal", signal: <test signal>,
+   drafts: ["chat-route", "chat-loop"])`. Include only the drafts you changed;
+   the dispatcher may stay built-in. Check `drafts[].ran`, the selected route
+   and loop, the first actions, failures, final delivery and the exit rule.
+   Revise and try again when behavior differs from the request. Also try a
+   signal outside the route's scope to check that the default or another
+   matching route still handles it as intended.
+6. Return the behavior, dry-run evidence and exact tried versions to the
+   parent. After the user's confirmation, the parent activates the loop first
+   and then the route. Matching future signals select that route and loop
+   automatically; do not create a scheduled task for them. An already
+   admitted run keeps its definition.
+
+For example, "show 👀 first for Telegram signals" can be an explicit
+`telegram_send_status` step in a Telegram route before `primary_loop`, with
+cleanup after the loop and in the error path. It can keep `agent-loop` when
+its turn and exit rules need no change. Use `workflow_functions` to inspect
+the status tool's actual arguments and the route context for the chat/thread;
+test the sequence in the dry run. Writing "always send 👀 first" into the
+Telegram skill alone leaves that action to a model turn.
+
+### Loop and route contracts
 
 A loop declares `loop: { description: "…" }` in **document.metadata**,
 OWF's metadata extension point. Start from `read_workflow("agent-loop")`,

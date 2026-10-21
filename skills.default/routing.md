@@ -22,10 +22,17 @@ Typical routes:
 - `nashdom-bill`: utility mail and PDF extraction.
 - `dreaming`: the scheduled skill-maintenance task. It may update skills
   as assigned; it should report what changed.
-- `workflow-author`: the user wants something done on a schedule
-  ("присылай каждое утро …"), or recurring deterministic work should run as a
-  saved workflow. The worker saves a draft workflow, tries it on today's data and returns, in words, what it does with a sample of what the
-  user would get; deliver that to the user as it is (never the
+- `workflow-author`: author or change a saved task, the agent's own loop,
+  signal handling or routing. Examples: "присылай каждое утро …",
+  "поправь цикл для Telegram", "сначала покажи статус", "заканчивай после
+  ответа", or "для peer используй другой цикл". Workflows include scheduled
+  pipelines, named `agent-loop` variants and signal routes selecting those
+  loops by source or payload. A schedule is needed only for scheduled tasks.
+  Delegate these requests even if discovery did not select the skill; a skill
+  edit alone cannot establish a required execution order or exit condition.
+  The worker saves drafts, tries the scheduled pipeline on today's data or
+  the route/loop chain on a signal, and returns what changes with a sample
+  and the versions tried. Deliver that to the user as it is (never the
   definition, YAML or JSON) and ask them to confirm. A change the user
   asks for goes back to a worker with the workflow's name. Pass the
   worker the user's request and leave the how to its skill: never ask it
@@ -65,12 +72,17 @@ saved news workflow owns it. A watermark the conversation does own (an
 IT digest) is stamped only after its delivery succeeded.
 
 A drafted workflow runs only after the user confirms it in the chat. On
-their yes, call `activate_workflow(name, version)`, then `schedule_task`
-with `workflow: "<name>"` and a one-line `prompt` saying what it does
-(none if a schedule for it already exists: `list_scheduled_tasks`).
+their yes, call `activate_workflow(name, version)` for the versions tried.
+For a loop and route pair, activate the loop first, then its route. An active
+route is selected automatically for matching incoming signals; its
+`primary_loop(loop: ...)` chooses the loop. A loop variant alone is available
+for selection and does not replace every loop. These changes need no schedule.
+For scheduled work, then call `schedule_task` with `workflow: "<name>"` and
+a one-line `prompt` saying what it does (none if a schedule for it already
+exists: `list_scheduled_tasks`).
 Never activate on your own judgement.
-To run a saved workflow once on request ("прогони сейчас"), schedule it
-with `cron_expr: "now"`: it runs as soon as this turn ends, sends what it
+To run a saved scheduled pipeline once on request ("прогони сейчас"), schedule
+it with `cron_expr: "now"`: it runs as soon as this turn ends, sends what it
 would send on schedule and moves its watermarks.
 
 User knowledge ("запомни", "что помнишь про") uses MCP `remember`,
