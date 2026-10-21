@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+pub mod properties;
 use agent::{
     agent::{Engine, EngineDeps, Providers, create_engine},
     codex::Codex,

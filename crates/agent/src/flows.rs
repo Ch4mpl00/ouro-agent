@@ -1576,7 +1576,8 @@ impl Functions {
         let round = args["i"].as_u64().ok_or_else(|| invalid("start_child", "guard requires a round"))?;
         let key = format!("guard:{round}");
         let id = format!("{}/guard/{round}", info.run_id);
-        let input = json!({"calls":args["calls"],"round":round});
+        // Freeze history before independent calls in this round can run.
+        let input = json!({"calls":args["calls"],"round":round,"history":live.guard_history().await});
         self.start_child(
             runs,
             events,
@@ -1589,7 +1590,13 @@ impl Functions {
             &self.spans.root,
         )
         .await?;
-        Ok(json!({"run":id}))
+        let guarded: Vec<_> = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| crate::guard::needs_guard(&self.engine, c))
+            .map(|(i, _)| i)
+            .collect();
+        Ok(json!({"run":id,"guarded":guarded}))
     }
 
     async fn guard_step(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError> {
@@ -1617,6 +1624,7 @@ impl Functions {
                 &json!({"loop":admitted["loop"],"calls":saved.input["calls"]}),
                 &root,
                 info.cancel,
+                saved.input.get("history").cloned().map(serde_json::from_value).transpose().map_err(failed_json)?,
             )
             .await
             .map_err(failed);

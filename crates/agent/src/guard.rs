@@ -217,8 +217,11 @@ static SECRET: LazyLock<Regex> = LazyLock::new(|| {
     ))
     .expect("secret patterns")
 });
-static LINK: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)[a-z][a-z0-9+.-]*://|www\.|\b[a-z0-9-]+\.[a-z]{2,}/").expect("link pattern"));
+static LINK: LazyLock<Regex> = LazyLock::new(|| {
+    // Previews also fetch bare domains, including internationalized names.
+    Regex::new(r"(?i)[a-z][a-z0-9+.-]*://|www\.|\b[\p{L}\p{N}-]+\.(?:\p{L}{2,}|xn--[a-z0-9-]+)\b")
+        .expect("link pattern")
+});
 const TEST_CONFIRM: &str = "guard test confirm";
 fn has_secret(value: &Value) -> bool {
     match value {

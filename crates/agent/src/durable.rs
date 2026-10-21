@@ -644,7 +644,19 @@ fn lifecycle(tx: &rusqlite::Transaction<'_>, id: &str, status: &Status) -> anyho
         Status::Waiting { .. } => ("waiting", serde_json::json!({"status":"waiting"})),
         Status::Interrupted(_) => return Ok(()),
     };
-    deliver(tx, &format!("{kind}:{id}"), &data, parent.as_deref())?;
+    let type_ = format!("{kind}:{id}");
+    // Joining an ended child again must not recreate a completion the parent
+    // already consumed. Unlike ordinary events, completion happens once.
+    if kind == "done"
+        && tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_events WHERE run_id=?1 AND type=?2)",
+            params![parent, type_],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        return Ok(());
+    }
+    deliver(tx, &type_, &data, parent.as_deref())?;
     Ok(())
 }
 
