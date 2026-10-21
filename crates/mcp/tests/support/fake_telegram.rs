@@ -48,6 +48,7 @@ pub struct FakeState {
     // sendChatAction calls, in order: chat, action, thread.
     pub actions: Vec<(i64, String, Option<i64>)>,
     pub batch: usize,
+    pub requests: Vec<(String, Value)>,
     failures: HashMap<String, (usize, usize)>,
     next_message_id: i64,
 }
@@ -104,6 +105,7 @@ async fn handle(
     }
     let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    s.requests.push((method.clone(), body.clone()));
     if let Some((after, times)) = s.failures.get_mut(&method) {
         if *after > 0 {
             *after -= 1;
@@ -173,6 +175,7 @@ async fn handle(
             }
             ok(json!(true))
         }
+        "answerCallbackQuery" => ok(json!(true)),
         "sendChatAction" => {
             let action = (
                 number(&body["chat_id"]).unwrap_or_default(),

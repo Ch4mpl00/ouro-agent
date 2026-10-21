@@ -740,3 +740,43 @@ fn reports_the_parts_already_delivered_when_a_later_part_fails_and_logs_them() {
         assert_eq!(logged, [Some(first)]);
     });
 }
+
+#[tokio::test]
+async fn inline_buttons_split_edit_and_callback_signals() {
+    use mcp_tools::telegram::{Button, send_long_message_buttons};
+    let fake = fake_telegram::start("buttons").await;
+    let bot = BotApi::with_root(reqwest::Client::new(), Some(fake.token.clone()), Some(fake.root.clone()));
+    let buttons = vec![vec![Button { text: "Confirm".into(), data: "cf:yes".into() }]];
+    let (_, sent) = send_long_message_buttons(&bot, "4242", &"x".repeat(5000), Some(7), Some(&buttons)).await.unwrap();
+    let requests = fake.lock().requests.clone();
+    let sends: Vec<_> = requests.iter().filter(|(m,_)| m == "sendMessage").collect();
+    assert!(sends[0].1.get("reply_markup").is_none());
+    assert_eq!(sends[1].1["reply_markup"]["inline_keyboard"][0][0], json!({"text":"Confirm","callback_data":"cf:yes"}));
+    bot.edit_message_buttons("4242", sent[1].message_id, "Confirmed", None).await.unwrap();
+    assert_eq!(fake.lock().requests.last().unwrap().1["reply_markup"], json!({"inline_keyboard":[]}));
+
+    #[derive(Default)]
+    struct Memory { cursor: Mutex<Option<i64>>, signals: Mutex<Vec<(String,Value)>>, log: Mutex<Vec<String>> }
+    #[async_trait]
+    impl PollerStore for Memory {
+        async fn last_update_id(&self) -> anyhow::Result<Option<i64>> { Ok(*self.cursor.lock().unwrap()) }
+        async fn set_last_update_id(&self, id: i64) -> anyhow::Result<()> { *self.cursor.lock().unwrap() = Some(id); Ok(()) }
+        async fn record_message(&self, _: i64, _: i64, _: Option<i64>, text: &str) -> anyhow::Result<()> { self.log.lock().unwrap().push(text.into()); Ok(()) }
+        async fn record_signal(&self, source: &str, content: &str) -> anyhow::Result<()> { self.signals.lock().unwrap().push((source.into(), serde_json::from_str(content)?)); Ok(()) }
+    }
+    let press = |id, chat, data| json!({"update_id":id,"callback_query":{"id":format!("q{id}"),"data":data,"message":{
+        "message_id":1001,"chat":{"id":chat,"type":"private"},"message_thread_id":7,
+        "reply_markup":{"inline_keyboard":[[{"text":"Confirm","callback_data":"cf:yes"}]]}}}});
+    fake.push(press(1, CHAT, "cf:yes"));
+    fake.push(press(2, OTHER_CHAT, "cf:yes"));
+    fake.push(press(3, CHAT, "missing"));
+    fake.fail("answerCallbackQuery", 1, 0);
+    let store = Memory::default();
+    assert_eq!(poll_once(&bot, &store, CHAT, 0).await.unwrap(), 3);
+    assert_eq!(*store.cursor.lock().unwrap(), Some(3));
+    assert_eq!(*store.log.lock().unwrap(), ["[button] Confirm", "[button] missing"]);
+    let signals = store.signals.lock().unwrap();
+    assert_eq!(signals[0], ("telegram_button".into(),json!({"chatId":CHAT,"messageThreadId":7,"messageId":1001,"data":"cf:yes","text":"Confirm"})));
+    assert_eq!(signals[1].1["text"], Value::Null);
+    assert_eq!(fake.lock().requests.iter().filter(|(m,_)| m == "answerCallbackQuery").count(), 2);
+}
