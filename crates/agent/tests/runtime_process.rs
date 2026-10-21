@@ -1,6 +1,7 @@
 // Full composition-root smoke: compiled binary, real MCP + LLM HTTP, real
 // SQLite and real OTLP exporter. Every service is a local fixture; env_clear
 // prevents production credentials/configuration from entering the child.
+mod support;
 use agent::db::{AgentDb, TraceStore};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult, PaginatedRequestParams,
@@ -113,6 +114,14 @@ impl Fixture {
             .conn()
             .execute("DELETE FROM scheduled_tasks WHERE workflow = 'skill-index'", [])
             .unwrap();
+        if source == "telegram" {
+            // Install the reference policy through the authoring checks, in
+            // the database that the real child process opens on startup.
+            let mut author = support::fixture(Arc::new(support::Scripted::new(vec![])), &[], &[]);
+            Arc::get_mut(&mut author.engine).unwrap().deps.workflows =
+                Arc::new(AgentDb::open(root.join("agent.db")).unwrap());
+            support::activate_telegram_flows(&author.engine);
+        }
         std::fs::create_dir(root.join("skills.default")).unwrap();
         for (name, tools, body) in [
             ("orchestrator", "*", "ORCHESTRATOR"),
