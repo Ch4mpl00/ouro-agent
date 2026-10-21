@@ -20,6 +20,7 @@ pub struct Pending {
 type ResolutionRow = (String, String, Option<i64>, String, Option<i64>, Option<String>);
 
 pub trait Store: Send + Sync {
+    fn outcome(&self, run: &str, key: &str) -> anyhow::Result<Option<String>>;
     fn get(&self, run: &str, key: &str) -> anyhow::Result<Option<Pending>>;
     fn pending(&self, target: &ConfirmTarget) -> anyhow::Result<Value>;
     fn insert(&self, pending: &Pending) -> anyhow::Result<()>;
@@ -28,6 +29,16 @@ pub trait Store: Send + Sync {
     fn resolve(&self, run: &str, key: &str, claimed: &str) -> anyhow::Result<String>;
 }
 impl Store for AgentDb {
+    fn outcome(&self, run: &str, key: &str) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row("SELECT outcome FROM confirmations WHERE run_id=?1 AND call_key=?2", params![run, key], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .flatten())
+    }
+
     fn pending(&self, target: &ConfirmTarget) -> anyhow::Result<Value> {
         let conn = self.conn();
         let mut stmt = conn.prepare(

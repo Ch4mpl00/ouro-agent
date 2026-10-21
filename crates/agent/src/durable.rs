@@ -169,6 +169,12 @@ impl RunStore {
                 params![link.parent, t, now()],
             )?;
         }
+        // Keep completion subscribed across the gap between consuming waiting
+        // and entering the parent's final done listen.
+        tx.execute(
+            "INSERT INTO workflow_listeners (run_id,key,type) VALUES (?1,?2,?3) ON CONFLICT DO NOTHING",
+            params![link.parent, format!("child:{id}"), format!("done:{id}")],
+        )?;
         let owner = uuid::Uuid::new_v4().to_string();
         let inserted = tx.execute("INSERT INTO workflow_runs (id,name,definition,input,state,owner,lease_until_ms,parent_run,child_key,child_reference)
             VALUES (?1,?2,?3,?4,'running',?5,?6,?7,?8,?9) ON CONFLICT DO NOTHING",
@@ -215,6 +221,28 @@ impl RunStore {
             "child run does not belong to this parent and key"
         );
         outcome.map(|o| Ok(serde_json::from_str(&o)?)).transpose()
+    }
+
+    pub fn pending_child_confirmation(&self, parent: &str, call: &str) -> anyhow::Result<bool> {
+        Ok(self.db.conn().query_row("SELECT EXISTS(SELECT 1 FROM confirmations c JOIN workflow_runs g ON g.id=c.run_id WHERE g.parent_run=?1 AND g.name='guard' AND c.call_key=?2 AND c.outcome IS NULL)",params![parent,call],|r|r.get(0))?)
+    }
+
+    /// One reviewed call authorizes one host invocation. A malicious loop
+    /// cannot spend a confirmed verdict again by lying about its round.
+    pub fn use_guard_verdict(&self, child: &str, call: &str, invocation: &str) -> anyhow::Result<bool> {
+        let mut conn = self.db.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO guard_verdict_uses (child_run,call_key,invocation) VALUES (?1,?2,?3) ON CONFLICT DO NOTHING",
+            params![child, call, invocation],
+        )?;
+        let same = tx.query_row(
+            "SELECT invocation=?3 FROM guard_verdict_uses WHERE child_run=?1 AND call_key=?2",
+            params![child, call, invocation],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok(same)
     }
 
     /// One event belongs to one live run. A pending delivery excludes a second
@@ -281,6 +309,7 @@ impl RunStore {
     pub fn sweep(&self, kept_ms: i64) -> anyhow::Result<usize> {
         let mut conn = self.db.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM guard_verdict_uses WHERE child_run IN (SELECT c.id FROM workflow_runs c JOIN workflow_runs p ON p.id=c.parent_run WHERE p.ended_ms<=?1)",[now()-kept_ms])?;
         tx.execute(
             "DELETE FROM confirmations WHERE run_id IN (SELECT id FROM workflow_runs WHERE ended_ms <= ?1)",
             [now() - kept_ms],
@@ -470,7 +499,7 @@ impl owf::run::Events for Lease {
         });
         let mut notified = Box::pin(notify.notified_owned());
         notified.as_mut().enable();
-        Box::pin(async move { notified.await })
+        notified
     }
 
     fn unregister(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
@@ -547,6 +576,14 @@ impl owf::run::Events for Lease {
             "UPDATE workflow_events SET consumed_at_ms = ?2, consumed_key = ?3 WHERE id = ?1",
             params![id, now(), key],
         )?;
+        // The child-completion subscription survives the waiting→done gap,
+        // then closes with its one consumed completion event.
+        if let Some(child) = t.strip_prefix("done:") {
+            tx.execute(
+                "DELETE FROM workflow_listeners WHERE run_id=?1 AND key=?2",
+                params![run_id, format!("child:{child}")],
+            )?;
+        }
         tx.execute("DELETE FROM workflow_listeners WHERE run_id = ?1 AND key = ?2", params![run_id, key])?;
         close_awaits(&tx, run_id, types)?;
         tx.execute(

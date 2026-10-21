@@ -1029,3 +1029,31 @@ do:
     assert_eq!(RunStore::new(db).get("test:1").unwrap().unwrap().state, "completed");
     trace.end();
 }
+
+#[test]
+fn guard_is_reserved_readable_and_its_private_functions_are_not_in_the_catalog() {
+    let w = world(vec![]);
+    for name in ["save_workflow", "activate_workflow"] {
+        let args = json!({"name":"guard","version":1,"definition":agent::flows::built_in("guard")});
+        assert!(
+            agent::flows::tool(&w.engine, name, args.as_object().unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("reserved")
+        );
+    }
+    let args = json!({"name":"guard"});
+    let read = agent::flows::tool(&w.engine, "read_workflow", args.as_object().unwrap()).unwrap();
+    assert!(read.contains("call: review"));
+    // Even a directly stored override never replaces the reserved definition.
+    let version = w.engine.deps.workflows.save("guard", "forged", None).unwrap();
+    w.engine.deps.workflows.activate("guard", version.version).unwrap();
+    assert_eq!(agent::flows::definition(&w.engine, "guard").0, agent::flows::built_in("guard").unwrap());
+    for function in ["review", "confirm_request", "resolve_review"] {
+        let def = format!(
+            "document: {{ dsl: '1.0.4', namespace: t, name: other, version: '1.0.0' }}\ndo: [ {{ step: {{ call: {function} }} }} ]"
+        );
+        assert!(check(&*w.engine.deps.mcp, &def).is_err(), "{function}");
+        assert!(agent::flows::functions(&w.engine, json!({"name":function}).as_object().unwrap()).is_err());
+    }
+}

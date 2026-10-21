@@ -184,8 +184,9 @@ nothing, so keep each `try` narrow, around the call it retries, with the
 ## The agent loop is a workflow too
 
 Every agent loop, the parent's and each worker's, runs the workflow
-`agent-loop`. A `call: guard` step before the tool round is required; it reviews
-the round's writes, and the host checks every write even if an override skips it.
+`agent-loop`. A `call: start_child` of workflow `guard` before the tool round
+is required; it reviews writes and open-world reads. The host checks every
+guarded call even if an override skips the child.
 `read_workflow("agent-loop")` shows the version in force (the
 built-in one until another is saved). Its context carries `loop`,
 `messages`, `memory` and the turn count `i`; `agent_turn`, `tool` (one call
@@ -216,12 +217,14 @@ original error. Keep the final `raise` so a reported failure stays a failed
 signal for tracing and the breaker. An override without a catch deliberately
 gets no recovery report; Rust does not add one afterwards.
 
-The built-in loop keeps the guard's verdicts and sends a host-rendered card
-for a call needing confirmation, then listens for its Confirm/Decline event.
-The host verifies the consumed event against that exact call; setting an
-outcome in YAML cannot authorize it. Keep `call: guard` in loop overrides;
-omitting the confirmation branch keeps blocking. Workers report proposals
-to the main agent rather than waiting for confirmation themselves.
+The built-in loop starts the reserved `guard` child for each guarded round,
+listens for its `done` or `waiting` event with a 60 second in-memory hold,
+and sleeps durably after `waiting`. The guard workflow sequences review,
+host-rendered cards and concurrent confirmation listens. Rust verifies consumed
+events against exact calls; YAML verdicts and outcome words cannot authorize
+them. Workers inherit the parent's admitted target and use the same cards.
+Workers are joined with `start_child` and `listen` (15 minute hold); waiting
+workers release their parent and the supervisor for other signals.
 
 `signal` routes `telegram_button` presses through `deliver_event` first.
 Unmatched presses enter the primary loop with Telegram history. Its
@@ -239,6 +242,26 @@ array of `{ type, data, time }`. Durable runs suspend without holding a
 worker; `timeout: { after: PT24H }` raises the standard catchable timeout.
 Dry runs fail on an empty listen. `all`, `until`, correlation, read and
 foreach listen options are unsupported.
+
+A `listen` task may set `metadata: { hold: PT5S }` (a literal ISO 8601
+duration, default `PT0S`). It first consumes an available event, then waits
+in memory for host notifications during that hold, keeping its lease and
+heartbeat. Delivery continues the run without saving a waiting state. When
+the hold or the task timeout ends, it suspends durably; recovery replays the
+listen and consumes the persisted event or handles the timeout. A crash during
+the hold is recovered through the ordinary lease and journal.
+
+`start_child(workflow, key, input?)` starts an active saved workflow immediately
+as an owned durable child and returns `{ run }`. The invocation path and key
+identify it across replay; its admitted definition and input stay immutable.
+Listen on `done:<run>` / `waiting:<run>` (use an in-memory hold for fast work).
+After `waiting`, listen on `done:<run>` without a hold to release the worker.
+`child_outcome(run, key)` reads the owned child's stored terminal outcome;
+event data alone is not authority. Ending a parent cancels unfinished children.
+The built-in `guard` workflow is reserved and readable, but cannot be saved or
+activated; its review and confirmation functions are private. An `agent-loop`
+override must start a `guard` child before its tool round.
+
 
 A subset of the Open Workflow Specification 1.0, in YAML. Anything not
 listed here is rejected (`emit`, `run`, `schedule`, catalogs,
@@ -423,11 +446,3 @@ do:
       call: remember_sent
       with: { body: '${ $context.text }' }
 ```
-
-A `listen` task may set `metadata: { hold: PT5S }` (a literal ISO 8601
-duration, default `PT0S`). It first consumes an available event, then waits
-in memory for host notifications during that hold, keeping its lease and
-heartbeat. Delivery continues the run without saving a waiting state. When
-the hold or the task timeout ends, it suspends durably; recovery replays the
-listen and consumes the persisted event or handles the timeout. A crash during
-the hold is recovered through the ordinary lease and journal.

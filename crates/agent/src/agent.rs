@@ -1165,6 +1165,86 @@ pub async fn loop_guard(
     loop_.guard_calls(engine, &calls).await
 }
 
+pub async fn guard_review(
+    engine: &Arc<Engine>,
+    args: &Value,
+    scope: &Scope,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Value> {
+    let reviewed = loop_guard(engine, args, scope, cancel).await?;
+    let calls = args["calls"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("missing calls"))?
+        .iter()
+        .map(tool_call)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let loop_ = engine.loop_for(&loop_spec(args)?, scope, cancel).await?;
+    let verdicts: Vec<(String, crate::guard::Verdict)> = serde_json::from_value(reviewed["verdicts"].clone())?;
+    let items: Vec<_> = calls
+        .into_iter()
+        .filter_map(|call| {
+            verdicts
+                .iter()
+                .find(|(k, _)| k == &crate::guard::key(&call))
+                .map(|(k, v)| json!({"key":k,"call":{"id":call.id,"name":call.name,"arguments":call.arguments},"label":v.label,"verdict":v}))
+        })
+        .collect();
+    Ok(json!({"items":items,"confirmable":loop_.opts.confirm.is_some()}))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn guard_confirmation(
+    engine: &Arc<Engine>,
+    admitted: &Value,
+    call: &providers::ToolCall,
+    verdict: &crate::guard::Verdict,
+    scope: &Scope,
+    info: &owf::run::CallInfo<'_>,
+    runs: &crate::durable::RunStore,
+    events: Option<&dyn owf::run::Events>,
+) -> anyhow::Result<Value> {
+    let spec: LoopSpec = serde_json::from_value(admitted["loop"].clone())?;
+    let loop_ = engine.loop_for(&spec, scope, info.cancel).await?;
+    anyhow::ensure!(verdict.label == "needs_confirmation", "call needs no confirmation");
+    let target = loop_.opts.confirm.as_ref().ok_or_else(|| anyhow::anyhow!("no confirmation target"))?;
+    let context = loop_.guard.lock().await.context.clone().ok_or_else(|| anyhow::anyhow!("missing guard context"))?;
+    crate::confirmation::request(
+        runs.confirmations(),
+        events.ok_or_else(|| anyhow::anyhow!("no events"))?,
+        &*engine.deps.mcp,
+        crate::confirmation::Request {
+            run: info.run_id,
+            call,
+            target,
+            guidance: &verdict.guidance,
+            goal: if context.root_request.is_empty() { &context.task } else { &context.root_request },
+        },
+        info.cancel,
+    )
+    .await
+}
+
+pub fn confirmation_verdict(call: &providers::ToolCall, outcome: &str) -> crate::guard::Verdict {
+    let (label, guidance) = match outcome {
+        "confirmed" => ("allow", "The user confirmed this exact call.".to_owned()),
+        "declined" => (
+            "declined",
+            format!(
+                "{} was not made: declined by the user. Do not retry it; ask the user what they want instead",
+                call.name
+            ),
+        ),
+        "expired" => ("expired", format!("{} was not made: not confirmed within 24 h", call.name)),
+        _ => (
+            "unverified_confirmation",
+            format!("{} was not made: no consumed confirmation matches this exact call. Do not retry it", call.name),
+        ),
+    };
+    crate::guard::Verdict { label: label.into(), guidance, unavailable: None }
+}
+
+// Compatibility for runs admitted with the pre-child immutable definition.
+// Remove this function and tool's outcome path once those runs have drained.
 pub async fn loop_confirm_request(
     engine: &Arc<Engine>,
     args: &Value,
@@ -1211,8 +1291,11 @@ pub async fn loop_worker_input(
     args: &Value,
     scope: &Scope,
     cancel: &CancellationToken,
-) -> anyhow::Result<Option<(String, Value)>> {
+) -> anyhow::Result<Option<(String, Value, Arc<dyn Span>)>> {
     let loop_ = engine.loop_for(&loop_spec(args)?, scope, cancel).await?;
+    if !loop_.visible("invoke_sub_agent") {
+        return Ok(None);
+    }
     loop_.restore_memory(args.get("memory"))?;
     let Some(key) = child_key(args) else { return Ok(None) };
     let call = tool_call(&args["call"])?;
@@ -1241,16 +1324,48 @@ pub async fn loop_worker_input(
     let (opts, prompt) = loop_.worker_options(&arguments, worker_scope.clone(), Some(&key)).await?;
     let id = format!("{}/loop", opts.id);
     let input = engine.start_loop(opts).await?.workflow_input(&prompt).await;
-    Ok(Some((id, input)))
+    Ok(Some((id, input, worker_scope)))
 }
 
-fn tool_call(value: &Value) -> anyhow::Result<providers::ToolCall> {
+pub(crate) fn tool_call(value: &Value) -> anyhow::Result<providers::ToolCall> {
     let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
     Ok(providers::ToolCall {
         id: text("id").ok_or_else(|| anyhow::anyhow!("a call needs an id"))?,
         name: text("name").ok_or_else(|| anyhow::anyhow!("a call needs a name"))?,
         arguments: text("arguments").unwrap_or_default(),
     })
+}
+
+fn guard_child_verdict(
+    runs: Option<&crate::durable::RunStore>,
+    parent: Option<&str>,
+    args: &Value,
+    call: &providers::ToolCall,
+    invocation: Option<&str>,
+) -> anyhow::Result<Option<crate::guard::Verdict>> {
+    let Some(((runs, parent), id)) = runs.zip(parent).zip(args["guard_run"].as_str()) else { return Ok(None) };
+    let round = args["i"].as_u64().ok_or_else(|| anyhow::anyhow!("guard requires a round"))?;
+    let Some(owf::run::Status::Completed(output)) = runs.child_outcome(parent, &format!("guard:{round}"), id)? else {
+        return Ok(None);
+    };
+    let saved = runs.get(id)?.ok_or_else(|| anyhow::anyhow!("missing guard child"))?;
+    anyhow::ensure!(saved.name == "guard" && saved.input["round"] == round, "invalid guard child");
+    let verdicts: Vec<(String, crate::guard::Verdict)> = serde_json::from_value(output["verdicts"].clone())?;
+    let verdict = verdicts.into_iter().find(|(key, _)| key == &crate::guard::key(call)).map(|(_, v)| v);
+    if verdict.is_some()
+        && !runs.use_guard_verdict(
+            id,
+            &crate::guard::key(call),
+            invocation.ok_or_else(|| anyhow::anyhow!("guard result requires a host invocation"))?,
+        )?
+    {
+        return Ok(Some(crate::guard::Verdict {
+            label: "unverified_confirmation".into(),
+            guidance: "This verdict was already used by another call. Do not retry it.".into(),
+            unavailable: None,
+        }));
+    }
+    Ok(verdict)
 }
 
 /// `tool { loop, call, memory?, i?, index? }`: one call of the round: its reply as the
@@ -1264,6 +1379,19 @@ pub async fn loop_tool(
     cancel: &CancellationToken,
     runs: Option<&crate::durable::RunStore>,
     run_id: Option<&str>,
+) -> anyhow::Result<Value> {
+    loop_tool_at(engine, args, scope, cancel, runs, run_id, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn loop_tool_at(
+    engine: &Arc<Engine>,
+    args: &Value,
+    scope: &Scope,
+    cancel: &CancellationToken,
+    runs: Option<&crate::durable::RunStore>,
+    run_id: Option<&str>,
+    invocation: Option<&str>,
 ) -> anyhow::Result<Value> {
     let loop_ = engine.loop_for(&loop_spec(args)?, scope, cancel).await?;
     loop_.restore_memory(args.get("memory"))?;
@@ -1290,25 +1418,18 @@ pub async fn loop_tool(
         None
     };
     let verdict = if let Some(outcome) = &outcome {
-        let (label, guidance) = match outcome.as_str() {
-            "confirmed" => ("allow", "The user confirmed this exact call.".to_owned()),
-            "declined" => (
-                "declined",
-                format!(
-                    "{} was not made: declined by the user. Do not retry it; ask the user what they want instead",
-                    call.name
-                ),
-            ),
-            "expired" => ("expired", format!("{} was not made: not confirmed within 24 h", call.name)),
-            _ => (
-                "unverified_confirmation",
-                format!(
-                    "{} was not made: no consumed confirmation matches this exact call. Do not retry it",
-                    call.name
-                ),
-            ),
-        };
-        Some(crate::guard::Verdict { label: label.into(), guidance, unavailable: None })
+        Some(confirmation_verdict(&call, outcome))
+    } else if let Some(verdict) = guard_child_verdict(runs, run_id, args, &call, invocation)? {
+        loop_.guard.lock().await.verdicts.remove(&crate::guard::key(&call));
+        Some(verdict)
+    } else if runs
+        .zip(run_id)
+        .map(|(runs, parent)| runs.pending_child_confirmation(parent, &crate::guard::key(&call)))
+        .transpose()?
+        .unwrap_or(false)
+    {
+        // Omitting a guard child cannot bypass its outstanding human decision.
+        Some(confirmation_verdict(&call, "unverified"))
     } else if crate::guard::needs_guard(engine, &call) {
         let key = crate::guard::key(&call);
         let recorded = loop_.guard.lock().await.verdicts.remove(&key);

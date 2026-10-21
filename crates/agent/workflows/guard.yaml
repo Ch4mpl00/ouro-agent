@@ -1,0 +1,40 @@
+document: { dsl: '1.0.4', namespace: agent, name: guard, version: '1.0.0' }
+# Only host-owned review evidence and consumed button events can authorize a call.
+do:
+  - review:
+      call: review
+      export: { as: '${ . }' }
+  - calls:
+      for: { each: item, in: '${ $context.items }' }
+      metadata: { concurrency: 16 }
+      do:
+        - route:
+            switch:
+              - ask: { when: '${ $context.confirmable and $item.label == "needs_confirmation" }', then: confirm }
+              - ordinary: { then: resolve }
+        - confirm:
+            call: confirm_request
+            with: { call: '${ $item.call }' }
+            export: { as: '${ $context + { request: . } }' }
+        - answer:
+            try:
+              - listen:
+                  listen:
+                    to:
+                      any:
+                        - with: { type: '${ $context.request.types[0] }' }
+                        - with: { type: '${ $context.request.types[1] }' }
+                  metadata: { hold: PT5S }
+                  timeout: { after: PT24H }
+              - outcome:
+                  set: '${ if .[0].type == $context.request.types[0] then "confirmed" else "declined" end }'
+            catch:
+              errors: { with: { status: 408 } }
+              do:
+                - expired: { set: '${ "expired" }' }
+            export: { as: '${ $context + { outcome: . } }' }
+        - resolve:
+            call: resolve_review
+            with: { call: '${ $item.call }', outcome: '${ $context.outcome // null }' }
+output:
+  as: '${ { verdicts: . } }'
