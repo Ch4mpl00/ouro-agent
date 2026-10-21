@@ -538,6 +538,8 @@ pub fn activate_definition(engine: &Arc<Engine>, name: &str, definition: &str) -
     let saved: Value =
         serde_json::from_str(&agent::flows::tool(engine, "save_workflow", args.as_object().unwrap()).unwrap()).unwrap();
     let version = saved["version"].as_i64().unwrap();
+    // Stands in for the dry run activation requires (sandbox tests try them).
+    engine.deps.workflows.mark_tried(name, version).unwrap();
     let args = json!({"name": name, "version": version});
     agent::flows::tool(engine, "activate_workflow", args.as_object().unwrap()).unwrap();
     version

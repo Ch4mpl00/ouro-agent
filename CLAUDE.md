@@ -112,7 +112,8 @@ deletion.
    without anchors retain separate resume traces. The activity journal waits
    for every anchored run to end and its final spans to reach the mirror, then
    projects the request once. The agent may activate its own version of
-   any loop or signal route; three faults of a name in a row fall back to its
+   any loop or signal route once a dry run of it on a signal completed
+   (`src/sandbox.rs`); three faults of a name in a row fall back to its
    built-in one (a loop without one falls back to `agent-loop`; `flows.rs` §4b). A worker of the durable primary loop is a durable run of
    its own, started immediately as an owned child. The parent joins it with
    `listen` (15 minute in-memory hold); a worker waiting for confirmation lets
@@ -190,6 +191,8 @@ mcp-tools/
     │   ├── src/flows.rs                    saved workflows: store, function catalog, tracing,
     │   │                                   scheduled runs, the authoring tools
     │   ├── src/durable.rs                  saved workflows' run state: admission, leases, checkpoints
+    │   ├── src/sandbox.rs                  dry runs: a signal through the draft chain, real turns,
+    │   │                                   reads and guard, writes mocked, nothing kept
     │   ├── src/schedule.rs                 scheduled tasks: cron rows, the 30 s tick, the schedule
     │   │                                   tools, the first start's import
     │   ├── src/agent.rs                    the engine, the loop's turn/tool/settle, synthetic tools
@@ -506,8 +509,10 @@ volume — written by the `dreaming` skill when it self-revises).
 - `composer` — the base prompt of saved workflows' `llm_compose` steps.
 - `workflow-author` — a worker skill (always `smartest`, maximum reasoning): drafts a saved
   workflow with `save_workflow`, dry-runs it with `try_workflow` (real reads
-  and model steps, writes only recorded) and describes it in words with a
-  sample; the parent activates it once the user confirms.
+  and model steps, writes only recorded; a loop, route or `signal` override
+  on a signal, through the whole chain with its drafts, `src/sandbox.rs`) and
+  describes it in words with a sample; the parent activates it once the user
+  confirms.
 - `recovery` — requested by the built-in `signal` catch to phrase a failed
   signal to the user; an activated workflow controls the report policy.
 

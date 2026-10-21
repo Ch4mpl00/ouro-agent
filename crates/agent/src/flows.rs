@@ -766,6 +766,9 @@ impl owf::run::Functions for Functions {
                     .filter(|k| !k.is_empty())
                     .ok_or_else(|| invalid(name, "`key` must be a nonempty string"))?;
                 let value = text(&args, name, "value")?.ok_or_else(|| invalid(name, "`value` must be a string"))?;
+                if let Some(sandbox) = self.engine.sandbox() {
+                    return Ok(parse_tool_json(&sandbox.mock(name, args.clone())));
+                }
                 self.engine.deps.memory.set(key, value).map_err(failed)?;
                 Ok(json!({"ok":true,"key":key}))
             }
@@ -980,6 +983,9 @@ impl Observer for Spans {
                     span.end(SpanEnd::output(json!({"waiting_until_ms":wake_at_ms})));
                 }
             }
+            Event::SwitchCase { reference, case } => {
+                self.scope(reference).update(crate::tracing::ContextUpdate::metadata(metadata(json!({"case":case}))))
+            }
             Event::TaskFaulted { reference, error } => match self.take(reference) {
                 Some(span) => span.end(SpanEnd::error(error.to_string()).with_output(json!(error))),
                 // Faulted before it started (its `if` or a limit).
@@ -1119,7 +1125,7 @@ fn execute_saved<'a>(
         let status = match owf::model::parse_yaml(&saved.definition) {
             Err(error) => (RunStatus::Interrupted(WorkflowError::validation(error.to_string())), true),
             Ok(wf) => {
-                let host = host(
+                let mut host = host(
                     engine,
                     &root,
                     is_loop_definition(&saved.name, &saved.definition),
@@ -1129,6 +1135,15 @@ fn execute_saved<'a>(
                     Some(lease.clone()),
                     children.clone(),
                 );
+                if let Some(sandbox) = engine.sandbox() {
+                    let version = match saved.name.as_str() {
+                        _ if loop_run => loop_version,
+                        "guard" => None,
+                        name => engine.deps.workflows.active(name).ok().flatten().map(|w| w.version),
+                    };
+                    let loop_id = saved.input["loop"]["id"].as_str().filter(|_| loop_run);
+                    sandbox.watch(&mut host, &saved.id, &saved.name, version, saved.parent_run.as_deref(), loop_id);
+                }
                 // Shutdown releases work for recovery; only explicit run
                 // cancellation is allowed to create a terminal Cancelled state.
                 let execution_cancel = CancellationToken::new();
@@ -1728,16 +1743,19 @@ impl Functions {
                             .resolve(info.run_id, &key, args["outcome"].as_str().unwrap_or("unverified"))
                             .map_err(failed)?,
                     };
-                    crate::confirmation::close_card(
-                        runs.confirmations(),
-                        &*self.engine.deps.mcp,
-                        info.run_id,
-                        &call,
-                        &outcome,
-                        &crate::confirmation::Card::load(&*self.engine.deps.memory),
-                        info.cancel,
-                    )
-                    .await;
+                    // A dry run's card was never sent: there is nothing to edit.
+                    if self.engine.sandbox().is_none() {
+                        crate::confirmation::close_card(
+                            runs.confirmations(),
+                            &*self.engine.deps.mcp,
+                            info.run_id,
+                            &call,
+                            &outcome,
+                            &crate::confirmation::Card::load(&*self.engine.deps.memory),
+                            info.cancel,
+                        )
+                        .await;
+                    }
                     crate::agent::confirmation_verdict(&call, &outcome)
                 } else {
                     verdict
@@ -1905,6 +1923,14 @@ pub fn definition(engine: &Engine, name: &str) -> (String, Option<i64>) {
         return builtin;
     }
     (saved.definition, Some(saved.version))
+}
+
+// A workflow the runtime runs on a signal: the dispatcher, the loop, a loop
+// variant or a signal route (a scheduled workflow is not one).
+fn is_runtime_workflow(name: &str, wf: &owf::model::Workflow) -> bool {
+    built_in(name).is_some()
+        || workflow_metadata(wf).get("loop").is_some()
+        || workflow_metadata(wf).get("route").is_some()
 }
 
 /// Metadata lives in document.metadata, the OWF extension point.
@@ -2111,14 +2137,11 @@ pub async fn run_loop_here(
             FlowResult::Faulted { error: WorkflowError::validation(error.to_string()), effects_started: false }
         }
         Ok(wf) => {
-            let outcome = owf::run::run(
-                &host(engine, &root, true, false, None, Some(input.clone()), None, Arc::default()),
-                &wf,
-                id,
-                with_override(input, version),
-                cancel,
-            )
-            .await;
+            let mut host = host(engine, &root, true, false, None, Some(input.clone()), None, Arc::default());
+            if let Some(sandbox) = engine.sandbox() {
+                sandbox.watch(&mut host, id, &name, version, None, input["loop"]["id"].as_str());
+            }
+            let outcome = owf::run::run(&host, &wf, id, with_override(input, version), cancel).await;
             flow_result(outcome.status, outcome.effects_started)
         }
     };
@@ -2173,7 +2196,7 @@ const DRY_MAX_PATH: usize = 120;
 
 const DRY_WRITE_MAX_CHARS: usize = 5000;
 
-const DRY_RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+pub(crate) const DRY_RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 fn effect_name(mcp: &dyn Mcp, wf: &owf::model::Workflow, function: &str) -> &'static str {
     match effect(mcp, function) {
@@ -2311,9 +2334,13 @@ pub fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::R
                 .into_iter()
                 .map(|c| json!({"reference":c.reference,"function":c.function,"effect":effect_name(mcp, &wf, &c.function)}))
                 .collect();
+            let next = if is_runtime_workflow(name, &wf) {
+                "Dry-run it on a signal of the type it handles (try_workflow with `signal`, and `drafts` for the other drafts of the chain) before the user sees it, then describe in words what it will do, the write calls above all; activate this version only after they confirm it in the chat."
+            } else {
+                "Dry-run it (try_workflow) before the user sees it, then describe in words what it will do, the write calls above all; activate this version only after they confirm it in the chat."
+            };
             let mut reply = json!({
-                "ok": true, "name": name, "version": saved.version, "status": "draft", "calls": calls,
-                "next": "Dry-run it (try_workflow) before the user sees it, then describe in words what it will do, the write calls above all; activate this version only after they confirm it in the chat.",
+                "ok": true, "name": name, "version": saved.version, "status": "draft", "calls": calls, "next": next,
             });
             let warnings = warnings(&wf);
             if !warnings.is_empty() {
@@ -2333,12 +2360,13 @@ pub fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::R
             require_loop_guard(name, &wf)?;
             require_metadata(&wf)?;
             require_route_priority(store, name, &wf)?;
-            if built_in(name).is_some()
-                || workflow_metadata(&wf).get("loop").is_some()
-                || workflow_metadata(&wf).get("route").is_some()
-            {
-                // The runtime's own workflow is tried by running: the breaker
-                // takes it back after a few faults in a row.
+            if is_runtime_workflow(name, &wf) {
+                // Tried on a signal like any workflow; the breaker stays the
+                // second line, taking it back after a few faults in a row.
+                anyhow::ensure!(
+                    saved.tried,
+                    "version {version} of `{name}` has not completed a dry run; the workflow-author worker tries it on a signal (try_workflow with `signal` and `drafts`) before it is shown to the user"
+                );
                 store.activate(name, version)?;
                 let runs = if is_loop_definition(name, &saved.definition) {
                     "A loop selecting this name"
@@ -2347,7 +2375,7 @@ pub fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::R
                 };
                 return Ok(json!({
                     "ok": true, "name": name, "version": version,
-                    "next": format!("{runs} started from now runs this version; three faults in a row put the built-in one back."),
+                    "next": format!("{runs} started from now runs this version, the one the dry run tried; three faults in a row put the built-in one back."),
                 })
                 .to_string());
             }
@@ -2546,6 +2574,8 @@ struct DryRun {
     writes: Mutex<Vec<Value>>,
 }
 
+// Kept for the scheduled form: saved workflows (skill-index) check a write's
+// `ok`. A signal's dry run answers with the sandbox's explicit mock instead.
 const DRY_WRITE_REPLY: &str = r#"{"ok":true,"dryRun":true}"#;
 
 impl DryRun {
@@ -2626,7 +2656,7 @@ impl Observer for DrySteps {
             Event::TaskRetrying { reference, attempt, error, .. } => {
                 json!({"task": reference, "retry": attempt, "error": error.to_string()})
             }
-            Event::TaskSuspended { .. } => return,
+            Event::TaskSuspended { .. } | Event::SwitchCase { .. } => return,
         };
         if report.steps.len() < DRY_MAX_STEPS {
             report.steps.push(step);
@@ -2659,13 +2689,18 @@ pub async fn try_draft(
     let saved =
         engine.deps.workflows.get(name, version)?.ok_or_else(|| anyhow::anyhow!("no saved workflow `{name}`"))?;
     let wf = check(&*engine.deps.mcp, &saved.definition).map_err(anyhow::Error::msg)?;
+    // A loop, a route or the dispatcher runs on a signal, never on a
+    // scheduled fire's empty input.
+    anyhow::ensure!(
+        !is_runtime_workflow(name, &wf),
+        "`{name}` handles signals: try it with a signal (try_workflow with `signal`, and `drafts` for the rest of the chain)"
+    );
     let signal = WorkflowSignal { id: 0, source: "scheduler".into(), content: String::new(), env_context: None };
     let input = Value::Object(signal_input(&signal, env));
-    let root = scope.span(
-        SpanStart::new("dry-run", SpanKind::Chain)
-            .input(input.clone())
-            .metadata(metadata(json!({"workflow":name,"workflow_version":saved.version,"engine":"owf"}))),
-    );
+    let root =
+        scope.span(SpanStart::new("dry-run", SpanKind::Chain).input(input.clone()).metadata(metadata(
+            json!({"workflow":name,"workflow_version":saved.version,"engine":"owf","dry_run":true}),
+        )));
     let spans = Arc::new(Spans { root: root.clone(), open: Mutex::default() });
     let functions = Arc::new(DryRun {
         functions: Functions {

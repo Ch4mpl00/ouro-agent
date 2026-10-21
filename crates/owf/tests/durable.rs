@@ -1243,3 +1243,35 @@ async fn listen_holds_until_delivery_or_the_shorter_deadline_and_replays_a_crash
         }
     }
 }
+
+// A host that never waits (a dry run) caps how long a listen holds: an event
+// already delivered is still taken, and one that is not there has expired at
+// once, through the listen's own timeout and its catch, instead of suspending.
+#[tokio::test]
+async fn a_listen_ceiling_takes_a_delivered_event_or_fires_the_timeout_at_once() {
+    use std::time::Duration;
+    let wf = workflow(
+        "do:\n - t:\n     try: [ { w: { listen: { to: { one: { with: { type: x } } } }, metadata: { hold: PT5S }, timeout: { after: PT24H } } } ]\n     catch: { errors: { with: { status: 408 } }, do: [ { expired: { set: { expired: true } } } ] }\n",
+    );
+    for early in [true, false] {
+        let inbox = Arc::new(Inbox::default());
+        if early {
+            inbox.queued.lock().unwrap().push(delivered("x"));
+        }
+        let mut h = event_host(inbox.clone(), Arc::new(Time(AtomicI64::new(1_000))));
+        h.limits.max_listen = Some(Duration::ZERO);
+        let start = tokio::time::Instant::now();
+        let status = run::resume(&h, &wf, "run", json!({}), &CancellationToken::new(), &*inbox.journal).await.status;
+        assert!(start.elapsed() < Duration::from_secs(1), "the hold was not waited out");
+        let expected = if early { json!([delivered("x")]) } else { json!({"expired":true}) };
+        assert_eq!(status, Status::Completed(expected));
+        assert!(!inbox.registered.lock().unwrap().contains(&"x".to_owned()) || early);
+    }
+    // Without a timeout there is nothing to fire: the listen suspends as before.
+    let inbox = Arc::new(Inbox::default());
+    let mut h = event_host(inbox.clone(), Arc::new(Time(AtomicI64::new(1_000))));
+    h.limits.max_listen = Some(Duration::ZERO);
+    let wf = workflow("do: [ { w: { listen: { to: { one: { with: { type: x } } } } } } ]\n");
+    let status = run::resume(&h, &wf, "run", json!({}), &CancellationToken::new(), &*inbox.journal).await.status;
+    assert!(matches!(status, Status::Waiting { .. }), "{status:?}");
+}

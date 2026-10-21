@@ -111,6 +111,7 @@ impl Observer for Journal {
                 Entry::Completed { reference: reference.to_string(), output: (*output).clone() }
             }
             Event::TaskSuspended { .. } => panic!("ephemeral test host suspended"),
+            Event::SwitchCase { .. } => return,
             Event::TaskFaulted { reference, error } => {
                 Entry::Faulted { reference: reference.to_string(), error: (*error).clone() }
             }
@@ -167,7 +168,7 @@ impl Default for Options {
 
 /// Small enough that a cycle ends fast, large enough for real programs.
 pub fn limits() -> Limits {
-    Limits { max_tasks: 60, max_attempts: 3, max_sleep: None }
+    Limits { max_tasks: 60, max_attempts: 3, max_sleep: None, max_listen: None }
 }
 
 #[derive(Debug)]

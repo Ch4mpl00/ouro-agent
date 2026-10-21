@@ -697,7 +697,7 @@ async fn a_failed_wait_backs_off_instead_of_spinning() {
 }
 
 // The agent may replace how signals are handled: the version it activates
-// under `signal` handles every signal after it, with no dry run, and three
+// under `signal` (after a dry run) handles every signal after it, and three
 // faults of it in a row put the built-in one back.
 #[tokio::test]
 async fn an_activated_signal_workflow_handles_signals_until_its_breaker_opens() {
@@ -706,6 +706,7 @@ async fn an_activated_signal_workflow_handles_signals_until_its_breaker_opens() 
     let tool = |name: &str, args: Value| agent::flows::tool(&f.engine, name, args.as_object().unwrap()).unwrap();
     let activate = |definition: &str| {
         let saved = f.engine.deps.workflows.save("signal", definition, None).unwrap();
+        f.engine.deps.workflows.mark_tried("signal", saved.version).unwrap();
         tool("activate_workflow", json!({"name": "signal", "version": saved.version}))
     };
     let read: Value = serde_json::from_str(&tool("read_workflow", json!({"name": "signal"}))).unwrap();
@@ -742,6 +743,7 @@ async fn an_activated_signal_override_changes_the_recovery_prompt() {
     let (f, _, supervisor) = setup(model.clone());
     let definition = SIGNAL.replace("Report the failure only.", "Explain this failure in one sentence.");
     let saved = f.engine.deps.workflows.save("signal", &definition, None).unwrap();
+    f.engine.deps.workflows.mark_tried("signal", saved.version).unwrap();
     agent::flows::tool(
         &f.engine,
         "activate_workflow",
@@ -1312,6 +1314,7 @@ do:
 output: {as: '${ .output }'}
 "#;
     let saved = f.engine.deps.workflows.save("research-signal", definition, None).unwrap();
+    f.engine.deps.workflows.mark_tried("research-signal", saved.version).unwrap();
     agent::flows::tool(
         &f.engine,
         "activate_workflow",
@@ -1344,6 +1347,7 @@ do:
   - failure: {raise: {error: {type: 'https://example.com/fault', status: 500}}}
 "#;
     let saved = f.engine.deps.workflows.save("signal-telegram", definition, None).unwrap();
+    f.engine.deps.workflows.mark_tried("signal-telegram", saved.version).unwrap();
     agent::flows::tool(
         &f.engine,
         "activate_workflow",

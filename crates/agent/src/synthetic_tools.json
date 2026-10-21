@@ -456,7 +456,7 @@
     "type": "function",
     "function": {
       "name": "try_workflow",
-      "description": "Dry-run a saved workflow version once, now, as a scheduled fire would run it: reads and model steps run for real on today's data, while every write (a message, a watermark, a journal entry) is only recorded with its arguments, so nothing changes. Returns the steps with their outputs, the writes it would have made and how the run ended.",
+      "description": "Dry-run a saved workflow once, now. Without `signal`: as a scheduled fire would run it. With `signal`: as if that signal had just arrived, through the whole chain (the signal dispatcher, the route it picks, the loop, the guard, workers), with this workflow and each of `drafts` at its latest saved version in place of the active one. Model turns, reads (the internet's and MCP's) and the guard run for real; every write is only recorded and answered with {\"mock\": true, \"note\": \"dry run: not executed\", \"delivered\": true}, a confirmation is answered automatically (`confirm`), and nothing is kept. Returns the trace: the path of every workflow with each switch's case, each model turn's reasoning, text and calls, each call's verdict and reply, the writes, how each loop ended and the output. A signal with an unknown or missing source runs nothing and lists the signal types, each with its latest real signal.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -466,7 +466,42 @@
           },
           "version": {
             "type": "integer",
-            "description": "The version to run; the latest saved one by default."
+            "description": "The version of `name` to run; the latest saved one by default."
+          },
+          "signal": {
+            "type": "object",
+            "description": "The signal to run as if it arrived, modelled on the latest real signal of its type.",
+            "properties": {
+              "source": {
+                "type": "string"
+              },
+              "content": {
+                "type": "string"
+              },
+              "envContext": {
+                "type": "string"
+              },
+              "payload": {
+                "type": "object"
+              }
+            }
+          },
+          "drafts": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "Other workflows of the chain (a route, a loop, `signal`) to run at their latest saved version instead of the active one."
+          },
+          "confirm": {
+            "type": "string",
+            "enum": [
+              "accept",
+              "decline",
+              "expire"
+            ],
+            "description": "How the user answers a confirmation the guard asks for; accept by default."
           }
         },
         "required": [

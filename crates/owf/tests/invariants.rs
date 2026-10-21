@@ -527,8 +527,10 @@ fn a_mutated_definition_parses_validates_and_runs_without_panicking() {
             && run::validate(&wf, &Known).is_ok()
         {
             // Whatever it does, it must not panic; a mutation may wait for days.
-            let opts =
-                Options { limits: Limits { max_tasks: 60, max_attempts: 3, max_sleep: None }, ..Options::default() };
+            let opts = Options {
+                limits: Limits { max_tasks: 60, max_attempts: 3, max_sleep: None, max_listen: None },
+                ..Options::default()
+            };
             let _ = try_execute_workflow(&wf, input, &opts);
         }
         Ok(())
@@ -567,7 +569,10 @@ fn the_task_ceiling_reports_a_fault_after_skipped_visits() {
         ]
     }))
     .unwrap();
-    let opts = Options { limits: Limits { max_tasks: 2, max_attempts: 1, max_sleep: None }, ..Options::default() };
+    let opts = Options {
+        limits: Limits { max_tasks: 2, max_attempts: 1, max_sleep: None, max_listen: None },
+        ..Options::default()
+    };
     let ran = execute_workflow(&wf, json!({ "n": 1 }), &opts);
     assert!(hit_limit(&ran.outcome));
     assert!(ran.journal.iter().any(|e| matches!(e, Entry::Faulted { error, .. } if is_limit(error))));

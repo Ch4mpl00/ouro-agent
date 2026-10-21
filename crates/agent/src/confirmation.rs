@@ -94,6 +94,9 @@ pub trait Store: Send + Sync {
     fn sent(&self, run: &str, key: &str, message: i64) -> anyhow::Result<()>;
     /// Resolves using a consumed event, never a YAML claim of approval.
     fn resolve(&self, run: &str, key: &str, claimed: &str) -> anyhow::Result<String>;
+    /// Moves a card's creation `by_ms` into the past: how a dry run, which
+    /// never waits a day, lets its card expire (`press`).
+    fn backdate(&self, run: &str, key: &str, by_ms: i64) -> anyhow::Result<()>;
 }
 impl Store for AgentDb {
     fn outcome(&self, run: &str, key: &str) -> anyhow::Result<Option<String>> {
@@ -199,6 +202,13 @@ impl Store for AgentDb {
         tx.commit()?;
         Ok(outcome)
     }
+    fn backdate(&self, run: &str, key: &str, by_ms: i64) -> anyhow::Result<()> {
+        self.conn().execute(
+            "UPDATE confirmations SET created_at_ms = created_at_ms - ?3 WHERE run_id = ?1 AND call_key = ?2",
+            params![run, key, by_ms],
+        )?;
+        Ok(())
+    }
 }
 
 // ── 2. requests and resolution ─────────────────────────────────────────────
@@ -209,6 +219,28 @@ fn clip(s: &str, limit: usize) -> String {
 }
 fn token() -> String {
     format!("cf:{}", URL_SAFE_NO_PAD.encode(uuid::Uuid::new_v4().as_bytes()))
+}
+
+// A new card for `req`, not sent yet: fresh tokens, the call as the user reads it.
+fn card(req: &Request<'_>, key: String) -> Pending {
+    let pretty = serde_json::from_str::<Value>(&req.call.arguments)
+        .ok()
+        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+        .unwrap_or_else(|| req.call.arguments.clone());
+    Pending {
+        run: req.run.into(),
+        key,
+        yes: token(),
+        no: token(),
+        target: req.target.clone(),
+        message: None,
+        card: req.card.render(
+            &clip(&req.call.name, 128),
+            &clip(&pretty, 1000),
+            &clip(req.guidance, 300),
+            &clip(req.goal, 400),
+        ),
+    }
 }
 
 pub struct Request<'a> {
@@ -231,24 +263,7 @@ pub async fn request(
     let p = if let Some(p) = store.get(req.run, &key)? {
         p
     } else {
-        let pretty = serde_json::from_str::<Value>(&req.call.arguments)
-            .ok()
-            .and_then(|v| serde_json::to_string_pretty(&v).ok())
-            .unwrap_or_else(|| req.call.arguments.clone());
-        let p = Pending {
-            run: req.run.into(),
-            key: key.clone(),
-            yes: token(),
-            no: token(),
-            target: req.target.clone(),
-            message: None,
-            card: req.card.render(
-                &clip(&req.call.name, 128),
-                &clip(&pretty, 1000),
-                &clip(req.guidance, 300),
-                &clip(req.goal, 400),
-            ),
-        };
+        let p = card(&req, key.clone());
         store.insert(&p)?;
         events.register(req.run, &[p.yes.clone(), p.no.clone()])?;
         let raw = mcp
@@ -271,6 +286,71 @@ pub async fn request(
         Pending { message: Some(message), ..p }
     };
     anyhow::ensure!(p.message.is_some(), "confirmation card outcome unknown; it will not be sent again");
+    Ok(json!({"required":true,"types":[p.yes,p.no]}))
+}
+
+/// How a dry run answers a card it does not send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answer {
+    Confirm,
+    Decline,
+    Expire,
+}
+
+impl Answer {
+    pub fn parse(word: Option<&str>) -> anyhow::Result<Answer> {
+        Ok(match word {
+            None | Some("accept") => Answer::Confirm,
+            Some("decline") => Answer::Decline,
+            Some("expire") => Answer::Expire,
+            Some(other) => anyhow::bail!("confirm: `{other}` is not one of accept, decline, expire"),
+        })
+    }
+    pub fn word(self) -> &'static str {
+        match self {
+            Answer::Confirm => "accept",
+            Answer::Decline => "decline",
+            Answer::Expire => "expire",
+        }
+    }
+}
+
+// The message id a dry card stands in for: no message exists.
+const DRY_CARD_MESSAGE: i64 = 0;
+
+/// A dry run's request: the card is stored and its tokens registered as for
+/// a real one, but nothing is sent. The answer is in place at once: a press
+/// of the button, delivered to the run as Telegram's would be, or, for an
+/// expiry, a card already a day old. The guard's listen and `resolve` then
+/// take and verify it exactly as in production.
+pub fn press(
+    runs: &crate::durable::RunStore,
+    events: &dyn owf::run::Events,
+    req: Request<'_>,
+    answer: Answer,
+) -> anyhow::Result<Value> {
+    let store = runs.confirmations();
+    let key = crate::guard::key(req.call);
+    if let Some(p) = store.get(req.run, &key)? {
+        return Ok(json!({"required":true,"types":[p.yes,p.no]}));
+    }
+    let p = card(&req, key.clone());
+    store.insert(&p)?;
+    store.sent(req.run, &key, DRY_CARD_MESSAGE)?;
+    events.register(req.run, &[p.yes.clone(), p.no.clone()])?;
+    let (pressed, label) = match answer {
+        Answer::Confirm => (&p.yes, &req.card.confirm),
+        Answer::Decline => (&p.no, &req.card.decline),
+        Answer::Expire => {
+            store.backdate(req.run, &key, 86_400_001)?;
+            return Ok(json!({"required":true,"types":[p.yes,p.no]}));
+        }
+    };
+    // The shape of a Telegram button press (supervisor's TelegramButton).
+    let chat = p.target.chat_id.parse::<i64>().map_or_else(|_| json!(p.target.chat_id), |id| json!(id));
+    let data = json!({"chatId":chat,"messageThreadId":p.target.message_thread_id,
+        "messageId":DRY_CARD_MESSAGE,"data":pressed,"text":label});
+    anyhow::ensure!(runs.deliver(pressed, &data)?, "the dry confirmation press found no waiting run");
     Ok(json!({"required":true,"types":[p.yes,p.no]}))
 }
 
