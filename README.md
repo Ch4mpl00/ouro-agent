@@ -7,13 +7,14 @@
 > A personal agent that reads your mail, chats with you in Telegram, watches
 > your news and channels, answers other agents, and remembers. Separate Rust
 > processes that talk to each other only over the
-> [Model Context Protocol](https://modelcontextprotocol.io).
+> [Model Context Protocol](https://modelcontextprotocol.io). Its agent loop
+> is itself a durable workflow.
 
 <p align="center">
   <a href="docs/architecture.md"><img src="https://img.shields.io/badge/status-work%20in%20progress-orange" alt="Status" /></a>
   <a href="docs/architecture.md"><img src="https://img.shields.io/badge/Rust-2024-b7410e" alt="Rust" /></a>
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/protocol-MCP-blueviolet" alt="MCP" /></a>
-  <a href="docs/architecture.md#saved-workflows"><img src="https://img.shields.io/badge/workflows-Open%20Workflow%20Spec-2e7d32" alt="Open Workflow Specification" /></a>
+  <a href="https://open-workflow-specification.org/"><img src="https://img.shields.io/badge/workflows-Open%20Workflow%20Spec-2e7d32" alt="Open Workflow Specification" /></a>
   <a href="docs/architecture.md#memory"><img src="https://img.shields.io/badge/memory-pgvector-336791" alt="pgvector" /></a>
 </p>
 
@@ -69,6 +70,70 @@ lives in skills Ouro can change, not in code it can't. One general
 mechanism, such as memory, skills, workflows or helpers, is always preferred
 to a special case. The goal is an assistant that becomes more capable as it
 learns, not one that is limited to the cases someone thought of in advance.
+
+**The unit of work is an agent loop.** A skill supplies the instructions
+and tool scope; the loop runs them with a transcript, working memory and
+execution state. Delegating to a specialist starts another loop with its
+own skills and context. The same mechanism serves the primary agent and
+its workers.
+
+## The agent loop is a workflow
+
+Ouro has its own Rust interpreter for the
+[Open Workflow Specification](https://open-workflow-specification.org/).
+It validates definitions against the official JSON Schema and executes
+the subset Ouro uses: branching, loops, reusable functions, fork/join,
+retries, timeouts and event waits, with jq expressions for data flow.
+The interpreter lives in [its own crate](crates/owf), independent of the
+agent and MCP.
+
+The same engine runs scheduled automations **and the agent itself**:
+
+- [`agent-loop.yaml`](crates/agent/workflows/agent-loop.yaml) defines the
+  cycle: ask the model → review calls → run tools or child agents → fold
+  results into context → continue or answer.
+- [`signal.yaml`](crates/agent/workflows/signal.yaml) defines how an event
+  becomes work: gather context, choose a saved workflow or the primary
+  loop, and request a recovery report if it fails.
+- [`guard.yaml`](crates/agent/workflows/guard.yaml) coordinates call review
+  and confirmation waits. Rust verifies the evidence that authorizes each
+  call.
+
+Ouro can propose and activate new versions of `agent-loop` and `signal`
+with your approval, changing its own orchestration without a Rust rebuild.
+Existing runs keep their pinned definitions. Three consecutive faults in
+an override restore the built-in version for new runs.
+
+Skills describe how to do the work; workflows describe how execution
+proceeds. Both are readable definitions the agent can work with. A task
+can stay an open-ended model/tool loop, become a fixed pipeline with model
+steps only where judgement is needed, or delegate to another loop.
+
+## Durable by design
+
+The primary loop, its workers and saved workflows persist their progress
+in SQLite. Restarting the process resumes admitted runs from checkpoints:
+completed steps restore their results, and agent loops recover their
+transcript and working memory.
+
+- **Waiting survives restarts.** Timers, retry deadlines and event waits
+  are persisted. A suspended run releases its worker, so waiting for your
+  confirmation does not block the next conversation.
+- **Children survive with their parent.** A resumed parent rejoins the
+  same durable child instead of starting a replacement. Ending the parent
+  cancels unfinished children.
+- **Recovery has ownership.** Fenced leases prevent an expired worker
+  from committing checkpoints after another worker takes over.
+- **Side effects have explicit delivery rules.** Saved workflows default
+  to at-least-once calls and can opt into at-most-once dispatch. The agent
+  loop protects tool writes with at-most-once dispatch; if a crash leaves
+  the outcome unknown, it tells the model rather than resending the call.
+
+At-most-once dispatch can lose execution if the process dies before the
+call goes out; at-least-once can repeat a call whose response was lost.
+The [durability contract](crates/owf/README.md) spells out these boundaries.
+Recovery is tested with injected checkpoint failures, property tests and
+real SIGKILLs across dispatch and commit boundaries.
 
 ## How it fits together
 
