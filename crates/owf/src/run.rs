@@ -44,6 +44,11 @@ pub struct CallInfo<'a> {
 /// The functions `call` reaches (MCP tools, model steps, …).
 #[async_trait]
 pub trait Functions: Send + Sync {
+    /// Optional event adapter; absent hosts reject event waits at validation.
+    fn events(&self) -> Option<&dyn Events> {
+        None
+    }
+
     /// The function's effect class; `None` when the host has no such function.
     fn effect(&self, name: &str) -> Option<Effect>;
     /// Durable entry point. Adapters must honor delivery at every internal
@@ -149,6 +154,15 @@ impl Drop for TaskSpan<'_> {
     }
 }
 
+/// Durable event delivery. `take` atomically consumes the first matching event
+/// AND saves `Record::Event` at `key` in this run's journal. It must fence the
+/// executor just like Journal::save. Repeating a take returns the saved event.
+/// Registration is idempotent, including registration before a question is sent.
+pub trait Events: Send + Sync {
+    fn register(&self, run_id: &str, types: &[String]) -> anyhow::Result<()>;
+    fn take(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<Option<Value>>;
+}
+
 pub trait Clock: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
 }
@@ -216,6 +230,9 @@ pub fn validate(wf: &Workflow, functions: &dyn Functions) -> Result<(), Invalid>
     impl Catalog for Known<'_> {
         fn has(&self, name: &str) -> bool {
             self.0.effect(name).is_some()
+        }
+        fn events(&self) -> bool {
+            self.0.events().is_some()
         }
     }
     model::validate(wf, &Known(functions))
@@ -441,6 +458,7 @@ async fn execute(
         Record::Task { .. } => key.ends_with("#task"),
         Record::Call { .. } => key.ends_with("#call"),
         Record::Winner { .. } => key.ends_with("#winner"),
+        Record::Event { .. } => key.ends_with("#event"),
         Record::Timer { .. } => key.ends_with("#wait") || key.contains("#retry["),
         Record::Retry { .. } => key.contains("#retry-decision["),
     }) {
@@ -900,6 +918,7 @@ impl Run<'_> {
         let body = self.kind(task, reference, &input, ctx, scope, &desc);
         let (out, flow) = match limit {
             None => body.await?,
+            Some(_) if self.record(&format!("{reference}#event")).is_some() => body.await?,
             Some(limit) => {
                 let (remaining, deadline) = self
                     .remaining(limit, started_ms)
@@ -1028,6 +1047,39 @@ impl Run<'_> {
             }
             Kind::Try { tasks, catch } => self.attempt(tasks, catch, reference, input, ctx, scope, desc).await,
             Kind::Raise(r) => Err(self.raise(r, reference, input, &args(ctx))?.into()),
+            Kind::Listen(filters) => {
+                if let Some(Record::Event { event }) = self.record(&format!("{reference}#event")) {
+                    return Ok((json!([event]), None));
+                }
+                let events = self
+                    .host
+                    .functions
+                    .events()
+                    .ok_or_else(|| WorkflowError::validation("events are not supported by this host"))?;
+                let types = filters
+                    .iter()
+                    .map(|v| {
+                        let v = expr::render(v, input, &args(ctx)).map_err(expression)?;
+                        v.as_str()
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                            .ok_or_else(|| expression("event type must be a non-empty string".into()))
+                    })
+                    .collect::<Result<Vec<_>, Fault>>()?;
+                let storage = |e: anyhow::Error| Fault::Storage(WorkflowError::runtime(e.to_string()));
+                events.register(self.run_id, &types).map_err(storage)?;
+                if self.journal.is_none() {
+                    return Err(
+                        WorkflowError::runtime("listen requires a durable journal; cannot wait in a dry run").into()
+                    );
+                }
+                let key = format!("{reference}#event");
+                if let Some(event) = events.take(self.run_id, &key, &types).map_err(storage)? {
+                    self.save(&key, Record::Event { event: event.clone() })?;
+                    return Ok((json!([event]), None));
+                }
+                Err(Fault::Waiting(253_402_300_799_000))
+            }
             Kind::Wait(spec) => {
                 let d = self.duration(spec, input, &args(ctx))?;
                 self.sleep(d, &format!("{reference}#wait")).await?;

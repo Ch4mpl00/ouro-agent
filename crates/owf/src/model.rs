@@ -92,6 +92,7 @@ pub enum Kind {
     },
     Raise(Raise),
     Wait(DurationSpec),
+    Listen(Vec<Value>),
 }
 
 impl Kind {
@@ -106,6 +107,7 @@ impl Kind {
             Kind::Try { .. } => "try",
             Kind::Raise(_) => "raise",
             Kind::Wait(_) => "wait",
+            Kind::Listen(_) => "listen",
         }
     }
 }
@@ -262,7 +264,6 @@ fn problem(at: &str, message: impl Into<String>) -> Problem {
 
 const COMMON: &[&str] = &["if", "input", "output", "export", "timeout", "then", "metadata"];
 const UNSUPPORTED_TASKS: &[(&str, &str)] = &[
-    ("listen", "listening for events is not supported yet"),
     ("emit", "emitting events is not supported yet"),
     ("run", "run (container/script/shell/workflow) is not supported; call a function instead"),
 ];
@@ -518,6 +519,9 @@ impl Parser {
         } else if let Some(r) = m.get("raise") {
             self.only(m, at, &[COMMON, &["raise"]].concat());
             self.raise_task(r, &format!("{at}/raise"))
+        } else if let Some(v) = m.get("listen") {
+            self.only(m, at, &[COMMON, &["listen"]].concat());
+            self.listen(v, &format!("{at}/listen"))
         } else if let Some(w) = m.get("wait") {
             self.only(m, at, &[COMMON, &["wait"]].concat());
             self.duration(w, &format!("{at}/wait")).map(Kind::Wait)
@@ -551,6 +555,42 @@ impl Parser {
             },
         };
         Some(Task { delivery, when, input, output, export, timeout, then, kind: kind?, definition: v.clone() })
+    }
+
+    fn listen(&mut self, v: &Value, at: &str) -> Option<Kind> {
+        let m = self.object(v, at)?;
+        for key in m.keys().filter(|k| k.as_str() != "to") {
+            self.fail(&format!("{at}/{key}"), "listen option not supported");
+        }
+        let to = self.object(m.get("to").unwrap_or(&Value::Null), &format!("{at}/to"))?;
+        if to.len() != 1 || !(to.contains_key("one") || to.contains_key("any")) {
+            self.fail(at, "only listen.to.one and listen.to.any are supported; all/until/correlate are not supported");
+            return None;
+        }
+        let filters = if let Some(one) = to.get("one") {
+            vec![one]
+        } else if let Some(Value::Array(any)) = to.get("any") {
+            any.iter().collect()
+        } else {
+            self.fail(at, "listen.to.any requires an array");
+            return None;
+        };
+        if filters.is_empty() {
+            self.fail(at, "listen requires at least one event type");
+        }
+        let mut types = Vec::new();
+        for filter in filters {
+            let f = self.object(filter, at)?;
+            self.only(f, at, &["with"]);
+            let with = self.object(f.get("with").unwrap_or(&Value::Null), at)?;
+            self.only(with, at, &["type"]);
+            let t = self.required_string(with, "type", at);
+            if t.is_empty() {
+                self.fail(at, "event type must not be empty");
+            }
+            types.push(Value::String(t));
+        }
+        Some(Kind::Listen(types))
     }
 
     fn for_task(&mut self, m: &Map<String, Value>, at: &str) -> Option<Kind> {
@@ -957,6 +997,9 @@ pub fn parse_iso_duration(s: &str) -> Option<Duration> {
 pub trait Catalog {
     /// Whether `name` is callable here.
     fn has(&self, name: &str) -> bool;
+    fn events(&self) -> bool {
+        false
+    }
 }
 
 /// Normalises `name:version@default` (the runtime's default catalog) to
@@ -1150,6 +1193,14 @@ impl Validator<'_> {
                     }
                 }
             }
+            Kind::Listen(types) => {
+                if !self.catalog.events() {
+                    self.problems.push(problem(&format!("{at}/listen"), "events are not supported by this host"));
+                }
+                for t in types {
+                    self.template(t, &format!("{at}/listen"), args);
+                }
+            }
             Kind::Wait(d) => {
                 if let DurationSpec::Expr(e) = d {
                     self.expr(e, &format!("{at}/wait"), args);
@@ -1195,7 +1246,7 @@ pub fn call_sites(wf: &Workflow) -> Vec<CallSite> {
                     list(h, &format!("{at}/catch/do"), out);
                 }
             }
-            Kind::Set(_) | Kind::Switch(_) | Kind::Raise(_) | Kind::Wait(_) => {}
+            Kind::Set(_) | Kind::Switch(_) | Kind::Raise(_) | Kind::Wait(_) | Kind::Listen(_) => {}
         }
     }
     let mut out = Vec::new();
