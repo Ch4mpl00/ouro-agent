@@ -117,6 +117,21 @@ impl RunStore {
         Ok(statement.query_map(params![name, prefix], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)
     }
 
+    pub fn loop_ids_prefix(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        let conn = self.db.conn();
+        let mut statement = conn.prepare(
+            "SELECT id, name, definition FROM workflow_runs WHERE substr(id, 1, length(?1)) = ?1 ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([prefix], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, name, definition)| crate::flows::is_loop_definition(name, definition))
+            .map(|(id, _, _)| id)
+            .collect())
+    }
+
     pub fn admit(&self, id: &str, name: &str, definition: &str, input: &Value) -> anyhow::Result<()> {
         self.insert(id, name, definition, input, None, None).map(|_| ())
     }

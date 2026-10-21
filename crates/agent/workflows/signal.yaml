@@ -26,7 +26,14 @@ do:
         - after_saved:
             switch:
               - done: { when: '${ .done == true }', then: end }
-              - on: { then: confirm_target }
+              - on: { then: route }
+        - route:
+            call: route_signal
+            with: { context: '${ $context }' }
+        - after_route:
+            switch:
+              - routed: { when: '${ .routed == true }', then: end }
+              - default: { then: confirm_target }
         - confirm_target:
             set: >-
                 ${ if $context.signal.source == "telegram" or $context.signal.source == "telegram_button"

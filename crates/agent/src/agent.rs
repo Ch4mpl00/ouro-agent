@@ -183,6 +183,8 @@ pub struct ConfirmTarget {
 #[derive(Clone)]
 pub struct LoopOptions {
     pub id: String,
+    pub workflow: String,
+    pub conversation: Option<ConfirmTarget>,
     pub session: Session,
     pub cancel: CancellationToken,
     pub generation_timeout: Option<Duration>,
@@ -211,6 +213,8 @@ impl LoopOptions {
     pub fn new(id: impl Into<String>, session: Session) -> Self {
         Self {
             id: id.into(),
+            workflow: AGENT_LOOP_NAME.into(),
+            conversation: None,
             session,
             cancel: CancellationToken::new(),
             generation_timeout: None,
@@ -418,6 +422,10 @@ impl AgentLoop {
             .filter(|t| self.allowed.as_ref().is_none_or(|s| s.contains(&t.name)))
             .collect();
         tools.extend(synthetic_definitions().iter().filter(|t| self.visible(&t.name)).cloned());
+        if let Some(tool) = tools.iter_mut().find(|t| t.name == "invoke_sub_agent") {
+            tool.description.get_or_insert_default().push_str(&format!("\nActive loops (optional loop argument; otherwise the first declared skill loop preference, then agent-loop):\n{}",
+                crate::flows::loop_catalog(&*engine.deps.workflows)?));
+        }
         let mut params = providers::CompletionParams {
             model: self.model.clone(),
             messages,
@@ -737,14 +745,26 @@ impl AgentLoop {
         opts.cancel = self.cancel.clone();
         opts.system_prompt = Some([Some(render_context(&self.opts.session.env)?), Some("You are a focused worker. Complete the assigned task and return the full result as your final answer; the runtime stores it automatically. Report missing data and failures explicitly. The parent owns delivery and bookkeeping unless it explicitly assigns them to you.".into()), system_prompt.filter(|s| !s.is_empty()).map(str::to_owned)].into_iter().flatten().collect::<Vec<_>>().join("\n\n"));
         opts.skills = if skills.is_empty() { vec!["worker".into()] } else { skills };
+        opts.workflow = if let Some(name) = optional_string(args, "loop")? {
+            name.to_owned()
+        } else {
+            let engine = self.engine.upgrade().ok_or_else(|| anyhow::anyhow!("engine closed"))?;
+            let mut selected = None;
+            for name in &opts.skills {
+                if let Some(skill) = engine.deps.skill_store.read_skill(name).await?
+                    && let Some(loop_name) = skill.loop_name
+                {
+                    selected = Some(loop_name);
+                    break;
+                }
+            }
+            selected.unwrap_or_else(|| AGENT_LOOP_NAME.into())
+        };
         opts.allow_skill_writes = self.opts.allow_skill_writes && opts.skills.iter().any(|s| s == "dreaming");
         opts.include_engine_skills = false;
         // A workflow is written in a language the cheap preset gets wrong:
-        // the author never runs below `smart`.
-        opts.preset = match preset {
-            PresetName::Base if opts.skills.iter().any(|s| s == "workflow-author") => PresetName::Smart,
-            preset => preset,
-        };
+        // the author always gets `smartest` with maximum reasoning effort.
+        opts.preset = if opts.skills.iter().any(|s| s == "workflow-author") { PresetName::Smartest } else { preset };
         opts.max_iterations = iterations;
         opts.parent_id = Some(self.opts.id.clone());
         opts.root_request = self
@@ -955,10 +975,17 @@ pub fn child_key(args: &Value) -> Option<String> {
     named.then(|| format!("{i}.{index}"))
 }
 
-/// What rebuilds a loop after a restart. The system prompt is the first
-/// message of the transcript, so it is not repeated here.
+fn default_loop_name() -> String {
+    AGENT_LOOP_NAME.into()
+}
+
+/// What rebuilds a loop after a restart. The system prompt travels in the transcript.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoopSpec {
+    #[serde(default = "default_loop_name")]
+    pub workflow: String,
+    #[serde(default)]
+    pub conversation: Option<ConfirmTarget>,
     #[serde(default)]
     pub confirm: Option<ConfirmTarget>,
     pub id: String,
@@ -985,6 +1012,8 @@ impl AgentLoop {
             w.sort();
         }
         LoopSpec {
+            workflow: opts.workflow.clone(),
+            conversation: opts.conversation.clone(),
             confirm: opts.confirm.clone(),
             id: opts.id.clone(),
             session: opts.session.id.clone(),
@@ -1124,6 +1153,8 @@ impl Engine {
         let mut opts = LoopOptions::new(&spec.id, crate::session::session(&spec.session, env));
         opts.cancel = cancel.clone();
         opts.confirm = spec.confirm.clone();
+        opts.conversation = spec.conversation.clone();
+        opts.workflow = spec.workflow.clone();
         opts.skills = spec.skills.clone();
         opts.include_engine_skills = spec.include_engine_skills;
         opts.allow_skill_writes = spec.allow_skill_writes;
@@ -1160,7 +1191,7 @@ pub async fn loop_turn(
     let loop_ = engine.loop_for(&spec, scope, cancel).await?;
     loop_.restore_memory(args.get("memory"))?;
     let i = args.get("i").and_then(Value::as_u64).unwrap_or(0) as usize;
-    if i >= spec.max_iterations {
+    if i >= spec.max_iterations.saturating_add(usize::from(args["extra_turn"] == true)) {
         anyhow::bail!("session {} exceeded maxIterations={}", spec.id, spec.max_iterations);
     }
     let mut messages: Vec<Message> = serde_json::from_value(args.get("messages").cloned().unwrap_or(Value::Null))?;
@@ -1367,7 +1398,10 @@ pub async fn loop_worker_input(
     meta.insert("tool_call_id".into(), call.id.clone().into());
     let worker_scope =
         loop_.scope.span(SpanStart::new("invoke_sub_agent", SpanKind::Agent).input(json!(arguments)).metadata(meta));
-    let (opts, prompt) = loop_.worker_options(&arguments, worker_scope.clone(), Some(&key)).await?;
+    let (mut opts, prompt) = loop_.worker_options(&arguments, worker_scope.clone(), Some(&key)).await?;
+    if let Some(name) = args["worker_loop"].as_str() {
+        opts.workflow = name.to_owned();
+    }
     let id = format!("{}/loop", opts.id);
     let input = engine.start_loop(opts).await?.workflow_input(&prompt).await;
     Ok(Some((id, input, worker_scope)))
@@ -1441,7 +1475,17 @@ pub async fn loop_tool_at(
 ) -> anyhow::Result<Value> {
     let loop_ = engine.loop_for(&loop_spec(args)?, scope, cancel).await?;
     loop_.restore_memory(args.get("memory"))?;
-    let call = tool_call(args.get("call").unwrap_or(&Value::Null))?;
+    let mut call = tool_call(args.get("call").unwrap_or(&Value::Null))?;
+    // In-process children have no durable run to carry the YAML selection.
+    // Pass that selection to the same worker adapter used by tool arguments.
+    if call.name == "invoke_sub_agent"
+        && runs.is_none()
+        && let Some(name) = args["worker_loop"].as_str()
+    {
+        let mut arguments: Map<String, Value> = serde_json::from_str(&call.arguments)?;
+        arguments.insert("loop".into(), json!(name));
+        call.arguments = serde_json::to_string(&arguments)?;
+    }
     let child = runs.zip(child_key(args)).map(|(runs, key)| ChildRun { runs, key });
     let worker_run = child.as_ref().map(|c| format!("{}/loop", child_loop_id(&loop_.opts.id, &c.key)));
     let _slot = loop_.slots.acquire().await?;
@@ -1541,7 +1585,7 @@ pub async fn loop_tool_at(
         presented = Value::Object(reply).to_string();
     }
     span.end(if failed { SpanEnd::error(raw.clone()).with_output(raw.clone()) } else { SpanEnd::output(raw.clone()) });
-    let mut out = json!({"presented": presented, "failed": failed, "stored": stored, "guard_call": guard_call});
+    let mut out = json!({"presented": presented, "failed": failed, "result": outcome_result(&raw), "stored": stored, "guard_call": guard_call});
     if !failed {
         let parsed: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
         match call.name.as_str() {
@@ -1556,6 +1600,15 @@ pub async fn loop_tool_at(
     Ok(out)
 }
 
+// Keep the pre-presentation reply for workflow policy, independently of model
+// truncation or working-memory storage. Bound each checkpointed reply to 64 Ki
+// UTF-16 units so a large attachment cannot inflate every durable round; clipped
+// replies remain explicit text rather than incomplete JSON that looks reliable.
+fn outcome_result(raw: &str) -> Value {
+    let bounded = crate::activity::clip(raw, 64 * 1024);
+    serde_json::from_str(&bounded).unwrap_or(Value::String(bounded))
+}
+
 /// What a write that may have run before a restart answers the model.
 pub fn unknown_tool_outcome(name: &str) -> Value {
     json!({"presented": format!("[tool error] outcome unknown: {name} was sent before a restart and its reply was lost, so it may or may not have run. Check its effect before repeating it."), "failed": true})
@@ -1563,7 +1616,8 @@ pub fn unknown_tool_outcome(name: &str) -> Value {
 
 /// `agent_settle { loop, calls, results, memory }`: the round's replies as
 /// the model sees them, the working memory after the round, and whether
-/// `finish` ended the session (with its `output`).
+/// `finish` ended the session (with its `output`), plus ordered generic tool
+/// outcomes for workflow-defined exit rules.
 pub async fn loop_settle(
     engine: &Arc<Engine>,
     args: &Value,
@@ -1580,6 +1634,7 @@ pub async fn loop_settle(
     let results = args.get("results").and_then(Value::as_array).cloned().unwrap_or_default();
     anyhow::ensure!(calls.len() == results.len(), "a round settles one result per call");
     let mut round = Vec::with_capacity(calls.len());
+    let mut outcomes = Vec::with_capacity(calls.len());
     for (call, result) in calls.iter().zip(&results) {
         let call = tool_call(call)?;
         match result.get("op").and_then(Value::as_array).map(Vec::as_slice) {
@@ -1598,6 +1653,17 @@ pub async fn loop_settle(
         }
         let presented = result.get("presented").and_then(Value::as_str).unwrap_or_default().to_owned();
         let failed = result.get("failed").and_then(Value::as_bool).unwrap_or(true);
+        outcomes.push(json!({
+            "name": call.name,
+            "arguments": serde_json::from_str::<Value>(&call.arguments).unwrap_or_else(|_| json!(call.arguments)),
+            "ok": !failed,
+            // Older admitted rounds kept the full reply in working-memory
+            // storage only. Preserve that evidence when resuming their records.
+            "result": result.get("result").cloned().unwrap_or_else(|| {
+                let raw = result.get("stored").and_then(|stored| stored.get(1)).and_then(Value::as_str);
+                outcome_result(raw.unwrap_or(&presented))
+            }),
+        }));
         let finish = finish_result(&call);
         round.push((call, presented, failed, finish));
     }
@@ -1611,6 +1677,7 @@ pub async fn loop_settle(
     Ok(json!({
         "replies": replies,
         "memory": memory.snapshot(),
+        "outcomes": outcomes,
         "finished": finished.is_some(),
         "output": finished.unwrap_or_default(),
     }))
@@ -1712,7 +1779,7 @@ fn history_turn(messages: &[Value]) -> Vec<String> {
 fn worker_runs(runs: &crate::durable::RunStore, loop_id: &str) -> anyhow::Result<Vec<String>> {
     let prefix = format!("{loop_id}__sub");
     Ok(runs
-        .list_prefix(AGENT_LOOP_NAME, &prefix)?
+        .loop_ids_prefix(&prefix)?
         .into_iter()
         .filter(|id| {
             id.strip_prefix(&prefix)
@@ -1748,7 +1815,11 @@ fn read_run(
                 )
             });
         };
-        anyhow::ensure!(run.name == AGENT_LOOP_NAME, "read_run only reads agent-loop runs; this run is {}", run.name);
+        anyhow::ensure!(
+            crate::flows::is_loop_definition(&run.name, &run.definition),
+            "read_run only reads agent-loop runs; this run is {}",
+            run.name
+        );
         let records = runs.records(id)?;
         let messages = history_messages(&records);
         let header = format!(

@@ -624,6 +624,7 @@ fn signal(source: &str, content: &str) -> PendingSignal {
 const SIGNAL_CONTENT: &str = "chatId=42: summarize";
 
 fn supervisor(h: &Harness) -> Arc<agent::supervisor::Supervisor> {
+    activate_telegram_flows(&h.engine);
     let timezone: Arc<dyn Mcp> = ToolMcp::returning(Vec::new(), "{\"timezone\":\"UTC\"}");
     create_supervisor(
         h.engine.clone(),
@@ -702,6 +703,7 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
                 answer("summary")
             }),
             turn(|_| answer("done")),
+            turn(|_| answer("done")),
         ],
         &history.to_string(),
         tracer,
@@ -718,7 +720,7 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
     assert_eq!(fetch.kind, ObservationType::Tool);
     assert_eq!(fetch.meta("automatic"), Some(&json!(true)));
     assert_eq!(fetch.meta("memory_key"), Some(&json!("telegram.history")));
-    assert_eq!(trace.observations.iter().filter(|o| o.kind == ObservationType::Generation).count(), 3);
+    assert_eq!(trace.observations.iter().filter(|o| o.kind == ObservationType::Generation).count(), 4);
 }
 
 #[tokio::test]
@@ -734,6 +736,7 @@ async fn guard_gets_only_preloaded_user_messages_and_raw_signal_for_parent_and_w
             turn(|_| call("set_memory", json!({"key":"worker_notes","value":"summary"}))),
             turn(|_| answer("notes ready")),
             turn(|_| call("set_memory", json!({"key":"parent_notes","value":"summary"}))),
+            turn(|_| answer("done")),
             turn(|_| answer("done")),
         ],
         &history.to_string(),
@@ -790,7 +793,7 @@ async fn runs_a_signal_directly_and_records_parent_worker_tool_io_memory_referen
     assert_eq!(trace.tags, ["telegram", "agent-loop"]);
     let agent = find(&trace.observations, "agent_loop");
     assert_eq!(agent.meta("preset"), Some(&json!("smart")));
-    assert_eq!(agent.meta("skills"), Some(&json!(["orchestrator"])));
+    assert_eq!(agent.meta("skills"), Some(&json!(["telegram", "orchestrator"])));
     let worker = find(&trace.observations, "invoke_sub_agent");
     let search = find(&trace.observations, "search_news");
     let generations: Vec<_> = trace
@@ -1183,7 +1186,8 @@ async fn only_the_workflow_author_is_offered_the_catalog_and_the_probe() {
     assert!(offered(0, "search_news"), "the parent keeps its MCP tools");
     assert!(author_tools.iter().all(|t| offered(1, t)), "the author");
     assert!(!offered(1, "search_news"), "no MCP tool of its own");
-    assert_eq!(seen[1].model, default_presets().smart.model, "the author runs on smart");
+    assert_eq!(seen[1].model, default_presets().smartest.model, "the author runs on smartest");
+    assert_eq!(seen[1].reasoning_effort, agent::models::ReasoningEffort::Max);
     drop(seen);
     f.engine.shutdown().await;
 }

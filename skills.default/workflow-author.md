@@ -184,30 +184,87 @@ nothing, so keep each `try` narrow, around the call it retries, with the
 
 ## The agent loop is a workflow too
 
-Every agent loop, the parent's and each worker's, runs the workflow
-`agent-loop`. A `call: start_child` of workflow `guard` before the tool round
-is required; it reviews writes and open-world reads. The host checks every
-guarded call even if an override skips the child.
-`read_workflow("agent-loop")` shows the version in force (the
-built-in one until another is saved). Its context carries `loop`,
-`messages`, `memory` and the turn count `i`; `agent_turn`, `tool` (one call
-by name, a write sent at most once) and `agent_settle` (`finish`, the
-replies, the memory) are its functions. Give `tool` the call's place too
-(`i` and the `for`'s `$index`): a sub-agent call with them runs as a durable
-run of its own, which a restart resumes; without them it runs in process. To change how loops work, save a
-new version under that name and activate it when the user agrees; it needs
-no dry run. Loops started after that run it, and three faults of it in a
-row put the built-in loop back.
+Every agent loop, the parent's and each worker's, runs a named workflow.
+The built-in default is `agent-loop`. You can write and activate variants
+with their own exit rules, including ending after a successful conversation
+reply or reminding the model once before a silent end.
 
-How a signal is handled is the workflow `signal` the same way: which path
-runs (a scheduled task's saved workflow or the primary loop), the
-context gathered first, the primary loop's skills, preset and system prompt.
-Its functions are `signal_session`, `run_saved_workflow`,
-`signal_input`, `recent_activity`, `pending_confirmations`, `deliver_event`,
-`preselect_skills`, `primary_loop`,
-`signal_transcript` (the primary loop's bounded transcript tail) and
-`recovery_loop`; `read_workflow("signal")` shows each one's use. It is
-replaced, activated and guarded the same way as `agent-loop`.
+A loop declares `loop: { description: "…" }` in **document.metadata**,
+OWF's metadata extension point. Start from `read_workflow("agent-loop")`,
+rename `document.name`, and add the description. Its input carries `loop`
+(the admitted host spec), `messages`, `memory` and turn count `i`; its output
+is the final string. Every round must start the reserved `guard` child before
+running tools. Save and activation check the reference; keep the guarded
+round and worker joins from the base loop.
+
+`agent_turn` accepts `extra_turn: true` to allow one turn past the iteration
+limit (for example a single reminder, recorded in context). `agent_settle`
+returns `finished`, `output`, model-facing `replies`, `memory`, and ordered
+`outcomes`, one per call: `{name, arguments, ok, result}`. Arguments are parsed
+JSON or their raw string; result is the full tool reply before model-facing
+storage/truncation, parsed as JSON when possible, otherwise text. Each result
+is capped at 64 Ki UTF-16 units to bound durable checkpoints; an oversized
+reply becomes text with an explicit clipping marker. `ok` is false for failed,
+guard-blocked or unknown outcomes. The host supplies facts; YAML decides
+whether a reply ends the loop.
+
+`loop.conversation` is `{chatId, messageThreadId}` for the incoming conversation,
+else null (including workers). For example, an exit switch after settle can
+use this jq condition to recognize a delivered reply to the exact conversation:
+
+    ${ $context.loop.conversation as $c | $c != null and any(.outcomes[];
+       .ok and .name == "send_telegram_message" and (.result | type) == "object"
+       and .result.delivered == true
+       and ((if (.result | has("chatId")) then .result.chatId else .arguments.chatId end) | tostring) == ($c.chatId | tostring)
+       and (if (.result | has("messageThreadId")) then .result.messageThreadId else .arguments.messageThreadId end) == $c.messageThreadId) }
+
+Select the matching outcome's `arguments.text` as the final output if desired.
+The same pattern works for any channel's reply tool. Keep any reminder flag
+in context so it survives restarts and fires only once.
+
+`primary_loop` selects a variant with `loop: <name>` and loads transport rules
+with `skills: [<name>]`. `invoke_sub_agent` accepts `loop:` too; otherwise the
+first worker skill with frontmatter `loop: <name>` supplies it, else `agent-loop`.
+Its description lists `agent-loop` and active variants. A worker's `start_child`
+can select a variant with `loop:` (or its `workflow` name); an explicit `loop:`
+overrides tool/skill preferences, including `loop: agent-loop`. Workers inherit
+the confirmation target. Give `tool` the call's place (`i`, `index`) so owned
+workers, joined with `listen`, survive restarts.
+
+Resolution is the active version of the selected name, else that name's git
+definition, else `agent-loop`. Each name has its own breaker: three faults in
+a row fall back to its git definition (or `agent-loop`). Definitions are fixed
+at admission. Runtime loops and signal routes need no dry run; activate only
+after the user agrees.
+
+Start a signal route from `read_workflow("signal")`. The dispatcher already
+offered buttons to waiting runs, opened the session and handled a scheduled
+workflow/handover before `route_signal` runs your route in the same session
+and trace. Keep context gathering and recovery, remove dispatcher setup and
+routing, rename it, and add a header under **document.metadata**:
+
+    metadata:
+      route:
+        when: { source: [telegram, telegram_button], topic: research }
+        priority: 1
+
+`when` matches `source` and top-level signal payload fields; values are strings
+or nonempty string lists. All keys must match. More keys win; for overlapping
+routes with equally many keys, larger `priority` wins (default 0). Activation
+refuses ties and names the conflicting route. Save and activate to install
+it; do not edit the dispatcher to add routes. Classifiers are not supported yet.
+Telegram uses the default path until you activate a matching route; no Telegram
+route or loop is built in.
+
+For the first turn, `signal_input` loads source history, `recent_activity`
+loads the activity journal, `pending_confirmations` takes `target:` and lists
+existing cards, and `preselect_skills` takes `request:`, `context:` and `loaded:`.
+Pass their context to `primary_loop` with `input:`, `confirm:`, `skills:`,
+`loaded:`, `preset:`, `system:` and optionally `loop:`. A Telegram route can
+load `skills: [telegram]` and choose its own loop variant. Other signal functions
+are `signal_session`, `run_saved_workflow`, `route_signal`, `deliver_event`,
+`signal_transcript` (bounded primary transcript tail), and `recovery_loop`;
+`read_workflow("signal")` shows their arguments.
 
 The built-in `signal` wraps its body in `try`/`catch` and passes the caught
 error and a prompt assembled in YAML to `recovery_loop`, along with skills,

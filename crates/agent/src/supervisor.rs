@@ -455,6 +455,7 @@ impl Supervisor {
         let (definition, version) = crate::flows::definition(&self.engine, SIGNAL_NAME);
         let wf = owf::model::parse_yaml(&definition)?;
         let functions = SignalFunctions {
+            routed: false,
             supervisor: self.clone(),
             signal: signal.clone(),
             trace: trace.clone(),
@@ -471,7 +472,7 @@ impl Supervisor {
         };
         let input = json!({"signal": {
             "id": signal.id, "source": signal.source, "content": signal.content,
-            "env_context": signal.env_context, "workflow": signal.saved_workflow(), "button":button(signal),
+            "env_context": signal.env_context, "workflow": signal.saved_workflow(), "button":button(signal), "payload":signal.payload,
         }});
         let run_id = format!("{}:{}/signal", signal.source, signal.id);
         let outcome = owf::run::run(&host, &wf, &run_id, input, &self.cancel).await;
@@ -541,6 +542,7 @@ pub const SIGNAL_FUNCTIONS: &[(&str, owf::run::Effect)] = {
         ("pending_confirmations", Read),
         ("preselect_skills", Read),
         ("primary_loop", Write),
+        ("route_signal", Write),
         ("signal_transcript", Read),
         ("recovery_loop", Write),
     ]
@@ -554,10 +556,13 @@ struct SignalState {
     primary: Option<Arc<AgentLoop>>,
     earlier_user_messages: Vec<String>,
     selected_skill_text: String,
+    recovery_reported: bool,
     span: Option<Arc<dyn Span>>,
 }
 
+#[derive(Clone)]
 struct SignalFunctions {
+    routed: bool,
     supervisor: Arc<Supervisor>,
     signal: PendingSignal,
     trace: Arc<dyn Trace>,
@@ -670,6 +675,58 @@ impl SignalFunctions {
                 ));
                 Ok(json!({"done":false,"handover":handover}))
             }
+            "route_signal" => {
+                anyhow::ensure!(!self.routed, "a routed signal workflow cannot dispatch routes again");
+                let Some((name, definition, version)) = crate::flows::signal_route(
+                    engine,
+                    &signal.source,
+                    signal.payload.as_ref().unwrap_or(&Value::Null),
+                )?
+                else {
+                    return Ok(json!({"routed":false}));
+                };
+                let wf = owf::model::parse_yaml(&definition)?;
+                let span =
+                    trace
+                        .span(SpanStart::new(format!("route:{name}"), SpanKind::Chain).metadata(
+                            json!({"workflow":name,"workflow_version":version}).as_object().unwrap().clone(),
+                        ));
+                let mut functions = self.clone();
+                functions.routed = true;
+                let host = owf::run::Host {
+                    functions: Arc::new(functions),
+                    observer: Arc::new(owf::run::Silent),
+                    clock: Arc::new(owf::run::SystemClock),
+                    limits: owf::run::Limits::default(),
+                    runtime: json!({"name":"agent-supervisor","version":env!("CARGO_PKG_VERSION")}),
+                };
+                let outcome =
+                    Box::pin(owf::run::run(&host, &wf, &format!("{id}/{name}"), args["context"].clone(), cancel)).await;
+                let result = crate::flows::flow_result(outcome.status, outcome.effects_started);
+                crate::flows::record_outcome(engine, &name, version, &result);
+                match result {
+                    FlowResult::Completed(output) => {
+                        span.end(SpanEnd::output(output.clone()));
+                        Ok(json!({"routed":true,"output":output}))
+                    }
+                    FlowResult::Cancelled => {
+                        span.end(SpanEnd::default());
+                        Err(aborted())
+                    }
+                    FlowResult::Faulted { error, .. } => {
+                        span.end(SpanEnd::error(error.to_string()));
+                        // Preserve the original typed host error across both YAML
+                        // catches, including aborts and the primary failure detail.
+                        Err(self.errors.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_else(|| {
+                            anyhow::anyhow!(error.detail.unwrap_or_else(|| error.title.unwrap_or_default()))
+                        }))
+                    }
+                    other => {
+                        span.end(SpanEnd::error(format!("{other:?}")));
+                        anyhow::bail!("signal route {name} did not end: {other:?}")
+                    }
+                }
+            }
             "signal_input" => {
                 let session = self.session()?;
                 let input = if let Some(b) = button(signal) {
@@ -750,6 +807,10 @@ impl SignalFunctions {
                 let Some(context) = context.filter(|_| !cancel.is_cancelled() && !aborted) else {
                     return Ok(Value::Null);
                 };
+                if self.state().recovery_reported {
+                    return Ok(Value::Null);
+                }
+                self.state().recovery_reported = true;
                 let error = args["error"]["detail"].as_str().unwrap_or("signal failed");
                 if let Some(primary) = self.state().span.take() {
                     primary.end(SpanEnd::error(error).with_output(json!({"error": error})));
@@ -810,6 +871,8 @@ impl SignalFunctions {
                 let mut opts = LoopOptions::new(&id, self.session()?);
                 opts.cancel = cancel.clone();
                 opts.guard_request = Some(signal.content.clone());
+                opts.workflow = args["loop"].as_str().unwrap_or(crate::agent::AGENT_LOOP_NAME).to_owned();
+                opts.conversation = conversation(signal);
                 opts.confirm = args
                     .get("confirm")
                     .filter(|v| !v.is_null())

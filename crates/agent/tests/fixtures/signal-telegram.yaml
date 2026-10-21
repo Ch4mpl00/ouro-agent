@@ -1,0 +1,84 @@
+document: { dsl: '1.0.4', namespace: agent, name: signal-telegram, version: '1.0.0', metadata: { route: { when: { source: [telegram, telegram_button] } } } }
+# Telegram first-turn context and delivery policy. The dispatcher has already
+# offered buttons, opened the session and handled a scheduled workflow.
+# Recovery has the same shape as signal.yaml; keep the catch in sync.
+# Input: { signal: { id, source, content, env_context, workflow } }.
+do:
+  - handle:
+      try:
+        - confirm_target:
+            set: '${ $context.conversation }'
+            export: { as: '${ $context + { confirm: . } }' }
+        - input:
+            call: signal_input
+            export: { as: '${ $context + { input: . } }' }
+        - activity:
+            call: recent_activity
+            export: { as: '${ $context + { activity: . } }' }
+        - pending_confirmations:
+            if: '${ $context.confirm != null }'
+            call: pending_confirmations
+            with: { target: '${ $context.confirm }' }
+            export: { as: '${ $context + { pending_confirmations: . } }' }
+        - own_skills:
+            # A transport source has a skill of its own; domain work is delegated.
+            set: '${ ["telegram"] }'
+            export: { as: '${ $context + { own: . } }' }
+        - preselect:
+            call: preselect_skills
+            with:
+              request: '${ $context.signal.content }'
+              context: '${ "Signal source: " + $context.signal.source + "\n\n" + $context.input }'
+              loaded: '${ $context.own + $context.engine_skills }'
+            export: { as: '${ $context + { preselected: . } }' }
+        - primary:
+            call: primary_loop
+            with:
+              loop: agent-loop-telegram
+              input: '${ $context.input }'
+              confirm: '${ $context.confirm }'
+              skills: '${ $context.own }'
+              loaded: '${ $context.own + $context.engine_skills + ($context.preselected.names // []) }'
+              preset: smart
+              allow_skill_writes: false
+              system: >-
+                ${ [
+                  $context.context,
+                  $context.activity,
+                  $context.pending_confirmations,
+                  ("Signal source: " + $context.signal.source),
+                  "Call find_skills only when the task needs something specific that the skills already in your instructions don't cover; the source is only a hint. You own delivery.",
+                  $context.preselected.block,
+                  "Delivery: use send_telegram_message for the current signal's chatId and optional messageThreadId. A final assistant message alone is not delivered to Telegram. A message delivered to this conversation ends the session: send it once the work is done, and use telegram_send_status for progress before that.",
+                  $context.signal.env_context,
+                  $context.handover
+                ] | map(select(. != null and . != "")) }
+      catch:
+        as: failure
+        do:
+          - transcript:
+              call: signal_transcript
+              export: { as: '${ $context + { transcript: . } }' }
+          - report:
+              call: recovery_loop
+              with:
+                error: '${ $failure }'
+                skills: [recovery]
+                preset: base
+                max_iterations: 5
+                system: '${ [ $context.context, $context.signal.env_context ] | map(select(. != null and . != "")) }'
+                prompt: >-
+                  ${ "Original signal (" + $context.signal.source + "):\n" + $context.signal.content
+                    + "\n\nError: " + ($failure.detail // $failure.title // "signal failed")
+                    + "\n\nRecent transcript (may be truncated):\n" + $context.transcript
+                    + "\n\nReport the failure only. Do not repeat the original actions; some may already have succeeded." }
+          - fail:
+              # Keep the original detail; the host retains a function's typed error.
+              raise:
+                error:
+                  type: https://open-workflow-specification.org/spec/1.0.0/errors/runtime
+                  status: 500
+                  title: '${ $failure.title // "Signal failed" }'
+                  detail: '${ $failure.detail // $failure.title // "signal failed" }'
+output:
+  as: '${ .output }'
