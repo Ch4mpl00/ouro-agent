@@ -156,11 +156,7 @@ async fn signals_without_saved_workflows_run_the_primary_loop_with_the_source_co
         let (f, mcp, supervisor) = setup(model.clone());
         assert_eq!(supervisor.run_signal(&signal(source, 42)).await.unwrap(), "done");
         let seen = model.seen.lock().unwrap().clone();
-        assert_eq!(
-            seen.len(),
-            if source == "telegram" { 2 } else { 1 },
-            "Telegram allows one turn after the silent-end nudge"
-        );
+        assert_eq!(seen.len(), 1, "one primary turn, with no compiler generation");
         let system = seen[0].messages[0]["content"].as_str().unwrap();
         assert!(system.contains("Europe/Chisinau"));
         assert!(system.contains("Default Telegram chat id: 999."));
@@ -172,7 +168,7 @@ async fn signals_without_saved_workflows_run_the_primary_loop_with_the_source_co
             (seen[0].model.as_str(), seen[0].reasoning_effort),
             (preset.model.as_str(), preset.reasoning_effort)
         );
-        assert_eq!(system.contains("TELEGRAM"), source == "telegram", "Telegram rules are always loaded by its route");
+        assert!(!system.contains("TELEGRAM"), "communication rules are discovered, never autoloaded");
         assert!(system.contains("Call find_skills only when the task needs something specific"));
         assert!(!system.contains("Skills selected for this request"), "no decision client, nothing preselected");
         assert_eq!(system.contains("Delivery: use send_telegram_message"), source == "telegram");
@@ -482,6 +478,7 @@ async fn a_signal_starts_with_the_skills_jev_selects_for_it() {
     let model = Arc::new(Scripted::new(vec![assistant("done"), assistant("done")]));
     let (api, client) = jev(false);
     let (f, _mcp, supervisor) = setup_with(model.clone(), Some(client));
+    activate_telegram_flows(&f.engine);
     supervisor.run_signal(&signal("telegram", 42)).await.unwrap();
     let seen = model.seen.lock().unwrap().clone();
     let system = seen[0].messages[0]["content"].as_str().unwrap();
@@ -503,6 +500,7 @@ async fn a_failed_preselection_leaves_the_search_to_the_model() {
     let model = Arc::new(Scripted::new(vec![assistant("done"), assistant("done")]));
     let (_api, client) = jev(true);
     let (f, _mcp, supervisor) = setup_with(model.clone(), Some(client));
+    activate_telegram_flows(&f.engine);
     assert_eq!(supervisor.run_signal(&signal("telegram", 42)).await.unwrap(), "done");
     let seen = model.seen.lock().unwrap().clone();
     let system = seen[0].messages[0]["content"].as_str().unwrap();
@@ -893,6 +891,7 @@ async fn button_routing_delivers_without_a_model_and_falls_back_with_telegram_co
     let deps = &mut Arc::get_mut(&mut f.engine).unwrap().deps;
     deps.mcp = mcp.clone();
     deps.skills = vec!["orchestrator".into(), "routing".into()];
+    activate_telegram_flows(&f.engine);
     let flows = agent::flows::create_durable_flows(f.engine.clone(), (*f.db).clone());
     let supervisor = create_supervisor(
         f.engine.clone(),
@@ -937,6 +936,7 @@ fn confirmation_fixture(model: Arc<Scripted>, mcp: Arc<ContextMcp>) -> Fixture {
     deps.mcp = mcp;
     deps.skills = vec!["orchestrator".into(), "routing".into(), "telegram".into()];
     deps.decisions = Some(agent::decisions::decision_client("guard-test".into(), api));
+    activate_telegram_flows(&f.engine);
     f
 }
 
@@ -1113,7 +1113,7 @@ async fn an_override_cannot_forge_confirmation_without_a_consumed_event() {
     ]));
     let mcp = Arc::new(ContextMcp::default());
     let f = confirmation_fixture(model.clone(), mcp.clone());
-    let definition = include_str!("../workflows/agent-loop-telegram.yaml")
+    let definition = include_str!("fixtures/agent-loop-telegram.yaml")
         .replace(
             "call: start_child\n      with: { workflow: guard, calls: '${ $context.calls }', i: '${ $context.i }' }",
             "set: { run: null }",
@@ -1336,7 +1336,7 @@ async fn a_signal_route_has_its_own_breaker_and_reports_each_failure_once() {
         assistant("report 1"),
         assistant("report 2"),
         assistant("report 3"),
-        calls(&[("send_telegram_message", json!({"chatId":"-10042","messageThreadId":7,"text":"reply restored"}))]),
+        assistant("reply restored"),
     ]));
     let (f, _, supervisor) = setup(model.clone());
     let definition = r#"document: {dsl: '1.0.4', namespace: agent, name: signal-telegram, version: '2.0.0', metadata: {route: {when: {source: telegram}}}}
@@ -1359,4 +1359,61 @@ do:
     let (trace, _) = f.db.get_trace("telegram:49").unwrap().unwrap();
     assert_eq!(trace.output, "reply restored");
     supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn telegram_without_an_active_route_keeps_the_default_first_turn_and_loop() {
+    for source in ["telegram", "telegram_button"] {
+        let model = Arc::new(Scripted::new(vec![assistant("default answer")]));
+        let (f, mcp, _) = setup(model.clone());
+        mcp.notes.lock().unwrap().push("Earlier activity from the journal".into());
+        mcp.history.lock().unwrap().push(history(
+            100,
+            "Earlier message",
+            "user",
+            -10042,
+            Some(7),
+            "2026-09-06 11:59:00",
+        ));
+        let flows = agent::flows::create_durable_flows(f.engine.clone(), (*f.db).clone());
+        let supervisor = create_supervisor(
+            f.engine.clone(),
+            EnvDeps { mcp: mcp.clone(), memory: f.db.clone(), user_email: None, telegram_chat_id: Some("999".into()) },
+            flows,
+        );
+        let mut incoming = signal(source, 50);
+        if source == "telegram_button" {
+            incoming.content =
+                json!({"chatId":-10042,"messageThreadId":7,"messageId":123,"text":"Stale button","data":"unclaimed"})
+                    .to_string();
+        }
+        assert!(agent::flows::signal_route(&f.engine, source, &Value::Null).unwrap().is_none());
+        assert_eq!(supervisor.run_signal(&incoming).await.unwrap(), "default answer");
+        let runs = agent::durable::RunStore::new((*f.db).clone());
+        let run = runs.get(&format!("{source}:50/loop")).unwrap().unwrap();
+        assert_eq!(run.name, "agent-loop");
+        assert_eq!(run.definition, agent::agent::AGENT_LOOP);
+        let target = json!({"chatId":"-10042","messageThreadId":7});
+        assert_eq!(run.input["loop"]["confirm"], target);
+        assert_eq!(run.input["loop"]["conversation"], target);
+        let seen = model.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "the default loop does not add a silent-end reminder");
+        let system = seen[0].messages[0]["content"].as_str().unwrap();
+        assert!(system.contains("Earlier activity from the journal"), "{system}");
+        assert!(system.contains("Delivery: use send_telegram_message for the current signal's chatId and optional messageThreadId. A final assistant message alone is not delivered to Telegram."));
+        assert!(!system.contains("A message delivered to this conversation ends the session"));
+        assert!(!system.contains("TELEGRAM"), "the default path does not autoload transport rules");
+        let user = seen[0].messages.last().unwrap()["content"].as_str().unwrap();
+        assert!(user.contains("telegram.history"), "{user}");
+        let (_, observations) = f.db.get_trace(&format!("{source}:50")).unwrap().unwrap();
+        assert!(!observations.iter().any(|o| o.name.starts_with("route:")));
+        assert!(
+            mcp.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(n, a)| n == "get_telegram_chat_history" && a["chatId"] == "-10042" && a["threadId"] == 7)
+        );
+        supervisor.shutdown().await;
+    }
 }

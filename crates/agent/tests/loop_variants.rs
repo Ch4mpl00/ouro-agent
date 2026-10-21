@@ -12,15 +12,15 @@ use support::*;
 use tokio_util::sync::CancellationToken;
 
 fn activate(f: &Fixture, name: &str, definition: &str) -> i64 {
-    let saved = f.engine.deps.workflows.save(name, definition, None).unwrap();
-    let args = json!({"name":name,"version":saved.version});
-    flows::tool(&f.engine, "activate_workflow", args.as_object().unwrap()).unwrap();
-    saved.version
+    activate_definition(&f.engine, name, definition)
 }
 fn variant(name: &str) -> String {
     AGENT_LOOP.replace("name: agent-loop,", &format!("name: {name},"))
 }
 async fn run(f: &Fixture, id: &str, name: &str, conversation: bool) -> FlowResult {
+    if name == "agent-loop-telegram" && f.engine.deps.workflows.active(name).unwrap().is_none() {
+        activate_telegram_loop(&f.engine);
+    }
     let mut opts = LoopOptions::new(id, context());
     opts.workflow = name.into();
     opts.guard_request = Some("Send to chat 42 and chat 43".into());
@@ -46,6 +46,7 @@ async fn a_reply_ends_the_telegram_variant_in_one_turn_and_is_the_trace_output()
     let model =
         Arc::new(Scripted::new(vec![calls(&[("send_telegram_message", sent("42", Some(7), "delivered reply"))])]));
     let f = fixture(model.clone(), &["send_telegram_message"], WORKER);
+    activate_telegram_loop(&f.engine);
     let mut opts = LoopOptions::new("reply", context());
     opts.workflow = "agent-loop-telegram".into();
     opts.skills = vec!["worker".into()];
@@ -79,6 +80,26 @@ async fn only_successful_sends_to_the_exact_conversation_count() {
             false,
         ),
         ("send_telegram_message", sent("42", Some(7), "reply"), true),
+        (
+            "send_telegram_message",
+            json!({"chatId":42,"messageThreadId":7,"text":"reply","output":"{\"delivered\":true}"}),
+            true,
+        ),
+        (
+            "send_telegram_message",
+            json!({"chatId":"42","messageThreadId":7,"text":"wrong effective topic","output":json!({"delivered":true,"chatId":42,"messageThreadId":null}).to_string()}),
+            false,
+        ),
+        (
+            "send_telegram_message",
+            json!({"chatId":"42","messageThreadId":7,"text":"wrong effective chat","output":json!({"delivered":true,"chatId":43,"messageThreadId":7}).to_string()}),
+            false,
+        ),
+        (
+            "send_telegram_message",
+            json!({"chatId":"43","messageThreadId":7,"text":"reply","output":json!({"delivered":true,"chatId":42,"messageThreadId":7}).to_string()}),
+            true,
+        ),
     ] {
         let model = Arc::new(Scripted::new(vec![
             calls(&[(name, args)]),
@@ -206,6 +227,10 @@ async fn workers_choose_tool_or_skill_loop_and_catalog_lists_active_versions() {
             &[],
             &[("worker", "---\ntools: *\n---\nworker"), ("research", "---\ntools: *\nloop: skill-loop\n---\nresearch")],
         );
+        let catalog = flows::loop_catalog(&*f.engine.deps.workflows).unwrap();
+        assert!(catalog.contains("agent-loop:"));
+        assert!(!catalog.contains("agent-loop-telegram:"));
+        activate_telegram_loop(&f.engine);
         for name in ["explicit-loop", "skill-loop"] {
             let def = variant(name).replace("output: .content", &format!("output: (\"{name}: \" + .content)"));
             activate(&f, name, &def);
@@ -239,6 +264,11 @@ fn route_definition(name: &str, when: &str, priority: Option<i64>) -> String {
 fn routing_uses_source_payload_specificity_priority_and_active_overrides() {
     let f = fixture(Arc::new(Scripted::new(vec![])), &[], WORKER);
     let pick = |source: &str, payload: &Value| flows::signal_route(&f.engine, source, payload).unwrap().map(|r| r.0);
+    assert_eq!(pick("telegram", &Value::Null), None);
+    assert_eq!(pick("telegram_button", &Value::Null), None);
+    assert!(flows::built_in("agent-loop-telegram").is_none());
+    assert!(flows::built_in("signal-telegram").is_none());
+    activate_telegram_flows(&f.engine);
     assert_eq!(pick("telegram", &Value::Null).as_deref(), Some("signal-telegram"));
     assert_eq!(pick("telegram_button", &Value::Null).as_deref(), Some("signal-telegram"));
     assert_eq!(pick("peer", &Value::Null), None);
@@ -301,6 +331,7 @@ async fn the_silent_end_nudge_gets_one_turn_beyond_the_iteration_limit() {
         calls(&[("finish", json!({"result":"no reply needed"}))]),
     ]));
     let f = fixture(model.clone(), &[], WORKER);
+    activate_telegram_loop(&f.engine);
     let mut opts = LoopOptions::new("limit", context());
     opts.workflow = "agent-loop-telegram".into();
     opts.skills = vec!["worker".into()];
@@ -374,4 +405,107 @@ async fn an_explicit_base_loop_in_yaml_overrides_a_skills_variant_preference() {
         let reply = seen[2].messages.last().unwrap()["content"].as_str().unwrap();
         assert!(reply.contains("worker answer") && !reply.contains("research: worker answer"), "{reply}");
     }
+}
+
+#[tokio::test]
+async fn settle_exposes_ordered_generic_outcomes_before_model_truncation() {
+    let f = fixture(Arc::new(Scripted::new(vec![])), &["t_ok", "t_err", "t_read"], WORKER);
+    let mut opts = LoopOptions::new("outcomes", context());
+    opts.skills = vec!["worker".into()];
+    let input = f.engine.start_loop(opts).await.unwrap().workflow_input("inspect tool facts").await;
+    let full = json!({"answer": "evidence".repeat(1500)});
+    let huge = "🦀".repeat(40_000);
+    let calls = vec![
+        json!({"id":"json","name":"t_read","arguments":json!({"output":full.to_string()}).to_string()}),
+        json!({"id":"text","name":"t_read","arguments":json!({"output":huge}).to_string()}),
+        json!({"id":"error","name":"t_err","arguments":"{}"}),
+        json!({"id":"invalid","name":"t_ok","arguments":"not JSON"}),
+        json!({"id":"unknown","name":"t_ok","arguments":"{}"}),
+    ];
+    // t_read uses the same injected MCP as any other tool, with no channel contract.
+    let mut results = Vec::new();
+    for call in &calls[..4] {
+        let result = agent::agent::loop_tool(
+            &f.engine,
+            &json!({"loop":input["loop"],"call":call}),
+            &null_scope(),
+            &CancellationToken::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        results.push(result);
+    }
+    assert!(results[0]["presented"].as_str().unwrap().contains("\"truncated\":true"));
+    // A round admitted before outcomes existed only has the full stored reply.
+    results[1].as_object_mut().unwrap().remove("result");
+    results.push(agent::agent::unknown_tool_outcome("t_ok"));
+    let settled = agent::agent::loop_settle(
+        &f.engine,
+        &json!({"loop":input["loop"],"calls":calls,"results":results}),
+        &null_scope(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(settled.get("replied").is_none() && settled.get("reply").is_none());
+    let outcomes = settled["outcomes"].as_array().unwrap();
+    assert_eq!(outcomes.len(), calls.len());
+    assert_eq!(outcomes[0], json!({"name":"t_read","arguments":{"output":full.to_string()},"ok":true,"result":full}));
+    assert_eq!(outcomes[1]["ok"], true);
+    let clipped = outcomes[1]["result"].as_str().unwrap();
+    assert!(clipped.starts_with('🦀') && clipped.contains("[clipped, 80000 chars]"));
+    assert!(clipped.encode_utf16().count() < 66_000);
+    for (outcome, name) in outcomes[2..].iter().zip(["t_err", "t_ok", "t_ok"]) {
+        assert_eq!(outcome["name"], name);
+        assert_eq!(outcome["ok"], false);
+        assert!(outcome["result"].as_str().unwrap().starts_with("[tool error]"));
+    }
+    assert_eq!(outcomes[3]["arguments"], "not JSON");
+    assert!(outcomes[4]["result"].as_str().unwrap().contains("outcome unknown"));
+    f.engine.end_loop("outcomes").await;
+}
+
+#[tokio::test]
+async fn workflow_authors_use_maximum_effort_for_every_requested_worker_preset() {
+    for durable in [false, true] {
+        for preset in ["base", "smart", "smartest"] {
+            let model = Arc::new(Scripted::new(vec![
+                calls(&[("invoke_sub_agent", json!({"skills":["workflow-author"],"preset":preset,"prompt":"draft"}))]),
+                assistant("draft"),
+                assistant("done"),
+            ]));
+            let f = fixture(
+                model.clone(),
+                &[],
+                &[("worker", "---\ntools: *\n---\nworker"), ("workflow-author", "---\ntools: []\n---\nauthor")],
+            );
+            if durable {
+                assert!(matches!(run(&f,"author","agent-loop",false).await,FlowResult::Completed(ref v) if v=="done"));
+            } else {
+                let mut opts = LoopOptions::new("author", context());
+                opts.skills = vec!["worker".into()];
+                assert_eq!(f.engine.start_loop(opts).await.unwrap().send("draft".into()).await.unwrap(), "done");
+            }
+            let seen = model.seen.lock().unwrap();
+            assert_eq!(seen[1].model, agent::models::default_presets().smartest.model, "{preset}");
+            assert_eq!(seen[1].reasoning_effort, agent::models::ReasoningEffort::Max, "{preset}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn another_channels_loop_can_exit_from_generic_outcomes_without_host_changes() {
+    let model = Arc::new(Scripted::new(vec![calls(&[(
+        "reply_to_peer",
+        json!({"threadId":9,"text":"peer answer","output":"{\"sent\":true}"}),
+    )])]));
+    let f = fixture(model.clone(), &["reply_to_peer"], WORKER);
+    let definition = variant("peer-loop")
+        .replace("        - finished:", "        - sent: { when: '${ any(.outcomes[]; .ok and .name == \"reply_to_peer\" and .result.sent == true) }', then: peer_reply }\n        - finished:")
+        .replace("  - answer:", "  - peer_reply:\n      set: '${ { output: ([ .outcomes[] | select(.ok and .name == \"reply_to_peer\") | .arguments.text ] | last) } }'\n      then: end\n  - answer:");
+    activate(&f, "peer-loop", &definition);
+    assert!(matches!(run(&f,"peer","peer-loop",false).await,FlowResult::Completed(ref v) if v=="peer answer"));
+    assert_eq!(model.seen.lock().unwrap().len(), 1);
 }

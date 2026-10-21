@@ -385,6 +385,7 @@ async fn run(plans: &[(i64, Plan)]) -> Run {
         workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
         schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
     });
+    support::activate_telegram_flows(&engine);
     let supervisor = create_supervisor(
         engine.clone(),
         EnvDeps { mcp: mcp.clone(), memory: db.clone(), user_email: None, telegram_chat_id: Some(CHAT.to_string()) },

@@ -624,6 +624,7 @@ fn signal(source: &str, content: &str) -> PendingSignal {
 const SIGNAL_CONTENT: &str = "chatId=42: summarize";
 
 fn supervisor(h: &Harness) -> Arc<agent::supervisor::Supervisor> {
+    activate_telegram_flows(&h.engine);
     let timezone: Arc<dyn Mcp> = ToolMcp::returning(Vec::new(), "{\"timezone\":\"UTC\"}");
     create_supervisor(
         h.engine.clone(),
@@ -1185,7 +1186,8 @@ async fn only_the_workflow_author_is_offered_the_catalog_and_the_probe() {
     assert!(offered(0, "search_news"), "the parent keeps its MCP tools");
     assert!(author_tools.iter().all(|t| offered(1, t)), "the author");
     assert!(!offered(1, "search_news"), "no MCP tool of its own");
-    assert_eq!(seen[1].model, default_presets().smart.model, "the author runs on smart");
+    assert_eq!(seen[1].model, default_presets().smartest.model, "the author runs on smartest");
+    assert_eq!(seen[1].reasoning_effort, agent::models::ReasoningEffort::Max);
     drop(seen);
     f.engine.shutdown().await;
 }

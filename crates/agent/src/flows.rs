@@ -1876,8 +1876,6 @@ pub fn built_in(name: &str) -> Option<&'static str> {
     match name {
         crate::agent::AGENT_LOOP_NAME => Some(crate::agent::AGENT_LOOP),
         crate::supervisor::SIGNAL_NAME => Some(crate::supervisor::SIGNAL),
-        "agent-loop-telegram" => Some(include_str!("../workflows/agent-loop-telegram.yaml")),
-        "signal-telegram" => Some(include_str!("../workflows/signal-telegram.yaml")),
         "guard" => Some(include_str!("../workflows/guard.yaml")),
         _ => None,
     }
@@ -2033,11 +2031,10 @@ pub fn signal_route(
 
 /// Active versions replace built-ins even if a newer draft exists.
 fn runtime_definitions(store: &dyn WorkflowStore) -> anyhow::Result<Vec<(String, String)>> {
-    let mut definitions: std::collections::BTreeMap<String, String> =
-        ["agent-loop", "agent-loop-telegram", "signal", "signal-telegram"]
-            .into_iter()
-            .map(|name| (name.to_owned(), built_in(name).expect("built-in").to_owned()))
-            .collect();
+    let mut definitions: std::collections::BTreeMap<String, String> = ["agent-loop", "signal"]
+        .into_iter()
+        .map(|name| (name.to_owned(), built_in(name).expect("built-in").to_owned()))
+        .collect();
     for saved in store.list()? {
         if let Some(active) = store.active(&saved.name)? {
             definitions.insert(active.name, active.definition);

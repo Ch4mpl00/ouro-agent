@@ -530,3 +530,22 @@ impl agent::providers::JsonApi for GuardApi {
 pub fn allow_guard() -> Arc<agent::decisions::DecisionClient> {
     agent::decisions::decision_client("guard-test".into(), Arc::new(GuardApi::default()))
 }
+
+// Reference workflows are agent-authored examples, never runtime built-ins.
+// Exercise both authoring checks, including guard references and route conflicts.
+pub fn activate_definition(engine: &Arc<Engine>, name: &str, definition: &str) -> i64 {
+    let args = json!({"name": name, "definition": definition});
+    let saved: Value =
+        serde_json::from_str(&agent::flows::tool(engine, "save_workflow", args.as_object().unwrap()).unwrap()).unwrap();
+    let version = saved["version"].as_i64().unwrap();
+    let args = json!({"name": name, "version": version});
+    agent::flows::tool(engine, "activate_workflow", args.as_object().unwrap()).unwrap();
+    version
+}
+pub fn activate_telegram_loop(engine: &Arc<Engine>) {
+    activate_definition(engine, "agent-loop-telegram", include_str!("../fixtures/agent-loop-telegram.yaml"));
+}
+pub fn activate_telegram_flows(engine: &Arc<Engine>) {
+    activate_telegram_loop(engine);
+    activate_definition(engine, "signal-telegram", include_str!("../fixtures/signal-telegram.yaml"));
+}

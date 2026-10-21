@@ -763,11 +763,8 @@ impl AgentLoop {
         opts.allow_skill_writes = self.opts.allow_skill_writes && opts.skills.iter().any(|s| s == "dreaming");
         opts.include_engine_skills = false;
         // A workflow is written in a language the cheap preset gets wrong:
-        // the author never runs below `smart`.
-        opts.preset = match preset {
-            PresetName::Base if opts.skills.iter().any(|s| s == "workflow-author") => PresetName::Smart,
-            preset => preset,
-        };
+        // the author always gets `smartest` with maximum reasoning effort.
+        opts.preset = if opts.skills.iter().any(|s| s == "workflow-author") { PresetName::Smartest } else { preset };
         opts.max_iterations = iterations;
         opts.parent_id = Some(self.opts.id.clone());
         opts.root_request = self
@@ -1588,26 +1585,9 @@ pub async fn loop_tool_at(
         presented = Value::Object(reply).to_string();
     }
     span.end(if failed { SpanEnd::error(raw.clone()).with_output(raw.clone()) } else { SpanEnd::output(raw.clone()) });
-    let mut out = json!({"presented": presented, "failed": failed, "stored": stored, "guard_call": guard_call});
+    let mut out = json!({"presented": presented, "failed": failed, "result": outcome_result(&raw), "stored": stored, "guard_call": guard_call});
     if !failed {
         let parsed: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
-        let delivery: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-        let chat = match delivery.get("chatId").or_else(|| parsed.get("chatId")) {
-            Some(Value::String(chat)) => Some(chat.clone()),
-            Some(Value::Number(chat)) => Some(chat.to_string()),
-            Some(Value::Null) | None => loop_.opts.session.env.telegram_chat_id.clone(),
-            _ => None,
-        };
-        let thread = delivery.get("messageThreadId").unwrap_or(&parsed["messageThreadId"]).as_i64();
-        if call.name == "send_telegram_message"
-            && delivery["delivered"] == true
-            && let Some(target) = &loop_.opts.conversation
-            && chat.as_deref() == Some(target.chat_id.as_str())
-            && thread == target.message_thread_id
-            && let Some(text) = parsed["text"].as_str()
-        {
-            out["reply"] = json!(text);
-        }
         match call.name.as_str() {
             "working_memory_put" => {
                 let format = parsed.get("format").and_then(Value::as_str).unwrap_or("text");
@@ -1620,6 +1600,15 @@ pub async fn loop_tool_at(
     Ok(out)
 }
 
+// Keep the pre-presentation reply for workflow policy, independently of model
+// truncation or working-memory storage. Bound each checkpointed reply to 64 Ki
+// UTF-16 units so a large attachment cannot inflate every durable round; clipped
+// replies remain explicit text rather than incomplete JSON that looks reliable.
+fn outcome_result(raw: &str) -> Value {
+    let bounded = crate::activity::clip(raw, 64 * 1024);
+    serde_json::from_str(&bounded).unwrap_or(Value::String(bounded))
+}
+
 /// What a write that may have run before a restart answers the model.
 pub fn unknown_tool_outcome(name: &str) -> Value {
     json!({"presented": format!("[tool error] outcome unknown: {name} was sent before a restart and its reply was lost, so it may or may not have run. Check its effect before repeating it."), "failed": true})
@@ -1627,7 +1616,8 @@ pub fn unknown_tool_outcome(name: &str) -> Value {
 
 /// `agent_settle { loop, calls, results, memory }`: the round's replies as
 /// the model sees them, the working memory after the round, and whether
-/// `finish` ended the session (with its `output`).
+/// `finish` ended the session (with its `output`), plus ordered generic tool
+/// outcomes for workflow-defined exit rules.
 pub async fn loop_settle(
     engine: &Arc<Engine>,
     args: &Value,
@@ -1644,6 +1634,7 @@ pub async fn loop_settle(
     let results = args.get("results").and_then(Value::as_array).cloned().unwrap_or_default();
     anyhow::ensure!(calls.len() == results.len(), "a round settles one result per call");
     let mut round = Vec::with_capacity(calls.len());
+    let mut outcomes = Vec::with_capacity(calls.len());
     for (call, result) in calls.iter().zip(&results) {
         let call = tool_call(call)?;
         match result.get("op").and_then(Value::as_array).map(Vec::as_slice) {
@@ -1662,15 +1653,21 @@ pub async fn loop_settle(
         }
         let presented = result.get("presented").and_then(Value::as_str).unwrap_or_default().to_owned();
         let failed = result.get("failed").and_then(Value::as_bool).unwrap_or(true);
+        outcomes.push(json!({
+            "name": call.name,
+            "arguments": serde_json::from_str::<Value>(&call.arguments).unwrap_or_else(|_| json!(call.arguments)),
+            "ok": !failed,
+            // Older admitted rounds kept the full reply in working-memory
+            // storage only. Preserve that evidence when resuming their records.
+            "result": result.get("result").cloned().unwrap_or_else(|| {
+                let raw = result.get("stored").and_then(|stored| stored.get(1)).and_then(Value::as_str);
+                outcome_result(raw.unwrap_or(&presented))
+            }),
+        }));
         let finish = finish_result(&call);
         round.push((call, presented, failed, finish));
     }
     let finished = settle_round(&mut round);
-    let reply = results
-        .iter()
-        .filter(|result| result["failed"] == false)
-        .filter_map(|result| result["reply"].as_str())
-        .next_back();
     let replies: Vec<Message> =
         round.iter().map(|(call, presented, _, _)| providers::tool_reply(&call.id, presented)).collect();
     loop_.messages.lock().await.extend(replies.iter().cloned());
@@ -1680,8 +1677,7 @@ pub async fn loop_settle(
     Ok(json!({
         "replies": replies,
         "memory": memory.snapshot(),
-        "replied": reply.is_some(),
-        "reply": reply,
+        "outcomes": outcomes,
         "finished": finished.is_some(),
         "output": finished.unwrap_or_default(),
     }))

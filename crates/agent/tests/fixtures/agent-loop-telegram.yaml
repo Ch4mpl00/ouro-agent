@@ -1,5 +1,5 @@
 document: { dsl: '1.0.4', namespace: agent, name: agent-loop-telegram, version: '1.0.0', metadata: { loop: { description: 'ReAct loop that ends on a conversation reply and nudges once before a silent end.' } } }
-# Keep the shared steps in sync with agent-loop.yaml.
+# Keep the shared steps in sync with ../../workflows/agent-loop.yaml.
 # The ReAct loop as a durable workflow. The context carries the loop's spec,
 # its transcript (`messages`), its working memory and the turn count; every
 # task record is a checkpoint, so a restart resumes the loop where it was.
@@ -86,10 +86,21 @@ do:
   - settle:
       call: agent_settle
       with: { loop: '${ $context.loop }', calls: '${ $context.calls }', results: '${ . }', memory: '${ $context.memory }' }
-      export: { as: '${ $context + { messages: ($context.messages + .replies), memory: .memory, replied: (($context.replied // false) or .replied) } }' }
+      export: { as: '${ $context + { messages: ($context.messages + .replies), memory: .memory } }' }
+  - delivery:
+      # Delivery policy belongs here: the host only records generic outcomes.
+      set: >-
+        ${ . + { reply: ([ .outcomes[]
+          | select(.ok and .name == "send_telegram_message" and (.result | type) == "object")
+          | select(.result.delivered == true)
+          | select($context.loop.conversation != null)
+          | select(((if (.result | has("chatId")) then .result.chatId else .arguments.chatId end) | tostring) == ($context.loop.conversation.chatId | tostring))
+          | select((if (.result | has("messageThreadId")) then .result.messageThreadId else .arguments.messageThreadId end) == $context.loop.conversation.messageThreadId)
+          | .arguments.text | select(type == "string") ] | last) } }
+      export: { as: '${ $context + { replied: (($context.replied // false) or .reply != null) } }' }
   - next:
       switch:
-        - replied: { when: '${ .replied }', then: reply }
+        - replied: { when: '${ .reply != null }', then: reply }
         - finished: { when: '${ .finished }', then: ending }
         - more: { then: turn }
   - reply:

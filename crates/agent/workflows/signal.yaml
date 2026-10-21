@@ -35,13 +35,17 @@ do:
               - routed: { when: '${ .routed == true }', then: end }
               - default: { then: confirm_target }
         - confirm_target:
-            set: '${ if $context.default_chat != null then { chatId: $context.default_chat, messageThreadId: null } else null end }'
+            set: >-
+                ${ if $context.signal.source == "telegram" or $context.signal.source == "telegram_button"
+                   then $context.conversation
+                   elif $context.default_chat != null then { chatId: $context.default_chat, messageThreadId: null }
+                   else null end }
             export: { as: '${ $context + { confirm: . } }' }
         - input:
             call: signal_input
             export: { as: '${ $context + { input: . } }' }
         - activity:
-            if: '${ $context.signal.source == "peer" }'
+            if: '${ $context.signal.source == "telegram" or $context.signal.source == "telegram_button" or $context.signal.source == "peer" }'
             call: recent_activity
             export: { as: '${ $context + { activity: . } }' }
         - pending_confirmations:
@@ -77,6 +81,7 @@ do:
                   ("Signal source: " + $context.signal.source),
                   "Call find_skills only when the task needs something specific that the skills already in your instructions don't cover; the source is only a hint. You own delivery.",
                   $context.preselected.block,
+                  (if $context.signal.source == "telegram" or $context.signal.source == "telegram_button" then "Delivery: use send_telegram_message for the current signal's chatId and optional messageThreadId. A final assistant message alone is not delivered to Telegram." else null end),
                   $context.signal.env_context,
                   $context.handover
                 ] | map(select(. != null and . != "")) }
