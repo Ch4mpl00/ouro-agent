@@ -989,3 +989,43 @@ do:
     );
     assert!(generation.model_parameters.as_ref().unwrap().get("response_format").is_none());
 }
+
+#[tokio::test]
+async fn fast_child_starts_immediately_and_parent_never_saves_waiting() {
+    use agent::{durable::RunStore, flows::create_durable_flows};
+    let w = world(vec![]);
+    w.activate(
+        "child",
+        "document: { dsl: '1.0.4', namespace: t, name: child, version: '1.0.0' }\ndo: [ { answer: { set: '${ 42 }' } } ]",
+    );
+    w.activate(
+        "parent",
+        r#"document: { dsl: '1.0.4', namespace: t, name: parent, version: '1.0.0' }
+do:
+ - start:
+     call: start_child
+     with: { workflow: child, key: one }
+     export: { as: '${ . }' }
+ - wait:
+     listen: { to: { one: { with: { type: '${ "done:" + $context.run }' } } } }
+     metadata: { hold: PT1S }
+ - result:
+     call: child_outcome
+     with: { run: '${ $context.run }', key: one }
+"#,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
+    db.conn().execute_batch("CREATE TABLE waiting_saved (id TEXT); CREATE TRIGGER record_waiting AFTER UPDATE OF state ON workflow_runs WHEN NEW.state='waiting' BEGIN INSERT INTO waiting_saved VALUES (NEW.id); END;").unwrap();
+    let flows = create_durable_flows(w.engine.clone(), db.clone());
+    let trace = w.tracer.trace(TraceStart { id: "children".into(), name: "test".into(), ..Default::default() });
+    let scope: Scope = trace.clone();
+    let signal = WorkflowSignal { id: 1, source: "test".into(), content: "".into(), env_context: None };
+    let started = std::time::Instant::now();
+    let result = flows.run("parent", &signal, &task_context("test:1"), &scope, &CancellationToken::new()).await;
+    assert!(matches!(result, FlowResult::Completed(ref v) if v == &json!({"Completed":42})), "{result:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(db.conn().query_row("SELECT count(*) FROM waiting_saved", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(RunStore::new(db).get("test:1").unwrap().unwrap().state, "completed");
+    trace.end();
+}

@@ -21,7 +21,7 @@ use crate::{
     tracing::{EventStart, GenerationEnd, Level, Scope, Span, SpanEnd, SpanKind, SpanStart},
 };
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt, future::BoxFuture};
 use owf::durable::{CallFailure, Delivery};
 use owf::run::{CallInfo, Effect, Event, Host, Limits, Observer, Status as RunStatus, SystemClock, WorkflowError};
 use rusqlite::{OptionalExtension, params};
@@ -252,6 +252,8 @@ impl WorkflowStore for MemoryWorkflows {
 // effect, the arguments it takes and the ones it needs.
 type ModelFunction = (&'static str, Effect, &'static [&'static str], &'static [&'static str]);
 const MODEL_FUNCTIONS: &[ModelFunction] = &[
+    ("start_child", Effect::Read, &["workflow", "key", "input"], &["workflow", "key"]),
+    ("child_outcome", Effect::Read, &["run", "key"], &["run", "key"]),
     ("hash_value", Effect::Read, &["value"], &["value"]),
     ("skill_catalog_snapshot", Effect::Read, &[], &[]),
     ("llm_compose", Effect::Read, &["preset", "skill", "prompt", "input", "json"], &[]),
@@ -318,6 +320,22 @@ struct Functions {
     loop_only: bool,
     loop_input: Option<Value>,
     events: Option<Arc<dyn owf::run::Events>>,
+    children: Arc<Children>,
+}
+
+// Every child task belongs to this execution attempt. Before its trace and
+// lease close, shutdown releases children for recovery and joins their cleanup.
+#[derive(Default)]
+struct Children {
+    tasks: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
+    cancel: CancellationToken,
+}
+impl Children {
+    async fn close(&self) {
+        self.cancel.cancel();
+        let mut tasks = self.tasks.lock().await;
+        while tasks.join_next().await.is_some() {}
+    }
 }
 
 fn invalid(name: &str, detail: impl std::fmt::Display) -> WorkflowError {
@@ -364,7 +382,7 @@ fn failed(e: anyhow::Error) -> WorkflowError {
 // The agent loop's functions (`agent::AGENT_LOOP`): a turn, one tool call
 // by name, a round's settlement. They take the loop from the run's context,
 // so they belong to an `agent-loop` definition.
-const LOOP_FUNCTIONS: &[&str] = &["agent_turn", "guard", "confirm_request", "tool", "agent_settle"];
+const LOOP_FUNCTIONS: &[&str] = &["agent_turn", "guard", "confirm_request", "start_worker", "tool", "agent_settle"];
 
 fn loop_tool_name(args: &Value) -> &str {
     args.get("call").and_then(|c| c.get("name")).and_then(Value::as_str).unwrap_or_default()
@@ -469,7 +487,7 @@ impl owf::run::Functions for Functions {
         let span = self.spans.scope(info.reference);
         let label = info.reference.rsplit('/').next().unwrap_or(name);
         match name {
-            "agent_turn" | "guard" | "confirm_request" | "tool" | "agent_settle" => {
+            "agent_turn" | "guard" | "confirm_request" | "start_worker" | "tool" | "agent_settle" => {
                 // A loop rebuilt after a restart is traced under the runner.
                 let root: Scope = self.spans.root.clone();
                 let engine = &self.engine;
@@ -498,13 +516,39 @@ impl owf::run::Functions for Functions {
                     "guard" => {
                         let mut output =
                             crate::agent::loop_guard(engine, &args, &root, info.cancel).await.map_err(failed)?;
-                        output["confirmable"] = json!(
-                            self.runs.is_some()
-                                && self.events.is_some()
-                                && spec.parent_id.is_none()
-                                && spec.confirm.is_some()
-                        );
+                        output["confirmable"] =
+                            json!(self.runs.is_some() && self.events.is_some() && spec.confirm.is_some());
                         Ok(output)
+                    }
+                    "start_worker" => {
+                        let Some((runs, events, key)) = self
+                            .runs
+                            .as_ref()
+                            .zip(self.events.as_deref())
+                            .zip(crate::agent::child_key(&args))
+                            .map(|((r, e), k)| (r, e, k))
+                        else {
+                            return Ok(json!({"run":null}));
+                        };
+                        let Some((id, input)) =
+                            crate::agent::loop_worker_input(engine, &args, &root, info.cancel).await.map_err(failed)?
+                        else {
+                            return Ok(json!({"run":null}));
+                        };
+                        let definition = loop_definition(engine).0;
+                        self.start_child(
+                            runs,
+                            events,
+                            &id,
+                            crate::agent::AGENT_LOOP_NAME,
+                            &definition,
+                            input,
+                            &key,
+                            info,
+                            &root,
+                        )
+                        .await?;
+                        Ok(json!({"run":id}))
                     }
                     "confirm_request" => {
                         crate::agent::loop_confirm_request(
@@ -531,6 +575,38 @@ impl owf::run::Functions for Functions {
                     _ => crate::agent::loop_settle(engine, &args, &root, info.cancel).await,
                 }
                 .map_err(failed)
+            }
+            "start_child" => {
+                let workflow = text(&args, name, "workflow")?.ok_or_else(|| invalid(name, "workflow required"))?;
+                let key = text(&args, name, "key")?.ok_or_else(|| invalid(name, "key required"))?;
+                let runs = self.runs.as_ref().ok_or_else(|| invalid(name, "requires a durable run"))?;
+                let events = self.events.as_deref().ok_or_else(|| invalid(name, "requires events"))?;
+                let id = format!("{}/child/{}", info.run_id, crate::skills::hash_value(&json!([info.reference, key])));
+                let definition = if built_in(workflow).is_some() {
+                    definition(&self.engine, workflow).0
+                } else {
+                    self.engine
+                        .deps
+                        .workflows
+                        .active(workflow)
+                        .map_err(failed)?
+                        .ok_or_else(|| invalid(name, "workflow is not active"))?
+                        .definition
+                };
+                let input = args.get("input").cloned().unwrap_or(json!({}));
+                self.start_child(runs, events, &id, workflow, &definition, input, key, info, &span).await?;
+                Ok(json!({"run":id}))
+            }
+            "child_outcome" => {
+                let id = text(&args, name, "run")?.ok_or_else(|| invalid(name, "run required"))?;
+                let key = text(&args, name, "key")?.ok_or_else(|| invalid(name, "key required"))?;
+                let status = self
+                    .runs
+                    .as_ref()
+                    .ok_or_else(|| invalid(name, "requires a durable run"))?
+                    .child_outcome(info.run_id, key, id)
+                    .map_err(failed)?;
+                Ok(json!(status))
             }
             "hash_value" => {
                 let value = args.get("value").ok_or_else(|| invalid(name, "`value` is required"))?;
@@ -946,63 +1022,70 @@ pub fn flow_result(status: RunStatus, effects_started: bool) -> FlowResult {
 
 // Runs a claimed run to its next stop under `lease`, renewing it, and
 // stores how it ended (a stop of this process hands it back).
-async fn execute_saved(
-    engine: &Arc<Engine>,
-    runs: &crate::durable::RunStore,
+fn execute_saved<'a>(
+    engine: &'a Arc<Engine>,
+    runs: &'a crate::durable::RunStore,
     saved: crate::durable::SavedRun,
     lease: crate::durable::Lease,
-    scope: &Scope,
-    cancel: &CancellationToken,
-) -> FlowResult {
-    let lease = Arc::new(lease);
-    let root = scope.span(SpanStart::new("runner", SpanKind::Chain).input(saved.input.clone()));
-    let mut stopped = false;
-    let status = match owf::model::parse_yaml(&saved.definition) {
-        Err(error) => (RunStatus::Interrupted(WorkflowError::validation(error.to_string())), true),
-        Ok(wf) => {
-            let host = host(
-                engine,
-                &root,
-                saved.name == crate::agent::AGENT_LOOP_NAME,
-                Some(runs.clone()),
-                None,
-                Some(lease.clone()),
-            );
-            // Shutdown releases work for recovery; only explicit run
-            // cancellation is allowed to create a terminal Cancelled state.
-            let execution_cancel = CancellationToken::new();
-            let execution = owf::run::resume(&host, &wf, &saved.id, saved.input, &execution_cancel, &*lease);
-            tokio::pin!(execution);
-            let mut heartbeat = tokio::time::interval(std::time::Duration::from_millis(crate::durable::HEARTBEAT_MS));
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
-                        stopped = true;
-                        break (RunStatus::Interrupted(WorkflowError::runtime("worker stopped")), true);
+    scope: &'a Scope,
+    cancel: &'a CancellationToken,
+) -> BoxFuture<'a, FlowResult> {
+    async move {
+        let children = Arc::new(Children::default());
+        let lease = Arc::new(lease);
+        let root = scope.span(SpanStart::new("runner", SpanKind::Chain).input(saved.input.clone()));
+        let mut stopped = false;
+        let status = match owf::model::parse_yaml(&saved.definition) {
+            Err(error) => (RunStatus::Interrupted(WorkflowError::validation(error.to_string())), true),
+            Ok(wf) => {
+                let host = host(
+                    engine,
+                    &root,
+                    saved.name == crate::agent::AGENT_LOOP_NAME,
+                    Some(runs.clone()),
+                    None,
+                    Some(lease.clone()),
+                    children.clone(),
+                );
+                // Shutdown releases work for recovery; only explicit run
+                // cancellation is allowed to create a terminal Cancelled state.
+                let execution_cancel = CancellationToken::new();
+                let execution = owf::run::resume(&host, &wf, &saved.id, saved.input, &execution_cancel, &*lease);
+                tokio::pin!(execution);
+                let mut heartbeat =
+                    tokio::time::interval(std::time::Duration::from_millis(crate::durable::HEARTBEAT_MS));
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            stopped = true;
+                            break (RunStatus::Interrupted(WorkflowError::runtime("worker stopped")), true);
+                        }
+                        _ = heartbeat.tick() => if let Err(error) = lease.renew() {
+                            break (RunStatus::Interrupted(WorkflowError::runtime(error.to_string())), true);
+                        },
+                        outcome = &mut execution => break (outcome.status, outcome.effects_started),
                     }
-                    _ = heartbeat.tick() => if let Err(error) = lease.renew() {
-                        break (RunStatus::Interrupted(WorkflowError::runtime(error.to_string())), true);
-                    },
-                    outcome = &mut execution => break (outcome.status, outcome.effects_started),
                 }
             }
-        }
-    };
-    let (status, effects_started) = status;
-    let result = match if stopped { lease.release().map(|()| status) } else { lease.finish(&status) } {
-        Ok(status) => flow_result(status, effects_started),
-        Err(error) => FlowResult::Interrupted { error: WorkflowError::runtime(error.to_string()) },
-    };
-    root.end(match &result {
-        // Handed back for the next process to resume: not a failure.
-        FlowResult::Interrupted { .. } if stopped => SpanEnd::output(json!({"released":true})),
-        FlowResult::Completed(output) => SpanEnd::output(output.clone()),
-        FlowResult::Faulted { error, .. } | FlowResult::Interrupted { error } => SpanEnd::error(error.to_string()),
-        FlowResult::Waiting { wake_at_ms } => SpanEnd::output(json!({"waiting_until_ms":wake_at_ms})),
-        _ => SpanEnd::default(),
-    });
-    result
+        };
+        children.close().await;
+        let (status, effects_started) = status;
+        let result = match if stopped { lease.release().map(|()| status) } else { lease.finish(&status) } {
+            Ok(status) => flow_result(status, effects_started),
+            Err(error) => FlowResult::Interrupted { error: WorkflowError::runtime(error.to_string()) },
+        };
+        root.end(match &result {
+            // Handed back for the next process to resume: not a failure.
+            FlowResult::Interrupted { .. } if stopped => SpanEnd::output(json!({"released":true})),
+            FlowResult::Completed(output) => SpanEnd::output(output.clone()),
+            FlowResult::Faulted { error, .. } | FlowResult::Interrupted { error } => SpanEnd::error(error.to_string()),
+            FlowResult::Waiting { wake_at_ms } => SpanEnd::output(json!({"waiting_until_ms":wake_at_ms})),
+            _ => SpanEnd::default(),
+        });
+        result
+    }
+    .boxed()
 }
 
 impl Flows {
@@ -1072,7 +1155,14 @@ impl Flows {
         // A resumed loop (after a restart or a confirmation press) joins the
         // session of the signal that started it, with that signal's request
         // as input, so Langfuse shows both halves of one conversation.
-        let session = is_loop.then(|| saved.input["loop"]["session"].as_str().map(str::to_owned)).flatten();
+        let mut session = saved.input["loop"]["session"].as_str().map(str::to_owned);
+        let mut parent = saved.parent_run.clone();
+        while session.is_none() {
+            let Some(id) = parent.take() else { break };
+            let Ok(Some(run)) = runs.get(&id) else { break };
+            session = run.input["loop"]["session"].as_str().map(str::to_owned);
+            parent = run.parent_run;
+        }
         let trace = self.engine.deps.tracer.trace(crate::tracing::TraceStart {
             id: uuid::Uuid::new_v4().to_string(),
             name: format!("resume:{}", saved.name),
@@ -1246,6 +1336,7 @@ impl FlowRun for Flows {
                         loop_only: false,
                         loop_input: None,
                         events: None,
+                        children: Arc::default(),
                     }),
                     observer: spans,
                     clock: Arc::new(SystemClock),
@@ -1340,6 +1431,52 @@ pub async fn run_child(
     }
 }
 
+impl Functions {
+    #[allow(clippy::too_many_arguments)]
+    async fn start_child(
+        &self,
+        runs: &crate::durable::RunStore,
+        events: &dyn owf::run::Events,
+        id: &str,
+        workflow: &str,
+        definition: &str,
+        input: Value,
+        key: &str,
+        info: &CallInfo<'_>,
+        scope: &Scope,
+    ) -> Result<(), WorkflowError> {
+        events.register(info.run_id, &[format!("done:{id}"), format!("waiting:{id}")]).map_err(failed)?;
+        let lease = runs
+            .start_child(
+                id,
+                workflow,
+                definition,
+                &input,
+                crate::durable::ChildLink { parent: info.run_id, key, reference: info.reference },
+            )
+            .map_err(failed)?;
+        let lease = match lease {
+            Some(l) => Some(l),
+            None => runs.claim(id).map_err(failed)?,
+        };
+        if let Some(lease) = lease {
+            let saved = runs.get(id).map_err(failed)?.ok_or_else(|| invalid("start_child", "run disappeared"))?;
+            let (engine, runs, scope, cancel) =
+                (self.engine.clone(), runs.clone(), scope.clone(), self.children.cancel.child_token());
+            self.children.tasks.lock().await.spawn(async move {
+                let loop_id = (saved.name == crate::agent::AGENT_LOOP_NAME)
+                    .then(|| saved.input["loop"]["id"].as_str().map(str::to_owned))
+                    .flatten();
+                execute_saved(&engine, &runs, saved, lease, &scope, &cancel).await;
+                if let Some(id) = loop_id {
+                    engine.end_loop(&id).await;
+                }
+            });
+        }
+        Ok(())
+    }
+}
+
 // ── 4b. the agent loop's definition ─────────────────────────────────────────
 // Every agent loop runs `agent-loop`: the version the agent saved and
 // activated under that name, or the built-in one in git (`workflows/agent-loop.yaml`).
@@ -1356,7 +1493,7 @@ const OVERRIDE: &str = "override_version";
 /// The host an `agent-loop` run executes on, traced under `root`: for a
 /// caller that owns the run's journal itself (a test injecting crashes).
 pub fn loop_host(engine: &Arc<Engine>, root: &Arc<dyn Span>, input: Value) -> Host {
-    host(engine, root, true, None, Some(input), None)
+    host(engine, root, true, None, Some(input), None, Arc::default())
 }
 
 fn host(
@@ -1366,6 +1503,7 @@ fn host(
     runs: Option<crate::durable::RunStore>,
     loop_input: Option<Value>,
     events: Option<Arc<dyn owf::run::Events>>,
+    children: Arc<Children>,
 ) -> Host {
     let spans = Arc::new(Spans { root: root.clone(), open: Mutex::default() });
     // A loop's generations and tool calls trace themselves; spans for its
@@ -1379,6 +1517,7 @@ fn host(
             loop_only: agent_loop,
             loop_input,
             events,
+            children,
         }),
         observer,
         clock: Arc::new(SystemClock),
@@ -1493,7 +1632,7 @@ pub async fn run_loop_here(
         }
         Ok(wf) => {
             let outcome = owf::run::run(
-                &host(engine, &root, true, None, Some(input.clone()), None),
+                &host(engine, &root, true, None, Some(input.clone()), None, Arc::default()),
                 &wf,
                 id,
                 with_override(input, version),
@@ -2028,6 +2167,7 @@ pub async fn try_draft(
             loop_only: false,
             loop_input: None,
             events: None,
+            children: Arc::default(),
         },
         writes: Mutex::default(),
     });

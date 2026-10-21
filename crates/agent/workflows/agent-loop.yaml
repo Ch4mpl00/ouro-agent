@@ -52,12 +52,29 @@ do:
               do:
                 - expired: { set: '${ "expired" }' }
             export: { as: '${ $context + { confirmation_outcome: . } }' }
+        - start_worker:
+            if: '${ $call.name == "invoke_sub_agent" }'
+            call: start_worker
+            with: { call: '${ $call }', i: '${ $context.i }', index: '${ $index }', memory: '${ $context.memory }' }
+            export: { as: '${ $context + { worker: .run } }' }
+        - wait_worker:
+            if: '${ $context.worker != null }'
+            listen:
+              to:
+                any:
+                  - with: { type: '${ "done:" + $context.worker }' }
+                  - with: { type: '${ "waiting:" + $context.worker }' }
+            metadata: { hold: PT15M }
+        - sleep_worker:
+            if: '${ $context.worker != null and .[0].type == ("waiting:" + $context.worker) }'
+            listen: { to: { one: { with: { type: '${ "done:" + $context.worker }' } } } }
         - one:
             call: tool
             with:
               loop: '${ $context.loop }'
               call: '${ $call }'
               outcome: '${ $context.confirmation_outcome // null }'
+              worker_run: '${ $context.worker // null }'
               # Where the call is (turn, place in the round): a sub-agent's
               # durable run is keyed by it, so a resumed round joins it.
               i: '${ $context.i }'

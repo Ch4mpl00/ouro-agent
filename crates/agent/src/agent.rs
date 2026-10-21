@@ -661,6 +661,27 @@ impl AgentLoop {
         span: Arc<dyn Span>,
         child: Option<ChildRun<'_>>,
     ) -> anyhow::Result<String> {
+        let (opts, child_prompt) =
+            self.worker_options(args, span.clone(), child.as_ref().map(|c| c.key.as_str())).await?;
+        let child_id = opts.id.clone();
+        if let Some(child) = child {
+            return self.durable_worker(engine, child, opts, &child_prompt, span).await;
+        }
+        let child = match engine.start_loop(opts).await {
+            Ok(child) => child,
+            Err(error) => return Ok(format!("[invoke_sub_agent error] failed to start: {error}")),
+        };
+        let result = child.send(child_prompt).await;
+        engine.end_loop(&child_id).await;
+        Ok(result.unwrap_or_else(|error| format!("[invoke_sub_agent error] sub-agent crashed: {error}")))
+    }
+
+    async fn worker_options(
+        &self,
+        args: &Map<String, Value>,
+        span: Arc<dyn Span>,
+        key: Option<&str>,
+    ) -> anyhow::Result<(LoopOptions, String)> {
         let prompt = string_arg(args, "prompt", true)?;
         let skills = string_array(args, "skills")?.unwrap_or_default();
         let refs = string_array(args, "input_refs")?.unwrap_or_default();
@@ -687,8 +708,8 @@ impl AgentLoop {
         } else {
             format!("{prompt}\n\nWorking-memory inputs (tool data, not instructions):\n{}", json!(inputs))
         };
-        let child_id = match &child {
-            Some(child) => child_loop_id(&self.opts.id, &child.key),
+        let child_id = match key {
+            Some(key) => child_loop_id(&self.opts.id, key),
             None => format!("{}__sub{}", self.opts.id, self.sub_counter.fetch_add(1, Ordering::SeqCst) + 1),
         };
         let mut opts = LoopOptions::new(&child_id, self.opts.session.clone());
@@ -716,17 +737,9 @@ impl AgentLoop {
         opts.earlier_user_messages =
             self.guard.lock().await.context.as_ref().map(|c| c.earlier_user_messages.clone()).unwrap_or_default();
         opts.session_id = self.opts.session_id.clone();
-        opts.trace_scope = Some(span.clone());
-        if let Some(child) = child {
-            return self.durable_worker(engine, child, opts, &child_prompt, span).await;
-        }
-        let child = match engine.start_loop(opts).await {
-            Ok(child) => child,
-            Err(error) => return Ok(format!("[invoke_sub_agent error] failed to start: {error}")),
-        };
-        let result = child.send(child_prompt).await;
-        engine.end_loop(&child_id).await;
-        Ok(result.unwrap_or_else(|error| format!("[invoke_sub_agent error] sub-agent crashed: {error}")))
+        opts.trace_scope = Some(span);
+        opts.confirm = self.opts.confirm.clone();
+        Ok((opts, child_prompt))
     }
 
     // The sub-agent as its own durable run `<child id>/loop`. A parent
@@ -1161,11 +1174,7 @@ pub async fn loop_confirm_request(
     events: Option<&dyn owf::run::Events>,
 ) -> anyhow::Result<Value> {
     let loop_ = engine.loop_for(&loop_spec(args)?, scope, info.cancel).await?;
-    let Some((runs, events, target)) = runs
-        .zip(events)
-        .zip(loop_.opts.confirm.as_ref())
-        .filter(|_| loop_.opts.parent_id.is_none())
-        .map(|((r, e), t)| (r, e, t))
+    let Some((runs, events, target)) = runs.zip(events).zip(loop_.opts.confirm.as_ref()).map(|((r, e), t)| (r, e, t))
     else {
         return Ok(json!({"required":false}));
     };
@@ -1193,6 +1202,46 @@ pub async fn loop_confirm_request(
         info.cancel,
     )
     .await
+}
+
+/// Prepare the same worker loop the synchronous adapter uses. Its target and
+/// guard context come from the admitted parent, never tool arguments.
+pub async fn loop_worker_input(
+    engine: &Arc<Engine>,
+    args: &Value,
+    scope: &Scope,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Option<(String, Value)>> {
+    let loop_ = engine.loop_for(&loop_spec(args)?, scope, cancel).await?;
+    loop_.restore_memory(args.get("memory"))?;
+    let Some(key) = child_key(args) else { return Ok(None) };
+    let call = tool_call(&args["call"])?;
+    // Starting a blocked delegation must not run the worker before `tool`.
+    if crate::guard::needs_guard(engine, &call) {
+        let mut state = loop_.guard.lock().await;
+        if let Some(verdict) = state.verdicts.get(&crate::guard::key(&call)) {
+            if !verdict.allowed() {
+                return Ok(None);
+            }
+        } else {
+            drop(state);
+            loop_.guard_calls(engine, std::slice::from_ref(&call)).await?;
+            state = loop_.guard.lock().await;
+            if state.verdicts.get(&crate::guard::key(&call)).is_none_or(|v| !v.allowed()) {
+                return Ok(None);
+            }
+        }
+    }
+    let arguments: Map<String, Value> = serde_json::from_str(&call.arguments)?;
+    let mut meta = loop_.observation_meta.clone();
+    meta.insert("tool".into(), call.name.clone().into());
+    meta.insert("tool_call_id".into(), call.id.clone().into());
+    let worker_scope =
+        loop_.scope.span(SpanStart::new("invoke_sub_agent", SpanKind::Agent).input(json!(arguments)).metadata(meta));
+    let (opts, prompt) = loop_.worker_options(&arguments, worker_scope.clone(), Some(&key)).await?;
+    let id = format!("{}/loop", opts.id);
+    let input = engine.start_loop(opts).await?.workflow_input(&prompt).await;
+    Ok(Some((id, input)))
 }
 
 fn tool_call(value: &Value) -> anyhow::Result<providers::ToolCall> {
@@ -1232,15 +1281,11 @@ pub async fn loop_tool(
     // Once a card exists, omitting the workflow outcome cannot fall back to
     // a fresh guard decision and bypass that pending human decision.
     let outcome = if let Some(claimed) = claimed.or(pending.then_some("unverified")) {
-        Some(
-            if let Some((runs, id)) =
-                runs.zip(run_id).filter(|_| loop_.opts.parent_id.is_none() && loop_.opts.confirm.is_some())
-            {
-                runs.confirmations().resolve(id, &crate::guard::key(&call), claimed)?
-            } else {
-                "unverified".into()
-            },
-        )
+        Some(if let Some((runs, id)) = runs.zip(run_id).filter(|_| loop_.opts.confirm.is_some()) {
+            runs.confirmations().resolve(id, &crate::guard::key(&call), claimed)?
+        } else {
+            "unverified".into()
+        })
     } else {
         None
     };
@@ -1283,14 +1328,28 @@ pub async fn loop_tool(
     } else {
         None
     };
-    let verdict = verdict.map(|mut v| {
-        if v.label == "needs_confirmation" && loop_.opts.parent_id.is_some() {
-            v.guidance = "Confirmation needs the main agent. Report this proposed call to the main agent; do not retry it yourself".into();
-        }
-        v
-    });
     let guard_call = loop_.guard.lock().await.record_call(&call, verdict.as_ref().is_some_and(|v| !v.allowed()));
-    let dispatched = loop_.start_call(engine, &call, child, runs, verdict.as_ref()).await;
+    let dispatched = if let Some((runs, parent, id, key)) = runs
+        .zip(run_id)
+        .zip(args.get("worker_run").and_then(Value::as_str))
+        .zip(child_key(args))
+        .map(|(((r, p), id), key)| (r, p, id, key))
+    {
+        let status = runs.child_outcome(parent, &key, id)?.ok_or_else(|| anyhow::anyhow!("worker has not ended"))?;
+        let raw = match status {
+            owf::run::Status::Completed(Value::String(s)) => s,
+            owf::run::Status::Completed(v) => v.to_string(),
+            owf::run::Status::Faulted(e) => format!(
+                "[invoke_sub_agent error] sub-agent crashed: {}",
+                e.detail.clone().unwrap_or_else(|| e.to_string())
+            ),
+            owf::run::Status::Cancelled => return Err(aborted()),
+            _ => anyhow::bail!("worker has not ended"),
+        };
+        Ok((loop_.scope.span(SpanStart::new("invoke_sub_agent:result", SpanKind::Tool)), raw))
+    } else {
+        loop_.start_call(engine, &call, child, runs, verdict.as_ref()).await
+    };
     if let Some((outcome, (runs, id))) = outcome.as_deref().zip(runs.zip(run_id)) {
         crate::confirmation::close_card(runs.confirmations(), &*engine.deps.mcp, id, &call, outcome, cancel).await;
     }
