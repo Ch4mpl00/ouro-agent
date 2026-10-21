@@ -154,3 +154,11 @@ the executor returns `Waiting` until the saved task timeout deadline (or the
 far future). Delivery wakes the run; expiry raises the standard catchable
 timeout. The agent stores registrations and deliveries in agent.db and
 preserves a delivery wake-up racing with suspension.
+
+A `listen` task may set `metadata: { hold: PT5S }` (a literal ISO 8601
+duration, default `PT0S`). It first consumes an available event, then waits
+in memory for host notifications during that hold, keeping its lease and
+heartbeat. Delivery continues the run without saving a waiting state. When
+the hold or the task timeout ends, it suspends durably; recovery replays the
+listen and consumes the persisted event or handles the timeout. A crash during
+the hold is recovered through the ordinary lease and journal.

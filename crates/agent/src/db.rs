@@ -29,6 +29,7 @@ pub const DEFAULT_DB_PATH: &str = "packages/agent/data/agent.db";
 #[derive(Clone)]
 pub struct AgentDb {
     conn: Arc<Mutex<Connection>>,
+    pub(crate) notifications: Arc<Mutex<std::collections::BTreeMap<String, std::sync::Weak<tokio::sync::Notify>>>>,
 }
 
 impl AgentDb {
@@ -49,7 +50,7 @@ impl AgentDb {
         retry_boot_race(|| conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(())).map_err(anyhow::Error::from))?;
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL")?;
         retry_boot_race(|| migrate(&conn))?;
-        Ok(AgentDb { conn: Arc::new(Mutex::new(conn)) })
+        Ok(AgentDb { conn: Arc::new(Mutex::new(conn)), notifications: Arc::default() })
     }
 
     pub fn conn(&self) -> MutexGuard<'_, Connection> {

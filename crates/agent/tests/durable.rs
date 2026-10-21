@@ -531,3 +531,20 @@ fn a_concurrent_take_or_timeout_does_not_close_another_listener_of_the_same_type
     assert!(lease.take("r", "d#event", &types).unwrap().is_some());
     assert!(!store.deliver("shared", &json!({})).unwrap());
 }
+
+#[tokio::test]
+async fn a_held_listener_is_notified_without_saving_a_waiting_run() {
+    use owf::run::Events;
+    let dir = tempfile::tempdir().unwrap();
+    let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
+    let runs = RunStore::new(db.clone());
+    let lease = runs.start("r", "w", "definition", &json!({})).unwrap().unwrap();
+    lease.register("r", &["answer".into()]).unwrap();
+    let notified = lease.notification("r");
+    assert!(lease.take("r", "listen#event", &["answer".into()]).unwrap().is_none());
+    assert!(runs.deliver("answer", &json!(42)).unwrap());
+    tokio::time::timeout(std::time::Duration::from_millis(100), notified).await.unwrap();
+    assert_eq!(runs.get("r").unwrap().unwrap().state, "running");
+    assert_eq!(lease.take("r", "listen#event", &["answer".into()]).unwrap().unwrap()["data"], 42);
+    lease.finish(&Status::Completed(json!(42))).unwrap();
+}

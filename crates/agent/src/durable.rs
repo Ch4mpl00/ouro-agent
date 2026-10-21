@@ -156,6 +156,11 @@ impl RunStore {
         )?;
         tx.execute("UPDATE workflow_runs SET wake_at_ms = ?2 WHERE id = ?1", params![run, now()])?;
         tx.commit()?;
+        if let Some(notify) =
+            self.db.notifications.lock().unwrap_or_else(|e| e.into_inner()).get(&run).and_then(std::sync::Weak::upgrade)
+        {
+            notify.notify_waiters();
+        }
         Ok(true)
     }
 
@@ -377,6 +382,19 @@ impl Journal for Lease {
 // ── 3. durable events ──────────────────────────────────────────────────────
 
 impl owf::run::Events for Lease {
+    fn notification(&self, run_id: &str) -> futures::future::BoxFuture<'_, ()> {
+        let mut notifications = self.db.notifications.lock().unwrap_or_else(|e| e.into_inner());
+        notifications.retain(|_, n| n.strong_count() > 0);
+        let notify = notifications.get(run_id).and_then(std::sync::Weak::upgrade).unwrap_or_else(|| {
+            let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+            notifications.insert(run_id.into(), std::sync::Arc::downgrade(&notify));
+            notify
+        });
+        let mut notified = Box::pin(notify.notified_owned());
+        notified.as_mut().enable();
+        Box::pin(async move { notified.await })
+    }
+
     fn unregister(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
         anyhow::ensure!(run_id == self.id, "event run does not own this lease");
         let mut conn = self.db.conn();
