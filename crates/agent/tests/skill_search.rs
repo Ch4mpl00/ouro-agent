@@ -72,15 +72,29 @@ async fn live_agent_discovery_scores_new_telegram_and_domain_skills_without_mcp_
     std::fs::write(store.live_dir.join("telegram.md"),
         "---\ntools: *\n---\n# Telegram communication\n\nApply to every Telegram message and reply regardless of topic. Define the preferred reply style; combine with domain skills.\n").unwrap();
     let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills.default/news-query.md");
-    std::fs::copy(shipped,store.defaults_dir.join("news-query.md")).unwrap();
-    let path=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.env.agent");
-    let values:std::collections::HashMap<String,String>=dotenvy::from_path_iter(path).unwrap().map(Result::unwrap).collect();
-    let key=std::env::var("OPEN_ROUTER_API_KEY").ok().or_else(||values.get("OPEN_ROUTER_API_KEY").cloned()).expect("OPEN_ROUTER_API_KEY");
-    let client=decision_client(agent::models::DEFAULT_DECISION_MODEL.into(),Arc::new(agent::providers::openrouter_api(&key)));
-    let result=find_skills(&store,&json!({}),&client,&params("Find recent OpenAI news and reply briefly"),&null_scope(),&CancellationToken::new()).await.unwrap();
-    let names:Vec<_>=result["skills"].as_array().unwrap().iter().map(|s|s["name"].as_str().unwrap()).collect();
-    assert!(names.contains(&"telegram") && names.contains(&"news-query"),"{result}");
-    assert_eq!(result["scored_count"],2);
+    std::fs::copy(shipped, store.defaults_dir.join("news-query.md")).unwrap();
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.env.agent");
+    let values: std::collections::HashMap<String, String> =
+        dotenvy::from_path_iter(path).unwrap().map(Result::unwrap).collect();
+    let key = std::env::var("OPEN_ROUTER_API_KEY")
+        .ok()
+        .or_else(|| values.get("OPEN_ROUTER_API_KEY").cloned())
+        .expect("OPEN_ROUTER_API_KEY");
+    let client =
+        decision_client(agent::models::DEFAULT_DECISION_MODEL.into(), Arc::new(agent::providers::openrouter_api(&key)));
+    let result = find_skills(
+        &store,
+        &json!({}),
+        &client,
+        &params("Find recent OpenAI news and reply briefly"),
+        &null_scope(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let names: Vec<_> = result["skills"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"telegram") && names.contains(&"news-query"), "{result}");
+    assert_eq!(result["scored_count"], 2);
     println!("Agent-local live discovery: {result}");
 }
 

@@ -233,8 +233,7 @@ async fn serve_overridden(
     embedder: SharedEmbedder,
     overrides: Overrides,
 ) -> anyhow::Result<Server> {
-    let Overrides { actor, fetcher, account, telegram, files, gmail_api_root, storage_dir, monobank } =
-        overrides;
+    let Overrides { actor, fetcher, account, telegram, files, gmail_api_root, storage_dir, monobank } = overrides;
     let actor = actor.unwrap_or_else(|| "spec".into());
     let pool = pg::connect(database_url)?;
     pg::migrate(&pool).await?;
