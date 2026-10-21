@@ -410,9 +410,42 @@ fn choose_options(args: &Value) -> Result<Map<String, Value>, String> {
 static CHOICE_LABEL: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"^[a-z][a-z0-9_]*$").expect("valid label regex"));
 
+// How a host function failed. `Stopped`: a cancellation abort cut it short
+// (`errors::Aborted`: shutdown, or the loop's owner released or ended), so
+// it gave no answer; `invoke` reports that as an interruption, which a
+// durable run does not record and resumes at. Typed here, before the error
+// is only a message.
+enum HostError {
+    Failed(WorkflowError),
+    Stopped(WorkflowError),
+}
+
+impl From<WorkflowError> for HostError {
+    fn from(error: WorkflowError) -> Self {
+        HostError::Failed(error)
+    }
+}
+
+impl HostError {
+    fn into_error(self) -> WorkflowError {
+        match self {
+            HostError::Failed(error) | HostError::Stopped(error) => error,
+        }
+    }
+
+    // A stop is an interruption; anything else as `failure` classifies it.
+    fn or_failure(self, failure: impl FnOnce(WorkflowError) -> CallFailure) -> CallFailure {
+        match self {
+            HostError::Stopped(error) => CallFailure::Interrupted(error),
+            HostError::Failed(error) => failure(error),
+        }
+    }
+}
+
 // A failure the model or a tool reported, as opposed to the transport.
-fn failed(e: anyhow::Error) -> WorkflowError {
-    WorkflowError::runtime(e.to_string())
+fn failed(e: anyhow::Error) -> HostError {
+    let error = WorkflowError::runtime(e.to_string());
+    if is_aborted(&e) { HostError::Stopped(error) } else { HostError::Failed(error) }
 }
 
 // The agent loop's functions (`agent::AGENT_LOOP`): a turn, one tool call
@@ -541,9 +574,16 @@ impl owf::run::Functions for Functions {
         is_loop_function(name) || name == "start_child" || self.guard_only
     }
 
+    // A stop (shutdown, the loop's owner released) that cuts a call short is
+    // an interruption, not its result: the run resumes at the call. Not for
+    // a call that may have sent something: `confirm_request` (a card) and a
+    // `tool` call held at most once keep their recorded or unknown outcome.
     async fn invoke(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
         if self.guard_only {
-            return self.guard_step(name, args, info).await.map_err(CallFailure::Response);
+            return self.guard_step(name, args, info).await.map_err(|error| match name {
+                "confirm_request" => CallFailure::Response(error.into_error()),
+                _ => error.or_failure(CallFailure::Response),
+            });
         }
         if self.loop_only
             && !is_loop_function(name)
@@ -561,10 +601,14 @@ impl owf::run::Functions for Functions {
         }
         if is_loop_function(name) {
             // A tool reports its own failures in its reply; an error here
-            // (cancellation, a lost loop) leaves a write's outcome unknown.
-            return self.call(name, args, info).await.map_err(|error| {
-                if name == "tool" { CallFailure::Unknown(error) } else { CallFailure::Response(error) }
-            });
+            // (a lost loop, a stop) leaves a held write's outcome unknown.
+            let failure: fn(WorkflowError) -> CallFailure =
+                if name == "tool" { CallFailure::Unknown } else { CallFailure::Response };
+            let held = name == "confirm_request" || (name == "tool" && self.at_most_once(name, &args));
+            return self
+                .host_call(name, args, info)
+                .await
+                .map_err(|error| if held { failure(error.into_error()) } else { error.or_failure(failure) });
         }
         if MODEL_FUNCTIONS.iter().any(|f| f.0 == name) {
             if info.delivery == Delivery::AtMostOnce && name != "set_memory" {
@@ -572,8 +616,10 @@ impl owf::run::Functions for Functions {
                     "model adapters do not yet support at_most_once",
                 )));
             }
-            return self.call(name, args, info).await.map_err(|error| {
-                if error.is("validation") { CallFailure::NotExecuted(error) } else { CallFailure::Unknown(error) }
+            return self.host_call(name, args, info).await.map_err(|error| {
+                error.or_failure(|error| {
+                    if error.is("validation") { CallFailure::NotExecuted(error) } else { CallFailure::Unknown(error) }
+                })
             });
         }
         let Value::Object(args) = args else {
@@ -597,16 +643,23 @@ impl owf::run::Functions for Functions {
     }
 
     async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError> {
+        self.host_call(name, args, info).await.map_err(HostError::into_error)
+    }
+}
+
+impl Functions {
+    // `call`, with a stop told apart from a failure for `invoke`.
+    async fn host_call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, HostError> {
         if self.guard_only {
             return self.guard_step(name, args, info).await;
         }
         if self.loop_only
             && !is_loop_function(name)
-            && (self.effect(name) != Some(Effect::Read)
+            && (owf::run::Functions::effect(self, name) != Some(Effect::Read)
                 || (self.engine.deps.mcp.tools().iter().any(|t| t.name == name)
                     && self.engine.deps.mcp.open_world(name)))
         {
-            return Err(invalid(name, "agent-loop guarded calls must use tool so the host guard reviews them"));
+            return Err(invalid(name, "agent-loop guarded calls must use tool so the host guard reviews them").into());
         }
         let span = self.spans.scope(info.reference);
         let label = info.reference.rsplit('/').next().unwrap_or(name);
@@ -706,7 +759,7 @@ impl owf::run::Functions for Functions {
                 let events = self.events.as_deref().ok_or_else(|| invalid(name, "requires events"))?;
                 let id = format!("{}/child/{}", info.run_id, crate::skills::hash_value(&json!([info.reference, key])));
                 if built_in(workflow).is_some() {
-                    return Err(invalid(name, "built-in child workflows require an admitted agent-loop"));
+                    return Err(invalid(name, "built-in child workflows require an admitted agent-loop").into());
                 }
                 let definition = self
                     .engine
@@ -717,7 +770,7 @@ impl owf::run::Functions for Functions {
                     .ok_or_else(|| invalid(name, "workflow is not active"))?
                     .definition;
                 if is_loop_definition(workflow, &definition) {
-                    return Err(invalid(name, "loop children require an admitted agent-loop"));
+                    return Err(invalid(name, "loop children require an admitted agent-loop").into());
                 }
                 let input = args.get("input").cloned().unwrap_or(json!({}));
                 self.start_child(
@@ -762,12 +815,12 @@ impl owf::run::Functions for Functions {
                 match args.get("input") {
                     None | Some(Value::Null) => {}
                     Some(Value::Object(input)) => parts.push(render_input_xml(input)),
-                    Some(_) => return Err(invalid(name, "`input` must be an object")),
+                    Some(_) => return Err(invalid(name, "`input` must be an object").into()),
                 }
                 let json = match args.get("json") {
                     None | Some(Value::Null) => false,
                     Some(Value::Bool(json)) => *json,
-                    Some(_) => return Err(invalid(name, "`json` must be true or false")),
+                    Some(_) => return Err(invalid(name, "`json` must be true or false").into()),
                 };
                 let user = parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("\n\n");
                 span.update(crate::tracing::ContextUpdate::input(json!({"skill":skill,"prompt":user})));
@@ -807,7 +860,8 @@ impl owf::run::Functions for Functions {
                             "`input` is over {} characters as JSON; pass the fields the choice needs",
                             crate::decisions::FILTER_MAX_BATCH_CHARS
                         ),
-                    ));
+                    )
+                    .into());
                 }
                 let floor = match (args.get("min_confidence"), args.get("default")) {
                     (None | Some(Value::Null), None | Some(Value::Null)) => None,
@@ -817,11 +871,13 @@ impl owf::run::Functions for Functions {
                             .filter(|m| (0.0..=1.0).contains(m))
                             .ok_or_else(|| invalid(name, "`min_confidence` must be a number from 0 to 1"))?;
                         if !options.contains_key(default) {
-                            return Err(invalid(name, format!("`default` `{default}` is not one of the options")));
+                            return Err(
+                                invalid(name, format!("`default` `{default}` is not one of the options")).into()
+                            );
                         }
                         Some((min, default.clone()))
                     }
-                    _ => return Err(invalid(name, "`min_confidence` and `default` (an option) go together")),
+                    _ => return Err(invalid(name, "`min_confidence` and `default` (an option) go together").into()),
                 };
                 span.update(crate::tracing::ContextUpdate::input(
                     json!({"question":question,"options":options,"input":input}),
@@ -851,7 +907,7 @@ impl owf::run::Functions for Functions {
                 Ok(json!({"ok":true,"key":key}))
             }
             tool => {
-                let Value::Object(args) = args else { return Err(invalid(tool, "arguments must be an object")) };
+                let Value::Object(args) = args else { return Err(invalid(tool, "arguments must be an object").into()) };
                 span.update(crate::tracing::ContextUpdate::input(json!({"tool":tool,"args":args})));
                 let raw = self
                     .engine
@@ -861,7 +917,7 @@ impl owf::run::Functions for Functions {
                     .await
                     .map_err(|e| WorkflowError::communication(503, format!("{tool}: {e}")))?;
                 if raw.starts_with("[tool error]") {
-                    return Err(WorkflowError::communication(500, raw));
+                    return Err(WorkflowError::communication(500, raw).into());
                 }
                 Ok(parse_tool_json(&raw))
             }
@@ -1254,6 +1310,15 @@ fn execute_saved<'a>(
         if loop_run {
             record_outcome(engine, &saved.name, loop_version, &flow_result(status.clone(), effects_started));
         }
+        // A host call cut short by a stop this attempt did not see first (a
+        // worker's model turn aborted by shutdown or by its parent's release
+        // before `children.close` reaches it) ends Interrupted, not stopped:
+        // it takes the interruption backoff rather than a release. The first
+        // retry is due 2 s later, which the recovery worker of the next
+        // process picks up at once; a release would be due at once too, but
+        // a cause that aborts every attempt (a loop whose token stays
+        // cancelled) would then retry forever without MAX_INTERRUPTIONS.
+        // Neither publishes `done:` or `waiting:`, so a parent keeps waiting.
         let interrupted = matches!(status, RunStatus::Interrupted(_));
         let result = match if stopped { lease.release().map(|()| status) } else { lease.finish(&status) } {
             Ok(status) => flow_result(status, effects_started),
@@ -1676,7 +1741,7 @@ pub async fn run_child(
 }
 
 impl Functions {
-    async fn loop_child(&self, mut args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError> {
+    async fn loop_child(&self, mut args: Value, info: &CallInfo<'_>) -> Result<Value, HostError> {
         let root: Scope = self.spans.root.clone();
         let workflow = args["workflow"].as_str().unwrap_or_default().to_owned();
         if workflow != "guard" {
@@ -1687,10 +1752,10 @@ impl Functions {
                 .or_else(|| (workflow != crate::agent::AGENT_LOOP_NAME).then(|| json!(workflow)))
                 .unwrap_or(Value::Null);
             // Same worker preparation and id scheme as legacy durable_worker.
-            return owf::run::Functions::call(self, "start_worker", args, info).await;
+            return Box::pin(self.host_call("start_worker", args, info)).await;
         }
         if workflow != "guard" {
-            return Err(invalid("start_child", "agent-loop may start only guard or worker children"));
+            return Err(invalid("start_child", "agent-loop may start only guard or worker children").into());
         }
         let admitted = match &self.runs {
             Some(runs) => runs
@@ -1750,7 +1815,7 @@ impl Functions {
         Ok(json!({"run":id,"guarded":guarded}))
     }
 
-    async fn guard_step(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError> {
+    async fn guard_step(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, HostError> {
         let root: Scope = self.spans.root.clone();
         let runs = self.runs.as_ref().ok_or_else(|| invalid(name, "requires a durable guard run"))?;
         let saved = runs
@@ -1840,7 +1905,7 @@ impl Functions {
                 };
                 Ok(json!([key, verdict]))
             }
-            _ => Err(invalid(name, "only guard review, confirmation and resolution are available")),
+            _ => Err(invalid(name, "only guard review, confirmation and resolution are available").into()),
         }
     }
 }
@@ -1862,7 +1927,7 @@ impl Functions {
         key: &str,
         info: &CallInfo<'_>,
         scope: &Arc<dyn Span>,
-    ) -> Result<(), WorkflowError> {
+    ) -> Result<(), HostError> {
         let permit = self.children.slots.clone().acquire_owned().await.map_err(|e| invalid("start_child", e))?;
         events.register(info.run_id, &[format!("done:{id}"), format!("waiting:{id}")]).map_err(failed)?;
         let lease = runs
