@@ -152,6 +152,44 @@ pub fn millis(iso: &str) -> i64 {
     chrono::DateTime::parse_from_rfc3339(iso).map(|t| t.timestamp_millis()).unwrap_or(0)
 }
 
+// A durable worker's original AGENT span ends at suspension. Its terminal
+// runner (possibly below a continuation) carries the eventual black-box
+// output. Keep judging that same agent node, with its completed result.
+pub fn node_output<'a>(
+    o: &'a Observation,
+    observations: &'a [Observation],
+    by_id: &HashMap<&str, &Observation>,
+) -> &'a Value {
+    if o.kind != ObservationType::Agent {
+        return &o.output;
+    }
+    observations
+        .iter()
+        .filter(|candidate| {
+            if !candidate
+                .meta("durable_terminal")
+                .is_some_and(|v| v == &Value::Bool(true) || v.as_str() == Some("true"))
+                || candidate.meta("durable_workflow").and_then(Value::as_str) != Some(agent::agent::AGENT_LOOP_NAME)
+            {
+                return false;
+            }
+            let mut parent = candidate.parent_observation_id.as_deref().and_then(|id| by_id.get(id));
+            for _ in 0..by_id.len() {
+                let Some(p) = parent else {
+                    return false;
+                };
+                if p.kind == ObservationType::Agent {
+                    return p.id == o.id;
+                }
+                parent = p.parent_observation_id.as_deref().and_then(|id| by_id.get(id));
+            }
+            false
+        })
+        .max_by_key(|candidate| &candidate.end_time)
+        .map(|candidate| &candidate.output)
+        .unwrap_or(&o.output)
+}
+
 // Walk the observation tree and lift out every JUDGEABLE generative node, in
 // execution order.
 pub async fn assemble_node_materials(
@@ -184,7 +222,7 @@ pub async fn assemble_node_materials(
             skill,
             label: o.name.clone(),
             input_text: render_io(&o.input),
-            output_text: render_io(&o.output),
+            output_text: render_io(node_output(o, &observations, &by_id)),
         });
     }
     Ok((trace, nodes))

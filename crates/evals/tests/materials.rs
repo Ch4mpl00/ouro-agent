@@ -273,3 +273,47 @@ fn attributes_a_compose_with_an_empty_skill_to_the_planner() {
     let by_id: HashMap<&str, &Observation> = observations.iter().map(|o| (o.id.as_str(), o)).collect();
     assert_eq!(classify(by_id["gen-compose"], &trace.name, &by_id), node(NodeKind::Compose, "planner"));
 }
+
+#[test]
+fn continued_trace_keeps_root_identity_final_output_and_judgeable_nodes() {
+    use ObservationType::*;
+    use evals::langfuse_api::trace_from_observations;
+    let root = obs("root", "signal:telegram", Agent, None, "2026-06-14T00:00:00.000Z");
+    let primary = obs("primary", "agent_loop", Chain, Some("root"), "2026-06-14T00:00:00.100Z");
+    let mut resumed = obs("resume", "resume:agent-loop", Span, Some("primary"), "2026-06-14T00:10:00.000Z");
+    resumed.end_time = "2026-06-14T00:10:01.000Z".into();
+    resumed.output = json!("final answer");
+    resumed.metadata = meta(json!({"trace_output":true}));
+    let mut gen_after = obs("after", "attempt-1", Generation, Some("resume"), "2026-06-14T00:10:00.100Z");
+    gen_after.metadata = meta(json!({JUDGE_NODE_META:"compose"}));
+    let worker = obs("worker", "invoke_sub_agent", Agent, Some("primary"), "2026-06-14T00:00:00.200Z");
+    let child_resume = obs("worker-resume", "resume:agent-loop", Span, Some("worker"), "2026-06-14T00:09:00.000Z");
+    let child_gen =
+        obs("worker-generation", "attempt-1", Generation, Some("worker-resume"), "2026-06-14T00:09:00.100Z");
+    // Endpoint order is arbitrary; nested continuation output belongs to the root trace.
+    let (trace, observations) =
+        trace_from_observations("trace", vec![gen_after, resumed, child_resume, child_gen, root, primary, worker]);
+    assert_eq!(trace.name, "signal:telegram");
+    assert_eq!(trace.output, "final answer");
+    let by_id = observations.iter().map(|o| (o.id.as_str(), o)).collect();
+    assert!(matches!(
+        classify(&observations[0], &trace.name, &by_id),
+        Classified::Node { kind: NodeKind::Compose, .. }
+    ));
+    assert_eq!(classify(&observations[1], &trace.name, &by_id), Classified::Skip);
+    assert_eq!(classify(&observations[3], &trace.name, &by_id), Classified::Skip);
+}
+
+#[test]
+fn a_suspended_workers_agent_material_uses_its_final_continued_result() {
+    use ObservationType::*;
+    use evals::materials::node_output;
+    let worker = obs("worker", "invoke_sub_agent", Agent, Some("root"), "2026-06-14T00:00:00.000Z");
+    let resume = obs("resume", "resume:agent-loop", Span, Some("worker"), "2026-06-14T00:10:00.000Z");
+    let mut runner = obs("runner", "runner", Chain, Some("resume"), "2026-06-14T00:10:00.100Z");
+    runner.metadata = meta(json!({"durable_terminal":"true","durable_workflow":"agent-loop"}));
+    runner.output = json!("worker final answer");
+    let observations = vec![worker, resume, runner];
+    let by_id = observations.iter().map(|o| (o.id.as_str(), o)).collect();
+    assert_eq!(node_output(&observations[0], &observations, &by_id), &json!("worker final answer"));
+}

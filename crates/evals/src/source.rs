@@ -34,9 +34,10 @@ impl TraceSource for Langfuse {
     }
 }
 
-// Reads from the local store. A trace is only written on trace.end(), so
-// anything in the store is a COMPLETE run — no "is it still running?" age
-// filter needed (unlike the Langfuse list, which can surface mid-run traces).
+// Reads from the local store. Individual segments land on trace.end(); the
+// unjudged query excludes requests with live or not-yet-recorded anchored
+// runs, so the worker judges the final tree once. Explicit reads still show
+// suspended requests, which is useful for inspection.
 // `fallback` (e.g. Langfuse) covers get_trace for ids not mirrored locally.
 pub struct LocalSource {
     pub db: AgentDb,
