@@ -1,14 +1,12 @@
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/e9695e32-8317-44c5-9f2a-b8f72da6ed94" width="140" alt="Ouro helper logo" />
+  <img src="docs/assets/logo.png" width="140" alt="Ouro helper logo" />
 </p>
 
 <h1 align="center">Ouro helper</h1>
 
-> A personal agent that reads your mail, chats with you in Telegram, watches
-> your news and channels, answers other agents, and remembers. Separate Rust
-> processes that talk to each other only over the
-> [Model Context Protocol](https://modelcontextprotocol.io). Its agent loop
-> is itself a durable workflow.
+<p align="center">
+  <b>A personal agent whose own loop is a workflow it can read, rewrite and resume.</b>
+</p>
 
 <p align="center">
   <a href="docs/architecture.md"><img src="https://img.shields.io/badge/status-work%20in%20progress-orange" alt="Status" /></a>
@@ -18,141 +16,97 @@
   <a href="docs/architecture.md#memory"><img src="https://img.shields.io/badge/memory-pgvector-336791" alt="pgvector" /></a>
 </p>
 
-> 🚧 **Work in progress.** This is a personal project under active
-> development, and its interfaces and internals change often.
+Ouro lives on a small server and works for one person. You talk to it in
+Telegram; it also acts on its own when mail arrives, news breaks or a
+scheduled task comes due. It decides how to handle each request, delegates
+to sub-agents, remembers what matters, and turns routine work into its own
+skills and workflows.
 
----
+> 🚧 A personal project under active development. Interfaces change often.
 
-## Meet Ouro
+## Highlights
 
-Ouro is a personal agent that lives on a small server and works for one
-person. You talk to it in Telegram the way you would talk to an assistant.
-It also keeps an eye on things for you without being asked: bills arriving
-by mail, news worth knowing, tasks you scheduled for later.
+- **The agent loop is a workflow.** Turn, review, tools, settle: the loop is
+  [`agent-loop.yaml`](crates/agent/workflows/agent-loop.yaml), run by
+  Ouro's own [Open Workflow Specification](https://open-workflow-specification.org/)
+  interpreter ([`crates/owf`](crates/owf)). With your approval Ouro
+  activates its own version of the loop, or of how a signal is handled,
+  without a rebuild;
+  three faults in a row restore the built-in one.
+- **Durable.** Loops, sub-agents and saved workflows checkpoint every step
+  to SQLite. A restart resumes them where they were; a run waiting for an
+  event or a timer sleeps without holding a worker.
+- **Guarded.** Every write and every call to the open internet is reviewed
+  against what the user asked. Consequential ones wait for your tap on
+  Confirm / Decline in Telegram; the run sleeps until you answer.
+- **Self-improving.** Behaviour lives in plain-text skills and workflows
+  Ouro reads and rewrites, not in code it can't change.
+- **MCP all the way down.** The agent and its tools are separate processes
+  that speak only the [Model Context Protocol](https://modelcontextprotocol.io).
+  The same memory serves Ouro, Claude Code and ChatGPT.
 
-It is not a chatbot bolted onto a few APIs. Ouro decides how to handle each
-request itself. It can delegate to sub-agents, write and run small
-programs, remember what matters, and over time turn what it has learned
-into new skills and automations of its own.
-
-## What it does
+## What it does for you
 
 | | |
 |---|---|
-| 💬 **Talks to you in Telegram** | Answers questions and carries out requests, using the conversation's history as context. |
-| 📰 **Reads the news for you** | Collects Hacker News, Habr and the Telegram channels you follow, and sends digests that skip what you have already seen. |
-| 🧾 **Handles your mail** | Notices utility bills in Gmail, reads the PDF and tells you what to pay. |
-| 🧠 **Remembers** | Keeps projects, notes and facts in a memory it shares with your other AI tools, and finds them by meaning, not just by keywords. |
-| ⏰ **Keeps time** | Reminders, recurring checks and scheduled reports, set up in plain words. |
-| 🤝 **Works with other agents** | Other assistants, such as Claude Code, can message Ouro and get answers back. |
+| 💬 **Telegram** | Answers and carries out requests, with the conversation as context. |
+| 📰 **News** | Reads Hacker News, Habr and your Telegram channels; digests skip what you've seen. |
+| 🧾 **Mail** | Notices bills in Gmail, reads the PDF, tells you what to pay. |
+| 🧠 **Memory** | Projects, notes and facts, found by meaning, shared with your other AI tools. |
+| ⏰ **Schedule** | Reminders, recurring checks and reports, set up in plain words. |
+| 🤝 **Other agents** | Claude Code and others can message Ouro and get answers back. |
 
-## It grows with you
-
-Ouro's behaviour is written in plain-text **skills**: how to talk in a chat,
-what a good digest looks like, when to hand work to a helper. Ouro can read
-and rewrite its own skills. Ask it to change how it does something, and it
-updates the skill instead of forgetting by the next conversation.
-
-Routine work becomes **workflows**. When a task repeats, Ouro drafts a
-workflow for it, tries it out safely first, shows you what it would do, and
-then runs it on schedule. A workflow doesn't need a model to decide every
-step, so it is cheaper and more predictable.
-
-Every night Ouro looks back over its recent work and decides what to
-improve in its own skills.
-
-## The idea behind it
-
-> **Give the agent as much freedom and generality as possible.**
-
-The system around Ouro informs it and never acts on its behalf. Behaviour
-lives in skills Ouro can change, not in code it can't. One general
-mechanism, such as memory, skills, workflows or helpers, is always preferred
-to a special case. The goal is an assistant that becomes more capable as it
-learns, not one that is limited to the cases someone thought of in advance.
-
-**The unit of work is an agent loop.** A skill supplies the instructions
-and tool scope; the loop runs them with a transcript, working memory and
-execution state. Delegating to a specialist starts another loop with its
-own skills and context. The same mechanism serves the primary agent and
-its workers.
-
-## The agent loop is a workflow
-
-Ouro has its own Rust interpreter for the
-[Open Workflow Specification](https://open-workflow-specification.org/).
-It validates definitions against the official JSON Schema and executes
-the subset Ouro uses: branching, loops, reusable functions, fork/join,
-retries, timeouts and event waits, with jq expressions for data flow.
-The interpreter lives in [its own crate](crates/owf), independent of the
-agent and MCP.
-
-The same engine runs scheduled automations **and the agent itself**:
-
-- [`agent-loop.yaml`](crates/agent/workflows/agent-loop.yaml) defines the
-  cycle: ask the model → review calls → run tools or child agents → fold
-  results into context → continue or answer.
-- [`signal.yaml`](crates/agent/workflows/signal.yaml) defines how an event
-  becomes work: gather context, choose a saved workflow or the primary
-  loop, and request a recovery report if it fails.
-- [`guard.yaml`](crates/agent/workflows/guard.yaml) coordinates call review
-  and confirmation waits. Rust verifies the evidence that authorizes each
-  call.
-
-Ouro can propose and activate new versions of `agent-loop` and `signal`
-with your approval, changing its own orchestration without a Rust rebuild.
-Existing runs keep their pinned definitions. Three consecutive faults in
-an override restore the built-in version for new runs.
-
-Skills describe how to do the work; workflows describe how execution
-proceeds. Both are readable definitions the agent can work with. A task
-can stay an open-ended model/tool loop, become a fixed pipeline with model
-steps only where judgement is needed, or delegate to another loop.
-
-## Durable by design
-
-The primary loop, its workers and saved workflows persist their progress
-in SQLite. Restarting the process resumes admitted runs from checkpoints:
-completed steps restore their results, and agent loops recover their
-transcript and working memory.
-
-- **Waiting survives restarts.** Timers, retry deadlines and event waits
-  are persisted. A suspended run releases its worker, so waiting for your
-  confirmation does not block the next conversation.
-- **Children survive with their parent.** A resumed parent rejoins the
-  same durable child instead of starting a replacement. Ending the parent
-  cancels unfinished children.
-- **Recovery has ownership.** Fenced leases prevent an expired worker
-  from committing checkpoints after another worker takes over.
-- **Side effects have explicit delivery rules.** Saved workflows default
-  to at-least-once calls and can opt into at-most-once dispatch. The agent
-  loop protects tool writes with at-most-once dispatch; if a crash leaves
-  the outcome unknown, it tells the model rather than resending the call.
-
-At-most-once dispatch can lose execution if the process dies before the
-call goes out; at-least-once can repeat a call whose response was lost.
-The [durability contract](crates/owf/README.md) spells out these boundaries.
-Recovery is tested with injected checkpoint failures, property tests and
-real SIGKILLs across dispatch and commit boundaries.
-
-## How it fits together
+## How it works
 
 ```mermaid
 flowchart LR
-    E[Mail · Telegram · other agents · schedule] --> O((Ouro))
-    O --> S[Skills]
-    O --> W[Workflows]
-    O --> M[Memory]
-    O --> T[Tools: Telegram, mail, news, files, sandbox]
+    subgraph mcp [MCP server]
+      P[Telegram, Gmail, peer messages] --> Q[(signal queue)]
+      T[Tools]
+    end
+    Q --> S[signal.yaml]
+    C[Schedule] --> S
+    S --> L[agent-loop.yaml]
+    L --> G[guard.yaml]
+    G -->|allowed or confirmed| T
+    L -->|delegate| W[child agent-loop]
+    L -.checkpoints.-> D[(SQLite)]
 ```
 
-Events arrive as signals. Ouro picks them up one at a time, decides what to
-do, and acts only through tools. Everything it does is traced, so any
-decision can be looked at afterwards.
+1. A poller turns an incoming message, mail or peer request into a signal;
+   the agent's own schedule fires the rest.
+2. [`signal.yaml`](crates/agent/workflows/signal.yaml) gathers context
+   (history, recent activity, the skills Jev picks for the request) and
+   starts a loop, or runs a saved workflow.
+3. [`agent-loop.yaml`](crates/agent/workflows/agent-loop.yaml) asks the
+   model, has [`guard.yaml`](crates/agent/workflows/guard.yaml) review the
+   calls, runs tools and child loops, and repeats until done.
+4. Every side effect is a tool call, and every run is traced.
 
-## Learn more
+## Principles
 
-- [Architecture](docs/architecture.md) explains how the system is built.
-- [Operations](docs/operations.md) covers running it, tests and deployment.
+- **The runtime informs; the agent decides.** The system gathers context
+  but never acts on the agent's behalf. A reply is a tool call the agent
+  chooses to make.
+- **Behaviour in skills and workflows, not in Rust.** How to talk in a
+  chat, when to delegate, what a digest looks like: all text Ouro can
+  change.
+- **General mechanisms over special cases.** Memory, skills, workflows and
+  sub-agents, rather than a branch for one situation.
 
-<sub>A personal project, built in Rust with a lot of help from AI coding agents.</sub>
+## Repository
+
+| Crate | What it is |
+|---|---|
+| [`crates/mcp`](crates/mcp) | MCP server: Gmail, Telegram, news, memory and other tools, plus the pollers that emit signals. Knows nothing about the agent. |
+| [`crates/agent`](crates/agent) | The supervisor: signals, loops, guard, schedule, durable runs. Reaches tools only over MCP. |
+| [`crates/owf`](crates/owf) | Open Workflow Specification interpreter with a [durability contract](crates/owf/README.md). Independent of the rest. |
+| [`crates/evals`](crates/evals) | Judges, golden sets (news filter, guard) and trace replay. |
+| [`crates/codex`](crates/codex) | The sandbox for the agent's `code_agent` tool. |
+
+## Docs
+
+- [Architecture](docs/architecture.md): how the system is built.
+- [Operations](docs/operations.md): running, testing, deploying.
+
+<sub>Built in Rust with a lot of help from AI coding agents.</sub>
