@@ -208,9 +208,19 @@ fn store_case(ops: Vec<(u8, usize, usize, usize)>, witnesses: &Witnesses) {
                 s.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
             };
             for (key, t) in listeners {
-                store.deliver(&t, &json!({"drain":true})).unwrap();
-                assert!(l.take(&id, &key, &[t]).unwrap().is_some(), "listener stalled");
-                audit(&db);
+                // Delivery selects the oldest eligible run, which can be a
+                // sibling after an unregister/register. Fill those inboxes
+                // too; one pending event excludes each from the next pass.
+                let mut taken = false;
+                for _ in 0..leases.len() {
+                    store.deliver(&t, &json!({"drain":true})).unwrap();
+                    taken = l.take(&id, &key, std::slice::from_ref(&t)).unwrap().is_some();
+                    audit(&db);
+                    if taken {
+                        break;
+                    }
+                }
+                assert!(taken, "listener stalled after driving every eligible inbox");
             }
             l.finish(&Status::Completed(json!("drained"))).unwrap();
         }
@@ -228,12 +238,19 @@ fn event_histories_preserve_consumption_and_terminal_cleanup() {
         "reopen",
         "delivery rollback",
     ]);
-    TestRunner::new(Config { cases: runs(), ..Config::default() })
-        .run(&prop::collection::vec((0u8..9, 0usize..3, 0usize..4, 0usize..3), 32..65), |ops| {
-            store_case(ops, &w);
-            Ok(())
-        })
-        .unwrap();
+    TestRunner::new(Config {
+        cases: runs(),
+        source_file: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/durable_properties.rs")),
+        failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::WithSource(
+            "proptest-regressions",
+        ))),
+        ..Config::default()
+    })
+    .run(&prop::collection::vec((0u8..9, 0usize..3, 0usize..4, 0usize..3), 32..65), |ops| {
+        store_case(ops, &w);
+        Ok(())
+    })
+    .unwrap();
     w.finish();
 }
 
@@ -271,6 +288,7 @@ struct Inbox {
     saves: AtomicUsize,
     fail: usize,
     after_take: bool,
+    after_save: bool,
 }
 impl Journal for Inbox {
     fn load(&self) -> anyhow::Result<BTreeMap<String, Record>> {
@@ -278,8 +296,10 @@ impl Journal for Inbox {
     }
     fn save(&self, key: &str, record: &Record) -> anyhow::Result<()> {
         let n = self.saves.fetch_add(1, Ordering::SeqCst);
-        anyhow::ensure!(n != self.fail, "crash before commit {n}");
-        self.lease.save(key, record)
+        anyhow::ensure!(self.after_save || n != self.fail, "crash before commit {n}");
+        self.lease.save(key, record)?;
+        anyhow::ensure!(!self.after_save || n != self.fail, "crash after commit {n}");
+        Ok(())
     }
 }
 impl Events for Inbox {
@@ -331,7 +351,14 @@ async fn listen_case(mode: u8, hold: u64, timeout: u64, fail: usize, w: &Witness
     let token = CancellationToken::new();
     // Exercise each checkpoint boundary for every generated ordering, plus
     // the crash between atomic take and the next interpreter checkpoint.
-    let inbox = Arc::new(Inbox { lease: lease.clone(), saves: AtomicUsize::new(0), fail, after_take: fail == 12 });
+    let after_save = (13..25).contains(&fail);
+    let inbox = Arc::new(Inbox {
+        lease: lease.clone(),
+        saves: AtomicUsize::new(0),
+        fail: if after_save { fail - 13 } else { fail },
+        after_take: fail == 12,
+        after_save,
+    });
     let h = host(inbox.clone(), time.clone());
     if mode == 0 {
         lease.register("r", &["x".into()]).unwrap();
@@ -354,6 +381,9 @@ async fn listen_case(mode: u8, hold: u64, timeout: u64, fail: usize, w: &Witness
     let interrupted = matches!(first, Status::Interrupted(_));
     if interrupted {
         w.hit("checkpoint crash");
+        if after_save {
+            w.hit("after commit crash");
+        }
     }
     if matches!(first, Status::Waiting { .. }) {
         lease.finish(&first).unwrap();
@@ -369,13 +399,20 @@ async fn listen_case(mode: u8, hold: u64, timeout: u64, fail: usize, w: &Witness
     if recovered.get("r").unwrap().unwrap().outcome.is_none() {
         let current = Arc::new(recovered.claim("r").unwrap().unwrap());
         assert!(lease.renew().is_err());
-        let next =
-            Arc::new(Inbox { lease: current.clone(), saves: AtomicUsize::new(0), fail: usize::MAX, after_take: false });
+        let next = Arc::new(Inbox {
+            lease: current.clone(),
+            saves: AtomicUsize::new(0),
+            fail: usize::MAX,
+            after_take: false,
+            after_save: false,
+        });
         let h = host(next.clone(), time.clone());
         // Crashing before registration needs recovery to register first.
         if mode != 3 {
             current.register("r", &["x".into()]).unwrap();
-            recovered.deliver("x", &json!("answer")).unwrap();
+            let replacement =
+                if count(&reopened, "SELECT count(*) FROM workflow_events") > 0 { "replacement" } else { "answer" };
+            recovered.deliver("x", &json!(replacement)).unwrap();
         } else {
             tokio::time::advance(Duration::from_millis(timeout + 1)).await;
         }
@@ -398,6 +435,14 @@ async fn listen_case(mode: u8, hold: u64, timeout: u64, fail: usize, w: &Witness
     }
     audit(&reopened);
     assert_eq!(
+        count(
+            &reopened,
+            "SELECT count(*) FROM workflow_records WHERE key LIKE '%/expired#task' AND json_type(record,'$.result')='object'"
+        ),
+        i64::from(mode == 3),
+        "timeout handler completed exactly once"
+    );
+    assert_eq!(
         count(&reopened, "SELECT count(*) FROM workflow_events WHERE consumed_at_ms IS NOT NULL"),
         i64::from(mode != 3)
     );
@@ -411,31 +456,39 @@ async fn listen_case(mode: u8, hold: u64, timeout: u64, fail: usize, w: &Witness
 fn listen_hold_delivery_timeout_and_every_checkpoint_crash() {
     let w = Witnesses::new(&[
         "checkpoint crash",
+        "after commit crash",
         "suspended",
         "catchable timeout",
         "delivered and completed",
         "inside hold",
     ]);
-    TestRunner::new(Config { cases: runs(), ..Config::default() })
-        .run(&(2u64..20, 2u64..20, 0usize..13), |(hold, timeout, fail)| {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
-            rt.block_on(async {
-                for mode in 0..4 {
-                    for failure in [fail, usize::MAX] {
-                        listen_case(mode, hold, timeout, failure, &w).await;
-                    }
+    TestRunner::new(Config {
+        cases: runs(),
+        source_file: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/durable_properties.rs")),
+        failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::WithSource(
+            "proptest-regressions",
+        ))),
+        ..Config::default()
+    })
+    .run(&(2u64..20, 2u64..20, 0usize..25), |(hold, timeout, fail)| {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
+        rt.block_on(async {
+            for mode in 0..4 {
+                for failure in [fail, usize::MAX] {
+                    listen_case(mode, hold, timeout, failure, &w).await;
                 }
-            });
-            Ok(())
-        })
-        .unwrap();
+            }
+        });
+        Ok(())
+    })
+    .unwrap();
     w.finish();
 }
 
 fn child_link<'a>(parent: &'a str, key: &'a str) -> ChildLink<'a> {
     ChildLink { parent, key, reference: "/start" }
 }
-fn child_case(order: Vec<(u8, bool)>, w: &Witnesses) {
+fn child_case(order: Vec<(u8, bool)>, cancel: bool, w: &Witnesses) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("agent.db");
     let db = AgentDb::open(&path).unwrap();
@@ -452,6 +505,9 @@ fn child_case(order: Vec<(u8, bool)>, w: &Witnesses) {
         assert!(runs.start_child(&id, "child", "x", &json!({}), child_link("stranger", &key)).is_err());
         assert!(runs.child_outcome("stranger", &key, &id).is_err());
         assert!(runs.child_outcome("p", "foreign-key", &id).is_err());
+        let saved = runs.get(&id).unwrap().unwrap();
+        assert_eq!(saved.definition, "original");
+        assert_eq!(saved.input, json!({"i":i}));
         audit(&db);
         if crash {
             expired(&db, &id);
@@ -513,8 +569,11 @@ fn child_case(order: Vec<(u8, bool)>, w: &Witnesses) {
                 _ => unreachable!(),
             }
         );
-        if let Status::Completed(output) = expected {
-            assert_eq!(done["data"]["output"], output);
+        match expected {
+            Status::Completed(output) => assert_eq!(done["data"]["output"], output),
+            Status::Faulted(error) => assert_eq!(done["data"]["error"], serde_json::to_value(error).unwrap()),
+            Status::Cancelled => assert_eq!(done["data"], json!({"status":"cancelled"})),
+            _ => unreachable!(),
         }
         assert_eq!(parent.take("p", &format!("done{i}"), &[format!("done:{id}")]).unwrap(), Some(done));
         // A replay may rejoin a finished child, but cannot publish a second
@@ -532,7 +591,12 @@ fn child_case(order: Vec<(u8, bool)>, w: &Witnesses) {
     let child = runs.start_child("live", "child", "x", &json!({}), child_link("p", "live")).unwrap().unwrap();
     let grandchild =
         runs.start_child("grandchild", "child", "x", &json!({}), child_link("live", "grand")).unwrap().unwrap();
-    parent.finish(&Status::Completed(json!("all children joined"))).unwrap();
+    if cancel {
+        assert!(runs.cancel("p").unwrap());
+        w.hit("parent cancellation");
+    } else {
+        parent.finish(&Status::Completed(json!("all children joined"))).unwrap();
+    }
     for id in ["live", "grandchild"] {
         assert_eq!(runs.get(id).unwrap().unwrap().outcome, Some(Status::Cancelled));
     }
@@ -541,24 +605,34 @@ fn child_case(order: Vec<(u8, bool)>, w: &Witnesses) {
     assert_eq!(runs.list_prefix("child", "child").unwrap().len(), ids.len());
     audit(&db);
     stranger.finish(&Status::Completed(json!({}))).unwrap();
-    w.hit("parent completes and cancels descendants");
+    if !cancel {
+        w.hit("parent completes and cancels descendants");
+    }
 }
 
 #[test]
 fn children_join_once_replay_and_cascade_without_stranding_parents() {
     let w = Witnesses::new(&[
         "parent and child restart",
+        "parent cancellation",
         "child waiting then done",
         "interruption without waiting",
         "joined stored child outcome",
         "parent completes and cancels descendants",
     ]);
-    TestRunner::new(Config { cases: runs(), ..Config::default() })
-        .run(&prop::collection::vec((0u8..5, any::<bool>()), 5..9), |ops| {
-            child_case(ops, &w);
-            Ok(())
-        })
-        .unwrap();
+    TestRunner::new(Config {
+        cases: runs(),
+        source_file: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/durable_properties.rs")),
+        failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::WithSource(
+            "proptest-regressions",
+        ))),
+        ..Config::default()
+    })
+    .run(&(prop::collection::vec((0u8..5, any::<bool>()), 5..9), any::<bool>()), |(ops, cancel)| {
+        child_case(ops, cancel, &w);
+        Ok(())
+    })
+    .unwrap();
     w.finish();
 }
 
@@ -566,6 +640,7 @@ fn children_join_once_replay_and_cascade_without_stranding_parents() {
 fn listen_recovers_at_every_commit_boundary() {
     let w = Witnesses::new(&[
         "checkpoint crash",
+        "after commit crash",
         "suspended",
         "catchable timeout",
         "delivered and completed",
@@ -574,7 +649,7 @@ fn listen_recovers_at_every_commit_boundary() {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
     rt.block_on(async {
         for mode in 0..4 {
-            for fail in (0..13).chain([usize::MAX]) {
+            for fail in (0..25).chain([usize::MAX]) {
                 listen_case(mode, 10, 4, fail, &w).await;
             }
         }
@@ -592,4 +667,20 @@ fn replaying_a_join_after_consuming_done_does_not_publish_done_again() {
     assert!(parent.take("p", "first", &["done:c".into()]).unwrap().is_some());
     assert!(runs.start_child("c", "child", "x", &json!({}), child_link("p", "key")).unwrap().is_none());
     assert!(parent.take("p", "second", &["done:c".into()]).unwrap().is_none());
+}
+
+#[test]
+fn timing_out_one_same_type_listener_keeps_its_sibling_subscribed() {
+    let db = AgentDb::open(":memory:").unwrap();
+    let runs = RunStore::new(db.clone());
+    let l = runs.start("r", "w", "x", &json!({})).unwrap().unwrap();
+    l.register("r", &["x".into()]).unwrap();
+    for key in ["timeout", "live"] {
+        assert!(l.take("r", key, &["x".into()]).unwrap().is_none());
+    }
+    l.unregister("r", "timeout", &["x".into()]).unwrap();
+    audit(&db);
+    assert!(runs.deliver("x", &json!("survivor")).unwrap());
+    assert_eq!(l.take("r", "live", &["x".into()]).unwrap().unwrap()["data"], "survivor");
+    audit(&db);
 }
