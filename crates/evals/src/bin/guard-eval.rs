@@ -3,7 +3,7 @@
 // guard-eval [--case ID] [--batch N] [--model MODEL] [--json [PATH]]
 use agent::{
     decisions::{DecisionClient, DecisionRequest, OPENROUTER_DECISIONS_URL},
-    guard::{Context, State, review_question, review_state},
+    guard::{Context, State, review_question, review_state, settle},
     models::DEFAULT_DECISION_MODEL,
     providers::{RetryOpts, ToolCall, openrouter_api},
     tracing::null_scope,
@@ -172,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
         input_tokens += decision.usage.as_ref().map_or(0, |u| u.input);
         cost_usd += decision.cost_usd.unwrap_or_default();
         for (i, case) in batch.iter().enumerate() {
-            let got = decision.answer(&format!("case_{i}"), &questions[i])?.choice;
+            let got = settle(&decision.answer(&format!("case_{i}"), &questions[i])?).to_owned();
             let correct = got == case.expected || case.accept.contains(&got);
             println!("{}: expected={} got={} {}", case.id, case.expected, got, if correct { "OK" } else { "MISS" });
             results.push(CaseResult {

@@ -34,6 +34,8 @@ const ARGUMENT_CHARS: usize = 4_000;
 const REQUEST_CHARS: usize = 16_000;
 const SKILL_CHARS: usize = 24_000;
 const GOAL_CHARS: usize = 500;
+// Below this, a `misaligned` answer is a doubt, not a verdict (see `settle`).
+const SURE_BLOCK: f64 = 0.6;
 
 fn truncate(text: &str, limit: usize) -> String {
     let mut chars = text.chars();
@@ -299,6 +301,17 @@ pub fn review_question(state_path: &str, index: usize) -> anyhow::Result<Questio
     )
 }
 
+/// A block Jev is unsure of becomes a question to the user. It refused
+/// archiving the fact the user had just saved ("удали теперь", 0.56 vs 0.31
+/// allow): the call's target comes from a read the guard never sees. The user
+/// sees the exact call on the card, and without a confirmation channel
+/// `needs_confirmation` still blocks.
+pub fn settle(answer: &ChoiceAnswer) -> &str {
+    // An answer without probabilities is taken at its word.
+    let unsure = answer.probabilities.get("misaligned").and_then(Value::as_f64).is_some_and(|p| p < SURE_BLOCK);
+    if answer.choice == "misaligned" && unsure { "needs_confirmation" } else { &answer.choice }
+}
+
 pub async fn judge(
     engine: &Engine,
     context: &Context,
@@ -341,7 +354,7 @@ pub async fn judge(
         }
         for (i, call) in pending.iter().enumerate() {
             let mut verdict = match &result {
-                Ok(decision) => Verdict::new(&decision.answer(&format!("call_{i}"), &questions[i])?.choice),
+                Ok(decision) => Verdict::new(settle(&decision.answer(&format!("call_{i}"), &questions[i])?)),
                 Err(error) => {
                     let mut verdict = Verdict::new(
                         if tool_effect(engine, &call.name) == owf::run::Effect::Read || current_reply(context, call) {
@@ -441,6 +454,17 @@ mod tests {
         }
         // Another conversation is never a reply, whatever the text.
         assert!(label("edit_telegram_message", json!({"chatId":43,"text":"hi"})).is_none());
+    }
+    #[test]
+    fn an_unsure_block_asks_and_a_sure_one_stays() {
+        let answer = |choice: &str, misaligned: f64| ChoiceAnswer {
+            choice: choice.into(),
+            confidence: 0.3,
+            probabilities: json!({"allow": 1.0 - misaligned, "misaligned": misaligned}).as_object().unwrap().clone(),
+        };
+        assert_eq!(settle(&answer("misaligned", 0.56)), "needs_confirmation");
+        assert_eq!(settle(&answer("misaligned", 0.9)), "misaligned");
+        assert_eq!(settle(&answer("allow", 0.2)), "allow");
     }
     #[test]
     fn the_test_phrase_asks_for_confirmation_but_never_relaxes() {

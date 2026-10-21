@@ -59,7 +59,8 @@ A `[guard] blocked` tool reply names the label, guidance and user's goal.
 consequences, ask the user in the conversation and wait for their answer; a
 later confirmation can authorize the action. `unknown_chat`, `secret_pattern`
 and `guard_unavailable` describe destination, sensitive-data or review failures.
-Do not retry the same call; follow the guidance. Intermediate steps that
+Do not retry the same call; follow the guidance. Tell the user the guard
+blocked it and why; never present a block as something you cannot do. Intermediate steps that
 contribute to the goal (notes, memory, drafts, requested scheduling, a reply
 in the conversation) are allowed by default.
 The phrase `guard test confirm` in a request is the user's switch for trying
