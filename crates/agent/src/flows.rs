@@ -273,6 +273,7 @@ fn mcp_tool(mcp: &dyn Mcp, name: &str) -> Option<ToolDef> {
 // What `name` does, or None when a workflow cannot call it. An MCP tool not
 // marked read-only counts as a write.
 pub fn effect(mcp: &dyn Mcp, name: &str) -> Option<Effect> {
+    if name == "confirm_request" { return Some(Effect::Write); }
     if LOOP_FUNCTIONS.contains(&name) {
         return Some(Effect::Read);
     }
@@ -361,7 +362,7 @@ fn failed(e: anyhow::Error) -> WorkflowError {
 // The agent loop's functions (`agent::AGENT_LOOP`): a turn, one tool call
 // by name, a round's settlement. They take the loop from the run's context,
 // so they belong to an `agent-loop` definition.
-const LOOP_FUNCTIONS: &[&str] = &["agent_turn", "guard", "tool", "agent_settle"];
+const LOOP_FUNCTIONS: &[&str] = &["agent_turn", "guard", "confirm_request", "tool", "agent_settle"];
 
 fn loop_tool_name(args: &Value) -> &str {
     args.get("call").and_then(|c| c.get("name")).and_then(Value::as_str).unwrap_or_default()
@@ -383,9 +384,9 @@ impl owf::run::Functions for Functions {
 
     // A durable sub-agent is the exception: calling it again joins its run.
     fn at_most_once(&self, name: &str, args: &Value) -> bool {
-        name == "tool"
-            && self.effect_of(name, args) == Some(Effect::Write)
-            && (self.runs.is_none() || crate::agent::child_key(args).is_none())
+        name == "confirm_request" || (name == "tool"
+            && (self.effect_of(name, args) == Some(Effect::Write) || args.get("outcome").is_some_and(|v| !v.is_null()))
+            && (self.runs.is_none() || crate::agent::child_key(args).is_none()))
     }
 
     fn unknown_outcome(&self, name: &str, args: &Value) -> Option<Value> {
@@ -462,7 +463,7 @@ impl owf::run::Functions for Functions {
         let span = self.spans.scope(info.reference);
         let label = info.reference.rsplit('/').next().unwrap_or(name);
         match name {
-            "agent_turn" | "guard" | "tool" | "agent_settle" => {
+            "agent_turn" | "guard" | "confirm_request" | "tool" | "agent_settle" => {
                 // A loop rebuilt after a restart is traced under the runner.
                 let root: Scope = self.spans.root.clone();
                 let engine = &self.engine;
@@ -488,8 +489,13 @@ impl owf::run::Functions for Functions {
                 args["loop"] = admitted["loop"].clone();
                 match name {
                     "agent_turn" => crate::agent::loop_turn(engine, &args, &root, info.cancel).await,
-                    "guard" => crate::agent::loop_guard(engine, &args, &root, info.cancel).await,
-                    "tool" => crate::agent::loop_tool(engine, &args, &root, info.cancel, self.runs.as_ref()).await,
+                    "guard" => {
+                        let mut output = crate::agent::loop_guard(engine, &args, &root, info.cancel).await.map_err(failed)?;
+                        output["confirmable"] = json!(self.runs.is_some() && self.events.is_some() && spec.parent_id.is_none() && spec.confirm.is_some());
+                        Ok(output)
+                    }
+                    "confirm_request" => crate::agent::loop_confirm_request(engine, &args, &root, info, self.runs.as_ref(), self.events.as_deref()).await,
+                    "tool" => crate::agent::loop_tool(engine, &args, &root, info.cancel, self.runs.as_ref(), Some(info.run_id)).await,
                     _ => crate::agent::loop_settle(engine, &args, &root, info.cancel).await,
                 }
                 .map_err(failed)

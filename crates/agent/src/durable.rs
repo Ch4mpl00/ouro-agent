@@ -53,6 +53,8 @@ impl RunStore {
         Self { db }
     }
 
+    pub fn confirmations(&self) -> &dyn crate::confirmation::Store { &self.db }
+
     pub fn get(&self, id: &str) -> anyhow::Result<Option<SavedRun>> {
         let row = self
             .db
@@ -191,6 +193,7 @@ impl RunStore {
     pub fn sweep(&self, kept_ms: i64) -> anyhow::Result<usize> {
         let mut conn = self.db.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM confirmations WHERE run_id IN (SELECT id FROM workflow_runs WHERE ended_ms <= ?1)", [now() - kept_ms])?;
         tx.execute("DELETE FROM workflow_events WHERE run_id IN (SELECT id FROM workflow_runs WHERE ended_ms <= ?1)", [now() - kept_ms])?;
         let deleted = tx.execute(
             "DELETE FROM workflow_records WHERE run_id IN (SELECT id FROM workflow_runs WHERE ended_ms <= ?1)",
@@ -384,7 +387,12 @@ impl owf::run::Events for Lease {
         let event = serde_json::json!({"type":t,"data":serde_json::from_str::<Value>(&data)?,
             "time":chrono::DateTime::from_timestamp_millis(time).ok_or_else(|| anyhow::anyhow!("invalid event time"))?.to_rfc3339()});
         tx.execute("UPDATE workflow_events SET consumed_at_ms = ?2, consumed_key = ?3 WHERE id = ?1", params![id,now(),key])?;
-        for t in types { tx.execute("DELETE FROM workflow_awaits WHERE run_id = ?1 AND type = ?2", params![run_id,t])?; }
+        for t in types {
+            tx.execute("DELETE FROM workflow_awaits WHERE run_id = ?1 AND type = ?2", params![run_id,t])?;
+            // Two competing buttons may both arrive before the first take.
+            // The loser must not keep waking a later, unrelated wait.
+            tx.execute("DELETE FROM workflow_events WHERE run_id = ?1 AND type = ?2 AND consumed_at_ms IS NULL", params![run_id,t])?;
+        }
         tx.execute("INSERT INTO workflow_records (run_id,key,record) VALUES (?1,?2,?3)",
             params![run_id,key,serde_json::to_string(&Record::Event { event: event.clone() })?])?;
         tx.commit()?;

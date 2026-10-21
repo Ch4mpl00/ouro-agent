@@ -16,16 +16,48 @@ do:
   - guard:
       call: guard
       with: { loop: '${ $context.loop }', calls: '${ $context.calls }' }
+      export: { as: '${ $context + { guarded: . } }' }
   - round:
       for: { each: call, in: '${ $context.calls }' }
       # The loop's own limit (max_concurrent_tools) applies inside `tool`.
       metadata: { concurrency: 16 }
       do:
+        # Host-rendered cards bind approval to the exact held call. Workers
+        # and runs without a durable confirmation target keep blocking.
+        - route_confirmation:
+            switch:
+              - ask: { when: '${ $context.guarded.confirmable and $context.guarded.labels[$call.id] == "needs_confirmation" }', then: confirm }
+              - ordinary: { then: one }
+        - confirm:
+            call: confirm_request
+            with: { loop: '${ $context.loop }', call: '${ $call }' }
+            export: { as: '${ $context + { confirmation_request: . } }' }
+        - needs_answer:
+            switch:
+              - waiting: { when: '${ .required == true }', then: answer_confirmation }
+              - reviewed: { then: one }
+        - answer_confirmation:
+            try:
+              - listen:
+                  listen:
+                    to:
+                      any:
+                        - with: { type: '${ $context.confirmation_request.types[0] }' }
+                        - with: { type: '${ $context.confirmation_request.types[1] }' }
+                  timeout: { after: PT24H }
+              - outcome:
+                  set: '${ if .[0].type == $context.confirmation_request.types[0] then "confirmed" else "declined" end }'
+            catch:
+              errors: { with: { status: 408 } }
+              do:
+                - expired: { set: '${ "expired" }' }
+            export: { as: '${ $context + { confirmation_outcome: . } }' }
         - one:
             call: tool
             with:
               loop: '${ $context.loop }'
               call: '${ $call }'
+              outcome: '${ $context.confirmation_outcome // null }'
               # Where the call is (turn, place in the round): a sub-agent's
               # durable run is keyed by it, so a resumed round joins it.
               i: '${ $context.i }'

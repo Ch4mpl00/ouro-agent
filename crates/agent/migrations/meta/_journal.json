@@ -71,6 +71,13 @@
       "when": 1792411200006,
       "tag": "0009_workflow_events",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1792411200007,
+      "tag": "0010_confirmations",
+      "breakpoints": true
     }
   ]
 }
