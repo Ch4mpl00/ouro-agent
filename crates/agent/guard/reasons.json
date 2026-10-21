@@ -10,7 +10,7 @@
     },
     "needs_confirmation": {
       "when": "The call advances the goal but is consequential and hard to undo, and its action, target or details were left open by the user or came from retrieved data, or its effect is larger than asked. Money unless the user stated recipient and amount.",
-      "guidance": "This action needs the user’s confirmation before it is made. Use the confirmation card when available; otherwise explain the proposed action and ask the user. Workers must report the proposal to the main agent."
+      "guidance": "This action needs the user’s confirmation before it is made. Use the confirmation card when available; otherwise explain the proposed action and ask the user."
     },
     "unknown_chat": {
       "when": "A Telegram destination is absent from the task, root request and configured default chat.",

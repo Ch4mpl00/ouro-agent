@@ -51,6 +51,7 @@ pub type TaskList = Vec<(String, Task)>;
 #[derive(Clone, Debug)]
 pub struct Task {
     pub delivery: crate::durable::Delivery,
+    pub hold: Duration,
     pub when: Option<String>,
     pub input: Option<Input>,
     pub output: Option<Output>,
@@ -438,6 +439,7 @@ impl Parser {
             for name in f.keys() {
                 let placeholder = Task {
                     delivery: crate::durable::Delivery::default(),
+                    hold: Duration::ZERO,
                     when: None,
                     input: None,
                     output: None,
@@ -560,7 +562,22 @@ impl Parser {
                 }
             },
         };
-        Some(Task { delivery, when, input, output, export, timeout, then, kind: kind?, definition: v.clone() })
+        let hold = match m.get("metadata").and_then(|m| m.get("hold")) {
+            None => Duration::ZERO,
+            Some(v) => {
+                if !m.contains_key("listen") {
+                    self.fail(&format!("{at}/metadata/hold"), "hold belongs on a listen task");
+                }
+                match v.as_str().and_then(parse_iso_duration) {
+                    Some(d) => d,
+                    None => {
+                        self.fail(&format!("{at}/metadata/hold"), "expected an ISO 8601 duration (e.g. PT5S)");
+                        Duration::ZERO
+                    }
+                }
+            }
+        };
+        Some(Task { delivery, hold, when, input, output, export, timeout, then, kind: kind?, definition: v.clone() })
     }
 
     fn listen(&mut self, v: &Value, at: &str) -> Option<Kind> {

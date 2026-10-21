@@ -270,7 +270,7 @@ async fn an_activated_agent_loop_runs_and_three_faults_in_a_row_put_the_built_in
     assert!(matches!(run(1).await, FlowResult::Completed(ref v) if v == "v2 hello"));
 
     let broken = "document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '9.0.0' }\n\
-        do: [ { boom: { raise: { error: { type: 'https://example.com/boom', status: 500 } } } }, { guard: { call: guard, with: { loop: '${ $context.loop }', calls: [] } } } ]\n";
+        do: [ { boom: { raise: { error: { type: 'https://example.com/boom', status: 500 } } } }, { guard: { call: start_child, with: { workflow: guard, calls: [], i: 1 } } } ]\n";
     activate(broken);
     for n in 2..5 {
         assert!(matches!(run(n).await, FlowResult::Faulted { .. }), "fault {}", n - 1);
@@ -548,10 +548,10 @@ async fn guarded_run(engine: &Arc<Engine>, id: &str) -> FlowResult {
     create_flows(engine.clone()).run_loop(id, input, &scope(engine), &CancellationToken::new()).await
 }
 fn without_guard() -> String {
-    agent::agent::AGENT_LOOP.replace("- act: { then: guard }", "- act: { then: round }").replace(
-        "  - guard:\n      call: guard\n      with: { loop: '${ $context.loop }', calls: '${ $context.calls }' }\n",
-        "",
-    )
+    let definition = agent::agent::AGENT_LOOP;
+    let a = definition.find("  - guard:\n").unwrap();
+    let b = definition.find("  - round:\n").unwrap();
+    format!("{}{}", &definition[..a], &definition[b..]).replace("- act: { then: guard }", "- act: { then: round }")
 }
 
 #[tokio::test]
@@ -670,14 +670,14 @@ async fn guardless_overrides_are_refused_early_but_old_stored_ones_are_enforced_
     assert!(!definition.contains("call: guard"));
     let save = json!({"name":"agent-loop","definition":definition});
     let error = agent::flows::tool(&engine, "save_workflow", save.as_object().unwrap()).unwrap_err().to_string();
-    assert!(error.contains("requires a `call: guard`"), "{error}");
+    assert!(error.contains("requires a `call: start_child`"), "{error}");
     let saved = engine.deps.workflows.save("agent-loop", &definition, None).unwrap();
     let activate = json!({"name":"agent-loop","version":saved.version});
     assert!(
         agent::flows::tool(&engine, "activate_workflow", activate.as_object().unwrap())
             .unwrap_err()
             .to_string()
-            .contains("requires a `call: guard`")
+            .contains("requires a `call: start_child`")
     );
     engine.deps.workflows.activate("agent-loop", saved.version).unwrap();
     assert!(matches!(guarded_run(&engine, "legacy").await, FlowResult::Completed(_)));
@@ -812,7 +812,7 @@ async fn a_restart_after_guard_rechecks_against_admitted_input_before_dispatch()
                 check_transition(old, record)?;
             }
             records.insert(key.into(), record.clone());
-            if matches!(record, Record::Call { function, state: CallState::Done(_), .. } if function == "guard")
+            if matches!(record, Record::Call { function, state: CallState::Done(_), .. } if function == "start_child")
                 && !self.crashed.swap(true, Ordering::SeqCst)
             {
                 self.dead.store(true, Ordering::SeqCst);
@@ -997,4 +997,109 @@ async fn a_legacy_loop_without_a_guard_step_cannot_dispatch_a_blocked_remote_rea
     assert!(matches!(guarded_run(&engine, "legacy-remote").await, FlowResult::Completed(_)));
     assert!(world.calls.lock().unwrap().is_empty());
     assert_eq!(api.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn fast_guard_and_worker_children_never_suspend_the_parent() {
+    for mode in ["guard", "worker", "local"] {
+        let replies = match mode {
+            "guard" => vec![calls(&[("send", json!({"q":"one"}))]), assistant("done")],
+            "worker" => vec![
+                calls(&[("invoke_sub_agent", json!({"prompt":"work"}))]),
+                assistant("worker result"),
+                assistant("done"),
+            ],
+            _ => vec![calls(&[("search", json!({"q":"local"}))]), assistant("done")],
+        };
+        let model = Arc::new(Scripted::new(replies));
+        let world = Arc::new(World { calls: Mutex::default(), stop: None });
+        let engine = engine(model, world);
+        let dir = tempfile::tempdir().unwrap();
+        let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
+        db.conn().execute_batch("CREATE TABLE waiting_saved (id TEXT); CREATE TRIGGER record_waiting AFTER UPDATE OF state ON workflow_runs WHEN NEW.state='waiting' BEGIN INSERT INTO waiting_saved VALUES (NEW.id); END;").unwrap();
+        let input = input(&engine, "fast").await;
+        let start = std::time::Instant::now();
+        let result = create_durable_flows(engine.clone(), db.clone())
+            .run_loop("fast/loop", input, &scope(&engine), &CancellationToken::new())
+            .await;
+        assert!(matches!(result,FlowResult::Completed(ref output) if output=="done"), "{mode}: {result:?}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(1), "{mode}: {:?}", start.elapsed());
+        assert_eq!(
+            db.conn().query_row("SELECT count(*) FROM waiting_saved", [], |r| r.get::<_, i64>(0)).unwrap(),
+            0,
+            "{mode}"
+        );
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT count(*) FROM workflow_runs WHERE name='guard'", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            i64::from(mode == "guard")
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_guard_child_result_cannot_authorize_another_invocation() {
+    let (engine, world, _, _) = guarded(vec![], "allow");
+    let dir = tempfile::tempdir().unwrap();
+    let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
+    let definition = r#"document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '2.0.0' }
+do:
+ - guard:
+     call: start_child
+     with: { workflow: guard, i: 1, calls: [{ id: c, name: send, arguments: '{}' }] }
+     export: { as: '${ $context + { guard: .run } }' }
+ - wait:
+     listen: { to: { one: { with: { type: '${ "done:" + $context.guard }' } } } }
+     metadata: { hold: PT1S }
+ - first:
+     call: tool
+     with: { call: { id: c, name: send, arguments: '{}' }, i: 1, guard_run: '${ $context.guard }' }
+ - duplicate:
+     call: tool
+     with: { call: { id: c, name: send, arguments: '{}' }, i: 1, guard_run: '${ $context.guard }' }
+"#;
+    let saved = engine.deps.workflows.save("agent-loop", definition, None).unwrap();
+    engine.deps.workflows.activate("agent-loop", saved.version).unwrap();
+    let input = input(&engine, "once").await;
+    let result = create_durable_flows(engine.clone(), db)
+        .run_loop("once/loop", input, &scope(&engine), &CancellationToken::new())
+        .await;
+    assert!(matches!(result, FlowResult::Completed(_)), "{result:?}");
+    assert_eq!(*world.calls.lock().unwrap(), ["send"]);
+}
+
+#[tokio::test]
+async fn worker_children_keep_the_active_loop_version_and_its_breaker() {
+    let model = Arc::new(Scripted::new(vec![
+        calls(&[("invoke_sub_agent", json!({"prompt":"first"}))]),
+        calls(&[("invoke_sub_agent", json!({"prompt":"second"}))]),
+        calls(&[("invoke_sub_agent", json!({"prompt":"third"}))]),
+        calls(&[("invoke_sub_agent", json!({"prompt":"fourth"}))]),
+        assistant("worker recovered"),
+        assistant("done"),
+    ]));
+    let dir = tempfile::tempdir().unwrap();
+    let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
+    let engine =
+        engine_with(model.clone(), Arc::new(World { calls: Mutex::default(), stop: None }), Arc::new(db.clone()));
+    let admitted = input(&engine, "breaker-parent").await;
+    let runs = RunStore::new(db.clone());
+    runs.admit("breaker-parent/loop", "agent-loop", agent::agent::AGENT_LOOP, &admitted).unwrap();
+    let broken = "document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '2.0.0' }\ndo: [{ boom: { raise: { error: { type: 'https://example.com/boom', status: 500 } } } }, { guard: { call: start_child, with: { workflow: guard, calls: [], i: 1 } } }]";
+    let version = engine.deps.workflows.save("agent-loop", broken, None).unwrap();
+    engine.deps.workflows.activate("agent-loop", version.version).unwrap();
+    let result = create_durable_flows(engine.clone(), db)
+        .run_loop("breaker-parent/loop", admitted, &scope(&engine), &CancellationToken::new())
+        .await;
+    assert!(matches!(result,FlowResult::Completed(ref output) if output=="done"), "{result:?}");
+    for round in 1..=3 {
+        let child = runs.get(&format!("breaker-parent__sub{round}.0/loop")).unwrap().unwrap();
+        assert_eq!(child.input["override_version"], version.version);
+        assert!(matches!(child.outcome, Some(Status::Faulted(_))));
+    }
+    let recovered = runs.get("breaker-parent__sub4.0/loop").unwrap().unwrap();
+    assert!(recovered.input["override_version"].is_null());
+    assert_eq!(recovered.outcome, Some(Status::Completed(json!("worker recovered"))));
+    assert_eq!(model.seen.lock().unwrap().len(), 6);
 }

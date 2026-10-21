@@ -51,7 +51,7 @@ fn earlier_messages(messages: &[String]) -> String {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Verdict {
     pub label: String,
     pub guidance: String,
@@ -77,7 +77,8 @@ impl Verdict {
 }
 
 // Set only from live loop admission or a durable run's admitted input, never
-// from the arguments to a workflow task. Verdicts intentionally do not persist.
+// from the arguments to a workflow task. This cache is local to the loop;
+// durable authorization comes from an owned guard child's stored outcome.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Context {
     pub task: String,

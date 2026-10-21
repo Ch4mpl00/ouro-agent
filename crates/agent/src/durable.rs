@@ -39,9 +39,17 @@ pub struct RunStore {
 }
 
 #[derive(Debug)]
+pub struct ChildLink<'a> {
+    pub parent: &'a str,
+    pub key: &'a str,
+    pub reference: &'a str,
+}
+
+#[derive(Debug)]
 pub struct SavedRun {
     pub id: String,
     pub name: String,
+    pub parent_run: Option<String>,
     pub state: String,
     pub definition: String,
     pub input: Value,
@@ -61,20 +69,26 @@ impl RunStore {
         let row = self
             .db
             .conn()
-            .query_row("SELECT name, definition, input, outcome, state FROM workflow_runs WHERE id = ?1", [id], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                    r.get::<_, String>(4)?,
-                ))
-            })
+            .query_row(
+                "SELECT name, definition, input, outcome, state, parent_run FROM workflow_runs WHERE id = ?1",
+                [id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
             .optional()?;
-        row.map(|(name, definition, input, outcome, state)| {
+        row.map(|(name, definition, input, outcome, state, parent_run)| {
             Ok(SavedRun {
                 id: id.into(),
                 name,
+                parent_run,
                 state,
                 definition,
                 input: serde_json::from_str(&input)?,
@@ -134,28 +148,115 @@ impl RunStore {
         Ok(inserted)
     }
 
+    /// Child admission, ownership and the parent's subscriptions are atomic.
+    /// Replaying the same invocation joins its immutable original definition.
+    pub fn start_child(
+        &self,
+        id: &str,
+        name: &str,
+        definition: &str,
+        input: &Value,
+        link: ChildLink<'_>,
+    ) -> anyhow::Result<Option<Lease>> {
+        let mut conn = self.db.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let alive: bool =
+            tx.query_row("SELECT ended_ms IS NULL FROM workflow_runs WHERE id = ?1", [link.parent], |r| r.get(0))?;
+        anyhow::ensure!(alive, "parent run has ended");
+        for t in [format!("done:{id}"), format!("waiting:{id}")] {
+            tx.execute(
+                "INSERT INTO workflow_awaits (run_id,type,registered_at_ms) VALUES (?1,?2,?3) ON CONFLICT DO NOTHING",
+                params![link.parent, t, now()],
+            )?;
+        }
+        // Keep completion subscribed across the gap between consuming waiting
+        // and entering the parent's final done listen.
+        tx.execute(
+            "INSERT INTO workflow_listeners (run_id,key,type) VALUES (?1,?2,?3) ON CONFLICT DO NOTHING",
+            params![link.parent, format!("child:{id}"), format!("done:{id}")],
+        )?;
+        let owner = uuid::Uuid::new_v4().to_string();
+        let inserted = tx.execute("INSERT INTO workflow_runs (id,name,definition,input,state,owner,lease_until_ms,parent_run,child_key,child_reference)
+            VALUES (?1,?2,?3,?4,'running',?5,?6,?7,?8,?9) ON CONFLICT DO NOTHING",
+            params![id,name,definition,serde_json::to_string(input)?,owner,now()+LEASE_MS,link.parent,link.key,link.reference])? == 1;
+        // Adopt workers admitted before child ownership existed. Their run id
+        // and input stay unchanged, so an in-flight worker is never restarted.
+        tx.execute(
+            "UPDATE workflow_runs SET parent_run=?2,child_key=?3,child_reference=?4 WHERE id=?1 AND parent_run IS NULL",
+            params![id, link.parent, link.key, link.reference],
+        )?;
+        let valid: bool = tx.query_row(
+            "SELECT name=?2 AND parent_run=?3 AND child_key=?4 AND child_reference=?5 FROM workflow_runs WHERE id=?1",
+            params![id, name, link.parent, link.key, link.reference],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(valid, "child run does not belong to this invocation");
+        // Replaying after the child ended must make its outcome reachable too.
+        if !inserted {
+            let (state, outcome): (String, Option<String>) =
+                tx.query_row("SELECT state,outcome FROM workflow_runs WHERE id=?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?;
+            if let Some(outcome) = outcome {
+                lifecycle(&tx, id, &serde_json::from_str(&outcome)?)?;
+            } else if state == "waiting" {
+                lifecycle(&tx, id, &Status::Waiting { wake_at_ms: 0 })?;
+            }
+        }
+        tx.commit()?;
+        Ok(inserted.then(|| Lease { db: self.db.clone(), id: id.into(), owner, ended: AtomicBool::new(false) }))
+    }
+
+    /// Outcomes are trusted only after checking the persisted parent and key.
+    pub fn child_outcome(&self, parent: &str, key: &str, id: &str) -> anyhow::Result<Option<Status>> {
+        let conn = self.db.conn();
+        let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
+            .query_row("SELECT parent_run,child_key,outcome FROM workflow_runs WHERE id=?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
+        let (p, k, outcome) = row.ok_or_else(|| anyhow::anyhow!("unknown child run"))?;
+        anyhow::ensure!(
+            p.as_deref() == Some(parent) && k.as_deref() == Some(key),
+            "child run does not belong to this parent and key"
+        );
+        outcome.map(|o| Ok(serde_json::from_str(&o)?)).transpose()
+    }
+
+    pub fn pending_child_confirmation(&self, parent: &str, call: &str) -> anyhow::Result<bool> {
+        Ok(self.db.conn().query_row("SELECT EXISTS(SELECT 1 FROM confirmations c JOIN workflow_runs g ON g.id=c.run_id WHERE g.parent_run=?1 AND g.name='guard' AND c.call_key=?2 AND c.outcome IS NULL)",params![parent,call],|r|r.get(0))?)
+    }
+
+    /// One reviewed call authorizes one host invocation. A malicious loop
+    /// cannot spend a confirmed verdict again by lying about its round.
+    pub fn use_guard_verdict(&self, child: &str, call: &str, invocation: &str) -> anyhow::Result<bool> {
+        let mut conn = self.db.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO guard_verdict_uses (child_run,call_key,invocation) VALUES (?1,?2,?3) ON CONFLICT DO NOTHING",
+            params![child, call, invocation],
+        )?;
+        let same = tx.query_row(
+            "SELECT invocation=?3 FROM guard_verdict_uses WHERE child_run=?1 AND call_key=?2",
+            params![child, call, invocation],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok(same)
+    }
+
     /// One event belongs to one live run. A pending delivery excludes a second
     /// copy; taking it removes its registration, closing double presses.
     pub fn deliver(&self, type_: &str, data: &Value) -> anyhow::Result<bool> {
         let mut conn = self.db.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let run: Option<String> = tx
-            .query_row(
-                "SELECT a.run_id FROM workflow_awaits a JOIN workflow_runs r ON r.id = a.run_id
-             WHERE a.type = ?1 AND r.ended_ms IS NULL AND r.state IN ('ready','running','waiting')
-             AND NOT EXISTS (SELECT 1 FROM workflow_events e WHERE e.run_id = a.run_id AND e.type = a.type AND e.consumed_at_ms IS NULL)
-             ORDER BY a.registered_at_ms, a.run_id LIMIT 1",
-                [type_],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(run) = run else { return Ok(false) };
-        tx.execute(
-            "INSERT INTO workflow_events (run_id,type,data,delivered_at_ms) VALUES (?1,?2,?3,?4)",
-            params![run, type_, serde_json::to_string(data)?, now()],
-        )?;
-        tx.execute("UPDATE workflow_runs SET wake_at_ms = ?2 WHERE id = ?1", params![run, now()])?;
+        let Some(run) = deliver(&tx, type_, data, None)? else { return Ok(false) };
         tx.commit()?;
+        if let Some(notify) =
+            self.db.notifications.lock().unwrap_or_else(|e| e.into_inner()).get(&run).and_then(std::sync::Weak::upgrade)
+        {
+            notify.notify_waiters();
+        }
         Ok(true)
     }
 
@@ -193,7 +294,12 @@ impl RunStore {
         )? == 1;
         tx.execute("DELETE FROM workflow_awaits WHERE run_id = ?1", [id])?;
         tx.execute("DELETE FROM workflow_listeners WHERE run_id = ?1", [id])?;
+        if changed {
+            cancel_children(&tx, id)?;
+            lifecycle(&tx, id, &Status::Cancelled)?;
+        }
         tx.commit()?;
+        notify_runs(&self.db);
         Ok(changed)
     }
 
@@ -203,6 +309,7 @@ impl RunStore {
     pub fn sweep(&self, kept_ms: i64) -> anyhow::Result<usize> {
         let mut conn = self.db.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM guard_verdict_uses WHERE child_run IN (SELECT c.id FROM workflow_runs c JOIN workflow_runs p ON p.id=c.parent_run WHERE p.ended_ms<=?1)",[now()-kept_ms])?;
         tx.execute(
             "DELETE FROM confirmations WHERE run_id IN (SELECT id FROM workflow_runs WHERE ended_ms <= ?1)",
             [now() - kept_ms],
@@ -314,7 +421,12 @@ impl Lease {
             tx.execute("DELETE FROM workflow_awaits WHERE run_id = ?1", [&self.id])?;
             tx.execute("DELETE FROM workflow_listeners WHERE run_id = ?1", [&self.id])?;
         }
+        if terminal {
+            cancel_children(&tx, &self.id)?;
+        }
+        lifecycle(&tx, &self.id, &status)?;
         tx.commit()?;
+        notify_runs(&self.db);
         Ok(status)
     }
 
@@ -377,6 +489,19 @@ impl Journal for Lease {
 // ── 3. durable events ──────────────────────────────────────────────────────
 
 impl owf::run::Events for Lease {
+    fn notification(&self, run_id: &str) -> futures::future::BoxFuture<'_, ()> {
+        let mut notifications = self.db.notifications.lock().unwrap_or_else(|e| e.into_inner());
+        notifications.retain(|_, n| n.strong_count() > 0);
+        let notify = notifications.get(run_id).and_then(std::sync::Weak::upgrade).unwrap_or_else(|| {
+            let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+            notifications.insert(run_id.into(), std::sync::Arc::downgrade(&notify));
+            notify
+        });
+        let mut notified = Box::pin(notify.notified_owned());
+        notified.as_mut().enable();
+        notified
+    }
+
     fn unregister(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
         anyhow::ensure!(run_id == self.id, "event run does not own this lease");
         let mut conn = self.db.conn();
@@ -451,6 +576,14 @@ impl owf::run::Events for Lease {
             "UPDATE workflow_events SET consumed_at_ms = ?2, consumed_key = ?3 WHERE id = ?1",
             params![id, now(), key],
         )?;
+        // The child-completion subscription survives the waiting→done gap,
+        // then closes with its one consumed completion event.
+        if let Some(child) = t.strip_prefix("done:") {
+            tx.execute(
+                "DELETE FROM workflow_listeners WHERE run_id=?1 AND key=?2",
+                params![run_id, format!("child:{child}")],
+            )?;
+        }
         tx.execute("DELETE FROM workflow_listeners WHERE run_id = ?1 AND key = ?2", params![run_id, key])?;
         close_awaits(&tx, run_id, types)?;
         tx.execute(
@@ -473,4 +606,71 @@ fn close_awaits(tx: &rusqlite::Transaction<'_>, run_id: &str, types: &[String]) 
         )?;
     }
     Ok(())
+}
+
+// Lifecycle state and event insertion share the finishing transaction. A crash
+// cannot strand a parent between committing the child and notifying it.
+fn deliver(
+    tx: &rusqlite::Transaction<'_>,
+    type_: &str,
+    data: &Value,
+    target: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let run: Option<String> = tx.query_row(
+        "SELECT a.run_id FROM workflow_awaits a JOIN workflow_runs r ON r.id=a.run_id
+         WHERE a.type=?1 AND (?2 IS NULL OR a.run_id=?2) AND r.ended_ms IS NULL AND r.state IN ('ready','running','waiting')
+         AND NOT EXISTS (SELECT 1 FROM workflow_events e WHERE e.run_id=a.run_id AND e.type=a.type AND e.consumed_at_ms IS NULL)
+         ORDER BY a.registered_at_ms,a.run_id LIMIT 1", params![type_,target], |r|r.get(0)).optional()?;
+    if let Some(run) = &run {
+        tx.execute(
+            "INSERT INTO workflow_events (run_id,type,data,delivered_at_ms) VALUES (?1,?2,?3,?4)",
+            params![run, type_, serde_json::to_string(data)?, now()],
+        )?;
+        tx.execute("UPDATE workflow_runs SET wake_at_ms=?2 WHERE id=?1", params![run, now()])?;
+    }
+    Ok(run)
+}
+
+fn lifecycle(tx: &rusqlite::Transaction<'_>, id: &str, status: &Status) -> anyhow::Result<()> {
+    let parent: Option<String> =
+        tx.query_row("SELECT parent_run FROM workflow_runs WHERE id=?1", [id], |r| r.get(0))?;
+    if parent.is_none() {
+        return Ok(());
+    }
+    let (kind, data) = match status {
+        Status::Completed(output) => ("done", serde_json::json!({"status":"completed","output":output})),
+        Status::Faulted(error) => ("done", serde_json::json!({"status":"faulted","error":error})),
+        Status::Cancelled => ("done", serde_json::json!({"status":"cancelled"})),
+        Status::Waiting { .. } => ("waiting", serde_json::json!({"status":"waiting"})),
+        Status::Interrupted(_) => return Ok(()),
+    };
+    deliver(tx, &format!("{kind}:{id}"), &data, parent.as_deref())?;
+    Ok(())
+}
+
+fn cancel_children(tx: &rusqlite::Transaction<'_>, parent: &str) -> anyhow::Result<()> {
+    let children = {
+        let mut stmt = tx.prepare("SELECT id FROM workflow_runs WHERE parent_run=?1 AND ended_ms IS NULL")?;
+        stmt.query_map([parent], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for child in children {
+        tx.execute("UPDATE workflow_runs SET state='cancelled',outcome=?2,ended_ms=?3,owner=NULL,lease_until_ms=NULL WHERE id=?1", params![child,serde_json::to_string(&Status::Cancelled)?,now()])?;
+        tx.execute("DELETE FROM workflow_awaits WHERE run_id=?1", [&child])?;
+        tx.execute("DELETE FROM workflow_listeners WHERE run_id=?1", [&child])?;
+        cancel_children(tx, &child)?;
+        lifecycle(tx, &child, &Status::Cancelled)?;
+    }
+    Ok(())
+}
+
+fn notify_runs(db: &AgentDb) {
+    let mut notifications = db.notifications.lock().unwrap_or_else(|e| e.into_inner());
+    notifications.retain(|_, n| {
+        if let Some(n) = n.upgrade() {
+            n.notify_waiters();
+            true
+        } else {
+            false
+        }
+    });
 }

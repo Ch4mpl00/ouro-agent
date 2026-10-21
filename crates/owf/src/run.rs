@@ -159,6 +159,11 @@ impl Drop for TaskSpan<'_> {
 /// executor just like Journal::save. Repeating a take returns the saved event.
 /// Registration is idempotent, including registration before a question is sent.
 pub trait Events: Send + Sync {
+    /// Subscribe before taking, so a delivery between take and wait is not lost.
+    /// Hosts without in-memory notifications still support zero-hold listens.
+    fn notification(&self, _run_id: &str) -> BoxFuture<'_, ()> {
+        Box::pin(std::future::pending())
+    }
     fn register(&self, run_id: &str, types: &[String]) -> anyhow::Result<()>;
     /// Close a timed-out wait. Delivered events remain available to a future
     /// matching listen, but cannot keep an unrelated wait awake.
@@ -936,7 +941,14 @@ impl Run<'_> {
                 }
                 let (remaining, deadline) = remaining
                     .map_err(|error| if self.has_unknown(reference) { self.unknown(reference) } else { error })?;
-                match tokio::time::timeout(remaining, self.kind(task, reference, &input, ctx, scope, &desc)).await {
+                // A listen reaching its deadline suspends first; replay then
+                // performs the normal durable timeout and closes its subscription.
+                let result = if matches!(task.kind, Kind::Listen(_)) {
+                    Ok(self.kind(task, reference, &input, ctx, scope, &desc).await)
+                } else {
+                    tokio::time::timeout(remaining, self.kind(task, reference, &input, ctx, scope, &desc)).await
+                };
+                match result {
                     Ok(Err(Fault::Waiting(wake))) => return Err(Fault::Waiting(wake.min(deadline))),
                     Ok(r) => r?,
                     Err(_) => {
@@ -1073,14 +1085,36 @@ impl Run<'_> {
                 let storage = |e: anyhow::Error| Fault::Storage(WorkflowError::runtime(e.to_string()));
                 events.register(self.run_id, &types).map_err(storage)?;
                 let key = format!("{reference}#event");
-                if let Some(event) = events.take(self.run_id, &key, &types).map_err(storage)? {
-                    self.save(&key, Record::Event { event: event.clone() })?;
-                    return Ok((json!([event]), None));
-                }
                 if self.journal.is_none() {
+                    if let Some(event) = events.take(self.run_id, &key, &types).map_err(storage)? {
+                        return Ok((json!([event]), None));
+                    }
                     return Err(
                         WorkflowError::runtime("listen requires a durable journal; cannot wait in a dry run").into()
                     );
+                }
+                let mut hold = task.hold;
+                if let Some(spec) = &task.timeout {
+                    let limit = self.duration(spec, input, &args(ctx))?;
+                    let started = desc["startedAt"]["epoch"]["milliseconds"]
+                        .as_i64()
+                        .ok_or_else(|| WorkflowError::runtime("invalid task start"))?;
+                    hold = hold.min(self.remaining(limit, started)?.0);
+                }
+                let deadline = tokio::time::Instant::now() + hold;
+                loop {
+                    let notification = events.notification(self.run_id);
+                    if let Some(event) = events.take(self.run_id, &key, &types).map_err(storage)? {
+                        self.save(&key, Record::Event { event: event.clone() })?;
+                        return Ok((json!([event]), None));
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = notification => {},
+                        _ = tokio::time::sleep_until(deadline) => break,
+                    }
                 }
                 Err(Fault::Waiting(253_402_300_799_000))
             }

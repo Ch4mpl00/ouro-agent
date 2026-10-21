@@ -531,3 +531,155 @@ fn a_concurrent_take_or_timeout_does_not_close_another_listener_of_the_same_type
     assert!(lease.take("r", "d#event", &types).unwrap().is_some());
     assert!(!store.deliver("shared", &json!({})).unwrap());
 }
+
+#[tokio::test]
+async fn a_held_listener_is_notified_without_saving_a_waiting_run() {
+    use owf::run::Events;
+    let dir = tempfile::tempdir().unwrap();
+    let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
+    let runs = RunStore::new(db.clone());
+    let lease = runs.start("r", "w", "definition", &json!({})).unwrap().unwrap();
+    lease.register("r", &["answer".into()]).unwrap();
+    let notified = lease.notification("r");
+    assert!(lease.take("r", "listen#event", &["answer".into()]).unwrap().is_none());
+    assert!(runs.deliver("answer", &json!(42)).unwrap());
+    tokio::time::timeout(std::time::Duration::from_millis(100), notified).await.unwrap();
+    assert_eq!(runs.get("r").unwrap().unwrap().state, "running");
+    assert_eq!(lease.take("r", "listen#event", &["answer".into()]).unwrap().unwrap()["data"], 42);
+    lease.finish(&Status::Completed(json!(42))).unwrap();
+}
+
+#[test]
+fn child_lifecycle_is_atomic_owned_and_cascades_cancellation() {
+    use agent::durable::ChildLink;
+    use owf::run::Events;
+    let dir = tempfile::tempdir().unwrap();
+    let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
+    let runs = RunStore::new(db.clone());
+    let parent = runs.start("p", "parent", "x", &json!({})).unwrap().unwrap();
+    let child = runs
+        .start_child(
+            "c",
+            "child",
+            "original",
+            &json!({"v":1}),
+            ChildLink { parent: "p", key: "round:1", reference: "/start" },
+        )
+        .unwrap()
+        .unwrap();
+    child.finish(&Status::Waiting { wake_at_ms: i64::MAX }).unwrap();
+    assert!(parent.take("p", "waiting#event", &["waiting:c".into()]).unwrap().is_some());
+    assert!(!runs.deliver("unawaited", &json!({})).unwrap());
+    assert!(runs.child_outcome("wrong", "round:1", "c").is_err());
+    assert!(runs.child_outcome("p", "round:2", "c").is_err());
+    db.conn().execute("UPDATE workflow_runs SET wake_at_ms=0 WHERE id='c'", []).unwrap();
+    runs.claim("c").unwrap().unwrap().finish(&Status::Completed(json!(42))).unwrap();
+    assert_eq!(
+        parent.take("p", "done#event", &["done:c".into()]).unwrap().unwrap()["data"],
+        json!({"status":"completed","output":42})
+    );
+    assert_eq!(runs.child_outcome("p", "round:1", "c").unwrap(), Some(Status::Completed(json!(42))));
+    assert!(!runs.deliver("done:c", &json!({})).unwrap(), "consumed completion closes its subscription");
+    assert!(
+        runs.start_child(
+            "c",
+            "child",
+            "changed",
+            &json!({}),
+            ChildLink { parent: "p", key: "round:1", reference: "/start" }
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(runs.get("c").unwrap().unwrap().definition, "original");
+    let _active = runs
+        .start_child("active", "child", "x", &json!({}), ChildLink { parent: "p", key: "2", reference: "/start" })
+        .unwrap()
+        .unwrap();
+    let _nested = runs
+        .start_child("nested", "child", "x", &json!({}), ChildLink { parent: "active", key: "3", reference: "/start" })
+        .unwrap()
+        .unwrap();
+    parent.finish(&Status::Completed(json!({}))).unwrap();
+    for id in ["active", "nested"] {
+        assert_eq!(runs.get(id).unwrap().unwrap().outcome, Some(Status::Cancelled));
+    }
+}
+
+#[tokio::test]
+async fn held_listens_complete_suspend_timeout_and_recover_a_lost_executor() {
+    use agent::durable::Lease;
+    use async_trait::async_trait;
+    use owf::run::{self, CallInfo, Effect, Functions, Host, Limits, Silent, SystemClock, WorkflowError};
+    use serde_json::Value;
+    use std::{sync::Arc, time::Duration};
+    use tokio_util::sync::CancellationToken;
+    struct Held(Arc<Lease>);
+    #[async_trait]
+    impl Functions for Held {
+        fn effect(&self, _: &str) -> Option<Effect> {
+            None
+        }
+        fn events(&self) -> Option<&dyn run::Events> {
+            Some(&*self.0)
+        }
+        async fn call(&self, _: &str, _: Value, _: &CallInfo<'_>) -> Result<Value, WorkflowError> {
+            unreachable!()
+        }
+    }
+    for mode in ["delivery", "empty", "timeout", "crash"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.db");
+        let db = AgentDb::open(&path).unwrap();
+        db.conn().execute_batch("CREATE TABLE waiting_saved (id TEXT); CREATE TRIGGER record_waiting AFTER UPDATE OF state ON workflow_runs WHEN NEW.state='waiting' BEGIN INSERT INTO waiting_saved VALUES (NEW.id); END;").unwrap();
+        let runs = RunStore::new(db.clone());
+        let timeout = if mode == "timeout" { ", timeout: { after: PT0.02S }" } else { "" };
+        let definition = format!(
+            "document: {{ dsl: '1.0.4', namespace: t, name: held, version: '1.0.0' }}\ndo: [ {{ wait: {{ listen: {{ to: {{ one: {{ with: {{ type: answer }} }} }} }}, metadata: {{ hold: PT0.1S }}{timeout} }} }} ]"
+        );
+        let wf = owf::model::parse_yaml(&definition).unwrap();
+        let lease = Arc::new(runs.start("r", "held", &definition, &json!({})).unwrap().unwrap());
+        let host = Host {
+            functions: Arc::new(Held(lease.clone())),
+            observer: Arc::new(Silent),
+            clock: Arc::new(SystemClock),
+            limits: Limits::default(),
+            runtime: json!({}),
+        };
+        let cancel = CancellationToken::new();
+        let start = std::time::Instant::now();
+        let mut future = Box::pin(run::resume(&host, &wf, "r", json!({}), &cancel, &*lease));
+        tokio::select! { result=&mut future=>panic!("did not hold: {result:?}"),_=tokio::time::sleep(Duration::from_millis(5))=>{} }
+        if mode == "delivery" {
+            assert!(runs.deliver("answer", &json!(42)).unwrap());
+            let outcome = future.await;
+            assert!(matches!(outcome.status, Status::Completed(_)));
+            lease.finish(&outcome.status).unwrap();
+        } else if mode == "crash" {
+            drop(future);
+            // A killed process does not release: the next lease fences it.
+            db.conn().execute("UPDATE workflow_runs SET lease_until_ms=0 WHERE id='r'", []).unwrap();
+            assert!(runs.deliver("answer", &json!(42)).unwrap());
+            let recovered = RunStore::new(AgentDb::open(path).unwrap());
+            let lease = Arc::new(recovered.claim("r").unwrap().unwrap());
+            let host = Host { functions: Arc::new(Held(lease.clone())), ..host };
+            let outcome = run::resume(&host, &wf, "r", json!({}), &cancel, &*lease).await;
+            assert!(matches!(outcome.status, Status::Completed(_)));
+            lease.finish(&outcome.status).unwrap();
+        } else {
+            let outcome = future.await;
+            assert!(matches!(outcome.status, Status::Waiting { .. }));
+            lease.finish(&outcome.status).unwrap();
+            if mode == "timeout" {
+                assert!(start.elapsed() < Duration::from_millis(80))
+            } else {
+                assert!(start.elapsed() >= Duration::from_millis(90))
+            }
+        }
+        assert_eq!(
+            db.conn().query_row("SELECT count(*) FROM waiting_saved", [], |r| r.get::<_, i64>(0)).unwrap(),
+            i64::from(mode == "empty" || mode == "timeout"),
+            "{mode}"
+        );
+    }
+}

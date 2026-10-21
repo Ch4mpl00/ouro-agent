@@ -969,9 +969,9 @@ async fn confirmation_holds_exact_call_frees_supervisor_and_resumes_after_press_
         };
         if mode == "expired" {
             let conn = f.db.conn();
-            conn.execute("UPDATE workflow_runs SET wake_at_ms = 0 WHERE id = 'telegram:42/loop'", []).unwrap();
+            conn.execute("UPDATE workflow_runs SET wake_at_ms = 0 WHERE id = 'telegram:42/loop/guard/1'", []).unwrap();
             conn.execute("UPDATE confirmations SET created_at_ms = created_at_ms - 86400001", []).unwrap();
-            conn.execute("UPDATE workflow_records SET record = json_set(record, '$.started_ms', json_extract(record,'$.started_ms') - 86400001) WHERE run_id = 'telegram:42/loop' AND key LIKE '%/listen#task'", []).unwrap();
+            conn.execute("UPDATE workflow_records SET record = json_set(record, '$.started_ms', json_extract(record,'$.started_ms') - 86400001) WHERE run_id = 'telegram:42/loop/guard/1' AND key LIKE '%/listen#task'", []).unwrap();
         } else {
             let index = usize::from(mode == "declined");
             let mut press = signal("telegram_button", 44);
@@ -981,7 +981,8 @@ async fn confirmation_holds_exact_call_frees_supervisor_and_resumes_after_press_
             assert_eq!(supervisor.run_signal(&press).await.unwrap(), "Button delivered");
             assert_eq!(model.seen.lock().unwrap().len(), 2, "delivery has no model turn");
         }
-        assert_eq!(resumed.recover_once(&CancellationToken::new()).await.unwrap(), 1, "{mode}");
+        assert_eq!(resumed.recover_once(&CancellationToken::new()).await.unwrap(), 1, "{mode}: guard resumes");
+        assert_eq!(resumed.recover_once(&CancellationToken::new()).await.unwrap(), 1, "{mode}: parent resumes");
         let held: Vec<_> = mcp.calls.lock().unwrap().iter().filter(|(n, _)| n == "t1").cloned().collect();
         assert_eq!(
             held.len(),
@@ -1041,10 +1042,13 @@ async fn an_override_cannot_forge_confirmation_without_a_consumed_event() {
     let f = confirmation_fixture(model.clone(), mcp.clone());
     let definition = agent::agent::AGENT_LOOP
         .replace(
-            "${ $context.guarded.confirmable and $context.guarded.labels[$call.id] == \"needs_confirmation\" }",
-            "${ false }",
+            "call: start_child\n      with: { workflow: guard, calls: '${ $context.calls }', i: '${ $context.i }' }",
+            "set: { run: null }",
         )
-        .replace("outcome: '${ $context.confirmation_outcome // null }'", "outcome: confirmed");
+        .replace(
+            "guard_run: '${ $context.guard_run // null }'",
+            "guard_run: null\n              verdict: { label: allow }\n              outcome: confirmed",
+        );
     let version = f.engine.deps.workflows.save("agent-loop", &definition, None).unwrap();
     f.engine.deps.workflows.activate("agent-loop", version.version).unwrap();
     let flows = agent::flows::create_durable_flows(f.engine.clone(), (*f.db).clone());
@@ -1095,5 +1099,114 @@ async fn the_next_session_knows_pending_cards_in_its_conversation_only() {
     drop(seen);
     assert_eq!(mcp.calls.lock().unwrap().iter().filter(|(n, _)| n == "send_telegram_message").count(), 1);
     assert!(!mcp.calls.lock().unwrap().iter().any(|(n, _)| n == "t1"));
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_worker_confirmation_sleeps_its_parent_and_survives_restart() {
+    for restart in [false, true] {
+        let args = json!({"recipient":"worker@example.test","body":"held exactly once"});
+        let model = Arc::new(Scripted::new(vec![
+            calls(&[("invoke_sub_agent", json!({"prompt":"send the proposed message","skills":["telegram"]}))]),
+            calls(&[("t1", args.clone())]),
+            assistant("next signal answered"),
+            assistant("worker answer"),
+            assistant("parent answer"),
+        ]));
+        let mcp = Arc::new(ContextMcp::default());
+        let f = confirmation_fixture(model.clone(), mcp.clone());
+        let flows = agent::flows::create_durable_flows(f.engine.clone(), (*f.db).clone());
+        let supervisor = create_supervisor(
+            f.engine.clone(),
+            EnvDeps { mcp: mcp.clone(), memory: f.db.clone(), user_email: None, telegram_chat_id: Some("999".into()) },
+            flows.clone(),
+        );
+        let result = supervisor.run_signal(&signal("telegram", 42)).await.unwrap();
+        assert!(result.contains("resumes"), "{result}");
+        let runs = agent::durable::RunStore::new((*f.db).clone());
+        let worker = "telegram:42__sub1.0/loop";
+        for id in ["telegram:42/loop", worker, "telegram:42__sub1.0/loop/guard/1"] {
+            assert_eq!(runs.get(id).unwrap().unwrap().state, "waiting", "{id}");
+        }
+        assert_eq!(
+            runs.get(worker).unwrap().unwrap().input["loop"]["confirm"],
+            json!({"chatId":"-10042","messageThreadId":7})
+        );
+        assert_eq!(supervisor.run_signal(&signal("peer", 43)).await.unwrap(), "next signal answered");
+        assert!(!mcp.calls.lock().unwrap().iter().any(|(n, _)| n == "t1"));
+        let card = mcp.calls.lock().unwrap().iter().find(|(n, _)| n == "send_telegram_message").unwrap().1.clone();
+        let mut restarted = confirmation_fixture(model.clone(), mcp.clone());
+        let resumed = if restart {
+            restarted.db = Arc::new(agent::db::AgentDb::open(f.root.path().join("agent.db")).unwrap());
+            Arc::get_mut(&mut restarted.engine).unwrap().deps.memory = restarted.db.clone();
+            agent::flows::create_durable_flows(restarted.engine.clone(), (*restarted.db).clone())
+        } else {
+            flows
+        };
+        let mut press = signal("telegram_button", 44);
+        press.content=json!({"chatId":-10042,"messageThreadId":7,"messageId":700,"data":card["buttons"][0][0]["data"],"text":"Confirm"}).to_string();
+        assert_eq!(supervisor.run_signal(&press).await.unwrap(), "Button delivered");
+        for _ in 0..3 {
+            assert_eq!(resumed.recover_once(&CancellationToken::new()).await.unwrap(), 1);
+        }
+        assert_eq!(
+            runs.get(worker).unwrap().unwrap().outcome,
+            Some(owf::run::Status::Completed(json!("worker answer")))
+        );
+        assert_eq!(
+            runs.get("telegram:42/loop").unwrap().unwrap().outcome,
+            Some(owf::run::Status::Completed(json!("parent answer")))
+        );
+        let held: Vec<_> = mcp.calls.lock().unwrap().iter().filter(|(n, _)| n == "t1").cloned().collect();
+        assert_eq!(held.len(), 1);
+        assert_eq!(json!(held[0].1), args);
+        assert_eq!(mcp.calls.lock().unwrap().iter().filter(|(n, _)| n == "send_telegram_message").count(), 1);
+        assert_eq!(resumed.recover_once(&CancellationToken::new()).await.unwrap(), 0);
+        supervisor.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn confirmation_during_the_hold_finishes_without_any_saved_waiting_state() {
+    let model = Arc::new(Scripted::new(vec![calls(&[("t1", json!({"body":"held"}))]), assistant("done")]));
+    let mcp = Arc::new(ContextMcp::default());
+    let f = confirmation_fixture(model, mcp.clone());
+    f.db.conn().execute_batch("CREATE TABLE waiting_saved (id TEXT); CREATE TRIGGER record_waiting AFTER UPDATE OF state ON workflow_runs WHEN NEW.state='waiting' BEGIN INSERT INTO waiting_saved VALUES (NEW.id); END;").unwrap();
+    let flows = agent::flows::create_durable_flows(f.engine.clone(), (*f.db).clone());
+    let supervisor = create_supervisor(
+        f.engine.clone(),
+        EnvDeps { mcp: mcp.clone(), memory: f.db.clone(), user_email: None, telegram_chat_id: Some("999".into()) },
+        flows,
+    );
+    let incoming = signal("telegram", 42);
+    let future = supervisor.run_signal(&incoming);
+    tokio::pin!(future);
+    let card = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                result=&mut future=>panic!("finished before pressing: {result:?}"),
+                _=tokio::time::sleep(std::time::Duration::from_millis(1))=>{}
+            }
+            if let Some(card) =
+                mcp.calls.lock().unwrap().iter().find(|(n, _)| n == "send_telegram_message").map(|(_, a)| a.clone())
+            {
+                break card;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let store = agent::durable::RunStore::new((*f.db).clone());
+    assert!(
+        store
+            .deliver(
+                card["buttons"][0][0]["data"].as_str().unwrap(),
+                &json!({"chatId":-10042,"messageThreadId":7,"messageId":700})
+            )
+            .unwrap()
+    );
+    assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(2), future).await.unwrap().unwrap(), "done");
+    assert_eq!(f.db.conn().query_row("SELECT count(*) FROM waiting_saved", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(mcp.calls.lock().unwrap().iter().filter(|(n, _)| n == "t1").count(), 1);
     supervisor.shutdown().await;
 }

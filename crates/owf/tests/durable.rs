@@ -1045,8 +1045,15 @@ struct Inbox {
     journal: Arc<Store>,
     queued: Mutex<Vec<Value>>,
     registered: Mutex<Vec<String>>,
+    notify: tokio::sync::Notify,
 }
 impl run::Events for Inbox {
+    fn notification(&self, _: &str) -> futures::future::BoxFuture<'_, ()> {
+        let mut future = Box::pin(self.notify.notified());
+        future.as_mut().enable();
+        Box::pin(future)
+    }
+
     fn unregister(&self, _: &str, _: &str, types: &[String]) -> anyhow::Result<()> {
         self.registered.lock().unwrap().retain(|t| !types.contains(t));
         Ok(())
@@ -1182,4 +1189,57 @@ async fn ephemeral_listen_consumes_an_available_event_but_never_waits() {
         run::run(&h, &wf, "empty", json!({}), &CancellationToken::new()).await.status,
         Status::Faulted(_)
     ));
+}
+
+#[test]
+fn listen_hold_requires_a_literal_duration_on_a_listen() {
+    for hold in ["wrong", "42", "'${ .delay }'", "{}"] {
+        let yaml = format!(
+            "document: {{ dsl: '1.0.4', namespace: t, name: w, version: '0.1.0' }}\ndo: [ {{ w: {{ listen: {{ to: {{ one: {{ with: {{ type: x }} }} }} }}, metadata: {{ hold: {hold} }} }} }} ]"
+        );
+        assert!(model::parse_yaml(&yaml).unwrap_err().to_string().contains("metadata/hold"));
+    }
+}
+
+#[tokio::test]
+async fn listen_holds_until_delivery_or_the_shorter_deadline_and_replays_a_crash() {
+    use std::time::Duration;
+    for mode in ["delivery", "empty", "timeout", "crash"] {
+        let inbox = Arc::new(Inbox::default());
+        let time = Arc::new(Time(AtomicI64::new(1_000)));
+        let h = event_host(inbox.clone(), time);
+        let timeout = if mode == "timeout" { ", timeout: { after: PT0.02S }" } else { "" };
+        let wf = workflow(&format!(
+            "do: [ {{ w: {{ listen: {{ to: {{ one: {{ with: {{ type: x }} }} }} }}, metadata: {{ hold: PT0.1S }}{timeout} }} }} ]"
+        ));
+        let token = CancellationToken::new();
+        let mut future = Box::pin(run::resume(&h, &wf, "run", json!({}), &token, &*inbox.journal));
+        tokio::select! {
+            result = &mut future => panic!("did not hold: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+        }
+        if mode == "crash" {
+            // Dropping the executor during a hold leaves only the task start.
+            drop(future);
+            inbox.queued.lock().unwrap().push(delivered("x"));
+            assert_eq!(
+                run::resume(&h, &wf, "run", json!({}), &token, &*inbox.journal).await.status,
+                Status::Completed(json!([delivered("x")]))
+            );
+        } else if mode == "delivery" {
+            inbox.queued.lock().unwrap().push(delivered("x"));
+            inbox.notify.notify_waiters();
+            assert_eq!(future.await.status, Status::Completed(json!([delivered("x")])));
+        } else {
+            let start = tokio::time::Instant::now();
+            let result = future.await.status;
+            assert!(matches!(result, Status::Waiting { .. }), "{result:?}");
+            if mode == "timeout" {
+                assert_eq!(result, Status::Waiting { wake_at_ms: 1020 });
+                assert!(start.elapsed() < Duration::from_millis(80));
+            } else {
+                assert!(start.elapsed() >= Duration::from_millis(80));
+            }
+        }
+    }
 }

@@ -101,7 +101,16 @@ deletion.
    it from its last round. The agent may activate its own version of
    `agent-loop`; three faults of it in a row fall back to the built-in one
    (`flows.rs` §4b). A worker of the durable primary loop is a durable run of
-   its own, which a resumed parent joins. A missing saved workflow or one that
+   its own, started immediately as an owned child. The parent joins it with
+   `listen` (15 minute in-memory hold); a worker waiting for confirmation lets
+   the parent sleep durably and the supervisor take the next signal. Workers
+   inherit the admitted confirmation target. A round's guard is a reserved
+   built-in child workflow (`workflows/guard.yaml`): Rust reviews the calls,
+   YAML sequences concurrent cards and event waits, and `tool` reads the
+   verified final verdicts from its owned child's stored outcome. Fast guard
+   results use a 60 second hold and never suspend the parent; rounds with only
+   local reads skip the guard child. Existing runs retain their definitions.
+   A missing saved workflow or one that
    faulted before any write call hands over to the agent loop in the same
    trace; a saved workflow that faulted after a write goes to `recovery`
    instead of being retried. Writes are the MCP tools without `readOnlyHint` (plus `set_memory`). The agent-loop path loads:
@@ -173,7 +182,8 @@ mcp-tools/
     │   ├── src/guard.rs                    loop write/open-world policy, deterministic rules, batched verdicts
     │   ├── guard/                          compiled guard instructions and reason data (git-owned)
     │   ├── workflows/                      the built-in OWF workflows in git: agent-loop.yaml
-    │   │                                   (every loop), signal.yaml (every signal)
+    │   │                                   (every loop), signal.yaml (every signal),
+    │   │                                   guard.yaml (reserved round review and confirmation)
     │   ├── src/activity.rs                 traces → ouro/activity journal notes (background
     │   │                                   task inside the supervisor)
     │   ├── src/providers.rs                ChatProviders: openai, gemini, deepseek, openrouter

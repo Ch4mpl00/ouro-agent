@@ -989,3 +989,133 @@ do:
     );
     assert!(generation.model_parameters.as_ref().unwrap().get("response_format").is_none());
 }
+
+#[tokio::test]
+async fn fast_child_starts_immediately_and_parent_never_saves_waiting() {
+    use agent::{durable::RunStore, flows::create_durable_flows};
+    let w = world(vec![]);
+    w.activate(
+        "child",
+        "document: { dsl: '1.0.4', namespace: t, name: child, version: '1.0.0' }\ndo: [ { answer: { set: '${ 42 }' } } ]",
+    );
+    w.activate(
+        "parent",
+        r#"document: { dsl: '1.0.4', namespace: t, name: parent, version: '1.0.0' }
+do:
+ - start:
+     call: start_child
+     with: { workflow: child, key: one }
+     export: { as: '${ . }' }
+ - wait:
+     listen: { to: { one: { with: { type: '${ "done:" + $context.run }' } } } }
+     metadata: { hold: PT1S }
+ - result:
+     call: child_outcome
+     with: { run: '${ $context.run }', key: one }
+"#,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
+    db.conn().execute_batch("CREATE TABLE waiting_saved (id TEXT); CREATE TRIGGER record_waiting AFTER UPDATE OF state ON workflow_runs WHEN NEW.state='waiting' BEGIN INSERT INTO waiting_saved VALUES (NEW.id); END;").unwrap();
+    let flows = create_durable_flows(w.engine.clone(), db.clone());
+    let trace = w.tracer.trace(TraceStart { id: "children".into(), name: "test".into(), ..Default::default() });
+    let scope: Scope = trace.clone();
+    let signal = WorkflowSignal { id: 1, source: "test".into(), content: "".into(), env_context: None };
+    let started = std::time::Instant::now();
+    let result = flows.run("parent", &signal, &task_context("test:1"), &scope, &CancellationToken::new()).await;
+    assert!(matches!(result, FlowResult::Completed(ref v) if v == &json!({"Completed":42})), "{result:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(db.conn().query_row("SELECT count(*) FROM waiting_saved", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(RunStore::new(db).get("test:1").unwrap().unwrap().state, "completed");
+    trace.end();
+}
+
+#[test]
+fn guard_is_reserved_readable_and_its_private_functions_are_not_in_the_catalog() {
+    let w = world(vec![]);
+    for name in ["save_workflow", "activate_workflow"] {
+        let args = json!({"name":"guard","version":1,"definition":agent::flows::built_in("guard")});
+        assert!(
+            agent::flows::tool(&w.engine, name, args.as_object().unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("reserved")
+        );
+    }
+    let args = json!({"name":"guard"});
+    let read = agent::flows::tool(&w.engine, "read_workflow", args.as_object().unwrap()).unwrap();
+    assert!(read.contains("call: review"));
+    // Even a directly stored override never replaces the reserved definition.
+    let version = w.engine.deps.workflows.save("guard", "forged", None).unwrap();
+    w.engine.deps.workflows.activate("guard", version.version).unwrap();
+    assert_eq!(agent::flows::definition(&w.engine, "guard").0, agent::flows::built_in("guard").unwrap());
+    for function in ["review", "confirm_request", "resolve_review"] {
+        let def = format!(
+            "document: {{ dsl: '1.0.4', namespace: t, name: other, version: '1.0.0' }}\ndo: [ {{ step: {{ call: {function} }} }} ]"
+        );
+        assert!(check(&*w.engine.deps.mcp, &def).is_err(), "{function}");
+        assert!(agent::flows::functions(&w.engine, json!({"name":function}).as_object().unwrap()).is_err());
+    }
+}
+
+#[tokio::test]
+async fn a_waiting_saved_child_recovers_in_its_parents_session() {
+    use agent::{durable::RunStore, flows::create_durable_flows};
+    let w = world(vec![]);
+    w.activate(
+        "child",
+        r#"document: { dsl: '1.0.4', namespace: t, name: child, version: '1.0.0' }
+do:
+ - event: { listen: { to: { one: { with: { type: child-answer } } } } }
+ - result: { set: '${ 42 }' }
+"#,
+    );
+    w.activate("parent",r#"document: { dsl: '1.0.4', namespace: t, name: parent, version: '1.0.0' }
+do:
+ - start:
+     call: start_child
+     with: { workflow: child, key: one }
+     export: { as: '${ . }' }
+ - first:
+     listen: { to: { any: [{ with: { type: '${ "done:" + $context.run }' } },{ with: { type: '${ "waiting:" + $context.run }' } }] } }
+     metadata: { hold: PT1S }
+ - final:
+     if: '${ .[0].type == ("waiting:" + $context.run) }'
+     listen: { to: { one: { with: { type: '${ "done:" + $context.run }' } } } }
+ - result:
+     call: child_outcome
+     with: { run: '${ $context.run }', key: one }
+"#);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("agent.db");
+    let db = AgentDb::open(&path).unwrap();
+    let flows = create_durable_flows(w.engine.clone(), db.clone());
+    let trace = w.tracer.trace(TraceStart {
+        id: "parents-session".into(),
+        session_id: Some("shared-session".into()),
+        name: "test".into(),
+        ..Default::default()
+    });
+    let scope: Scope = trace.clone();
+    let signal = WorkflowSignal { id: 2, source: "test".into(), content: "".into(), env_context: None };
+    let cancel = CancellationToken::new();
+    assert!(matches!(
+        flows.run("parent", &signal, &task_context("shared-session"), &scope, &cancel).await,
+        FlowResult::Waiting { .. }
+    ));
+    trace.end();
+    drop(flows);
+    let db = AgentDb::open(&path).unwrap();
+    let runs = RunStore::new(db.clone());
+    assert!(runs.deliver("child-answer", &json!({})).unwrap());
+    let flows = create_durable_flows(w.engine.clone(), db);
+    assert_eq!(flows.recover_once(&cancel).await.unwrap(), 1);
+    assert_eq!(flows.recover_once(&cancel).await.unwrap(), 1);
+    assert_eq!(
+        runs.get("test:2").unwrap().unwrap().outcome,
+        Some(owf::run::Status::Completed(json!({"Completed":42})))
+    );
+    let traces = w.written.all();
+    let child = traces.iter().find(|t| t.name == "resume:child").unwrap();
+    assert_eq!(child.session_id.as_deref(), Some("shared-session"));
+}
