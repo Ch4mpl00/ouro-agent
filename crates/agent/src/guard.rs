@@ -196,6 +196,9 @@ fn target(call: &ToolCall, context: &Context) -> Option<String> {
     let args: Value = serde_json::from_str(&call.arguments).ok()?;
     match call.name.as_str() {
         "send_telegram_message" => args.get("chatId").and_then(identifier).or_else(|| context.default_chat.clone()),
+        "edit_telegram_message" | "start_typing" | "send_telegram_chat_action" => {
+            args.get("chatId").and_then(identifier)
+        }
         "reply_to_peer" => args.get("threadId").and_then(identifier),
         _ => None,
     }
@@ -213,6 +216,9 @@ static SECRET: LazyLock<Regex> = LazyLock::new(|| {
     ))
     .expect("secret patterns")
 });
+static LINK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)[a-z][a-z0-9+.-]*://|www\.|\b[a-z0-9-]+\.[a-z]{2,}/").expect("link pattern"));
+const TEST_CONFIRM: &str = "guard test confirm";
 fn has_secret(value: &Value) -> bool {
     match value {
         Value::String(s) => SECRET.is_match(s),
@@ -232,6 +238,17 @@ fn deterministic(context: &Context, call: &ToolCall) -> Option<Verdict> {
         "unknown_chat"
     } else if has_secret(&serde_json::from_str::<Value>(&call.arguments).unwrap_or_else(|_| json!(call.arguments))) {
         "secret_pattern"
+    } else if current_reply(context, call) && !LINK.is_match(&call.arguments) {
+        // Text shown to the user in their own conversation leaves nothing to
+        // anyone else; Jev blocked such replies as "a different kind than
+        // asked" (a draft shown when the user said "send"). A link still goes
+        // to Jev: a preview fetches it, and it can be a phishing lure.
+        "allow"
+    } else if [&context.task, &context.root_request].iter().any(|r| r.to_lowercase().contains(TEST_CONFIRM)) {
+        // The user's switch for trying the confirmation card on a real call.
+        // It only ever asks for more than Jev would, so retrieved text that
+        // carries the phrase can't weaken anything.
+        "needs_confirmation"
     } else {
         return None;
     };
@@ -397,7 +414,8 @@ mod tests {
             ..Default::default()
         };
         for id in [json!(-100123), json!("42"), json!(99), Value::Null] {
-            assert!(deterministic(&context, &call("send_telegram_message", json!({"chatId":id}))).is_none());
+            let verdict = deterministic(&context, &call("send_telegram_message", json!({"chatId":id})));
+            assert!(verdict.is_none_or(|v| v.label != "unknown_chat"), "{id}");
         }
         for id in [4, 142, 100123, 7] {
             assert_eq!(
@@ -407,6 +425,27 @@ mod tests {
         }
         assert!(!current_reply(&context, &call("send_telegram_message", json!({"chatId":99}))));
         assert!(current_reply(&context, &call("reply_to_peer", json!({"threadId":"42"}))));
+    }
+    #[test]
+    fn plain_replies_to_the_conversation_skip_jev_and_links_do_not() {
+        let context = Context { task: "Telegram message in chat 42. Text: \"send\"".into(), ..Default::default() };
+        let label = |name: &str, args: Value| deterministic(&context, &call(name, args)).map(|v| v.label);
+        assert_eq!(label("send_telegram_message", json!({"chatId":42,"text":"Draft: the cat ate"})).unwrap(), "allow");
+        assert_eq!(label("start_typing", json!({"chatId":"42"})).unwrap(), "allow");
+        for text in ["see https://x.io", "www.example.com", "pic: cdn.example.org/a.png?d=1", "tg://resolve"] {
+            assert!(label("send_telegram_message", json!({"chatId":42,"text":text})).is_none(), "{text}");
+        }
+        // Another conversation is never a reply, whatever the text.
+        assert!(label("edit_telegram_message", json!({"chatId":43,"text":"hi"})).is_none());
+    }
+    #[test]
+    fn the_test_phrase_asks_for_confirmation_but_never_relaxes() {
+        let context =
+            Context { task: "Guard test confirm: remember the cat sleeps (chat 42)".into(), ..Default::default() };
+        let label = |name: &str, args: Value| deterministic(&context, &call(name, args)).map(|v| v.label);
+        assert_eq!(label("remember", json!({"text":"the cat sleeps"})).unwrap(), "needs_confirmation");
+        assert_eq!(label("send_telegram_message", json!({"chatId":42,"text":"asking"})).unwrap(), "allow");
+        assert_eq!(label("send_telegram_message", json!({"chatId":7,"text":"x"})).unwrap(), "unknown_chat");
     }
     #[test]
     fn evidence_and_goal_have_visible_unicode_safe_limits() {

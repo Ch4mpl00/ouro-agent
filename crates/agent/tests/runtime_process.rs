@@ -65,7 +65,7 @@ impl ServerHandler for Server {
         let result = match p.name.as_ref() {
             "get_next_signal" => {
                 if self.0.polls.fetch_add(1, Ordering::SeqCst) == 0 {
-                    json!({"signal":{"id":42,"source":self.0.source,"content":if self.0.source=="telegram"{"Telegram message in chat 42.\nText: \"hello\""}else{"Task: reply in Telegram chat 42."},"envContext":"Send to chat 42","created_at":"2026-10-01T12:00:00Z"},"pendingAfter":0})
+                    json!({"signal":{"id":42,"source":self.0.source,"content":if self.0.source=="telegram"{"Telegram message in chat 42.\nText: \"hello\""}else{"Task: reply in Telegram."},"envContext":"Send to chat 42","created_at":"2026-10-01T12:00:00Z"},"pendingAfter":0})
                 } else {
                     json!({"signal":null,"pendingAfter":0})
                 }
@@ -206,8 +206,12 @@ async fn binary_runs_scheduler_and_agent_sources_and_flushes_matching_otel_ids()
         let output = tokio::time::timeout(Duration::from_secs(10), f.child(true).output()).await.unwrap().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         assert_eq!(f.state.sends.load(Ordering::SeqCst), 1);
-        assert!(
-            f.state.decisions.lock().unwrap().iter().any(|r| r["state"]["calls"][0]["name"] == "send_telegram_message")
+        // A plain reply to the conversation the request came from skips Jev;
+        // a send to the default chat on a scheduler's behalf is judged.
+        assert_eq!(
+            f.state.decisions.lock().unwrap().iter().any(|r| r["state"]["calls"][0]["name"] == "send_telegram_message"),
+            source != "telegram",
+            "{source}"
         );
         let (trace, observations) = f.trace();
         assert_eq!(trace.metadata.as_ref().unwrap()["activity"], "run");
