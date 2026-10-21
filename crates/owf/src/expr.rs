@@ -92,10 +92,21 @@ fn run(code: &str, args: &Args, input: Option<&Value>) -> Result<Value, String> 
         // `empty` (no output) reads as null: an absent value, not a failure.
         None => Ok(Value::Null),
         Some(Ok(v)) => from_val(&v),
+        // The value it ran on, so the author sees what the expression met.
         Some(Err(exn)) => match exn.get_err() {
-            Ok(e) => Err(format!("jq `{code}` failed: {e}")),
+            Ok(e) => Err(format!("jq `{code}` failed on {}: {e}", clip(&input.to_string(), INPUT_SHOWN))),
             Err(_) => Err(format!("jq `{code}` halted; halt is not allowed in workflows")),
         },
+    }
+}
+
+// How much of the value a failed expression ran on its error shows.
+const INPUT_SHOWN: usize = 300;
+
+fn clip(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((end, _)) => format!("{}… ({} characters)", &text[..end], text.chars().count()),
+        None => text.to_owned(),
     }
 }
 

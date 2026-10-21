@@ -980,6 +980,9 @@ impl Observer for Spans {
                     span.end(SpanEnd::output(json!({"waiting_until_ms":wake_at_ms})));
                 }
             }
+            Event::SwitchCase { reference, case } => {
+                self.scope(reference).update(crate::tracing::ContextUpdate::metadata(metadata(json!({"case":case}))))
+            }
             Event::TaskFaulted { reference, error } => match self.take(reference) {
                 Some(span) => span.end(SpanEnd::error(error.to_string()).with_output(json!(error))),
                 // Faulted before it started (its `if` or a limit).
@@ -2626,7 +2629,7 @@ impl Observer for DrySteps {
             Event::TaskRetrying { reference, attempt, error, .. } => {
                 json!({"task": reference, "retry": attempt, "error": error.to_string()})
             }
-            Event::TaskSuspended { .. } => return,
+            Event::TaskSuspended { .. } | Event::SwitchCase { .. } => return,
         };
         if report.steps.len() < DRY_MAX_STEPS {
             report.steps.push(step);

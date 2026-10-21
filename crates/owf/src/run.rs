@@ -105,6 +105,12 @@ pub enum Event<'a> {
         reference: &'a str,
         wake_at_ms: i64,
     },
+    /// A `switch` took `case` (its default case included). A switch whose
+    /// cases all miss with no default takes none and reports none.
+    SwitchCase {
+        reference: &'a str,
+        case: &'a str,
+    },
     TaskFaulted {
         reference: &'a str,
         error: &'a WorkflowError,
@@ -193,11 +199,16 @@ pub struct Limits {
     /// The longest a `wait` or a retry delay sleeps (a dry run's `ZERO`);
     /// `None`: as long as the definition says.
     pub max_sleep: Option<Duration>,
+    /// The longest a `listen` with a `timeout` waits for its event; past it
+    /// the timeout fires at once instead of the run suspending until it (a
+    /// dry run's `ZERO`: an event not already delivered has expired).
+    /// `None`: the listen holds and suspends as the definition says.
+    pub max_listen: Option<Duration>,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_tasks: 10_000, max_attempts: 10, max_sleep: None }
+        Self { max_tasks: 10_000, max_attempts: 10, max_sleep: None, max_listen: None }
     }
 }
 
@@ -1057,16 +1068,20 @@ impl Run<'_> {
             }
             Kind::Switch(cases) => {
                 let a = args(ctx);
-                for (_, case) in cases {
+                for (name, case) in cases {
                     let hit = match &case.when {
                         None => false,
                         Some(w) => expr::truthy(&expr::eval(w, input, &a).map_err(expression)?),
                     };
                     if hit {
+                        self.observe(Event::SwitchCase { reference, case: name });
                         return Ok((input.clone(), Some(case.then.clone())));
                     }
                 }
-                let default = cases.iter().find(|(_, case)| case.when.is_none()).map(|(_, case)| case.then.clone());
+                let default = cases.iter().find(|(_, case)| case.when.is_none()).map(|(name, case)| {
+                    self.observe(Event::SwitchCase { reference, case: name });
+                    case.then.clone()
+                });
                 // Without a default, the task's own `then` applies.
                 Ok((input.clone(), default))
             }
@@ -1094,12 +1109,19 @@ impl Run<'_> {
                     );
                 }
                 let mut hold = task.hold;
+                // The host's ceiling, when it is reached first: the timeout
+                // fires there instead of the run suspending until it.
+                let mut expires = None;
                 if let Some(spec) = &task.timeout {
                     let limit = self.duration(spec, input, &args(ctx))?;
                     let started = desc["startedAt"]["epoch"]["milliseconds"]
                         .as_i64()
                         .ok_or_else(|| WorkflowError::runtime("invalid task start"))?;
                     hold = hold.min(self.remaining(limit, started)?.0);
+                    if let Some(max) = self.host.limits.max_listen.filter(|max| *max <= hold) {
+                        hold = max;
+                        expires = Some(limit);
+                    }
                 }
                 let deadline = tokio::time::Instant::now() + hold;
                 loop {
@@ -1115,6 +1137,13 @@ impl Run<'_> {
                         _ = notification => {},
                         _ = tokio::time::sleep_until(deadline) => break,
                     }
+                }
+                if let Some(limit) = expires {
+                    events.unregister(self.run_id, &key, &types).map_err(storage)?;
+                    return Err(WorkflowError::timeout(format!(
+                        "{reference} did not receive an event within {limit:?} (the host does not wait longer than {hold:?})"
+                    ))
+                    .into());
                 }
                 Err(Fault::Waiting(253_402_300_799_000))
             }
@@ -1688,6 +1717,7 @@ mod tests {
                 Event::TaskCompleted { reference, .. } => format!("done {reference}"),
                 Event::TaskFaulted { reference, .. } => format!("fault {reference}"),
                 Event::TaskSuspended { reference, .. } => format!("wait {reference}"),
+                Event::SwitchCase { reference, case } => format!("case {reference} {case}"),
                 Event::TaskRetrying { reference, attempt, delay, .. } => {
                     format!("retry {reference} #{attempt} after {}s", delay.as_secs())
                 }
