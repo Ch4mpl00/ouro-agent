@@ -58,6 +58,8 @@ async fn a_reply_ends_the_telegram_variant_in_one_turn_and_is_the_trace_output()
     assert_eq!(trace.output, json!("delivered reply"));
 }
 
+// The rule decides on what the call asked for and whether it succeeded: the
+// reply is never read, so a dry run's mock ends the loop as a real send does.
 #[tokio::test]
 async fn only_successful_sends_to_the_exact_conversation_count() {
     for (name, args, delivered) in [
@@ -76,7 +78,7 @@ async fn only_successful_sends_to_the_exact_conversation_count() {
         ),
         (
             "send_telegram_message",
-            json!({"chatId":"42","messageThreadId":7,"text":"unconfirmed result","output":"{\"delivered\":false}"}),
+            json!({"chatId":"43","messageThreadId":7,"text":"elsewhere","output":json!({"delivered":true,"chatId":42,"messageThreadId":7}).to_string()}),
             false,
         ),
         ("send_telegram_message", sent("42", Some(7), "reply"), true),
@@ -87,19 +89,10 @@ async fn only_successful_sends_to_the_exact_conversation_count() {
         ),
         (
             "send_telegram_message",
-            json!({"chatId":"42","messageThreadId":7,"text":"wrong effective topic","output":json!({"delivered":true,"chatId":42,"messageThreadId":null}).to_string()}),
-            false,
-        ),
-        (
-            "send_telegram_message",
-            json!({"chatId":"42","messageThreadId":7,"text":"wrong effective chat","output":json!({"delivered":true,"chatId":43,"messageThreadId":7}).to_string()}),
-            false,
-        ),
-        (
-            "send_telegram_message",
-            json!({"chatId":"43","messageThreadId":7,"text":"reply","output":json!({"delivered":true,"chatId":42,"messageThreadId":7}).to_string()}),
+            json!({"chatId":"42","messageThreadId":7,"text":"reply","output":json!({"delivered":false,"chatId":43,"messageThreadId":null}).to_string()}),
             true,
         ),
+        ("send_telegram_message", json!({"chatId":"42","messageThreadId":7,"text":"reply","output":MOCK}), true),
     ] {
         let model = Arc::new(Scripted::new(vec![
             calls(&[(name, args)]),
@@ -125,6 +118,8 @@ async fn only_successful_sends_to_the_exact_conversation_count() {
         }
     }
 }
+
+const MOCK: &str = agent::sandbox::MOCK_REPLY;
 
 #[tokio::test]
 async fn a_guard_blocked_send_does_not_end_the_loop() {

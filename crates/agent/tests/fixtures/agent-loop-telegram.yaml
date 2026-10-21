@@ -89,13 +89,14 @@ do:
       export: { as: '${ $context + { messages: ($context.messages + .replies), memory: .memory } }' }
   - delivery:
       # Delivery policy belongs here: the host only records generic outcomes.
+      # It decides on what the call asked for and whether it succeeded, never
+      # on the reply, which a dry run answers with a mock.
       set: >-
         ${ . + { reply: ([ .outcomes[]
-          | select(.ok and .name == "send_telegram_message" and (.result | type) == "object")
-          | select(.result.delivered == true)
+          | select(.ok and .name == "send_telegram_message" and (.arguments | type) == "object")
           | select($context.loop.conversation != null)
-          | select(((if (.result | has("chatId")) then .result.chatId else .arguments.chatId end) | tostring) == ($context.loop.conversation.chatId | tostring))
-          | select((if (.result | has("messageThreadId")) then .result.messageThreadId else .arguments.messageThreadId end) == $context.loop.conversation.messageThreadId)
+          | select((.arguments.chatId | tostring) == ($context.loop.conversation.chatId | tostring))
+          | select(.arguments.messageThreadId == $context.loop.conversation.messageThreadId)
           | .arguments.text | select(type == "string") ] | last) } }
       export: { as: '${ $context + { replied: (($context.replied // false) or .reply != null) } }' }
   - next:

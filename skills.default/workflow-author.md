@@ -43,7 +43,9 @@ re-planned on every fire.
    accepted reply names flows that are legal but usually a mistake: fix
    them too unless you meant exactly that.
 5. Try it: `try_workflow(name)` runs the saved draft now, on today's data,
-   as a scheduled fire would, except that its writes are only recorded.
+   as a scheduled fire would, except that its writes are only recorded and
+   answered with a mock. (A loop, a route or `signal` is tried on a signal
+   instead: see "Trying a loop, a route or the dispatcher".)
    Read the report as the user would live with it:
    - it ended `completed`, and its `path` is the one you meant: every
      task that ran, in order; a task of another branch in it (the "nothing
@@ -210,17 +212,20 @@ whether a reply ends the loop.
 
 `loop.conversation` is `{chatId, messageThreadId}` for the incoming conversation,
 else null (including workers). For example, an exit switch after settle can
-use this jq condition to recognize a delivered reply to the exact conversation:
+use this jq condition to recognize a successful reply to the exact conversation:
 
     ${ $context.loop.conversation as $c | $c != null and any(.outcomes[];
-       .ok and .name == "send_telegram_message" and (.result | type) == "object"
-       and .result.delivered == true
-       and ((if (.result | has("chatId")) then .result.chatId else .arguments.chatId end) | tostring) == ($c.chatId | tostring)
-       and (if (.result | has("messageThreadId")) then .result.messageThreadId else .arguments.messageThreadId end) == $c.messageThreadId) }
+       .ok and .name == "send_telegram_message" and (.arguments | type) == "object"
+       and (.arguments.chatId | tostring) == ($c.chatId | tostring)
+       and .arguments.messageThreadId == $c.messageThreadId) }
 
-Select the matching outcome's `arguments.text` as the final output if desired.
-The same pattern works for any channel's reply tool. Keep any reminder flag
-in context so it survives restarts and fires only once.
+Decide on what a call asked for (`arguments`) and whether it succeeded
+(`ok`), never on a write's reply (`result`): a failed send is not `ok`, and
+in a dry run every write answers a mock (below), so a rule that reads the
+reply behaves differently there than in production. Select the matching
+outcome's `arguments.text` as the final output if desired. The same pattern
+works for any channel's reply tool. Keep any reminder flag in context so it
+survives restarts and fires only once.
 
 `primary_loop` selects a variant with `loop: <name>` and loads transport rules
 with `skills: [<name>]`. `invoke_sub_agent` accepts `loop:` too; otherwise the
@@ -234,8 +239,9 @@ workers, joined with `listen`, survive restarts.
 Resolution is the active version of the selected name, else that name's git
 definition, else `agent-loop`. Each name has its own breaker: three faults in
 a row fall back to its git definition (or `agent-loop`). Definitions are fixed
-at admission. Runtime loops and signal routes need no dry run; activate only
-after the user agrees.
+at admission. A loop, a route or a `signal` override is activated like any
+workflow: after a completed dry run on a signal (below) and the user's
+agreement; the breaker is only the second line.
 
 Start a signal route from `read_workflow("signal")`. The dispatcher already
 offered buttons to waiting runs, opened the session and handled a scheduled
@@ -290,6 +296,48 @@ Unmatched presses enter the primary loop with Telegram history. Its
 conversation for Telegram, the default chat for other sources. A null target
 keeps blocking. `pending_confirmations` adds information about existing cards
 to a later session without taking action.
+
+## Trying a loop, a route or the dispatcher
+
+A loop, a route and `signal` run on signals, so you try them on one:
+`try_workflow(name, signal: {source, content, envContext?, payload?},
+drafts: [...], confirm?)` runs the signal as if it had just arrived, through
+the whole chain: the dispatcher, the route it picks, the loop, the guard,
+workers. `name` and every name in `drafts` run at their latest saved version
+instead of the active one, in this run only; name every draft of the chain
+you changed (the route and the loop it selects, say).
+
+- **The signal.** Model it on a real one; never invent its shape.
+  `try_workflow(name, signal: {})` runs nothing and lists the signal types
+  this agent receives, each with its latest real signal: copy its form (a
+  Telegram signal's header line with the chat and thread, a peer's
+  "Message from …, thread N"), change only the text. A source that is not
+  one of them is refused.
+- **What is real.** Model turns (they cost what a real signal costs), reads,
+  the internet and MCP's reads included, and the guard (its rules and its
+  model). Every write is recorded instead, with its arguments, and answers
+  `{"mock": true, "note": "dry run: not executed", "delivered": true}`,
+  marked `mock` in the trace; a worker runs, dry too. Nothing is kept: no
+  message, card, memory, journal entry, schedule, skill or workflow changes.
+- **Confirmations.** A call the guard asks the user about is answered on the
+  spot: `confirm: "accept"` (the default), `"decline"` or `"expire"`; try
+  each branch your loop must handle.
+- **The trace.** `status` and `output`, `ended` (how the primary loop ended:
+  `finish`, `answer`, a `workflow rule` and the step it ended at, `limit` or
+  `fault`; `nudged` when it got a reminder), `writes`, and `runs`: each
+  workflow that ran, with its `version` (`draft vN` for yours), its `path`
+  (every step in order, `task → case` for each switch, a fault with its
+  error; a jq error names the expression and the value it met), a loop's
+  `turns` (reasoning, text, calls with their `verdict`, `confirmation`,
+  `ok` and `result`), and `children` (guard rounds, workers). A large reply
+  is in your working memory (`memory_key`) with a preview.
+- **Judging it.** Compare the trace with what the user asked for, as for a
+  scheduled workflow: the route taken, each turn, each call's arguments,
+  how the loop ended and what it answered. Fix and try again, three tries
+  at most. `drafts` with `ran: false` did not run and stay untried: check
+  the signal against the route's `when` and the loop the route selects.
+
+A completed try marks every draft that ran as tried; activation needs it.
 
 ## The language
 
