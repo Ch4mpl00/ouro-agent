@@ -102,6 +102,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0009_workflow_events", include_str!("../migrations/0009_workflow_events.sql")),
     ("0010_confirmations", include_str!("../migrations/0010_confirmations.sql")),
     ("0011_event_listeners", include_str!("../migrations/0011_event_listeners.sql")),
+    ("0012_child_runs", include_str!("../migrations/0012_child_runs.sql")),
 ];
 
 pub struct Migration {

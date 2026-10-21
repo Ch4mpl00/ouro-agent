@@ -548,3 +548,59 @@ async fn a_held_listener_is_notified_without_saving_a_waiting_run() {
     assert_eq!(lease.take("r", "listen#event", &["answer".into()]).unwrap().unwrap()["data"], 42);
     lease.finish(&Status::Completed(json!(42))).unwrap();
 }
+
+#[test]
+fn child_lifecycle_is_atomic_owned_and_cascades_cancellation() {
+    use agent::durable::ChildLink;
+    use owf::run::Events;
+    let dir = tempfile::tempdir().unwrap();
+    let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
+    let runs = RunStore::new(db.clone());
+    let parent = runs.start("p", "parent", "x", &json!({})).unwrap().unwrap();
+    let child = runs
+        .start_child(
+            "c",
+            "child",
+            "original",
+            &json!({"v":1}),
+            ChildLink { parent: "p", key: "round:1", reference: "/start" },
+        )
+        .unwrap()
+        .unwrap();
+    child.finish(&Status::Waiting { wake_at_ms: i64::MAX }).unwrap();
+    assert!(parent.take("p", "waiting#event", &["waiting:c".into()]).unwrap().is_some());
+    assert!(!runs.deliver("unawaited", &json!({})).unwrap());
+    assert!(runs.child_outcome("wrong", "round:1", "c").is_err());
+    assert!(runs.child_outcome("p", "round:2", "c").is_err());
+    db.conn().execute("UPDATE workflow_runs SET wake_at_ms=0 WHERE id='c'", []).unwrap();
+    runs.claim("c").unwrap().unwrap().finish(&Status::Completed(json!(42))).unwrap();
+    assert_eq!(
+        parent.take("p", "done#event", &["done:c".into()]).unwrap().unwrap()["data"],
+        json!({"status":"completed","output":42})
+    );
+    assert_eq!(runs.child_outcome("p", "round:1", "c").unwrap(), Some(Status::Completed(json!(42))));
+    assert!(
+        runs.start_child(
+            "c",
+            "child",
+            "changed",
+            &json!({}),
+            ChildLink { parent: "p", key: "round:1", reference: "/start" }
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(runs.get("c").unwrap().unwrap().definition, "original");
+    let _active = runs
+        .start_child("active", "child", "x", &json!({}), ChildLink { parent: "p", key: "2", reference: "/start" })
+        .unwrap()
+        .unwrap();
+    let _nested = runs
+        .start_child("nested", "child", "x", &json!({}), ChildLink { parent: "active", key: "3", reference: "/start" })
+        .unwrap()
+        .unwrap();
+    parent.finish(&Status::Completed(json!({}))).unwrap();
+    for id in ["active", "nested"] {
+        assert_eq!(runs.get(id).unwrap().unwrap().outcome, Some(Status::Cancelled));
+    }
+}
