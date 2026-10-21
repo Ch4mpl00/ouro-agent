@@ -860,3 +860,38 @@ async fn an_abort_without_supervisor_shutdown_gets_no_recovery() {
     assert!(f.engine.loop_ids().await.is_empty());
     supervisor.shutdown().await;
 }
+
+#[tokio::test]
+async fn button_routing_delivers_without_a_model_and_falls_back_with_telegram_context() {
+    use owf::run::Events;
+    let model = Arc::new(Scripted::new(vec![assistant("stale button understood"),assistant("peer done")]));
+    let mut f = fixture(model.clone(), &[], SKILLS);
+    let mcp = Arc::new(ContextMcp::default());
+    let deps = &mut Arc::get_mut(&mut f.engine).unwrap().deps;
+    deps.mcp = mcp.clone();
+    deps.skills = vec!["orchestrator".into(), "routing".into()];
+    let flows = agent::flows::create_durable_flows(f.engine.clone(), (*f.db).clone());
+    let supervisor = create_supervisor(f.engine.clone(), EnvDeps { mcp:mcp.clone(),memory:f.db.clone(),user_email:None,telegram_chat_id:Some("999".into()) }, flows);
+    let store = agent::durable::RunStore::new((*f.db).clone());
+    let lease = store.start("waiting", "example", "x", &json!({})).unwrap().unwrap();
+    lease.register("waiting", &["button-data".into()]).unwrap();
+    lease.finish(&owf::run::Status::Waiting { wake_at_ms:i64::MAX }).unwrap();
+    let mut press = signal("telegram_button", 10);
+    press.content = json!({"chatId":-10042,"messageThreadId":7,"messageId":123,"text":"Pick me","data":"button-data"}).to_string();
+    assert_eq!(supervisor.run_signal(&press).await.unwrap(), "Button delivered");
+    assert!(model.seen.lock().unwrap().is_empty());
+    press.id = 11;
+    assert_eq!(supervisor.run_signal(&press).await.unwrap(), "stale button understood");
+    let run = store.get("telegram_button:11/loop").unwrap().unwrap();
+    assert_eq!(run.input["loop"]["confirm"], json!({"chatId":"-10042","messageThreadId":7}));
+    let seen = model.seen.lock().unwrap();
+    let content = seen[0].messages.last().unwrap()["content"].as_str().unwrap();
+    assert!(content.contains("pressed the button") && content.contains("Pick me") && content.contains("123"));
+    assert!(seen[0].messages[0]["content"].as_str().unwrap().contains("Delivery:"));
+    drop(seen);
+    assert!(mcp.calls.lock().unwrap().iter().any(|(n,a)| n == "get_telegram_chat_history" && a["threadId"] == 7));
+    supervisor.run_signal(&signal("peer", 12)).await.unwrap();
+    let run = store.get("peer:12/loop").unwrap().unwrap();
+    assert_eq!(run.input["loop"]["confirm"], json!({"chatId":"999","messageThreadId":null}));
+    supervisor.shutdown().await;
+}

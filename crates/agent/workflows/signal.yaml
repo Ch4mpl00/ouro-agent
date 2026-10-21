@@ -7,6 +7,14 @@ document: { dsl: '1.0.4', namespace: agent, name: signal, version: '1.0.0' }
 do:
   - handle:
       try:
+        - offer_button:
+            if: '${ .signal.button != null }'
+            call: deliver_event
+            with: { type: '${ .signal.button.data }', data: '${ .signal.button }' }
+        - after_button:
+            switch:
+              - delivered: { when: '${ .delivered == true }', then: end }
+              - ordinary: { then: session }
         - session:
             call: signal_session
             export: { as: '${ $context + . }' }
@@ -23,7 +31,7 @@ do:
             call: signal_input
             export: { as: '${ $context + { input: . } }' }
         - activity:
-            if: '${ $context.signal.source == "telegram" or $context.signal.source == "peer" }'
+            if: '${ $context.signal.source == "telegram" or $context.signal.source == "telegram_button" or $context.signal.source == "peer" }'
             call: recent_activity
             export: { as: '${ $context + { activity: . } }' }
         - own_skills:
@@ -41,6 +49,11 @@ do:
             call: primary_loop
             with:
               input: '${ $context.input }'
+              confirm: >-
+                ${ if $context.signal.source == "telegram" or $context.signal.source == "telegram_button"
+                   then $context.conversation
+                   elif $context.default_chat != null then { chatId: $context.default_chat, messageThreadId: null }
+                   else null end }
               skills: '${ $context.own }'
               loaded: '${ $context.own + $context.engine_skills + ($context.preselected.names // []) }'
               preset: '${ if $context.signal.source == "scheduler" then "base" else "smart" end }'
@@ -52,7 +65,7 @@ do:
                   ("Signal source: " + $context.signal.source),
                   "Call find_skills only when the task needs something specific that the skills already in your instructions don't cover; the source is only a hint. You own delivery.",
                   $context.preselected.block,
-                  (if $context.signal.source == "telegram" then "Delivery: use send_telegram_message for the current signal's chatId and optional messageThreadId. A final assistant message alone is not delivered to Telegram." else null end),
+                  (if $context.signal.source == "telegram" or $context.signal.source == "telegram_button" then "Delivery: use send_telegram_message for the current signal's chatId and optional messageThreadId. A final assistant message alone is not delivered to Telegram." else null end),
                   $context.signal.env_context,
                   $context.handover
                 ] | map(select(. != null and . != "")) }

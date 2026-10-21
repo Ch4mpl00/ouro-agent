@@ -157,6 +157,13 @@ impl Engine {
 }
 
 // ── 2. loop lifecycle ───────────────────────────────────────────────────────
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmTarget {
+    pub chat_id: String,
+    pub message_thread_id: Option<i64>,
+}
+
 #[derive(Clone)]
 pub struct LoopOptions {
     pub id: String,
@@ -175,6 +182,7 @@ pub struct LoopOptions {
     pub root_request: Option<String>,
     // Host-only evidence, kept separately from rendered history/tool inputs.
     pub guard_request: Option<String>,
+    pub confirm: Option<ConfirmTarget>,
     pub earlier_user_messages: Vec<String>,
     pub loaded_skill_text: String,
     pub session_id: Option<String>,
@@ -200,6 +208,7 @@ impl LoopOptions {
             parent_id: None,
             root_request: None,
             guard_request: None,
+            confirm: None,
             earlier_user_messages: Vec::new(),
             loaded_skill_text: String::new(),
             session_id: None,
@@ -910,6 +919,8 @@ pub fn child_key(args: &Value) -> Option<String> {
 /// message of the transcript, so it is not repeated here.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoopSpec {
+    #[serde(default)]
+    pub confirm: Option<ConfirmTarget>,
     pub id: String,
     pub session: String,
     pub env: Value,
@@ -934,7 +945,7 @@ impl AgentLoop {
             w.sort();
         }
         LoopSpec {
-            id: opts.id.clone(),
+            confirm: opts.confirm.clone(),            id: opts.id.clone(),
             session: opts.session.id.clone(),
             env: opts.session.env.to_json(),
             skills: opts.skills.clone(),
@@ -1052,6 +1063,7 @@ impl Engine {
         let env = crate::session::EnvData::from_json(&spec.env)?;
         let mut opts = LoopOptions::new(&spec.id, crate::session::session(&spec.session, env));
         opts.cancel = cancel.clone();
+        opts.confirm = spec.confirm.clone();
         opts.skills = spec.skills.clone();
         opts.include_engine_skills = spec.include_engine_skills;
         opts.allow_skill_writes = spec.allow_skill_writes;
