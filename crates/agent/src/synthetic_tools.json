@@ -243,6 +243,10 @@
               "smartest"
             ],
             "description": "Model preset for the sub-agent. `base` \u2014 cheap chat model, no thinking (default; use for simple one-offs and lookups). `smart` \u2014 DeepSeek with thinking on (use for real editorial / parsing work: digests, semantic dedup, PDF amount extraction). Default `base`."
+          },
+          "loop": {
+            "type": "string",
+            "description": "Loop workflow name; defaults to the skill frontmatter preference, else agent-loop."
           }
         },
         "required": [

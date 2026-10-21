@@ -364,6 +364,7 @@ impl SkillStore for AnySkill {
     async fn read_skill(&self, _: &str) -> anyhow::Result<Option<SkillFile>> {
         Ok(Some(SkillFile {
             routable: true,
+            loop_name: None,
             body: "test skill".into(),
             tools: SkillTools::All,
             source: SkillSource::Default,

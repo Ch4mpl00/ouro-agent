@@ -1,0 +1,108 @@
+document: { dsl: '1.0.4', namespace: agent, name: agent-loop-telegram, version: '1.0.0', metadata: { loop: { description: 'ReAct loop that ends on a conversation reply and nudges once before a silent end.' } } }
+# Keep the shared steps in sync with agent-loop.yaml.
+# The ReAct loop as a durable workflow. The context carries the loop's spec,
+# its transcript (`messages`), its working memory and the turn count; every
+# task record is a checkpoint, so a restart resumes the loop where it was.
+input:
+  from: '${ . + { i: 0 } }'
+do:
+  - turn:
+      call: agent_turn
+      with: { loop: '${ $context.loop }', messages: '${ $context.messages }', memory: '${ $context.memory }', i: '${ $context.i }', extra_turn: '${ $context.nudged // false }' }
+      export: { as: '${ $context + { messages: ($context.messages + [ .message ]), calls: .calls, i: ($context.i + 1) } }' }
+  - route:
+      switch:
+        - answered: { when: '${ .calls == [] }', then: answer }
+        - act: { then: guard }
+  - guard:
+      call: start_child
+      with: { workflow: guard, calls: '${ $context.calls }', i: '${ $context.i }' }
+      export: { as: '${ $context + { guard_run: .run, guarded: (.guarded // []) } }' }
+  - round:
+      # Independent calls keep progressing while the guard waits for a press.
+      fork:
+        branches:
+          - ready:
+              for: { each: entry, in: '${ $context.calls | to_entries | map(select(.key as $k | ($context.guarded // [] | index($k)) == null)) }' }
+              metadata: { concurrency: 16 }
+              do:
+                - start_worker:
+                    if: '${ $entry.value.name == "invoke_sub_agent" }'
+                    call: start_child
+                    with: { workflow: agent-loop, call: '${ $entry.value }', i: '${ $context.i }', index: '${ $entry.key }', memory: '${ $context.memory }' }
+                    export: { as: '${ $context + { worker: .run } }' }
+                - wait_worker:
+                    if: '${ $context.worker != null }'
+                    listen:
+                      to:
+                        any:
+                          - with: { type: '${ "done:" + $context.worker }' }
+                          - with: { type: '${ "waiting:" + $context.worker }' }
+                    metadata: { hold: PT15M }
+                - sleep_worker:
+                    if: '${ $context.worker != null and .[0].type == ("waiting:" + $context.worker) }'
+                    listen: { to: { one: { with: { type: '${ "done:" + $context.worker }' } } } }
+                - one:
+                    call: tool
+                    with:
+                      loop: '${ $context.loop }'
+                      call: '${ $entry.value }'
+                      guard_run: null
+                      worker_run: '${ $context.worker // null }'
+                      i: '${ $context.i }'
+                      index: '${ $entry.key }'
+                      memory: '${ if ($entry.value.name | startswith("working_memory_")) or $entry.value.name == "invoke_sub_agent" then $context.memory else null end }'
+                - indexed:
+                    set: '${ { index: $entry.key, result: . } }'
+          - held:
+              do:
+                - wait_guard:
+                    if: '${ $context.guard_run != null }'
+                    listen:
+                      to:
+                        any:
+                          - with: { type: '${ "done:" + $context.guard_run }' }
+                          - with: { type: '${ "waiting:" + $context.guard_run }' }
+                    metadata: { hold: PT60S }
+                - sleep_guard:
+                    if: '${ $context.guard_run != null and .[0].type == ("waiting:" + $context.guard_run) }'
+                    listen: { to: { one: { with: { type: '${ "done:" + $context.guard_run }' } } } }
+                - calls:
+                    for: { each: entry, in: '${ $context.calls | to_entries | map(select(.key as $k | ($context.guarded // [] | index($k)) != null)) }' }
+                    metadata: { concurrency: 16 }
+                    do:
+                      - one:
+                          call: tool
+                          with:
+                            loop: '${ $context.loop }'
+                            call: '${ $entry.value }'
+                            guard_run: '${ $context.guard_run // null }'
+                            i: '${ $context.i }'
+                            index: '${ $entry.key }'
+                      - indexed:
+                          set: '${ { index: $entry.key, result: . } }'
+      output: { as: '${ (.[0] + .[1]) | sort_by(.index) | map(.result) }' }
+  - settle:
+      call: agent_settle
+      with: { loop: '${ $context.loop }', calls: '${ $context.calls }', results: '${ . }', memory: '${ $context.memory }' }
+      export: { as: '${ $context + { messages: ($context.messages + .replies), memory: .memory, replied: (($context.replied // false) or .replied) } }' }
+  - next:
+      switch:
+        - replied: { when: '${ .replied }', then: reply }
+        - finished: { when: '${ .finished }', then: ending }
+        - more: { then: turn }
+  - reply:
+      set: '${ { output: .reply } }'
+      then: end
+  - answer:
+      set: '${ { output: .content } }'
+  - ending:
+      switch:
+        - silent: { when: '${ $context.loop.conversation != null and ($context.replied // false) == false and ($context.nudged // false) == false }', then: nudge }
+        - done: { then: end }
+  - nudge:
+      set: { role: user, content: "Nothing was sent to the user in this conversation yet. Reply there, or finish if no reply is needed." }
+      export: { as: '${ $context + { messages: ($context.messages + [ . ]), nudged: true } }' }
+      then: turn
+output:
+  as: '${ .output }'

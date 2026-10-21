@@ -93,6 +93,7 @@ pub struct SkillFile {
     pub tools: SkillTools,
     pub source: SkillSource,
     pub routable: bool,
+    pub loop_name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -118,6 +119,13 @@ fn parse_skill(name: &str, raw: &str, source: SkillSource) -> anyhow::Result<Ski
         );
     };
     let frontmatter = m.get(1).map_or("", |g| g.as_str());
+    let loop_name = frontmatter
+        .lines()
+        .find_map(|line| line.strip_prefix("loop:"))
+        .map(|value| value.split('#').next().unwrap_or_default().trim().trim_matches(['\'', '"']).to_owned());
+    if let Some(name) = &loop_name {
+        validate_name(name)?;
+    }
     let body = raw[m.get(0).map_or(0, |g| g.end())..].to_owned();
     let routable = match ROUTABLE.captures(frontmatter) {
         None => true,
@@ -128,7 +136,7 @@ fn parse_skill(name: &str, raw: &str, source: SkillSource) -> anyhow::Result<Ski
         },
     };
     if TOOLS_WILDCARD.is_match(frontmatter) {
-        return Ok(SkillFile { body, tools: SkillTools::All, source, routable });
+        return Ok(SkillFile { body, tools: SkillTools::All, source, routable, loop_name });
     }
     let Some(t) = TOOLS_ARRAY.captures(frontmatter) else {
         anyhow::bail!(
@@ -147,7 +155,7 @@ fn parse_skill(name: &str, raw: &str, source: SkillSource) -> anyhow::Result<Ski
             anyhow::bail!("skill \"{name}\" ({}): tool name \"{tool}\" is not a valid identifier", source.as_str());
         }
     }
-    Ok(SkillFile { body, tools: SkillTools::Named(tools), source, routable })
+    Ok(SkillFile { body, tools: SkillTools::Named(tools), source, routable, loop_name })
 }
 
 /// Stable JSON fingerprint, independent of object insertion order.

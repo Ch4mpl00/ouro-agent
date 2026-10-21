@@ -183,6 +183,8 @@ pub struct ConfirmTarget {
 #[derive(Clone)]
 pub struct LoopOptions {
     pub id: String,
+    pub workflow: String,
+    pub conversation: Option<ConfirmTarget>,
     pub session: Session,
     pub cancel: CancellationToken,
     pub generation_timeout: Option<Duration>,
@@ -211,6 +213,8 @@ impl LoopOptions {
     pub fn new(id: impl Into<String>, session: Session) -> Self {
         Self {
             id: id.into(),
+            workflow: AGENT_LOOP_NAME.into(),
+            conversation: None,
             session,
             cancel: CancellationToken::new(),
             generation_timeout: None,
@@ -418,6 +422,10 @@ impl AgentLoop {
             .filter(|t| self.allowed.as_ref().is_none_or(|s| s.contains(&t.name)))
             .collect();
         tools.extend(synthetic_definitions().iter().filter(|t| self.visible(&t.name)).cloned());
+        if let Some(tool) = tools.iter_mut().find(|t| t.name == "invoke_sub_agent") {
+            tool.description.get_or_insert_default().push_str(&format!("\nActive loops (optional loop argument; otherwise the first skill's loop preference, then agent-loop):\n{}",
+                crate::flows::loop_catalog(&*engine.deps.workflows)?));
+        }
         let mut params = providers::CompletionParams {
             model: self.model.clone(),
             messages,
@@ -737,6 +745,21 @@ impl AgentLoop {
         opts.cancel = self.cancel.clone();
         opts.system_prompt = Some([Some(render_context(&self.opts.session.env)?), Some("You are a focused worker. Complete the assigned task and return the full result as your final answer; the runtime stores it automatically. Report missing data and failures explicitly. The parent owns delivery and bookkeeping unless it explicitly assigns them to you.".into()), system_prompt.filter(|s| !s.is_empty()).map(str::to_owned)].into_iter().flatten().collect::<Vec<_>>().join("\n\n"));
         opts.skills = if skills.is_empty() { vec!["worker".into()] } else { skills };
+        opts.workflow = if let Some(name) = optional_string(args, "loop")? {
+            name.to_owned()
+        } else {
+            let engine = self.engine.upgrade().ok_or_else(|| anyhow::anyhow!("engine closed"))?;
+            let mut selected = None;
+            for name in &opts.skills {
+                if let Some(skill) = engine.deps.skill_store.read_skill(name).await?
+                    && let Some(loop_name) = skill.loop_name
+                {
+                    selected = Some(loop_name);
+                    break;
+                }
+            }
+            selected.unwrap_or_else(|| AGENT_LOOP_NAME.into())
+        };
         opts.allow_skill_writes = self.opts.allow_skill_writes && opts.skills.iter().any(|s| s == "dreaming");
         opts.include_engine_skills = false;
         // A workflow is written in a language the cheap preset gets wrong:
@@ -955,10 +978,17 @@ pub fn child_key(args: &Value) -> Option<String> {
     named.then(|| format!("{i}.{index}"))
 }
 
-/// What rebuilds a loop after a restart. The system prompt is the first
-/// message of the transcript, so it is not repeated here.
+fn default_loop_name() -> String {
+    AGENT_LOOP_NAME.into()
+}
+
+/// What rebuilds a loop after a restart. The system prompt travels in the transcript.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoopSpec {
+    #[serde(default = "default_loop_name")]
+    pub workflow: String,
+    #[serde(default)]
+    pub conversation: Option<ConfirmTarget>,
     #[serde(default)]
     pub confirm: Option<ConfirmTarget>,
     pub id: String,
@@ -985,6 +1015,8 @@ impl AgentLoop {
             w.sort();
         }
         LoopSpec {
+            workflow: opts.workflow.clone(),
+            conversation: opts.conversation.clone(),
             confirm: opts.confirm.clone(),
             id: opts.id.clone(),
             session: opts.session.id.clone(),
@@ -1124,6 +1156,8 @@ impl Engine {
         let mut opts = LoopOptions::new(&spec.id, crate::session::session(&spec.session, env));
         opts.cancel = cancel.clone();
         opts.confirm = spec.confirm.clone();
+        opts.conversation = spec.conversation.clone();
+        opts.workflow = spec.workflow.clone();
         opts.skills = spec.skills.clone();
         opts.include_engine_skills = spec.include_engine_skills;
         opts.allow_skill_writes = spec.allow_skill_writes;
@@ -1160,7 +1194,7 @@ pub async fn loop_turn(
     let loop_ = engine.loop_for(&spec, scope, cancel).await?;
     loop_.restore_memory(args.get("memory"))?;
     let i = args.get("i").and_then(Value::as_u64).unwrap_or(0) as usize;
-    if i >= spec.max_iterations {
+    if i >= spec.max_iterations.saturating_add(usize::from(args["extra_turn"] == true)) {
         anyhow::bail!("session {} exceeded maxIterations={}", spec.id, spec.max_iterations);
     }
     let mut messages: Vec<Message> = serde_json::from_value(args.get("messages").cloned().unwrap_or(Value::Null))?;
@@ -1367,7 +1401,10 @@ pub async fn loop_worker_input(
     meta.insert("tool_call_id".into(), call.id.clone().into());
     let worker_scope =
         loop_.scope.span(SpanStart::new("invoke_sub_agent", SpanKind::Agent).input(json!(arguments)).metadata(meta));
-    let (opts, prompt) = loop_.worker_options(&arguments, worker_scope.clone(), Some(&key)).await?;
+    let (mut opts, prompt) = loop_.worker_options(&arguments, worker_scope.clone(), Some(&key)).await?;
+    if let Some(name) = args["worker_loop"].as_str().filter(|name| *name != AGENT_LOOP_NAME) {
+        opts.workflow = name.to_owned();
+    }
     let id = format!("{}/loop", opts.id);
     let input = engine.start_loop(opts).await?.workflow_input(&prompt).await;
     Ok(Some((id, input, worker_scope)))
@@ -1544,6 +1581,23 @@ pub async fn loop_tool_at(
     let mut out = json!({"presented": presented, "failed": failed, "stored": stored, "guard_call": guard_call});
     if !failed {
         let parsed: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+        let delivery: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+        let chat = delivery["chatId"].as_str().or_else(|| parsed["chatId"].as_str()).or(loop_
+            .opts
+            .session
+            .env
+            .telegram_chat_id
+            .as_deref());
+        let thread = delivery.get("messageThreadId").unwrap_or(&parsed["messageThreadId"]).as_i64();
+        if call.name == "send_telegram_message"
+            && delivery["delivered"] == true
+            && let Some(target) = &loop_.opts.conversation
+            && chat == Some(target.chat_id.as_str())
+            && thread == target.message_thread_id
+            && let Some(text) = parsed["text"].as_str()
+        {
+            out["reply"] = json!(text);
+        }
         match call.name.as_str() {
             "working_memory_put" => {
                 let format = parsed.get("format").and_then(Value::as_str).unwrap_or("text");
@@ -1602,6 +1656,11 @@ pub async fn loop_settle(
         round.push((call, presented, failed, finish));
     }
     let finished = settle_round(&mut round);
+    let reply = results
+        .iter()
+        .filter(|result| result["failed"] == false)
+        .filter_map(|result| result["reply"].as_str())
+        .next_back();
     let replies: Vec<Message> =
         round.iter().map(|(call, presented, _, _)| providers::tool_reply(&call.id, presented)).collect();
     loop_.messages.lock().await.extend(replies.iter().cloned());
@@ -1611,6 +1670,8 @@ pub async fn loop_settle(
     Ok(json!({
         "replies": replies,
         "memory": memory.snapshot(),
+        "replied": reply.is_some(),
+        "reply": reply,
         "finished": finished.is_some(),
         "output": finished.unwrap_or_default(),
     }))
@@ -1712,7 +1773,7 @@ fn history_turn(messages: &[Value]) -> Vec<String> {
 fn worker_runs(runs: &crate::durable::RunStore, loop_id: &str) -> anyhow::Result<Vec<String>> {
     let prefix = format!("{loop_id}__sub");
     Ok(runs
-        .list_prefix(AGENT_LOOP_NAME, &prefix)?
+        .loop_ids_prefix(&prefix)?
         .into_iter()
         .filter(|id| {
             id.strip_prefix(&prefix)
@@ -1748,7 +1809,11 @@ fn read_run(
                 )
             });
         };
-        anyhow::ensure!(run.name == AGENT_LOOP_NAME, "read_run only reads agent-loop runs; this run is {}", run.name);
+        anyhow::ensure!(
+            crate::flows::is_loop_definition(&run.name, &run.definition),
+            "read_run only reads agent-loop runs; this run is {}",
+            run.name
+        );
         let records = runs.records(id)?;
         let messages = history_messages(&records);
         let header = format!(
