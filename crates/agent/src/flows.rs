@@ -1183,7 +1183,11 @@ impl Flows {
             if let Err(error) = check(&*self.engine.deps.mcp, &saved.definition) {
                 return Ok(FlowResult::Faulted { error: WorkflowError::validation(error), effects_started: false });
             }
-            started = runs.start(&id, name, &saved.definition, &Value::Object(signal_input(signal, &session.env)))?;
+            let mut input = Value::Object(signal_input(signal, &session.env));
+            // Recovery of named child workflows joins the admitted session,
+            // including callers whose session differs from the signal's id.
+            input["__session_id"] = json!(session.id);
+            started = runs.start(&id, name, &saved.definition, &input)?;
         }
         let saved = runs.get(&id)?.ok_or_else(|| anyhow::anyhow!("run {id} disappeared"))?;
         anyhow::ensure!(saved.name == name, "run {id} belongs to another workflow");
@@ -1233,18 +1237,30 @@ impl Flows {
         // A resumed loop (after a restart or a confirmation press) joins the
         // session of the signal that started it, with that signal's request
         // as input, so Langfuse shows both halves of one conversation.
-        let mut session = saved.input["loop"]["session"].as_str().map(str::to_owned);
+        let admitted_session = |run: &crate::durable::SavedRun| {
+            let value = if run.name == crate::agent::AGENT_LOOP_NAME {
+                &run.input["loop"]["session"]
+            } else if run.parent_run.is_none() {
+                &run.input["__session_id"]
+            } else {
+                return None;
+            };
+            value.as_str().map(str::to_owned)
+        };
+        let mut session = admitted_session(&saved);
+        let mut session_run = id.clone();
         let mut parent = saved.parent_run.clone();
         while session.is_none() {
             let Some(id) = parent.take() else { break };
+            session_run = id.clone();
             let Ok(Some(run)) = runs.get(&id) else { break };
-            session = run.input["loop"]["session"].as_str().map(str::to_owned);
+            session = admitted_session(&run);
             parent = run.parent_run;
         }
         let trace = self.engine.deps.tracer.trace(crate::tracing::TraceStart {
             id: uuid::Uuid::new_v4().to_string(),
             name: format!("resume:{}", saved.name),
-            session_id: Some(session.unwrap_or_else(|| id.clone())),
+            session_id: Some(session.unwrap_or(session_run)),
             metadata: Some(json!({"run": id}).as_object().expect("object").clone()),
             ..Default::default()
         });

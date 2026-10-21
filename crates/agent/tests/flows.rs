@@ -1057,3 +1057,65 @@ fn guard_is_reserved_readable_and_its_private_functions_are_not_in_the_catalog()
         assert!(agent::flows::functions(&w.engine, json!({"name":function}).as_object().unwrap()).is_err());
     }
 }
+
+#[tokio::test]
+async fn a_waiting_saved_child_recovers_in_its_parents_session() {
+    use agent::{durable::RunStore, flows::create_durable_flows};
+    let w = world(vec![]);
+    w.activate(
+        "child",
+        r#"document: { dsl: '1.0.4', namespace: t, name: child, version: '1.0.0' }
+do:
+ - event: { listen: { to: { one: { with: { type: child-answer } } } } }
+ - result: { set: '${ 42 }' }
+"#,
+    );
+    w.activate("parent",r#"document: { dsl: '1.0.4', namespace: t, name: parent, version: '1.0.0' }
+do:
+ - start:
+     call: start_child
+     with: { workflow: child, key: one }
+     export: { as: '${ . }' }
+ - first:
+     listen: { to: { any: [{ with: { type: '${ "done:" + $context.run }' } },{ with: { type: '${ "waiting:" + $context.run }' } }] } }
+     metadata: { hold: PT1S }
+ - final:
+     if: '${ .[0].type == ("waiting:" + $context.run) }'
+     listen: { to: { one: { with: { type: '${ "done:" + $context.run }' } } } }
+ - result:
+     call: child_outcome
+     with: { run: '${ $context.run }', key: one }
+"#);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("agent.db");
+    let db = AgentDb::open(&path).unwrap();
+    let flows = create_durable_flows(w.engine.clone(), db.clone());
+    let trace = w.tracer.trace(TraceStart {
+        id: "parents-session".into(),
+        session_id: Some("shared-session".into()),
+        name: "test".into(),
+        ..Default::default()
+    });
+    let scope: Scope = trace.clone();
+    let signal = WorkflowSignal { id: 2, source: "test".into(), content: "".into(), env_context: None };
+    let cancel = CancellationToken::new();
+    assert!(matches!(
+        flows.run("parent", &signal, &task_context("shared-session"), &scope, &cancel).await,
+        FlowResult::Waiting { .. }
+    ));
+    trace.end();
+    drop(flows);
+    let db = AgentDb::open(&path).unwrap();
+    let runs = RunStore::new(db.clone());
+    assert!(runs.deliver("child-answer", &json!({})).unwrap());
+    let flows = create_durable_flows(w.engine.clone(), db);
+    assert_eq!(flows.recover_once(&cancel).await.unwrap(), 1);
+    assert_eq!(flows.recover_once(&cancel).await.unwrap(), 1);
+    assert_eq!(
+        runs.get("test:2").unwrap().unwrap().outcome,
+        Some(owf::run::Status::Completed(json!({"Completed":42})))
+    );
+    let traces = w.written.all();
+    let child = traces.iter().find(|t| t.name == "resume:child").unwrap();
+    assert_eq!(child.session_id.as_deref(), Some("shared-session"));
+}
