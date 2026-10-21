@@ -16,51 +16,71 @@ do:
   - guard:
       call: start_child
       with: { workflow: guard, calls: '${ $context.calls }', i: '${ $context.i }' }
-      export: { as: '${ $context + { guard_run: .run } }' }
-  - wait_guard:
-      if: '${ $context.guard_run != null }'
-      listen:
-        to:
-          any:
-            - with: { type: '${ "done:" + $context.guard_run }' }
-            - with: { type: '${ "waiting:" + $context.guard_run }' }
-      metadata: { hold: PT60S }
-  - sleep_guard:
-      if: '${ $context.guard_run != null and .[0].type == ("waiting:" + $context.guard_run) }'
-      listen: { to: { one: { with: { type: '${ "done:" + $context.guard_run }' } } } }
+      export: { as: '${ $context + { guard_run: .run, guarded: (.guarded // []) } }' }
   - round:
-      for: { each: call, in: '${ $context.calls }' }
-      # The loop's own limit (max_concurrent_tools) applies inside `tool`.
-      metadata: { concurrency: 16 }
-      do:
-        - start_worker:
-            if: '${ $call.name == "invoke_sub_agent" }'
-            call: start_child
-            with: { workflow: agent-loop, call: '${ $call }', i: '${ $context.i }', index: '${ $index }', memory: '${ $context.memory }' }
-            export: { as: '${ $context + { worker: .run } }' }
-        - wait_worker:
-            if: '${ $context.worker != null }'
-            listen:
-              to:
-                any:
-                  - with: { type: '${ "done:" + $context.worker }' }
-                  - with: { type: '${ "waiting:" + $context.worker }' }
-            metadata: { hold: PT15M }
-        - sleep_worker:
-            if: '${ $context.worker != null and .[0].type == ("waiting:" + $context.worker) }'
-            listen: { to: { one: { with: { type: '${ "done:" + $context.worker }' } } } }
-        - one:
-            call: tool
-            with:
-              loop: '${ $context.loop }'
-              call: '${ $call }'
-              guard_run: '${ $context.guard_run // null }'
-              worker_run: '${ $context.worker // null }'
-              # Where the call is (turn, place in the round): a sub-agent's
-              # durable run is keyed by it, so a resumed round joins it.
-              i: '${ $context.i }'
-              index: '${ $index }'
-              memory: '${ if ($call.name | startswith("working_memory_")) or $call.name == "invoke_sub_agent" then $context.memory else null end }'
+      # Independent calls keep progressing while the guard waits for a press.
+      fork:
+        branches:
+          - ready:
+              for: { each: entry, in: '${ $context.calls | to_entries | map(select(.key as $k | ($context.guarded // [] | index($k)) == null)) }' }
+              metadata: { concurrency: 16 }
+              do:
+                - start_worker:
+                    if: '${ $entry.value.name == "invoke_sub_agent" }'
+                    call: start_child
+                    with: { workflow: agent-loop, call: '${ $entry.value }', i: '${ $context.i }', index: '${ $entry.key }', memory: '${ $context.memory }' }
+                    export: { as: '${ $context + { worker: .run } }' }
+                - wait_worker:
+                    if: '${ $context.worker != null }'
+                    listen:
+                      to:
+                        any:
+                          - with: { type: '${ "done:" + $context.worker }' }
+                          - with: { type: '${ "waiting:" + $context.worker }' }
+                    metadata: { hold: PT15M }
+                - sleep_worker:
+                    if: '${ $context.worker != null and .[0].type == ("waiting:" + $context.worker) }'
+                    listen: { to: { one: { with: { type: '${ "done:" + $context.worker }' } } } }
+                - one:
+                    call: tool
+                    with:
+                      loop: '${ $context.loop }'
+                      call: '${ $entry.value }'
+                      guard_run: null
+                      worker_run: '${ $context.worker // null }'
+                      i: '${ $context.i }'
+                      index: '${ $entry.key }'
+                      memory: '${ if ($entry.value.name | startswith("working_memory_")) or $entry.value.name == "invoke_sub_agent" then $context.memory else null end }'
+                - indexed:
+                    set: '${ { index: $entry.key, result: . } }'
+          - held:
+              do:
+                - wait_guard:
+                    if: '${ $context.guard_run != null }'
+                    listen:
+                      to:
+                        any:
+                          - with: { type: '${ "done:" + $context.guard_run }' }
+                          - with: { type: '${ "waiting:" + $context.guard_run }' }
+                    metadata: { hold: PT60S }
+                - sleep_guard:
+                    if: '${ $context.guard_run != null and .[0].type == ("waiting:" + $context.guard_run) }'
+                    listen: { to: { one: { with: { type: '${ "done:" + $context.guard_run }' } } } }
+                - calls:
+                    for: { each: entry, in: '${ $context.calls | to_entries | map(select(.key as $k | ($context.guarded // [] | index($k)) != null)) }' }
+                    metadata: { concurrency: 16 }
+                    do:
+                      - one:
+                          call: tool
+                          with:
+                            loop: '${ $context.loop }'
+                            call: '${ $entry.value }'
+                            guard_run: '${ $context.guard_run // null }'
+                            i: '${ $context.i }'
+                            index: '${ $entry.key }'
+                      - indexed:
+                          set: '${ { index: $entry.key, result: . } }'
+      output: { as: '${ (.[0] + .[1]) | sort_by(.index) | map(.result) }' }
   - settle:
       call: agent_settle
       with: { loop: '${ $context.loop }', calls: '${ $context.calls }', results: '${ . }', memory: '${ $context.memory }' }

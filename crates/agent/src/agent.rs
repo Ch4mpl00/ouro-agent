@@ -70,8 +70,14 @@ impl Engine {
         })
     }
     pub async fn start_loop(self: &Arc<Self>, opts: LoopOptions) -> anyhow::Result<Arc<AgentLoop>> {
+        self.create_or_join_loop(opts, false).await
+    }
+    async fn create_or_join_loop(self: &Arc<Self>, opts: LoopOptions, join: bool) -> anyhow::Result<Arc<AgentLoop>> {
         self.check_start(&opts)?;
-        if self.loops.lock().await.contains_key(&opts.id) {
+        if let Some(live) = self.loops.lock().await.get(&opts.id).cloned() {
+            if join {
+                return Ok(live);
+            }
             anyhow::bail!("agent-loop id {} already exists", opts.id);
         }
         let mut resolved: Map<String, Value> = Map::new();
@@ -108,10 +114,16 @@ impl Engine {
         // IO above may have overlapped shutdown or another start of this id.
         let mut registry = self.loops.lock().await;
         self.check_start(&opts)?;
-        if registry.contains_key(&opts.id) {
+        if let Some(live) = registry.get(&opts.id) {
+            if join {
+                return Ok(live.clone());
+            }
             anyhow::bail!("agent-loop id {} already exists", opts.id);
         }
         let loop_ = create_loop(self, opts, resolved, allowed)?;
+        if join {
+            loop_.memory_restored.store(false, Ordering::SeqCst);
+        }
         registry.insert(loop_.opts.id.clone(), loop_.clone());
         Ok(loop_)
     }
@@ -1033,7 +1045,17 @@ impl AgentLoop {
         Ok(())
     }
 
-    async fn guard_calls(&self, engine: &Engine, calls: &[providers::ToolCall]) -> anyhow::Result<Value> {
+    pub(crate) async fn guard_history(&self) -> (Vec<Value>, usize) {
+        let state = self.guard.lock().await;
+        (state.chain.clone(), state.call_count)
+    }
+
+    async fn guard_calls(
+        &self,
+        engine: &Engine,
+        calls: &[providers::ToolCall],
+        history: Option<(Vec<Value>, usize)>,
+    ) -> anyhow::Result<Value> {
         let context = self
             .guard
             .lock()
@@ -1041,9 +1063,9 @@ impl AgentLoop {
             .context
             .clone()
             .ok_or_else(|| anyhow::anyhow!("guard requires the host's admitted loop input"))?;
-        let (chain, call_count) = {
-            let state = self.guard.lock().await;
-            (state.chain.clone(), state.call_count)
+        let (chain, call_count) = match history {
+            Some(h) => h,
+            None => self.guard_history().await,
         };
         let verdicts =
             crate::guard::judge(engine, &context, calls, &chain, call_count, &self.scope, &self.cancel).await?;
@@ -1101,9 +1123,9 @@ impl Engine {
         opts.root_request = spec.root_request.clone();
         opts.session_id = spec.session_id.clone();
         opts.trace_scope = Some(scope.clone());
-        let rebuilt = self.start_loop(opts).await?;
-        rebuilt.memory_restored.store(false, Ordering::SeqCst);
-        Ok(rebuilt)
+        // Concurrent guard resolutions can rebuild the same suspended loop.
+        // Join the winner under the registry lock after skill IO too.
+        self.create_or_join_loop(opts, true).await
     }
 }
 
@@ -1162,7 +1184,7 @@ pub async fn loop_guard(
         .iter()
         .map(tool_call)
         .collect::<anyhow::Result<Vec<_>>>()?;
-    loop_.guard_calls(engine, &calls).await
+    loop_.guard_calls(engine, &calls, None).await
 }
 
 pub async fn guard_review(
@@ -1170,8 +1192,8 @@ pub async fn guard_review(
     args: &Value,
     scope: &Scope,
     cancel: &CancellationToken,
+    history: Option<(Vec<Value>, usize)>,
 ) -> anyhow::Result<Value> {
-    let reviewed = loop_guard(engine, args, scope, cancel).await?;
     let calls = args["calls"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("missing calls"))?
@@ -1179,6 +1201,7 @@ pub async fn guard_review(
         .map(tool_call)
         .collect::<anyhow::Result<Vec<_>>>()?;
     let loop_ = engine.loop_for(&loop_spec(args)?, scope, cancel).await?;
+    let reviewed = loop_.guard_calls(engine, &calls, history).await?;
     let verdicts: Vec<(String, crate::guard::Verdict)> = serde_json::from_value(reviewed["verdicts"].clone())?;
     let items: Vec<_> = calls
         .into_iter()
@@ -1261,7 +1284,7 @@ pub async fn loop_confirm_request(
     let call = tool_call(&args["call"])?;
     let key = crate::guard::key(&call);
     if !loop_.guard.lock().await.verdicts.contains_key(&key) {
-        loop_.guard_calls(engine, std::slice::from_ref(&call)).await?;
+        loop_.guard_calls(engine, std::slice::from_ref(&call), None).await?;
     }
     let (guidance, goal) = {
         let state = loop_.guard.lock().await;
@@ -1308,7 +1331,7 @@ pub async fn loop_worker_input(
             }
         } else {
             drop(state);
-            loop_.guard_calls(engine, std::slice::from_ref(&call)).await?;
+            loop_.guard_calls(engine, std::slice::from_ref(&call), None).await?;
             state = loop_.guard.lock().await;
             if state.verdicts.get(&crate::guard::key(&call)).is_none_or(|v| !v.allowed()) {
                 return Ok(None);
@@ -1436,7 +1459,7 @@ pub async fn loop_tool_at(
         Some(match recorded {
             Some(verdict) => verdict,
             None => {
-                loop_.guard_calls(engine, std::slice::from_ref(&call)).await?;
+                loop_.guard_calls(engine, std::slice::from_ref(&call), None).await?;
                 loop_
                     .guard
                     .lock()
