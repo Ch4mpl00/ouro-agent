@@ -51,13 +51,34 @@ pub struct Engine {
     loops: tokio::sync::Mutex<HashMap<String, Arc<AgentLoop>>>,
     stopping: AtomicBool,
     shutdown: tokio::sync::Mutex<bool>,
+    // A dry run's own engine (sandbox.rs): its writes answer with a mock and
+    // its confirmations are answered on the spot.
+    sandbox: Option<Arc<crate::sandbox::Sandbox>>,
 }
 
 pub fn create_engine(deps: EngineDeps) -> Arc<Engine> {
-    Arc::new(Engine { deps, loops: Default::default(), stopping: AtomicBool::new(false), shutdown: Default::default() })
+    create(deps, None)
+}
+
+/// The engine of one dry run, over the sandbox's stores.
+pub(crate) fn create_sandbox_engine(deps: EngineDeps, sandbox: Arc<crate::sandbox::Sandbox>) -> Arc<Engine> {
+    create(deps, Some(sandbox))
+}
+
+fn create(deps: EngineDeps, sandbox: Option<Arc<crate::sandbox::Sandbox>>) -> Arc<Engine> {
+    Arc::new(Engine {
+        deps,
+        loops: Default::default(),
+        stopping: AtomicBool::new(false),
+        shutdown: Default::default(),
+        sandbox,
+    })
 }
 
 impl Engine {
+    pub fn sandbox(&self) -> Option<&Arc<crate::sandbox::Sandbox>> {
+        self.sandbox.as_ref()
+    }
     pub fn resolve_provider(&self, model: &str) -> anyhow::Result<SharedProvider> {
         let providers = &self.deps.providers;
         if providers::is_openrouter_model(model) {
@@ -506,10 +527,7 @@ impl AgentLoop {
     // memory with its content or a preview.
     // Also the entry it stored, `[key, value, format]`.
     fn present(&self, name: &str, raw: &str, span: &Arc<dyn Span>) -> (String, Option<Value>) {
-        if raw.starts_with("[guard] blocked:")
-            || name.starts_with("working_memory_")
-            || matches!(name, "try_workflow" | "read_run")
-        {
+        if raw.starts_with("[guard] blocked:") || name.starts_with("working_memory_") || name == "read_run" {
             return (raw.to_owned(), None);
         }
         let stored = store_tool_result(&self.opts.session.memory, raw);
@@ -530,12 +548,25 @@ impl AgentLoop {
         if synthetic && !self.visible(name) {
             return Ok(format!("[tool error] {name} is unavailable in this loop"));
         }
-        let outcome = if synthetic {
-            self.synthetic(engine, name, &args, span, child, runs).await
-        } else if !crate::mcp::model_tools(&*engine.deps.mcp).iter().any(|t| t.name == name)
-            || !self.allowed.as_ref().is_none_or(|s| s.contains(name))
+        if !synthetic
+            && (!crate::mcp::model_tools(&*engine.deps.mcp).iter().any(|t| t.name == name)
+                || !self.allowed.as_ref().is_none_or(|s| s.contains(name)))
         {
             return Ok(format!("[tool error] {name} is unavailable in this loop"));
+        }
+        // A dry run makes no write: a worker still runs (dry too), MCP's
+        // writes stop at the sandbox's MCP, the runtime's own stop here.
+        if let Some(sandbox) = engine.sandbox()
+            && name != "invoke_sub_agent"
+            && tool_effect(engine, name) == owf::run::Effect::Write
+        {
+            span.update(ContextUpdate::metadata(json!({"mock": true}).as_object().cloned().unwrap_or_default()));
+            if synthetic {
+                return Ok(sandbox.mock(name, Value::Object(args)));
+            }
+        }
+        let outcome = if synthetic {
+            self.synthetic(engine, name, &args, span, child, runs).await
         } else {
             engine.deps.mcp.call_tool(name, args, &self.cancel).await
         };
@@ -673,7 +704,11 @@ impl AgentLoop {
             "probe_function" => crate::flows::probe(engine, args, &self.cancel).await,
             "try_workflow" => {
                 let scope: crate::tracing::Scope = span;
-                crate::flows::try_draft(engine, args, &self.opts.session.env, &scope, &self.cancel).await
+                if args.get("signal").is_some_and(|s| !s.is_null()) {
+                    crate::sandbox::try_signal(engine, args, &self.opts.session, &scope, &self.cancel).await
+                } else {
+                    crate::flows::try_draft(engine, args, &self.opts.session.env, &scope, &self.cancel).await
+                }
             }
             name if crate::schedule::TOOLS.contains(&name) => {
                 let tz = &self.opts.session.env.timezone;
@@ -1201,6 +1236,9 @@ pub async fn loop_turn(
         loop_.scope.update(ContextUpdate::input(message.get("content").cloned().unwrap_or(Value::Null)));
     }
     let message = loop_.generate(engine, &mut messages, i).await?;
+    if let Some(sandbox) = engine.sandbox() {
+        sandbox.turn(&spec.id, i as u64 + 1, &message, args["extra_turn"] == true);
+    }
     // The live transcript follows the run's (a recovery report reads it).
     messages.push(message.clone());
     *loop_.messages.lock().await = messages;
@@ -1277,10 +1315,10 @@ pub async fn guard_confirmation(
     anyhow::ensure!(verdict.label == "needs_confirmation", "call needs no confirmation");
     let target = loop_.opts.confirm.as_ref().ok_or_else(|| anyhow::anyhow!("no confirmation target"))?;
     let context = loop_.guard.lock().await.context.clone().ok_or_else(|| anyhow::anyhow!("missing guard context"))?;
-    crate::confirmation::request(
-        runs.confirmations(),
+    request_confirmation(
+        engine,
+        runs,
         events.ok_or_else(|| anyhow::anyhow!("no events"))?,
-        &*engine.deps.mcp,
         crate::confirmation::Request {
             run: info.run_id,
             call,
@@ -1289,9 +1327,27 @@ pub async fn guard_confirmation(
             goal: if context.root_request.is_empty() { &context.task } else { &context.root_request },
             card: &crate::confirmation::Card::load(&*engine.deps.memory),
         },
+        &loop_.opts.id,
+        scope,
         info.cancel,
     )
     .await
+}
+
+// The card goes to the user; in a dry run it is answered on the spot.
+async fn request_confirmation(
+    engine: &Engine,
+    runs: &crate::durable::RunStore,
+    events: &dyn owf::run::Events,
+    req: crate::confirmation::Request<'_>,
+    loop_id: &str,
+    scope: &Scope,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Value> {
+    match engine.sandbox() {
+        Some(sandbox) => sandbox.press(runs, events, req, loop_id, scope),
+        None => crate::confirmation::request(runs.confirmations(), events, &*engine.deps.mcp, req, cancel).await,
+    }
 }
 
 pub fn confirmation_verdict(call: &providers::ToolCall, outcome: &str) -> crate::guard::Verdict {
@@ -1344,10 +1400,10 @@ pub async fn loop_confirm_request(
             if context.root_request.is_empty() { context.task.clone() } else { context.root_request.clone() },
         )
     };
-    crate::confirmation::request(
-        runs.confirmations(),
+    request_confirmation(
+        engine,
+        runs,
         events,
-        &*engine.deps.mcp,
         crate::confirmation::Request {
             run: info.run_id,
             call: &call,
@@ -1356,6 +1412,8 @@ pub async fn loop_confirm_request(
             goal: &goal,
             card: &crate::confirmation::Card::load(&*engine.deps.memory),
         },
+        &loop_.opts.id,
+        scope,
         info.cancel,
     )
     .await
@@ -1561,7 +1619,9 @@ pub async fn loop_tool_at(
     } else {
         loop_.start_call(engine, &call, child, runs, verdict.as_ref()).await
     };
-    if let Some((outcome, (runs, id))) = outcome.as_deref().zip(runs.zip(run_id)) {
+    // A dry run's card was never sent: there is nothing to edit.
+    if let Some((outcome, (runs, id))) = outcome.as_deref().zip(runs.zip(run_id)).filter(|_| engine.sandbox().is_none())
+    {
         crate::confirmation::close_card(
             runs.confirmations(),
             &*engine.deps.mcp,
@@ -1575,6 +1635,9 @@ pub async fn loop_tool_at(
     }
     let (span, raw) = dispatched?;
     let failed = raw.starts_with("[guard] blocked:") || is_tool_error(&raw);
+    if let Some(sandbox) = engine.sandbox() {
+        sandbox.call(&loop_.opts.id, args["i"].as_u64(), &call, verdict.as_ref(), !failed, &raw);
+    }
     let (mut presented, stored) = loop_.present(&call.name, &raw, &span);
     // A durable worker's run, for read_run: beside its answer, not in it,
     // so the answer can still be passed on as it is.
@@ -1668,6 +1731,9 @@ pub async fn loop_settle(
         round.push((call, presented, failed, finish));
     }
     let finished = settle_round(&mut round);
+    if let Some(sandbox) = engine.sandbox() {
+        sandbox.settled(&loop_.opts.id, finished.is_some());
+    }
     let replies: Vec<Message> =
         round.iter().map(|(call, presented, _, _)| providers::tool_reply(&call.id, presented)).collect();
     loop_.messages.lock().await.extend(replies.iter().cloned());

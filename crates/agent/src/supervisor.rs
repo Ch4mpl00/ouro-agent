@@ -463,7 +463,7 @@ impl Supervisor {
             errors: Default::default(),
         };
         let errors = functions.errors.clone();
-        let host = owf::run::Host {
+        let mut host = owf::run::Host {
             functions: Arc::new(functions),
             observer: Arc::new(owf::run::Silent),
             clock: Arc::new(owf::run::SystemClock),
@@ -475,6 +475,9 @@ impl Supervisor {
             "env_context": signal.env_context, "workflow": signal.saved_workflow(), "button":button(signal), "payload":signal.payload,
         }});
         let run_id = format!("{}:{}/signal", signal.source, signal.id);
+        if let Some(sandbox) = self.engine.sandbox() {
+            sandbox.watch(&mut host, &run_id, SIGNAL_NAME, version, None, None);
+        }
         let outcome = owf::run::run(&host, &wf, &run_id, input, &self.cancel).await;
         let result = crate::flows::flow_result(outcome.status, outcome.effects_started);
         crate::flows::record_outcome(&self.engine, SIGNAL_NAME, version, &result);
@@ -693,15 +696,18 @@ impl SignalFunctions {
                         ));
                 let mut functions = self.clone();
                 functions.routed = true;
-                let host = owf::run::Host {
+                let mut host = owf::run::Host {
                     functions: Arc::new(functions),
                     observer: Arc::new(owf::run::Silent),
                     clock: Arc::new(owf::run::SystemClock),
                     limits: owf::run::Limits::default(),
                     runtime: json!({"name":"agent-supervisor","version":env!("CARGO_PKG_VERSION")}),
                 };
-                let outcome =
-                    Box::pin(owf::run::run(&host, &wf, &format!("{id}/{name}"), args["context"].clone(), cancel)).await;
+                let run = format!("{id}/{name}");
+                if let Some(sandbox) = engine.sandbox() {
+                    sandbox.watch(&mut host, &run, &name, version, None, None);
+                }
+                let outcome = Box::pin(owf::run::run(&host, &wf, &run, args["context"].clone(), cancel)).await;
                 let result = crate::flows::flow_result(outcome.status, outcome.effects_started);
                 crate::flows::record_outcome(engine, &name, version, &result);
                 match result {

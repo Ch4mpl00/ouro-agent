@@ -239,7 +239,7 @@ async fn a_sub_agent_cut_by_a_restart_is_resumed_and_joined_by_its_parent() {
 }
 
 // The agent may replace the loop: the version it activates under
-// `agent-loop` drives every loop started after, with no dry run needed.
+// `agent-loop` (after a dry run) drives every loop started after.
 // LOOP_BREAKER faults in a row of that version put the built-in loop back.
 #[tokio::test]
 async fn an_activated_agent_loop_runs_and_three_faults_in_a_row_put_the_built_in_one_back() {
@@ -250,6 +250,7 @@ async fn an_activated_agent_loop_runs_and_three_faults_in_a_row_put_the_built_in
     let engine = engine_with(llm, Arc::new(World { calls: Mutex::default(), stop: None }), db);
     let activate = |definition: &str| {
         let saved = engine.deps.workflows.save("agent-loop", definition, None).unwrap();
+        engine.deps.workflows.mark_tried("agent-loop", saved.version).unwrap();
         let args = json!({"name": "agent-loop", "version": saved.version});
         agent::flows::tool(&engine, "activate_workflow", args.as_object().unwrap()).unwrap()
     };

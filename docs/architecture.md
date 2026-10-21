@@ -249,7 +249,8 @@ gateway preserves upstream annotations unchanged. Confirmation reasons currently
 consult the user; durable confirmation waits remain future work.
 
 The agent can read the loop (`read_workflow("agent-loop")`), save its own
-version and activate it. A circuit breaker counts that version's faults;
+version, try it on a signal (`try_workflow` with `signal` and `drafts`, see
+[Saved workflows](#saved-workflows)) and activate it. A circuit breaker counts that version's faults;
 three in a row and loops go back to the built-in definition until another
 version is activated.
 
@@ -396,11 +397,22 @@ ask for one.
    function catalog, and the reply lists every write the workflow would make.
 2. **Dry-run.** `try_workflow` runs a version once on today's data. Reads
    and model steps are real. Writes (messages, watermarks, journal entries)
-   are only recorded. The author fixes what the run shows and describes the
-   workflow to the user with a sample.
+   are only recorded and answered with an explicit mock. The author fixes
+   what the run shows and describes the workflow to the user with a sample.
+   A loop, a route or a `signal` override is tried on a signal instead
+   (`sandbox.rs`): `try_workflow(name, signal, drafts, confirm)` runs it as if
+   it had arrived, through the dispatcher, the route, the loop, the guard and
+   workers, with the drafts in place of the active versions. Model turns,
+   reads and the guard are real; confirmations are answered automatically
+   (accept, decline or expire); runs, cards and events live in an in-memory
+   database and every store refuses or keeps its writes, so nothing persists.
+   The reply is the trace: each workflow's path with its switch cases, each
+   turn's reasoning, text and calls with verdicts and replies, the writes,
+   and how each loop ended.
 3. **Activate.** `activate_workflow` makes a version the active one, and
    only after the user confirms in chat. Only a version with a completed dry
-   run can be activated. Versions never change; their status moves draft →
+   run can be activated, a loop, a route or `signal` included (their breaker
+   is the second line). Versions never change; their status moves draft →
    active → retired.
 4. **Schedule.** `schedule_task(workflow: name)` makes each fire run the
    active version.

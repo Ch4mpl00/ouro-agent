@@ -214,8 +214,25 @@ fn build_packet(
     let mut omitted = Map::new();
     let mut refs = HashMap::new();
     let mut kept = Vec::new();
+    // What a dry run did inside (sandbox.rs) did not happen: only the try
+    // itself is an action of the run.
+    let dry = |o: &Observation| {
+        let mut parent = o.parent_observation_id.as_deref();
+        let mut visited = HashSet::new();
+        while let Some(id) = parent.filter(|id| visited.insert(*id)) {
+            let Some(p) = by_id.get(id) else { break };
+            if p.meta("dry_run") == Some(&json!(true)) {
+                return true;
+            }
+            parent = p.parent_observation_id.as_deref();
+        }
+        false
+    };
     for o in observations {
-        if o.parent_observation_id.is_none() || !matches!(o.kind, ObservationType::Tool | ObservationType::Agent) {
+        if o.parent_observation_id.is_none()
+            || !matches!(o.kind, ObservationType::Tool | ObservationType::Agent)
+            || dry(o)
+        {
             continue;
         }
         let name = tool_name(o);

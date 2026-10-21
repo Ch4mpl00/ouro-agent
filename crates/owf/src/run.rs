@@ -1141,7 +1141,7 @@ impl Run<'_> {
                 if let Some(limit) = expires {
                     events.unregister(self.run_id, &key, &types).map_err(storage)?;
                     return Err(WorkflowError::timeout(format!(
-                        "{reference} did not receive an event within {limit:?} (the host does not wait longer than {hold:?})"
+                        "no event within {hold:?}, the most this host waits (the timeout allows {limit:?})"
                     ))
                     .into());
                 }
