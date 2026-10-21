@@ -128,11 +128,9 @@ const WORKHORSE: &str = "openrouter/deepseek/deepseek-v4.1-flash";
 pub fn default_presets() -> Presets {
     Presets {
         base: preset(WORKHORSE, ReasoningEffort::Disabled),
-        // Without reasoning: the loop's turns stay fast (MiMo at medium
-        // thought for four minutes over one workflow edit).
-        smart: preset(WORKHORSE, ReasoningEffort::Disabled),
+        smart: preset(WORKHORSE, ReasoningEffort::High),
         smartest: preset(WORKHORSE, ReasoningEffort::Max),
-        compiler: preset(WORKHORSE, ReasoningEffort::Disabled),
+        compiler: preset(WORKHORSE, ReasoningEffort::High),
         compose: preset("gpt-6.1-sol", ReasoningEffort::Medium),
     }
 }
