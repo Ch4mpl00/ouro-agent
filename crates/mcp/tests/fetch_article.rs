@@ -12,7 +12,8 @@
 //     and nothing is stored;
 //   - an error status is a tool error, and nothing is stored;
 //   - an HTML article comes back as its text, is stored once and becomes
-//     searchable; asking again answers from the store without fetching.
+//     searchable; asking again answers from the store without fetching;
+//   - an article the store refuses still comes back, marked unsaved.
 
 mod support;
 
@@ -244,4 +245,32 @@ fn bounds_what_it_reads_refuses_binaries_and_stores_each_article_once() {
         witnessed.into_inner().unwrap().into_iter().collect::<Vec<_>>(),
         ["a binary", "a body bigger than the bound", "an article"]
     );
+}
+
+#[test]
+fn an_article_the_store_refuses_comes_back_marked_unsaved() {
+    let env = env();
+    runtime().block_on(async {
+        let client = env.server.pool.get().await.unwrap();
+        client
+            .batch_execute(
+                "CREATE OR REPLACE FUNCTION refuse_broken() RETURNS trigger AS $$
+                 BEGIN RAISE EXCEPTION 'store refused'; END $$ LANGUAGE plpgsql;
+                 DROP TRIGGER IF EXISTS refuse_broken ON news_items;
+                 CREATE TRIGGER refuse_broken BEFORE INSERT ON news_items FOR EACH ROW
+                 WHEN (NEW.external_id LIKE '%/broken/%') EXECUTE FUNCTION refuse_broken();",
+            )
+            .await
+            .unwrap();
+        let url = "https://example.org/broken/1".to_owned();
+        let page = Page::Article { words: "kestrel basalt refused".into(), pad_kb: 0, content_type: Some("text/html") };
+        env.web.pages.lock().unwrap().insert(url.clone(), page);
+        let out = call(&env.client, "fetch_article", json!({ "url": url })).await;
+        let Outcome::Ok(value) = out else { panic!("the text still comes back: {out:?}") };
+        assert!(value["text"].as_str().unwrap_or_default().contains("kestrel basalt refused"));
+        assert_eq!(value["saved"], false);
+        assert!(value["saveError"].as_str().unwrap_or_default().contains("store refused"), "{value}");
+        let stored = client.query("SELECT 1 FROM news_items WHERE external_id = $1", &[&url]).await.unwrap();
+        assert!(stored.is_empty());
+    });
 }

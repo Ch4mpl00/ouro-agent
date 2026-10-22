@@ -1193,10 +1193,15 @@ async fn fetch_article_response(news: &NewsRepository, fetcher: &ArticleFetcher,
         metadata,
         posted_at: article.published_at,
     };
+    let mut response = fetched_article_json(&article, source);
+    // The read succeeded, so the text still comes back; the reply says the
+    // store missed it rather than letting a caller count it as saved.
     if let Err(err) = news.upsert(&item).await {
         tracing::error!(error = %format!("{err:#}"), "fetch_article: save step failed");
+        response["saved"] = false.into();
+        response["saveError"] = format!("{err:#}").into();
     }
-    Ok(fetched_article_json(&article, source))
+    Ok(response)
 }
 
 #[tool_router(router = news_tools, vis = "pub(crate)")]
@@ -1262,7 +1267,8 @@ impl McpTools {
             and Habr pollers already cover their feeds. Use this for ad-hoc \
             URLs the user shares. Returns clean plaintext (title + body). \
             If the URL is already cached, returns the cached row without \
-            re-fetching."
+            re-fetching (`cached: true`). If the article was read but could \
+            not be stored, the reply has `saved: false` and `saveError`."
     )]
     async fn fetch_article(&self, Parameters(params): Parameters<FetchArticleParams>) -> ToolResult {
         if url::Url::parse(&params.url).is_err() {
