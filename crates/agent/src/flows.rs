@@ -497,10 +497,26 @@ const LOOP_FUNCTIONS: &[HostFunction] = &[
         &["calls", "results"],
         "Settle ordered tool results into the admitted loop's transcript and working memory. Returns replies, memory, finished, output and outcomes: {name, arguments, ok, result}. Use these facts in workflow exit rules.",
     ),
+    host_function(
+        "loop_setup",
+        Effect::Read,
+        &["system", "skills", "input"],
+        &[],
+        "Set up the admitted loop's instructions, once and before its first agent_turn. system is an array of strings (null and empty entries are dropped) added to the system prompt; skills names skills loaded in full, with their tools; input replaces the first user message (a routed loop's is the signal's text, e.g. with signal_input's history). Returns messages and memory to export into $context, and setup (what a restart restores). Loaded skills and a preselect_skills block passed in system count for the guard.",
+    ),
 ];
 
 fn is_loop_function(name: &str) -> bool {
     LOOP_FUNCTIONS.iter().any(|f| f.name == name)
+}
+
+// The signal workflow's context functions a loop may call too, before its
+// `loop_setup`: on the signal its route started it for (agent.rs §4).
+const LOOP_CONTEXT: &[&str] = &["signal_input", "recent_activity", "pending_confirmations", "preselect_skills"];
+
+// A host function of an admitted loop run.
+fn is_loop_host(name: &str) -> bool {
+    is_loop_function(name) || LOOP_CONTEXT.contains(&name)
 }
 
 fn runtime_functions() -> impl Iterator<Item = (HostFunction, &'static str)> {
@@ -513,7 +529,11 @@ fn runtime_functions() -> impl Iterator<Item = (HostFunction, &'static str)> {
             )
         })
         .chain(LOOP_FUNCTIONS.iter().filter(|f| f.name != "confirm_request").map(|f| (*f, "agent-loop")))
-        .chain(crate::supervisor::SIGNAL_FUNCTIONS.iter().map(|f| (*f, "signal")))
+        .chain(
+            crate::supervisor::SIGNAL_FUNCTIONS
+                .iter()
+                .map(|f| (*f, if LOOP_CONTEXT.contains(&f.name) { "signal|agent-loop" } else { "signal" })),
+        )
 }
 
 fn loop_tool_name(args: &Value) -> &str {
@@ -571,7 +591,7 @@ impl owf::run::Functions for Functions {
     // A loop's turn and calls stop on its cancellation and end their spans
     // and child loops first.
     fn cooperative(&self, name: &str) -> bool {
-        is_loop_function(name) || name == "start_child" || self.guard_only
+        is_loop_host(name) || name == "start_child" || self.guard_only
     }
 
     // A stop (shutdown, the loop's owner released) that cuts a call short is
@@ -589,11 +609,13 @@ impl owf::run::Functions for Functions {
         // workflow's is: the user approved the definition after its dry run.
         // Only the model's calls go through `tool` and the guard. What stays
         // refused protects the dispatcher: its functions act on the one
-        // signal its run serves.
-        if crate::supervisor::SIGNAL_FUNCTIONS.iter().any(|f| f.name == name) {
-            return Err(CallFailure::NotExecuted(invalid(name, "only the signal workflow calls it")));
+        // signal its run serves (a loop has only its context subset).
+        if crate::supervisor::SIGNAL_FUNCTIONS.iter().any(|f| f.name == name)
+            && !(self.loop_only && LOOP_CONTEXT.contains(&name))
+        {
+            return Err(CallFailure::NotExecuted(invalid(name, "only the signal workflow or a loop calls it")));
         }
-        if is_loop_function(name) {
+        if is_loop_host(name) {
             // A tool reports its own failures in its reply; an error here
             // (a lost loop, a stop) leaves a held write's outcome unknown.
             let failure: fn(WorkflowError) -> CallFailure =
@@ -647,13 +669,25 @@ impl Functions {
         if self.guard_only {
             return self.guard_step(name, args, info).await;
         }
-        if crate::supervisor::SIGNAL_FUNCTIONS.iter().any(|f| f.name == name) {
-            return Err(invalid(name, "only the signal workflow calls it").into());
+        if crate::supervisor::SIGNAL_FUNCTIONS.iter().any(|f| f.name == name)
+            && !(self.loop_only && LOOP_CONTEXT.contains(&name))
+        {
+            return Err(invalid(name, "only the signal workflow or a loop calls it").into());
         }
         let span = self.spans.scope(info.reference);
         let label = info.reference.rsplit('/').next().unwrap_or(name);
         match name {
-            "agent_turn" | "guard" | "confirm_request" | "start_worker" | "tool" | "agent_settle" => {
+            "agent_turn"
+            | "guard"
+            | "confirm_request"
+            | "start_worker"
+            | "tool"
+            | "agent_settle"
+            | "loop_setup"
+            | "signal_input"
+            | "recent_activity"
+            | "pending_confirmations"
+            | "preselect_skills" => {
                 // A loop rebuilt after a restart is traced under the runner.
                 let root: Scope = self.spans.root.clone();
                 let engine = &self.engine;
@@ -674,6 +708,26 @@ impl Functions {
                 live.admit_guard(&admitted).await.map_err(failed)?;
                 if let Some(runs) = &self.runs {
                     live.restore_guard_history(runs, info.run_id).await.map_err(failed)?;
+                }
+                if LOOP_CONTEXT.contains(&name) {
+                    return crate::agent::loop_context(
+                        engine,
+                        &live,
+                        &admitted,
+                        name,
+                        &args,
+                        self.runs.as_ref(),
+                        info.cancel,
+                    )
+                    .await
+                    .map_err(failed);
+                }
+                if name == "loop_setup" {
+                    let records =
+                        self.runs.as_ref().map(|runs| runs.records(info.run_id)).transpose().map_err(failed)?;
+                    return crate::agent::loop_setup(engine, &live, &admitted, &args, records.as_deref())
+                        .await
+                        .map_err(failed);
                 }
                 let mut args = args;
                 args["loop"] = admitted["loop"].clone();
@@ -1968,6 +2022,13 @@ impl Functions {
 // ── 4b. runtime definitions, loop variants and signal routes ────────────────
 // Active versions replace git definitions by name. Each name has its own
 // breaker; runs keep the definition and override version admitted with them.
+//
+// A route (`metadata.route`) is declared by the workflow it routes to. A loop
+// declaring one is started as the signal's primary loop and gathers its own
+// context (supervisor.rs `loop_route`); that is how a channel's flow is one
+// workflow. A route on a non-loop workflow (a signal route, which calls
+// `primary_loop` itself) is superseded by loop routes and kept for the routes
+// already active; both are matched by the same rules.
 
 const LOOP_BREAKER: u32 = 3;
 // Where a run's input names the saved version it runs (null: the built-in).
@@ -2125,6 +2186,40 @@ fn route(wf: &owf::model::Workflow) -> anyhow::Result<Option<Route>> {
     Ok(Some(Route { when: fields, priority }))
 }
 
+/// What the confirmation target of a routed loop is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteConfirm {
+    // The signal's conversation, else the default chat (the dispatcher's
+    // default path does the same).
+    Conversation,
+    None,
+}
+
+/// How a routed loop starts: `metadata.route.preset` (default `smart`) and
+/// `metadata.route.confirm` (`conversation`, the default, or `none`).
+pub struct RouteStart {
+    pub preset: PresetName,
+    pub confirm: RouteConfirm,
+}
+
+pub fn route_start(wf: &owf::model::Workflow) -> anyhow::Result<RouteStart> {
+    let route = &workflow_metadata(wf)["route"];
+    let preset = match route.get("preset") {
+        None | Some(Value::Null) => PresetName::Smart,
+        Some(name) => name
+            .as_str()
+            .and_then(PresetName::selectable)
+            .ok_or_else(|| anyhow::anyhow!("metadata.route.preset must be base, smart or smartest"))?,
+    };
+    let confirm = match route.get("confirm").and_then(Value::as_str) {
+        None if route.get("confirm").is_none_or(Value::is_null) => RouteConfirm::Conversation,
+        Some("conversation") => RouteConfirm::Conversation,
+        Some("none") => RouteConfirm::None,
+        _ => anyhow::bail!("metadata.route.confirm must be `conversation` or `none`"),
+    };
+    Ok(RouteStart { preset, confirm })
+}
+
 fn require_metadata(wf: &owf::model::Workflow) -> anyhow::Result<()> {
     let metadata = workflow_metadata(wf);
     if let Some(loop_) = metadata.get("loop") {
@@ -2132,7 +2227,14 @@ fn require_metadata(wf: &owf::model::Workflow) -> anyhow::Result<()> {
             loop_["description"].as_str().is_some_and(|s| !s.trim().is_empty()),
             "metadata.loop.description must be a nonempty string"
         );
-        anyhow::ensure!(metadata.get("route").is_none(), "a loop cannot also declare a signal route");
+    }
+    if let Some(route) = metadata.get("route") {
+        let starts = route.get("preset").is_some() || route.get("confirm").is_some();
+        anyhow::ensure!(
+            !starts || metadata.get("loop").is_some(),
+            "metadata.route.preset and metadata.route.confirm belong to a loop's route; a signal route passes them to primary_loop"
+        );
+        route_start(wf)?;
     }
     route(wf)?;
     anyhow::ensure!(
@@ -2500,10 +2602,10 @@ pub fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::R
                     "version {version} of `{name}` has not completed a dry run; the workflow-author worker tries it on a signal (try_workflow with `signal` and `drafts`) before it is shown to the user"
                 );
                 store.activate(name, version)?;
-                let runs = if is_loop_definition(name, &saved.definition) {
-                    "A loop selecting this name"
-                } else {
-                    "A matching signal"
+                let runs = match (is_loop_definition(name, &saved.definition), route(&wf)?.is_some()) {
+                    (true, true) => "A matching signal, and a loop selecting this name,",
+                    (true, false) => "A loop selecting this name",
+                    _ => "A matching signal",
                 };
                 return Ok(json!({
                     "ok": true, "name": name, "version": version,

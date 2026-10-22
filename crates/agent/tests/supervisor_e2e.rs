@@ -211,6 +211,12 @@ impl ServerHandler for FakeMcp {
                 json!({"type":"object","properties":{"chatId":{"type":["string","number"]},"limit":{"type":"number"},"threadId":{"type":"number"}},"required":["chatId"]}),
             ),
             tool("get_timezone", "Timezone.", json!({"type":"object","properties":{}})),
+            // The reference Telegram loop's status bubble.
+            tool(
+                "telegram_send_status",
+                "Live status.",
+                json!({"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"},"chatId":{"type":["string","number"]},"messageThreadId":{"type":["number","null"]}},"required":["id","text"]}),
+            ),
         ]))
     }
     async fn call_tool(
@@ -254,6 +260,7 @@ impl ServerHandler for FakeMcp {
                 json_reply(json!({"messages":[]}))
             }
             "get_timezone" => json_reply(json!({"timezone":"UTC","local_now":"2026-10-12 10:00"})),
+            "telegram_send_status" => json_reply(json!({"ok":true})),
             other => return Err(ErrorData::invalid_params(format!("Tool {other} not found"), None)),
         })
     }
@@ -385,7 +392,7 @@ async fn run(plans: &[(i64, Plan)]) -> Run {
         workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
         schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
     });
-    support::activate_telegram_flows(&engine);
+    support::activate_telegram_loop(&engine);
     let supervisor = create_supervisor(
         engine.clone(),
         EnvDeps { mcp: mcp.clone(), memory: db.clone(), user_email: None, telegram_chat_id: Some(CHAT.to_string()) },

@@ -52,6 +52,7 @@ impl ServerHandler for Server {
                 "journal_tail",
                 "journal_append",
                 "send_telegram_message",
+                "telegram_send_status",
             ]
             .iter()
             .map(|n| Tool::new(*n, *n, Arc::new(json!({"type":"object"}).as_object().unwrap().clone())))
@@ -120,7 +121,7 @@ impl Fixture {
             let mut author = support::fixture(Arc::new(support::Scripted::new(vec![])), &[], &[]);
             Arc::get_mut(&mut author.engine).unwrap().deps.workflows =
                 Arc::new(AgentDb::open(root.join("agent.db")).unwrap());
-            support::activate_telegram_flows(&author.engine);
+            support::activate_telegram_loop(&author.engine);
         }
         std::fs::create_dir(root.join("skills.default")).unwrap();
         for (name, tools, body) in [

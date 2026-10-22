@@ -1,11 +1,56 @@
-document: { dsl: '1.0.4', namespace: agent, name: agent-loop-telegram, version: '1.0.0', metadata: { loop: { description: 'ReAct loop that ends on a conversation reply and nudges once before a silent end.' } } }
-# Keep the shared steps in sync with ../../workflows/agent-loop.yaml.
-# The ReAct loop as a durable workflow. The context carries the loop's spec,
-# its transcript (`messages`), its working memory and the turn count; every
-# task record is a checkpoint, so a restart resumes the loop where it was.
+document: { dsl: '1.0.4', namespace: agent, name: telegram-loop, version: '1.0.0', metadata: { loop: { description: 'Telegram conversation loop: gathers its context, shows a status, ends on a reply to the conversation and nudges once before a silent end.' }, route: { when: { source: [telegram, telegram_button] } } } }
+# The reference for a channel's flow as ONE loop: it declares the route that
+# starts it, gathers its own first-turn context and sets up its instructions;
+# a worker running it has no signal and skips all of that. Fixed steps (the
+# status bubble) are direct calls; `tool` is only for the model's calls.
+# Keep the guarded round in sync with ../../workflows/agent-loop.yaml.
 input:
   from: '${ . + { i: 0 } }'
 do:
+  - context:
+      if: '${ $context.signal != null }'
+      do:
+        - input:
+            call: signal_input
+            export: { as: '${ $context + { input: . } }' }
+        - activity:
+            call: recent_activity
+            export: { as: '${ $context + { activity: . } }' }
+        - pending_confirmations:
+            if: '${ $context.loop.confirm != null }'
+            call: pending_confirmations
+            with: { target: '${ $context.loop.confirm }' }
+            export: { as: '${ $context + { pending_confirmations: . } }' }
+        - preselect:
+            call: preselect_skills
+            with:
+              request: '${ $context.signal.content }'
+              context: '${ "Signal source: " + $context.signal.source + "\n\n" + $context.input }'
+              loaded: [telegram]
+            export: { as: '${ $context + { preselected: . } }' }
+        - setup:
+            call: loop_setup
+            with:
+              skills: [telegram]
+              input: '${ $context.input }'
+              system: >-
+                ${ [
+                  $context.activity,
+                  $context.pending_confirmations,
+                  "Call find_skills only when the task needs something specific that the skills already in your instructions don't cover; the source is only a hint. You own delivery.",
+                  $context.preselected.block,
+                  "Delivery: use send_telegram_message for the current signal's chatId and optional messageThreadId. A final assistant message alone is not delivered to Telegram. A message delivered to this conversation ends the session: send it once the work is done, and use telegram_send_status for progress before that."
+                ] }
+            export: { as: '${ $context + { messages: .messages, memory: .memory } }' }
+        - status:
+            if: '${ $context.loop.conversation != null }'
+            call: telegram_send_status
+            with:
+              id: '${ "status:" + ($context.signal.id | tostring) }'
+              text: 👀
+              chatId: '${ $context.loop.conversation.chatId }'
+              messageThreadId: '${ $context.loop.conversation.messageThreadId }'
+            export: { as: '${ $context + { status: true } }' }
   - turn:
       call: agent_turn
       with: { loop: '${ $context.loop }', messages: '${ $context.messages }', memory: '${ $context.memory }', i: '${ $context.i }', extra_turn: '${ $context.nudged // false }' }
@@ -88,9 +133,8 @@ do:
       with: { loop: '${ $context.loop }', calls: '${ $context.calls }', results: '${ . }', memory: '${ $context.memory }' }
       export: { as: '${ $context + { messages: ($context.messages + .replies), memory: .memory } }' }
   - delivery:
-      # Delivery policy belongs here: the host only records generic outcomes.
-      # It decides on what the call asked for and whether it succeeded, never
-      # on the reply, which a dry run answers with a mock.
+      # Decide on what the call asked for and whether it succeeded, never on
+      # the reply, which a dry run answers with a mock.
       set: >-
         ${ . + { reply: ([ .outcomes[]
           | select(.ok and .name == "send_telegram_message" and (.arguments | type) == "object")
@@ -106,16 +150,26 @@ do:
         - more: { then: turn }
   - reply:
       set: '${ { output: .reply } }'
-      then: end
+      then: clear
   - answer:
       set: '${ { output: .content } }'
   - ending:
       switch:
         - silent: { when: '${ $context.loop.conversation != null and ($context.replied // false) == false and ($context.nudged // false) == false }', then: nudge }
-        - done: { then: end }
+        - done: { then: clear }
   - nudge:
       set: { role: user, content: "Nothing was sent to the user in this conversation yet. Reply there, or finish if no reply is needed." }
       export: { as: '${ $context + { messages: ($context.messages + [ . ]), nudged: true } }' }
       then: turn
+  - clear:
+      # The status bubble goes on every ending; its output keeps the loop's.
+      if: '${ $context.status == true }'
+      call: telegram_send_status
+      with:
+        id: '${ "status:" + ($context.signal.id | tostring) }'
+        text: ''
+        chatId: '${ $context.loop.conversation.chatId }'
+        messageThreadId: '${ $context.loop.conversation.messageThreadId }'
+      output: { as: '${ $task.input }' }
 output:
   as: '${ .output }'
