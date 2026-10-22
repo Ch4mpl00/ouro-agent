@@ -72,15 +72,14 @@ The evaluation binaries run with `cargo run -p evals --bin <name>`:
 - `improve` runs one improver cycle.
 - `judge-replay` replays a compose generation under another model.
 - `langfuse-trace` prints a trace.
-- `optimize <trace-id>...` proposes a task-specific workflow from Langfuse
-  traces with the `smartest` model at maximum reasoning effort. It preserves
-  reasoning, tool arguments and worker/guard ancestry, shortening tool replies
-  to a head, shape and full-observation reference. `--definition FILE` replaces
-  the default `agent-loop.yaml`; `--model MODEL` overrides the model;
-  `--out FILE` also writes the report. `--dump` prints the assembled prompt
-  without an LLM call. The returned YAML is parsed against the OWF schema;
-  function contracts, guard structure and behaviour still need validation.
-  This CLI never connects to MCP, saves a workflow or activates it (#60).
+- `optimize <trace-id>...` iteratively proposes and tests a task-specific
+  standalone workflow using the normal agent loop with local workbench tools.
+  The optimizer uses `smartest` at maximum reasoning effort; candidate compose
+  calls use the configured presets. `--one-shot` retains proposal-only behavior;
+  `--dump` prints the prompt without a model call. No live MCP transport,
+  production workflow stores, activation or scheduling are available. See
+  [optimizer workbench](optimizer.md) for scenarios, permissions, artifacts and
+  the explicit standalone-context limitation (#60).
 - `news-filter-eval` runs the filter golden set.
 
 `judge-worker` and `improve-worker` are the long-running variants, and they
