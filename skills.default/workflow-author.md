@@ -4,45 +4,39 @@ tools: []
 
 # Authoring saved workflows
 
-Author and change workflows for the agent's own loops, signal handling and
-routes selecting different loops by source or payload, as well as scheduled
+Author and change workflows for the agent's own loops and for scheduled
 tasks. Use for requests to change the agent cycle, action order, exit rules
 or recurring work.
 
 The runtime exposes its own control flow as editable Open Workflow
 Specification definitions. You can author:
 
-- **Loop variants** (`document.metadata.loop`): how model turns, guarded tool
-  rounds and workers proceed, and when a cycle continues or ends. Start from
-  `read_workflow(name: "agent-loop")`.
-- **Signal routes** (`document.metadata.route`): how matching incoming signals
-  are handled, including explicit actions before or after the primary loop,
-  context gathering and which loop `primary_loop(loop: ...)` selects. Start
-  from `read_workflow(name: "signal")` and retain the relevant handling body.
-- **A dispatcher override** named `signal`: change dispatch itself when the
-  request requires it. For source-specific handling, add a matching route.
+- **Loops** (`document.metadata.loop`): how model turns, guarded tool rounds
+  and workers proceed, and when a cycle ends. A loop that declares
+  `metadata.route` handles the matching signals by itself: it gathers its
+  own context, sets up its instructions and runs. A channel's or a source's
+  flow is one such loop. Start from `read_workflow(name: "agent-loop")`.
+- **A dispatcher override** named `signal`: only when dispatch itself must
+  change (rare).
 - **Scheduled pipelines**: fixed steps run when their scheduled task fires;
   model adapters such as `llm_compose` and `filter_relevant` provide judgement.
 
 The user can describe the desired behavior without naming workflows or OWF.
 "Fix the Telegram cycle", "show a status before the first model turn", and
 "use another cycle for peer signals" are workflow-authoring requests.
-Choose the workflow kind from the behavior requested. Skills provide model
-instructions; explicit workflow steps and switches establish execution order
-and exit conditions. Loops, routes and dispatcher overrides need no cron task.
-
-For a runtime change, follow the shared procedure below and the sections
-"The agent loop is a workflow too" and "Trying a loop, a route or the
-dispatcher". The scheduled-pipeline design advice applies to scheduled work.
+Skills provide model instructions; explicit workflow steps and switches
+establish execution order and exit conditions. Loops and dispatcher
+overrides need no cron task. For a runtime change follow the procedure and
+"Loops"; the scheduled-pipeline advice applies to scheduled work.
 
 ## Procedure
 
-1. Identify whether the request needs a scheduled pipeline, a loop variant,
-   a signal route, a dispatcher override or a combination. For runtime work,
-   pin down which signals match, the required sequence, exit conditions and
-   behavior on errors. For a requested time today, compare it with the current
-   local time. If it already passed, ask what time/date to use; never silently
-   move it to tomorrow.
+1. Identify whether the request needs a scheduled pipeline, a loop or (rarely)
+   a dispatcher override. For runtime work, pin down which signals match, the
+   required sequence, exit conditions and behavior on errors. For a
+   requested time today, compare it with the current local time. If it
+   already passed, ask what time/date to use; never silently move it to
+   tomorrow.
    Pin down the ask: what the user wants to receive or have done, from
    which data, how often, and what counts as new or relevant. Ask the
    parent back only when a choice would change what the user gets.
@@ -51,11 +45,11 @@ dispatcher". The scheduled-pipeline design advice applies to scheduled work.
    user's ask is the whole specification: every rule they gave (what to
    take, what to drop, the order, the format, the tone) goes into the
    definition itself, word for word where it matters. Inspect existing saved
-   definitions with `list_workflows` and `read_workflow`; for loops and routes,
-   also read the built-in bases named above and preserve their host contracts.
-   A runtime route may load relevant transport/domain skills. For scheduled
-   pipelines, put the user's rules in the definition and use `llm_compose`'s
-   `skill` only for one the user names.
+   definitions with `list_workflows` and `read_workflow`; for a loop, read
+   `agent-loop` and preserve its host contracts. A loop may load relevant
+   transport/domain skills with `loop_setup`. For scheduled pipelines, put
+   the user's rules in the definition and use `llm_compose`'s `skill` only
+   for one the user names.
 3. Call the data-reading functions the workflow will use with `probe_function`,
    with the arguments the workflow will pass, and build each expression from
    the fields you saw in the reply. Do not skip this: `save_workflow`
@@ -67,7 +61,7 @@ dispatcher". The scheduled-pipeline design advice applies to scheduled work.
    write the values it happened to return (texts, names, ids, amounts)
    into the definition; judge what matters by criteria (`filter_relevant`) or
    by fields, never by the sample's words. Runtime host functions such as
-   `agent_turn` and `primary_loop` need an admitted run; inspect their use in
+   `agent_turn` and `loop_setup` need an admitted run; inspect their use in
    the base definitions and test them through a signal dry run instead.
 4. Design it with the principles below, write the definition and call
    `save_workflow(name, definition)`. It checks the definition against the
@@ -77,9 +71,9 @@ dispatcher". The scheduled-pipeline design advice applies to scheduled work.
    them too unless you meant exactly that.
 5. Try it: for a scheduled pipeline, `try_workflow(name)` runs the saved draft
    on today's data as a scheduled fire would, with writes recorded. For a
-   loop, route or `signal`, use `try_workflow` with `signal` and every changed
-   draft in the chain, as described below. Inspect both routing and the loop;
-   a completed run of the wrong route or base loop does not test your change.
+   loop or `signal`, use `try_workflow` with `signal` and every changed draft,
+   as described below. A completed run of the wrong loop does not test your
+   change.
    Read the report as the user would live with it:
    - it ended `completed`, and its `path` is the one you meant: every
      task that ran, in order; a task of another branch in it (the "nothing
@@ -106,15 +100,15 @@ dispatcher". The scheduled-pipeline design advice applies to scheduled work.
 6. Return to the parent, in Russian, a description the user can check
    without reading a definition, in plain words:
    - what they get and what triggers it (matching signals or scheduled times
-     on their clock); for runtime work, which route selects which loop and
-     what steps or exit rules change;
+     on their clock); for runtime work, which signals the loop takes and what
+     steps or exit rules change;
    - where it comes from, named the way the user knows it, not by
      function names;
    - how it picks what matters, what it does when there is nothing new,
      and what it changes besides sending (what it remembers between
      runs);
-   - the dry run's route, loop, action order and completion rule for runtime
-     work, and whether every intended draft actually ran;
+   - the dry run's loop, action order and completion rule for runtime work,
+     and whether every intended draft actually ran;
    - the message the dry run would have sent, quoted as it is, as a
      sample ("Вот что пришло бы сейчас: …"), or that today was
      quiet;
@@ -122,8 +116,7 @@ dispatcher". The scheduled-pipeline design advice applies to scheduled work.
      a choice you made for them).
    No definition, YAML, JSON, function names or task paths. End with one
    line for the parent listing every workflow's name, kind and tried version,
-   the activation order (loop before the route selecting it), and the cron
-   only for scheduled work. Do not activate or schedule: the parent activates
+   and the cron only for scheduled work. Do not activate or schedule: the parent activates
    after the user confirms, and schedules only work that needs a timer.
 
 To change a workflow: `read_workflow`, edit, `save_workflow` (a new
@@ -223,180 +216,149 @@ composed again inside the `try`), the run fails with a conflict and sends
 nothing, so keep each `try` narrow, around the call it retries, with the
 `llm_compose` before it. Reads and model steps run again on every attempt.
 
-## The agent loop is a workflow too
+## Loops
 
-Every agent loop, the parent's and each worker's, runs a named workflow.
-The built-in default is `agent-loop`. You can write and activate variants
-with their own exit rules, including ending after a successful conversation
-reply or reminding the model once before a silent end. Saving and activating
-a version named `agent-loop` overrides that default; a differently named
-variant is selected explicitly by a route, worker call or skill frontmatter.
+Every agent loop, the parent's and each worker's, runs a named loop
+workflow; the built-in is `agent-loop`. Saving and activating a version
+named `agent-loop` changes every loop's default; a differently named loop
+runs when its route matches a signal, or when a worker selects it
+(`invoke_sub_agent(loop: …)`, or a worker skill's frontmatter `loop:`).
 
-### From a request to a signal-specific cycle
+**A channel's or a source's flow is ONE loop that declares its route.**
+Never write a separate signal route for it, never copy `signal` or its
+recovery `catch`: the dispatcher already offers button presses to waiting
+runs, opens the session, runs a scheduled workflow, picks the route and
+reports a failure. Start from `read_workflow("agent-loop")` and change the
+minimum:
 
-1. Inspect `list_workflows`, then read any existing matching route and the
-   loop it selects. Read `signal` and `agent-loop` as bases. Decide which
-   layer needs to change: an explicit action before the first model turn
-   belongs in the signal route; turn/tool sequencing and exit rules belong
-   in the loop. A route can use the default loop, and several routes can
-   share one variant. Create both only when both layers need changes.
-2. For a new loop, copy the base, give it its own `document.name` (for
-   example `chat-loop`), and declare `document.metadata.loop` as below.
-   Preserve the guarded round, worker joins, transcript, working memory and
-   output contract. Change the requested steps or switches and
-   `save_workflow(name: "chat-loop", definition: ...)`.
-3. For a new route, copy the relevant handling body from `signal`, give it
-   its own name (for example `chat-route`), and declare
-   `document.metadata.route.when: { source: telegram }`. Retain context and
-   recovery, remove the dispatcher's already-completed setup and route
-   dispatch, and set `loop: chat-loop` on its `primary_loop` call. Keep the
-   other arguments from that call, including input, skills, system context
-   and confirmation target. Save the route with `save_workflow` too.
-4. To send peer signals through a different cycle, create another route
-   with `when: { source: peer }` and choose its variant on `primary_loop`.
-   Source names and payload fields come from actual signals; the matching
-   rules below also allow lists of sources and more specific payload matches.
-   Activating a loop makes it selectable; the route supplies the selection.
-5. Ask `try_workflow(name: "signal", signal: {})` for real signal examples.
-   Copy a matching signal's shape and replace its message with a test request.
-   Then call `try_workflow(name: "signal", signal: <test signal>,
-   drafts: ["chat-route", "chat-loop"])`. Include only the drafts you changed;
-   the dispatcher may stay built-in. Check `drafts[].ran`, the selected route
-   and loop, the first actions, failures, final delivery and the exit rule.
-   Revise and try again when behavior differs from the request. Also try a
-   signal outside the route's scope to check that the default or another
-   matching route still handles it as intended.
-6. Return the behavior, dry-run evidence and exact tried versions to the
-   parent. After the user's confirmation, the parent activates the loop first
-   and then the route. Matching future signals select that route and loop
-   automatically; do not create a scheduled task for them. An already
-   admitted run keeps its definition.
+1. Rename `document.name` and add `metadata.loop.description` and
+   `metadata.route.when` (below). Keep the guarded round as it is: `turn`,
+   the `guard` child, worker joins, `tool`, `settle`.
+2. Before the first turn, gather context with the steps you need, under one
+   `if: '${ $context.signal != null }'`: a worker running the same loop has
+   no signal and skips them. `signal_input` (the message with its source's
+   history), `recent_activity` (the activity journal), `pending_confirmations`
+   (`target:`, cards already waiting in the conversation) and
+   `preselect_skills` (`request:`, `context:`, `loaded:`).
+3. `loop_setup` (once, before the first `agent_turn`; later it is refused)
+   puts them into the instructions: `system` (strings; nulls are dropped),
+   `skills` (loaded in full, with their tools; they count for the guard) and
+   `input` (replaces the first user message, the signal's text). Export its
+   `messages` and `memory` into `$context`.
+4. Fixed steps of the loop (a status bubble before the first turn and its
+   cleanup) are direct `call:` steps, trusted as any saved workflow's calls
+   once the user approved the definition. `tool` is only for the model's
+   calls: it carries the guard's verdict.
+5. Exit rules decide on `agent_settle`'s `outcomes` (below).
 
-For example, "show 👀 first for Telegram signals" can be an explicit
-`telegram_send_status` step in a Telegram route before `primary_loop`, with
-cleanup after the loop and in the error path. It can keep `agent-loop` when
-its turn and exit rules need no change. Use `workflow_functions` to inspect
-the status tool's actual arguments and the route context for the chat/thread;
-test the sequence in the dry run. Writing "always send 👀 first" into the
-Telegram skill alone leaves that action to a model turn.
+```yaml
+document:
+  dsl: '1.0.4'
+  namespace: agent
+  name: chat-loop
+  version: '1.0.0'
+  metadata:
+    loop: { description: Telegram conversations; ends on a reply to the chat. }
+    route: { when: { source: [telegram, telegram_button] } }
+input:
+  from: '${ . + { i: 0 } }'
+do:
+  - context:
+      if: '${ $context.signal != null }'
+      do:
+        - input: { call: signal_input, export: { as: '${ $context + { input: . } }' } }
+        - activity: { call: recent_activity, export: { as: '${ $context + { activity: . } }' } }
+        - setup:
+            call: loop_setup
+            with:
+              skills: [telegram]
+              input: '${ $context.input }'
+              system: '${ [ $context.activity, "Delivery: reply with send_telegram_message to the current chat." ] }'
+            export: { as: '${ $context + { messages: .messages, memory: .memory } }' }
+        - status:
+            if: '${ $context.loop.conversation != null }'
+            call: telegram_send_status
+            with: { id: '${ "status:" + ($context.signal.id | tostring) }', text: 👀, chatId: '${ $context.loop.conversation.chatId }' }
+  - turn:
+      call: agent_turn
+      with: { loop: '${ $context.loop }', messages: '${ $context.messages }', memory: '${ $context.memory }', i: '${ $context.i }' }
+      export: { as: '${ $context + { messages: ($context.messages + [ .message ]), calls: .calls, i: ($context.i + 1) } }' }
+  # route, guard and round: as in agent-loop, unchanged
+  - settle:
+      call: agent_settle
+      with: { loop: '${ $context.loop }', calls: '${ $context.calls }', results: '${ . }', memory: '${ $context.memory }' }
+      export: { as: '${ $context + { messages: ($context.messages + .replies), memory: .memory } }' }
+  - next:
+      switch:
+        - replied:
+            when: '${ $context.loop.conversation as $c | $c != null and any(.outcomes[]; .ok and .name == "send_telegram_message" and (.arguments.chatId | tostring) == ($c.chatId | tostring)) }'
+            then: clear
+        - finished: { when: '${ .finished }', then: clear }
+        - more: { then: turn }
+  - clear:
+      if: '${ $context.signal != null and $context.loop.conversation != null }'
+      call: telegram_send_status
+      with: { id: '${ "status:" + ($context.signal.id | tostring) }', text: '', chatId: '${ $context.loop.conversation.chatId }' }
+```
 
-### Loop and route contracts
+**Route.** `when` matches `source` and top-level signal payload fields;
+values are strings or nonempty string lists, and all keys must match. More
+keys win; for overlapping routes with equally many keys, larger `priority`
+wins (default 0); activation refuses ties and names the conflicting
+workflow. A routed loop starts on the `smart` preset with the signal's
+conversation (else the default chat) as its confirmation target;
+`metadata.route.preset` (`base`, `smart`, `smartest`) and
+`metadata.route.confirm: none` change that. Its instructions start with the
+session context, the signal's source and its env addendum; its input carries
+`signal` (`id`, `source`, `content`, `env_context`, `payload`, `button`,
+`created_at`) besides `loop`, `messages`, `memory`. Telegram uses the
+default path until a matching loop is active. Older signal routes (a
+non-loop workflow with `route`, calling `primary_loop`) still run; do not
+write new ones.
 
-A loop declares `loop: { description: "…" }` in **document.metadata**,
-OWF's metadata extension point. Start from `read_workflow("agent-loop")`,
-rename `document.name`, and add the description. Its input carries `loop`
-(the admitted host spec), `messages`, `memory` and turn count `i`; its output
-is the final string. Every round must start the reserved `guard` child before
-running tools. Save and activation check the reference; keep the guarded
-round and worker joins from the base loop.
+**Contracts.** `loop` is the admitted host spec: `loop.conversation` is
+`{chatId, messageThreadId}` for the incoming conversation, else null
+(workers too). Every round must start the reserved `guard` child before
+running the model's calls; save and activation check it. `agent_turn` takes
+`extra_turn: true` to allow one turn past the iteration limit (a single
+reminder; keep its flag in context so it fires once). `agent_settle`
+returns `finished`, `output`, `replies`, `memory` and ordered `outcomes`,
+one per call: `{name, arguments, ok, result}` (`ok` is false for failed,
+blocked or unknown outcomes; `result` capped at 64 Ki UTF-16 units). Decide
+on what a call asked for (`arguments`) and whether it succeeded (`ok`),
+never on a write's reply: a dry run answers every write with a mock. Compare
+chat ids as strings. Select the matching outcome's `arguments.text` as the
+output if desired.
 
-`agent_turn` accepts `extra_turn: true` to allow one turn past the iteration
-limit (for example a single reminder, recorded in context). `agent_settle`
-returns `finished`, `output`, model-facing `replies`, `memory`, and ordered
-`outcomes`, one per call: `{name, arguments, ok, result}`. Arguments are parsed
-JSON or their raw string; result is the full tool reply before model-facing
-storage/truncation, parsed as JSON when possible, otherwise text. Each result
-is capped at 64 Ki UTF-16 units to bound durable checkpoints; an oversized
-reply becomes text with an explicit clipping marker. `ok` is false for failed,
-guard-blocked or unknown outcomes. The host supplies facts; YAML decides
-whether a reply ends the loop.
+**Workers.** `invoke_sub_agent` accepts `loop:`; otherwise the first worker
+skill with frontmatter `loop: <name>` supplies it, else `agent-loop`; its
+description lists the active loops. A worker's `start_child` can select one
+with `loop:`, which overrides those preferences. Workers inherit the
+confirmation target. Give `tool` the call's place (`i`, `index`) so owned
+workers, joined with `listen` (15 minute hold), survive restarts.
 
-`loop.conversation` is `{chatId, messageThreadId}` for the incoming conversation,
-else null (including workers). For example, an exit switch after settle can
-use this jq condition to recognize a successful reply to the exact conversation:
+**Resolution and safety.** A name runs its active version, else its git
+definition, else `agent-loop`. Each name has its own breaker: three faults
+in a row fall back to its git definition (a routed loop: the default path).
+Definitions are fixed at admission. A loop or a `signal` override is
+activated like any workflow: after a completed dry run on a signal and the
+user's agreement. The guard child sequences review, host-rendered cards and
+confirmation listens (60 second hold, then a durable sleep); Rust verifies
+consumed button events against exact calls, so YAML cannot authorize a
+model's call. The built-in `signal` routes `telegram_button` presses through
+`deliver_event` first; its catch reports failures through `recovery_loop`
+(skipped on cancellation and aborts).
 
-    ${ $context.loop.conversation as $c | $c != null and any(.outcomes[];
-       .ok and .name == "send_telegram_message" and (.arguments | type) == "object"
-       and (.arguments.chatId | tostring) == ($c.chatId | tostring)
-       and .arguments.messageThreadId == $c.messageThreadId) }
+## Trying a loop or the dispatcher
 
-Decide on what a call asked for (`arguments`) and whether it succeeded
-(`ok`), never on a write's reply (`result`): a failed send is not `ok`, and
-in a dry run every write answers a mock (below), so a rule that reads the
-reply behaves differently there than in production. Select the matching
-outcome's `arguments.text` as the final output if desired. The same pattern
-works for any channel's reply tool. Keep any reminder flag in context so it
-survives restarts and fires only once.
-
-`primary_loop` selects a variant with `loop: <name>` and loads transport rules
-with `skills: [<name>]`. `invoke_sub_agent` accepts `loop:` too; otherwise the
-first worker skill with frontmatter `loop: <name>` supplies it, else `agent-loop`.
-Its description lists `agent-loop` and active variants. A worker's `start_child`
-can select a variant with `loop:` (or its `workflow` name); an explicit `loop:`
-overrides tool/skill preferences, including `loop: agent-loop`. Workers inherit
-the confirmation target. Give `tool` the call's place (`i`, `index`) so owned
-workers, joined with `listen`, survive restarts.
-
-Resolution is the active version of the selected name, else that name's git
-definition, else `agent-loop`. Each name has its own breaker: three faults in
-a row fall back to its git definition (or `agent-loop`). Definitions are fixed
-at admission. A loop, a route or a `signal` override is activated like any
-workflow: after a completed dry run on a signal (below) and the user's
-agreement; the breaker is only the second line.
-
-Start a signal route from `read_workflow("signal")`. The dispatcher already
-offered buttons to waiting runs, opened the session and handled a scheduled
-workflow/handover before `route_signal` runs your route in the same session
-and trace. Keep context gathering and recovery, remove dispatcher setup and
-routing, rename it, and add a header under **document.metadata**:
-
-    metadata:
-      route:
-        when: { source: [telegram, telegram_button], topic: research }
-        priority: 1
-
-`when` matches `source` and top-level signal payload fields; values are strings
-or nonempty string lists. All keys must match. More keys win; for overlapping
-routes with equally many keys, larger `priority` wins (default 0). Activation
-refuses ties and names the conflicting route. Save and activate to install
-it; do not edit the dispatcher to add routes. Classifiers are not supported yet.
-Telegram uses the default path until you activate a matching route; no Telegram
-route or loop is built in.
-
-For the first turn, `signal_input` loads source history, `recent_activity`
-loads the activity journal, `pending_confirmations` takes `target:` and lists
-existing cards, and `preselect_skills` takes `request:`, `context:` and `loaded:`.
-Pass their context to `primary_loop` with `input:`, `confirm:`, `skills:`,
-`loaded:`, `preset:`, `system:` and optionally `loop:`. A Telegram route can
-load `skills: [telegram]` and choose its own loop variant. Other signal functions
-are `signal_session`, `run_saved_workflow`, `route_signal`, `deliver_event`,
-`signal_transcript` (bounded primary transcript tail), and `recovery_loop`;
-`read_workflow("signal")` shows their arguments.
-
-The built-in `signal` wraps its body in `try`/`catch` and passes the caught
-error and a prompt assembled in YAML to `recovery_loop`, along with skills,
-preset, `max_iterations` and system prompt parts. You can change the report
-policy there. The host skips reporting on cancellation, abort or before
-`signal_session` has run, and a reporting failure does not replace the
-original error. Keep the final `raise` so a reported failure stays a failed
-signal for tracing and the breaker. An override without a catch deliberately
-gets no recovery report; Rust does not add one afterwards.
-
-The built-in loop starts the reserved `guard` child for each guarded round,
-listens for its `done` or `waiting` event with a 60 second in-memory hold,
-and sleeps durably after `waiting`. The guard workflow sequences review,
-host-rendered cards and concurrent confirmation listens. Rust verifies consumed
-events against exact calls; YAML verdicts and outcome words cannot authorize
-them. Workers inherit the parent's admitted target and use the same cards.
-Workers are joined with `start_child` and `listen` (15 minute hold); waiting
-workers release their parent and the supervisor for other signals.
-
-`signal` routes `telegram_button` presses through `deliver_event` first.
-Unmatched presses enter the primary loop with Telegram history. Its
-`primary_loop.confirm` option chooses the Telegram chat/thread: the signal's
-conversation for Telegram, the default chat for other sources. A null target
-keeps blocking. `pending_confirmations` adds information about existing cards
-to a later session without taking action.
-
-## Trying a loop, a route or the dispatcher
-
-A loop, a route and `signal` run on signals, so you try them on one:
+A loop and `signal` run on signals, so you try them on one:
 `try_workflow(name, signal: {source, content, envContext?, payload?},
 drafts: [...], confirm?)` runs the signal as if it had just arrived, through
-the whole chain: the dispatcher, the route it picks, the loop, the guard,
+the whole chain: the dispatcher, the loop its route picks, the guard,
 workers. `name` and every name in `drafts` run at their latest saved version
-instead of the active one, in this run only; name every draft of the chain
-you changed (the route and the loop it selects, say).
+instead of the active one, in this run only: `try_workflow(name: "signal",
+signal: …, drafts: ["chat-loop"])`. Also try a signal outside the loop's
+route to check that it still takes the default path.
 
 - **The signal.** Model it on a real one; never invent its shape.
   `try_workflow(name: "signal", signal: {})` succeeds without a draft or a
@@ -424,10 +386,10 @@ you changed (the route and the loop it selects, say).
   `ok` and `result`), and `children` (guard rounds, workers). A large reply
   is in your working memory (`memory_key`) with a preview.
 - **Judging it.** Compare the trace with what the user asked for, as for a
-  scheduled workflow: the route taken, each turn, each call's arguments,
+  scheduled workflow: the loop taken, each turn, each call's arguments,
   how the loop ended and what it answered. Fix and try again, three tries
   at most. `drafts` with `ran: false` did not run and stay untried: check
-  the signal against the route's `when` and the loop the route selects.
+  the signal against the loop's route `when`.
 
 A completed try marks every draft that ran as tried; activation needs it.
 

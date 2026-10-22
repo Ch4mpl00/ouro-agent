@@ -1,7 +1,7 @@
 // Agent runtime: engine wiring, synthetic tools, and the ReAct loop. Shared
 // clients are injected once; each loop owns its conversation and cancellation.
 // Sections: 1. engine / skill scoping; 2. loop lifecycle; 3. dispatch / workers;
-// 4. the loop as a workflow; 5. run history.
+// 4. the loop as a workflow (and its own first-turn context); 5. run history.
 use crate::{
     codex::{SharedCodex, code_agent},
     db::MemoryStore,
@@ -224,6 +224,9 @@ pub struct LoopOptions {
     pub confirm: Option<ConfirmTarget>,
     pub earlier_user_messages: Vec<String>,
     pub loaded_skill_text: String,
+    // The signal a loop route started this loop for (the dispatcher's
+    // `$context.signal`): its input carries it, for its context functions.
+    pub signal: Option<Value>,
     pub session_id: Option<String>,
     pub tags: Option<Vec<String>>,
     pub metadata: Metadata,
@@ -253,6 +256,7 @@ impl LoopOptions {
             confirm: None,
             earlier_user_messages: Vec::new(),
             loaded_skill_text: String::new(),
+            signal: None,
             session_id: None,
             tags: None,
             metadata: Map::new(),
@@ -273,9 +277,9 @@ pub struct AgentLoop {
     cancel: CancellationToken,
     closed: AtomicBool,
     gate: tokio::sync::Mutex<()>,
-    allowed: Option<HashSet<String>>,
-    skill_names: Vec<String>,
+    skills: std::sync::RwLock<LoadedSkills>,
     loaded_skills: String,
+    setup: std::sync::Mutex<Setup>,
     sub_counter: AtomicUsize,
     observation_meta: Metadata,
     // False for a loop rebuilt after a restart until a host function has
@@ -285,6 +289,30 @@ pub struct AgentLoop {
     // The round's calls running at once: at most max_concurrent_tools.
     slots: tokio::sync::Semaphore,
 }
+
+// The skills a loop runs and the tools they allow (None: every tool).
+// `loop_setup` adds to them before the first turn (§4).
+struct LoadedSkills {
+    names: Vec<String>,
+    allowed: Option<HashSet<String>>,
+}
+
+// What `loop_setup` did, and what the context functions before it captured
+// for it (§4): the guard's evidence of earlier user messages and of the
+// skills preselected for the request.
+#[derive(Default)]
+struct Setup {
+    turned: bool,
+    done: bool,
+    earlier_user_messages: Option<Vec<String>>,
+    preselected: Option<(Vec<String>, String)>,
+    // The preselected skills setup put into the instructions.
+    loaded: Vec<String>,
+}
+
+// Between the parts of a loop's system prompt: its prompt, each skill, the
+// working-memory rules.
+const INSTRUCTION_SEPARATOR: &str = "\n\n---\n\n";
 
 fn create_loop(
     engine: &Arc<Engine>,
@@ -311,7 +339,7 @@ fn create_loop(
         .collect::<Vec<_>>()
         .join("\n\n");
     parts.push(WORKING_MEMORY_INSTRUCTIONS);
-    let messages = vec![providers::system(&parts.join("\n\n---\n\n"))];
+    let messages = vec![providers::system(&parts.join(INSTRUCTION_SEPARATOR))];
     let mut metadata = opts.metadata.clone();
     metadata.extend(json!({"agent_id": opts.id, "skills": skill_names, "preset": opts.preset.as_str(), "model": preset.model, "reasoning_effort": preset.reasoning_effort.as_str(), "max_iterations": opts.max_iterations}).as_object().cloned().unwrap_or_default());
     let mut observation_meta = Map::new();
@@ -349,9 +377,9 @@ fn create_loop(
         trace_ended: AtomicBool::new(false),
         closed: AtomicBool::new(false),
         gate: Default::default(),
-        allowed,
-        skill_names,
+        skills: std::sync::RwLock::new(LoadedSkills { names: skill_names, allowed }),
         loaded_skills,
+        setup: Default::default(),
         sub_counter: AtomicUsize::new(0),
         observation_meta,
         memory_restored: AtomicBool::new(true),
@@ -414,7 +442,7 @@ impl AgentLoop {
             }
             let task =
                 messages.iter().find(|m| providers::role(m) == "user").and_then(providers::content).unwrap_or_default();
-            json!({"loop": self.spec(), "messages": *messages, "memory": self.opts.session.memory.snapshot(), "guard_context": self.guard_context(task)})
+            self.with_signal(json!({"loop": self.spec(), "messages": *messages, "memory": self.opts.session.memory.snapshot(), "guard_context": self.guard_context(task)}))
         };
         self.admit_guard(&input).await?;
         let result = crate::flows::run_loop_here(&engine, &self.opts.id, input, &self.scope, &self.cancel).await;
@@ -438,10 +466,8 @@ impl AgentLoop {
     ) -> anyhow::Result<Message> {
         check(&self.cancel)?;
         let provider = engine.resolve_provider(&self.model)?;
-        let mut tools: Vec<_> = crate::mcp::model_tools(&*engine.deps.mcp)
-            .into_iter()
-            .filter(|t| self.allowed.as_ref().is_none_or(|s| s.contains(&t.name)))
-            .collect();
+        let mut tools: Vec<_> =
+            crate::mcp::model_tools(&*engine.deps.mcp).into_iter().filter(|t| self.allows(&t.name)).collect();
         tools.extend(synthetic_definitions().iter().filter(|t| self.visible(&t.name)).cloned());
         if let Some(tool) = tools.iter_mut().find(|t| t.name == "invoke_sub_agent") {
             tool.description.get_or_insert_default().push_str(&format!("\nActive loops (optional loop argument; otherwise the first declared skill loop preference, then agent-loop):\n{}",
@@ -467,17 +493,32 @@ impl AgentLoop {
         });
     }
 
+    fn allows(&self, tool: &str) -> bool {
+        self.skills.read().unwrap_or_else(|e| e.into_inner()).allowed.as_ref().is_none_or(|s| s.contains(tool))
+    }
+    fn runs_skill(&self, name: &str) -> bool {
+        self.skills.read().unwrap_or_else(|e| e.into_inner()).names.iter().any(|n| n == name)
+    }
+    /// The skills in this loop's instructions, a preselected block's included.
+    pub fn skill_names(&self) -> Vec<String> {
+        let mut names = self.skills.read().unwrap_or_else(|e| e.into_inner()).names.clone();
+        names.extend(self.setup().loaded.iter().cloned());
+        names
+    }
+    fn setup(&self) -> std::sync::MutexGuard<'_, Setup> {
+        self.setup.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn visible(&self, name: &str) -> bool {
         match name {
             "invoke_sub_agent" => self.opts.parent_id.is_none(),
             "write_skill" => {
-                self.opts.parent_id.is_none()
-                    || (self.opts.allow_skill_writes && self.skill_names.iter().any(|n| n == "dreaming"))
+                self.opts.parent_id.is_none() || (self.opts.allow_skill_writes && self.runs_skill("dreaming"))
             }
             // Writing a workflow is the author's alone; other loops read,
             // activate and schedule the versions it saved and tried.
             name if crate::flows::AUTHOR_TOOLS.contains(&name) || name == "save_workflow" => {
-                self.skill_names.iter().any(|n| n == "workflow-author")
+                self.runs_skill("workflow-author")
             }
             _ => true,
         }
@@ -549,8 +590,7 @@ impl AgentLoop {
             return Ok(format!("[tool error] {name} is unavailable in this loop"));
         }
         if !synthetic
-            && (!crate::mcp::model_tools(&*engine.deps.mcp).iter().any(|t| t.name == name)
-                || !self.allowed.as_ref().is_none_or(|s| s.contains(name)))
+            && (!crate::mcp::model_tools(&*engine.deps.mcp).iter().any(|t| t.name == name) || !self.allows(name))
         {
             return Ok(format!("[tool error] {name} is unavailable in this loop"));
         }
@@ -651,10 +691,7 @@ impl AgentLoop {
                 // A skill this loop already runs is in its instructions: a
                 // second copy would cost its size again on every turn. A loop
                 // that may rewrite skills still gets the text it edits.
-                if self.skill_names.iter().any(|n| n == name)
-                    && !self.visible("write_skill")
-                    && !args.contains_key("expected_hash")
-                {
+                if self.runs_skill(name) && !self.visible("write_skill") && !args.contains_key("expected_hash") {
                     return Ok(json!({"name": name, "found": true, "loaded": true, "content": null,
                         "note": "Already part of your instructions."})
                     .to_string());
@@ -949,7 +986,9 @@ fn string_array(args: &Map<String, Value>, name: &str) -> anyhow::Result<Option<
 // The built-in `agent-loop` definition drives a loop through three host
 // functions (flows.rs): `agent_turn`, `tool` and `agent_settle`. The transcript
 // and the working memory travel in the run's context, so the interpreter's
-// task records are the loop's checkpoints and a restart resumes it.
+// task records are the loop's checkpoints and a restart resumes it. A loop
+// may gather its own first-turn context and set up its instructions before
+// its first turn (`loop_context`, `loop_setup`, at the end of the section).
 pub const AGENT_LOOP: &str = include_str!("../workflows/agent-loop.yaml");
 
 pub const AGENT_LOOP_NAME: &str = "agent-loop";
@@ -1078,15 +1117,64 @@ impl AgentLoop {
         }
     }
 
+    /// What a rebuilt loop takes from its run's journal: the guard's call
+    /// chain, and what `loop_setup` added (its record's `setup`).
     pub(crate) async fn restore_guard_history(&self, runs: &crate::durable::RunStore, id: &str) -> anyhow::Result<()> {
+        if self.guard.lock().await.history_restored {
+            return Ok(());
+        }
+        let records = runs.records(id)?;
+        let setup = setup_record(&records);
+        let mut tools = Vec::new();
+        if let Some(setup) = &setup {
+            let engine = self.engine.upgrade().ok_or_else(aborted)?;
+            for name in setup["skills"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                match engine.deps.skill_store.read_skill(name).await? {
+                    Some(skill) => tools.push((name.to_owned(), skill.tools)),
+                    None => eprintln!("[{}] [warn] setup skill \"{name}\" not found, skipping", self.opts.id),
+                }
+            }
+        }
         let mut state = self.guard.lock().await;
         if state.history_restored {
             return Ok(());
         }
-        let records = runs.records(id)?;
         state.restore_chain(&records);
+        let mut done = self.setup();
+        done.turned = turned(&records);
+        if let Some(setup) = setup {
+            done.done = true;
+            done.loaded = string_list(&setup["preselected"]);
+            if let Some(context) = state.context.as_mut() {
+                add_evidence(context, setup["guard"]["skills"].as_str().unwrap_or_default());
+                if let Some(earlier) = setup["guard"]["earlier_user_messages"].as_array() {
+                    context.earlier_user_messages = string_list(&json!(earlier));
+                }
+            }
+            self.add_skills(tools);
+        }
         state.history_restored = true;
         Ok(())
+    }
+
+    // Skills join the loop's own and widen the tools it may call, as they
+    // would have at its start (within its whitelist).
+    fn add_skills(&self, skills: Vec<(String, SkillTools)>) {
+        let whitelist = self.opts.tool_whitelist.as_ref();
+        let mut loaded = self.skills.write().unwrap_or_else(|e| e.into_inner());
+        for (name, tools) in skills {
+            match tools {
+                SkillTools::All => loaded.allowed = whitelist.cloned(),
+                SkillTools::Named(names) => {
+                    if let Some(allowed) = loaded.allowed.as_mut() {
+                        allowed.extend(names.into_iter().filter(|n| whitelist.is_none_or(|w| w.contains(n))));
+                    }
+                }
+            }
+            if !loaded.names.contains(&name) {
+                loaded.names.push(name);
+            }
+        }
     }
 
     /// The run's input for this loop, which has not run yet, and its first
@@ -1095,8 +1183,17 @@ impl AgentLoop {
         let mut messages = self.messages.lock().await.clone();
         messages.push(providers::user(text));
         let guard_context = self.guard_context(text);
-        let input = json!({"loop": self.spec(), "messages": messages, "memory": self.opts.session.memory.snapshot(), "guard_context": guard_context});
+        let input = self.with_signal(json!({"loop": self.spec(), "messages": messages, "memory": self.opts.session.memory.snapshot(), "guard_context": guard_context}));
         self.admit_guard(&input).await.expect("host loop input");
+        input
+    }
+
+    // A routed loop's input names its signal; any other has none, which is
+    // how its context steps tell a worker's run apart.
+    fn with_signal(&self, mut input: Value) -> Value {
+        if let Some(signal) = &self.opts.signal {
+            input["signal"] = signal.clone();
+        }
         input
     }
 
@@ -1237,6 +1334,7 @@ pub async fn loop_turn(
     {
         loop_.scope.update(ContextUpdate::input(message.get("content").cloned().unwrap_or(Value::Null)));
     }
+    loop_.setup().turned = true;
     let message = loop_.generate(engine, &mut messages, i).await?;
     if let Some(sandbox) = engine.sandbox() {
         sandbox.turn(&spec.id, i as u64 + 1, &message, args["extra_turn"] == true);
@@ -1751,6 +1849,214 @@ pub async fn loop_settle(
         "finished": finished.is_some(),
         "output": finished.unwrap_or_default(),
     }))
+}
+
+/// The first-turn context a loop gathers itself (`signal_input`,
+/// `recent_activity`, `pending_confirmations`, `preselect_skills`): the
+/// dispatcher's functions (supervisor.rs §1) on the signal its loop route
+/// started it for, read from the admitted input, never from YAML. What they
+/// capture for the guard waits in the live loop for `loop_setup`. A restart
+/// between them and `loop_setup` replays their results without that
+/// evidence, which leaves the guard only stricter.
+#[allow(clippy::too_many_arguments)]
+pub async fn loop_context(
+    engine: &Arc<Engine>,
+    live: &Arc<AgentLoop>,
+    admitted: &Value,
+    name: &str,
+    args: &Value,
+    runs: Option<&crate::durable::RunStore>,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Value> {
+    live.restore_memory(admitted.get("memory"))?;
+    let (mcp, scope) = (&*engine.deps.mcp, &live.scope);
+    match name {
+        "signal_input" => {
+            let signal = crate::supervisor::admitted_signal(&admitted["signal"]).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "signal_input reads the signal a loop route started this loop for, and this run has none (a worker's loop): skip the step with `if: '${{ $context.signal != null }}'`"
+                )
+            })?;
+            let (input, earlier) =
+                crate::supervisor::signal_input(&signal, &live.opts.session, mcp, scope, cancel).await?;
+            live.setup().earlier_user_messages = Some(earlier);
+            Ok(json!(input))
+        }
+        "recent_activity" => Ok(json!(crate::supervisor::load_recent_activity(mcp, scope, cancel).await?)),
+        "pending_confirmations" => {
+            let target = serde_json::from_value(args["target"].clone())?;
+            let pending = runs.map_or(Ok(json!([])), |runs| runs.confirmations().pending(&target))?;
+            Ok(crate::supervisor::pending_text(pending))
+        }
+        "preselect_skills" => {
+            let text = |key: &str| args[key].as_str().unwrap_or_default().to_owned();
+            let mut loaded = live.skill_names();
+            loaded.extend(string_list(&args["loaded"]));
+            let found = crate::supervisor::preselect_skills(
+                &engine.deps,
+                &text("request"),
+                &text("context"),
+                &loaded,
+                scope,
+                cancel,
+            )
+            .await?;
+            live.setup().preselected = found.clone();
+            Ok(found.map_or(Value::Null, |(names, block)| json!({"names": names, "block": block})))
+        }
+        _ => anyhow::bail!("unknown loop context function {name}"),
+    }
+}
+
+/// `loop_setup { system?, skills?, input? }`, once and only before the
+/// loop's first `agent_turn`: the `system` blocks and the named `skills`
+/// join its instructions (before the working-memory rules), and `input`
+/// replaces the first user message (a routed loop's is the signal's text).
+/// The skills widen the tools as they would have at the start, and count,
+/// with a preselected block passed in `system`, as the guard's evidence of
+/// what the loop was told, as the dispatcher's `primary_loop` does. Returns
+/// the transcript and working memory the run carries on with, and `setup`,
+/// which a loop rebuilt after a restart takes back from this call's record.
+pub async fn loop_setup(
+    engine: &Arc<Engine>,
+    live: &Arc<AgentLoop>,
+    admitted: &Value,
+    args: &Value,
+    records: Option<&[owf::durable::Record]>,
+) -> anyhow::Result<Value> {
+    {
+        let setup = live.setup();
+        anyhow::ensure!(
+            !setup.turned && !records.is_some_and(turned),
+            "loop_setup must run before the loop's first agent_turn: its instructions are fixed once a turn has run"
+        );
+        anyhow::ensure!(
+            !setup.done && records.is_none_or(|r| setup_record(r).is_none()),
+            "loop_setup runs once per loop"
+        );
+    }
+    let system = match &args["system"] {
+        Value::Null => Vec::new(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter(|p| !p.is_null() && p.as_str() != Some(""))
+            .map(|p| p.as_str().map(str::to_owned).ok_or_else(|| anyhow::anyhow!("system: Expected strings")))
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        _ => anyhow::bail!("system: Expected an array of strings"),
+    };
+    let names = match args.get("skills").filter(|v| !v.is_null()) {
+        None => Vec::new(),
+        Some(Value::Array(names)) => names
+            .iter()
+            .map(|n| n.as_str().filter(|n| !n.is_empty()).map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| anyhow::anyhow!("skills: Expected nonempty strings"))?,
+        Some(_) => anyhow::bail!("skills: Expected an array of skill names"),
+    };
+    let input = match &args["input"] {
+        Value::Null => None,
+        Value::String(input) => Some(input.as_str()),
+        _ => anyhow::bail!("input: Expected a string"),
+    };
+    let (mut bodies, mut tools, mut added) = (Vec::new(), Vec::new(), Vec::<String>::new());
+    for name in names {
+        if live.runs_skill(&name) || added.contains(&name) {
+            continue;
+        }
+        let skill = engine.deps.skill_store.read_skill(&name).await?.ok_or_else(|| {
+            anyhow::anyhow!("skill \"{name}\" not found (skills/{name}.md and skills.default/{name}.md both missing)")
+        })?;
+        bodies.push(skill.body);
+        tools.push((name.clone(), skill.tools));
+        added.push(name);
+    }
+    live.restore_memory(admitted.get("memory"))?;
+    let mut messages: Vec<Message> = serde_json::from_value(admitted["messages"].clone())?;
+    let prompt = messages
+        .first_mut()
+        .filter(|m| providers::role(m) == "system")
+        .ok_or_else(|| anyhow::anyhow!("loop_setup requires the host's admitted loop input"))?;
+    let current = providers::content(prompt).unwrap_or_default().to_owned();
+    let (head, rules) = match current.strip_suffix(WORKING_MEMORY_INSTRUCTIONS) {
+        Some(head) => (head.strip_suffix(INSTRUCTION_SEPARATOR).unwrap_or(head), Some(WORKING_MEMORY_INSTRUCTIONS)),
+        None => (current.as_str(), None),
+    };
+    let block = system.join("\n\n");
+    let parts: Vec<&str> = [head, block.as_str()]
+        .into_iter()
+        .chain(bodies.iter().map(String::as_str))
+        .chain(rules)
+        .filter(|p| !p.is_empty())
+        .collect();
+    prompt.insert("content".into(), parts.join(INSTRUCTION_SEPARATOR).into());
+    if let Some(input) = input
+        && let Some(first) = messages.iter_mut().find(|m| providers::role(m) == "user")
+    {
+        first.insert("content".into(), input.into());
+    }
+    let (earlier, preselected) = {
+        let setup = live.setup();
+        (setup.earlier_user_messages.clone(), setup.preselected.clone())
+    };
+    let preselected =
+        preselected.filter(|(_, text)| !text.is_empty() && system.iter().any(|part| part.contains(text.as_str())));
+    let evidence = bodies.iter().map(String::as_str).chain(preselected.as_ref().map(|(_, text)| text.as_str()));
+    let evidence = evidence.collect::<Vec<_>>().join("\n\n");
+    {
+        let mut guard = live.guard.lock().await;
+        let context = guard
+            .context
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("loop_setup requires the host's admitted loop input"))?;
+        add_evidence(context, &evidence);
+        if let Some(earlier) = &earlier {
+            context.earlier_user_messages = earlier.clone();
+        }
+    }
+    live.add_skills(tools);
+    let preselected = preselected.map(|(names, _)| names).unwrap_or_default();
+    {
+        let mut setup = live.setup();
+        setup.done = true;
+        setup.loaded = preselected.clone();
+    }
+    live.scope.update(ContextUpdate::metadata(
+        json!({"skills": live.skill_names()}).as_object().cloned().unwrap_or_default(),
+    ));
+    Ok(json!({
+        "messages": messages,
+        "memory": live.opts.session.memory.snapshot(),
+        "setup": {"skills": added, "preselected": preselected,
+            "guard": {"skills": evidence, "earlier_user_messages": earlier}},
+    }))
+}
+
+// The `setup` a completed `loop_setup` recorded in a run's journal.
+fn setup_record(records: &[owf::durable::Record]) -> Option<Value> {
+    records.iter().find_map(|record| match record {
+        owf::durable::Record::Call { function, state: owf::durable::CallState::Done(Ok(output)), .. }
+            if function == "loop_setup" =>
+        {
+            Some(output["setup"].clone())
+        }
+        _ => None,
+    })
+}
+
+// Whether a run has started a turn.
+fn turned(records: &[owf::durable::Record]) -> bool {
+    records.iter().any(|r| matches!(r, owf::durable::Record::Call { function, .. } if function == "agent_turn"))
+}
+
+fn string_list(value: &Value) -> Vec<String> {
+    value.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect()
+}
+
+fn add_evidence(context: &mut crate::guard::Context, text: &str) {
+    if !text.is_empty() {
+        context.skills =
+            [context.skills.as_str(), text].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join("\n\n");
+    }
 }
 
 // ── 5. run history ──────────────────────────────────────────────────────────

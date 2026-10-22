@@ -624,7 +624,7 @@ fn signal(source: &str, content: &str) -> PendingSignal {
 const SIGNAL_CONTENT: &str = "chatId=42: summarize";
 
 fn supervisor(h: &Harness) -> Arc<agent::supervisor::Supervisor> {
-    activate_telegram_flows(&h.engine);
+    activate_telegram_loop(&h.engine);
     let timezone: Arc<dyn Mcp> = ToolMcp::returning(Vec::new(), "{\"timezone\":\"UTC\"}");
     create_supervisor(
         h.engine.clone(),
@@ -693,6 +693,10 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
                         ("get_telegram_chat_history".to_owned(), obj(json!({"chatId":"42","limit":20}))),
                         ("journal_tail".to_owned(), obj(json!({"stream":"ouro/activity","n":10}))),
                         ("read_doc".to_owned(), obj(json!({"project":"agent-system","doc":"skill-index.md"}))),
+                        (
+                            "telegram_send_status".to_owned(),
+                            obj(json!({"id":"status:1","text":"👀","chatId":"42","messageThreadId":null}))
+                        ),
                     ]
                 );
                 assert!(mentions(&p.messages, "Put together a weekly summary?"));
@@ -712,8 +716,9 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
     let runner = supervisor(&h);
     let content = "Telegram message in chat 42.\nText: \"go ahead\"";
     assert_eq!(runner.run_signal(&signal("telegram", content)).await.unwrap(), "done");
-    // History, activity and skill-index lookup; no worker fetch or extra LLM retrieval turn.
-    assert_eq!(h.mcp.calls.lock().unwrap().len(), 3);
+    // History, activity, skill-index lookup and the loop's status bubble,
+    // opened and cleared; no worker fetch or extra LLM retrieval turn.
+    assert_eq!(h.mcp.calls.lock().unwrap().len(), 5);
     let trace = &written.all()[0];
     assert_eq!(trace.input, Some(json!(content)));
     let fetch = find(&trace.observations, "get_telegram_chat_history");
@@ -793,7 +798,7 @@ async fn runs_a_signal_directly_and_records_parent_worker_tool_io_memory_referen
     assert_eq!(trace.tags, ["telegram", "agent-loop"]);
     let agent = find(&trace.observations, "agent_loop");
     assert_eq!(agent.meta("preset"), Some(&json!("smart")));
-    assert_eq!(agent.meta("skills"), Some(&json!(["telegram", "orchestrator"])));
+    assert_eq!(agent.meta("skills"), Some(&json!(["orchestrator", "telegram"])));
     let worker = find(&trace.observations, "invoke_sub_agent");
     let search = find(&trace.observations, "search_news");
     let generations: Vec<_> = trace

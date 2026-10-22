@@ -130,8 +130,15 @@ pub fn fixture(provider: Arc<dyn ChatProvider>, definitions: &[&str], skills: &[
     }
     let db = Arc::new(AgentDb::open(root.path().join("agent.db")).unwrap());
     let store = Arc::new(FsSkillStore::new(root.path()));
+    // The reference Telegram loop calls its status tool directly, so every
+    // fixture knows it (activation checks a definition's calls).
     let mcp = Arc::new(FakeMcp {
-        defs: definitions.iter().map(|name| ToolDef::new(name, name, json!({"type":"object"}))).collect(),
+        defs: definitions
+            .iter()
+            .copied()
+            .chain((!definitions.contains(&STATUS_TOOL)).then_some(STATUS_TOOL))
+            .map(|name| ToolDef::new(name, name, json!({"type":"object"})))
+            .collect(),
         ..Default::default()
     });
     let engine = create_engine(EngineDeps {
@@ -438,7 +445,8 @@ pub struct Harness {
 impl Harness {
     pub fn new(session: Session, turns: Vec<Turn>, tool_result: &str, tracer: Arc<dyn Tracer>) -> Harness {
         let model = Turns::new(turns);
-        let mcp = ToolMcp::returning(vec![search_tool()], tool_result);
+        let status = ToolDef::new(STATUS_TOOL, STATUS_TOOL, json!({"type":"object"}));
+        let mcp = ToolMcp::returning(vec![search_tool(), status], tool_result);
         let persist = Arc::new(PersistLog::default());
         let provider: Arc<dyn ChatProvider> = model.clone();
         let engine = create_engine(EngineDeps {
@@ -544,10 +552,9 @@ pub fn activate_definition(engine: &Arc<Engine>, name: &str, definition: &str) -
     agent::flows::tool(engine, "activate_workflow", args.as_object().unwrap()).unwrap();
     version
 }
-pub fn activate_telegram_loop(engine: &Arc<Engine>) {
-    activate_definition(engine, "agent-loop-telegram", include_str!("../fixtures/agent-loop-telegram.yaml"));
-}
-pub fn activate_telegram_flows(engine: &Arc<Engine>) {
-    activate_telegram_loop(engine);
-    activate_definition(engine, "signal-telegram", include_str!("../fixtures/signal-telegram.yaml"));
+// The reference flow of a channel: one loop that declares its route.
+pub const TELEGRAM_LOOP: &str = include_str!("../fixtures/telegram-loop.yaml");
+pub const STATUS_TOOL: &str = "telegram_send_status";
+pub fn activate_telegram_loop(engine: &Arc<Engine>) -> i64 {
+    activate_definition(engine, "telegram-loop", TELEGRAM_LOOP)
 }

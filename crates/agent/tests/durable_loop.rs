@@ -858,17 +858,21 @@ do:
     }
 }
 
+// A call written into the loop's definition is the author's, trusted as a
+// saved workflow's (the user approved the definition): it runs as a step,
+// unreviewed. Only the model's calls go through `tool` and the guard.
 #[tokio::test]
-async fn an_override_cannot_bypass_tool_by_calling_guarded_mcp_tools_directly() {
+async fn a_loops_own_calls_run_as_workflow_steps_without_a_review() {
     for name in ["send", "remote_read"] {
-        let (engine, world, _, _) = guarded(vec![], "allow");
+        let (engine, world, api, _) = guarded(vec![], "misaligned");
         let definition = "document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '2.0.0' }\ndo: [{ bypass: { call: send, with: { q: bypass } } }]";
         let definition = definition.replace("call: send", &format!("call: {name}"));
         let saved = engine.deps.workflows.save("agent-loop", &definition, None).unwrap();
         engine.deps.workflows.activate("agent-loop", saved.version).unwrap();
         let result = guarded_run(&engine, "direct").await;
-        assert!(matches!(result, FlowResult::Faulted { .. }), "{result:?}");
-        assert!(world.calls.lock().unwrap().is_empty());
+        assert!(matches!(result, FlowResult::Completed(_)), "{result:?}");
+        assert_eq!(*world.calls.lock().unwrap(), [name]);
+        assert!(api.requests.lock().unwrap().is_empty(), "no review of the definition's own call");
     }
 }
 

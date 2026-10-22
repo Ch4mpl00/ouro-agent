@@ -92,8 +92,17 @@ deletion.
    dispatches routes declared in `document.metadata.route.when`: source and
    top-level payload fields, with the most specific match winning (ties need
    distinct priorities at activation). Routes run after button delivery and
-   session setup. Telegram uses the default path below unless the agent
-   saves and activates a matching route; no Telegram route or loop is built in.
+   session setup. A route is declared by a loop: the dispatcher starts it as
+   the signal's primary loop (`supervisor.rs` `loop_route`), and the loop
+   gathers its own first-turn context (`signal_input`, `recent_activity`,
+   `pending_confirmations`, `preselect_skills`) and sets up its instructions
+   with `loop_setup` before its first turn (`agent.rs` §4), so a channel's
+   flow is one workflow. Signal routes (a non-loop workflow calling
+   `primary_loop`) are superseded and kept for the ones already active.
+   Telegram uses the default path below unless the agent activates a
+   matching loop; none is built in. Calls written into a loop's YAML are
+   trusted as a saved workflow's; only the model's calls go through `tool`
+   and the guard.
    A `scheduler` signal whose payload names a saved workflow (`{"workflow": …}`, set by
    `schedule_task(workflow: …)`) runs its active version (`flows.rs` over `crates/owf`, no
    model deciding the steps); all other signals run the primary agent loop.
@@ -112,7 +121,7 @@ deletion.
    without anchors retain separate resume traces. The activity journal waits
    for every anchored run to end and its final spans to reach the mirror, then
    projects the request once. The agent may activate its own version of
-   any loop or signal route once a dry run of it on a signal completed
+   any loop (or route) once a dry run of it on a signal completed
    (`src/sandbox.rs`); three faults of a name in a row fall back to its
    built-in one (a loop without one falls back to `agent-loop`; `flows.rs` §4b). A worker of the durable primary loop is a durable run of
    its own, started immediately as an owned child. The parent joins it with
@@ -132,7 +141,7 @@ deletion.
      working memory and when to delegate to a domain skill.
    - `skills/<signal.source>.md` (with `skills.default/` fallback) — for `peer`
      and `scheduler` on the default path. Telegram rules can be preselected or
-     loaded by an activated route; domain work is delegated to a sub-agent
+     loaded by an activated loop's `loop_setup`; domain work is delegated to a sub-agent
      with that source's skill.
 
    The built-in `signal` workflow's `try`/`catch` requests a recovery report
@@ -200,7 +209,7 @@ mcp-tools/
     │   ├── guard/                          compiled guard instructions and reason data (git-owned)
     │   ├── workflows/                      built-in OWF: agent-loop.yaml, signal.yaml (dispatcher),
     │   │                                   guard.yaml (reserved round review and confirmation);
-    │   │                                   agents may activate their own loop variants and routes
+    │   │                                   agents may activate their own loops (with routes)
     │   ├── src/activity.rs                 traces → ouro/activity journal notes (background
     │   │                                   task inside the supervisor)
     │   ├── src/providers.rs                ChatProviders: openai, gemini, deepseek, openrouter
@@ -509,7 +518,7 @@ volume — written by the `dreaming` skill when it self-revises).
 - `composer` — the base prompt of saved workflows' `llm_compose` steps.
 - `workflow-author` — a worker skill (always `smartest`, maximum reasoning): drafts a saved
   workflow with `save_workflow`, dry-runs it with `try_workflow` (real reads
-  and model steps, writes only recorded; a loop, route or `signal` override
+  and model steps, writes only recorded; a loop or `signal` override
   on a signal, through the whole chain with its drafts, `src/sandbox.rs`) and
   describes it in words with a sample; the parent activates it once the user
   confirms.

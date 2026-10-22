@@ -366,6 +366,91 @@ fn tail_chars(text: &str, max: usize) -> String {
     text.chars().skip(skip).collect()
 }
 
+/// The incoming message with its source's history (`signal_input`), and the
+/// user's earlier messages in that conversation, captured right after the
+/// host preload, before any loop can change the working-memory copy: the
+/// guard's evidence.
+pub async fn signal_input(
+    signal: &PendingSignal,
+    session: &Session,
+    mcp: &dyn Mcp,
+    scope: &Scope,
+    cancel: &CancellationToken,
+) -> anyhow::Result<(String, Vec<String>)> {
+    let input = if let Some(b) = button(signal) {
+        let mut telegram = signal.clone();
+        telegram.source = "telegram".into();
+        let pressed = format!("[button] {}", b.text.as_deref().unwrap_or(&b.data));
+        let thread = b.message_thread_id.map(|t| format!(" (forum topic thread_id={t})")).unwrap_or_default();
+        telegram.content = format!("Telegram message in chat {}{thread}.\nText: {}", b.chat_id, json!(pressed));
+        let history = prepare_telegram_input(&telegram, session, mcp, scope, cancel).await?;
+        format!(
+            "{history}\n\nThe user pressed the button {} with data {} under message {} (chatId={}, messageThreadId={:?}).",
+            json!(b.text),
+            json!(b.data),
+            b.message_id,
+            b.chat_id,
+            b.message_thread_id
+        )
+    } else if signal.source == PEER_SOURCE {
+        // Peer history currently survives only as rendered text.
+        prepare_peer_input(signal, mcp, scope, cancel).await?
+    } else {
+        prepare_telegram_input(signal, session, mcp, scope, cancel).await?
+    };
+    let mut earlier = Vec::new();
+    if matches!(signal.source.as_str(), "telegram" | "telegram_button") {
+        let history = session
+            .memory
+            .get(TELEGRAM_HISTORY_KEY)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .unwrap_or(Value::Null);
+        earlier = history["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|m| m["role"] == "user")
+            .filter_map(|m| m["text"].as_str().map(str::to_owned))
+            .collect();
+    }
+    Ok((input, earlier))
+}
+
+/// `pending_confirmations`' answer: the cards waiting in a conversation as
+/// information, or null.
+pub fn pending_text(pending: Value) -> Value {
+    if pending.as_array().is_some_and(|p| !p.is_empty()) {
+        json!(format!(
+            "Pending confirmations in this conversation (information only; the cards are waiting for the user):\n{pending}"
+        ))
+    } else {
+        Value::Null
+    }
+}
+
+/// A signal as workflows see it (`$context.signal`): the dispatcher's input,
+/// and a routed loop's.
+pub fn signal_value(signal: &PendingSignal) -> Value {
+    json!({
+        "id": signal.id, "source": signal.source, "content": signal.content,
+        "env_context": signal.env_context, "workflow": signal.saved_workflow(), "button": button(signal),
+        "payload": signal.payload, "created_at": signal.created_at,
+    })
+}
+
+/// The signal a routed loop's admitted input carries, back.
+pub fn admitted_signal(value: &Value) -> Option<PendingSignal> {
+    Some(PendingSignal {
+        id: value["id"].as_i64()?,
+        source: value["source"].as_str()?.to_owned(),
+        content: value["content"].as_str()?.to_owned(),
+        env_context: value["env_context"].as_str().map(str::to_owned),
+        created_at: value["created_at"].as_str()?.to_owned(),
+        payload: value.get("payload").filter(|p| !p.is_null()).cloned(),
+    })
+}
+
 // ── 2. routing / recovery ────────────────────────────────────────────────
 pub struct Supervisor {
     pub engine: Arc<Engine>,
@@ -470,10 +555,7 @@ impl Supervisor {
             limits: owf::run::Limits::default(),
             runtime: json!({"name":"agent-supervisor","version":env!("CARGO_PKG_VERSION")}),
         };
-        let input = json!({"signal": {
-            "id": signal.id, "source": signal.source, "content": signal.content,
-            "env_context": signal.env_context, "workflow": signal.saved_workflow(), "button":button(signal), "payload":signal.payload,
-        }});
+        let input = json!({ "signal": signal_value(signal) });
         let run_id = format!("{}:{}/signal", signal.source, signal.id);
         if let Some(sandbox) = self.engine.sandbox() {
             sandbox.watch(&mut host, &run_id, SIGNAL_NAME, version, None, None);
@@ -564,14 +646,14 @@ pub const SIGNAL_FUNCTIONS: &[crate::flows::HostFunction] = {
             Read,
             &[],
             &[],
-            "Prepare the incoming message with its source history after signal_session. Returns the input string for primary_loop; preloads Telegram history into working memory and captures conversation evidence.",
+            "Prepare the incoming message with its source history. Returns the input string for primary_loop, or for loop_setup's input in a loop its route started; preloads Telegram history into working memory and captures conversation evidence for the guard.",
         ),
         host_function(
             "recent_activity",
             Read,
             &[],
             &[],
-            "Read recent activity-journal notes as a context string, or null when unavailable. Pass it in primary_loop's system array when useful.",
+            "Read recent activity-journal notes as a context string, or null when unavailable. Pass it in primary_loop's or loop_setup's system array when useful.",
         ),
         host_function(
             "pending_confirmations",
@@ -585,21 +667,21 @@ pub const SIGNAL_FUNCTIONS: &[crate::flows::HostFunction] = {
             Read,
             &["request", "context", "loaded"],
             &[],
-            "Select relevant skills for this signal. request and context are strings, loaded is an array of already loaded skill names. Returns names and block, or null; pass block in primary_loop's system array.",
+            "Select relevant skills for this signal. request and context are strings, loaded is an array of already loaded skill names (a loop's own count already). Returns names and block, or null; pass block in primary_loop's or loop_setup's system array.",
         ),
         host_function(
             "primary_loop",
             Write,
             &["input", "loop", "confirm", "skills", "loaded", "preset", "allow_skill_writes", "system"],
             &["input"],
-            "Run the signal's primary agent after signal_session. input is a string; loop selects a named variant (default agent-loop); confirm is {chatId, messageThreadId} or null; skills/loaded and system are string arrays. preset defaults to smart; allow_skill_writes defaults to false. Returns output. A route inherits the dispatcher's session.",
+            "Run the signal's primary agent after signal_session: the dispatcher's default path. input is a string; loop selects a named variant (default agent-loop); confirm is {chatId, messageThreadId} or null; skills/loaded and system are string arrays. preset defaults to smart; allow_skill_writes defaults to false. Returns output. A loop that declares its own route needs none: the dispatcher starts it.",
         ),
         host_function(
             "route_signal",
             Write,
             &["context"],
             &["context"],
-            "Dispatch the incoming signal to the most specific active metadata.route match by source and top-level payload fields. Pass context: $context after session setup; the route inherits it as input. Returns routed and output when matched, or routed:false. Dispatcher only: a matching route cannot dispatch routes again.",
+            "Dispatch the incoming signal to the most specific active metadata.route match by source and top-level payload fields. A loop declaring the route starts as the signal's primary loop (its failure reaches this workflow's catch); a signal route (superseded by loop routes) runs with context as its input. Pass context: $context after session setup. Returns routed and output when matched, or routed:false. Dispatcher only: a matching route cannot dispatch routes again.",
         ),
         host_function(
             "signal_transcript",
@@ -649,6 +731,74 @@ fn strings(args: &Value, key: &str) -> Vec<String> {
 impl SignalFunctions {
     fn state(&self) -> std::sync::MutexGuard<'_, SignalState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // The signal's primary loop, `opts` with the signal's own parts added,
+    // driven under the `agent_loop` span (the recovery report reads its
+    // transcript). `loaded`: the skills the trace names, else the loop's.
+    async fn run_primary(
+        &self,
+        mut opts: LoopOptions,
+        input: String,
+        loaded: Option<Vec<String>>,
+    ) -> anyhow::Result<String> {
+        let (supervisor, signal, trace) = (&self.supervisor, &self.signal, &self.trace);
+        let primary = trace.span(
+            SpanStart::new("agent_loop", SpanKind::Chain)
+                .metadata(json!({"activity":"primary_loop"}).as_object().unwrap().clone()),
+        );
+        self.state().span = Some(primary.clone());
+        opts.cancel = supervisor.cancel.clone();
+        opts.guard_request = Some(signal.content.clone());
+        opts.conversation = conversation(signal);
+        opts.trace_scope = Some(primary.clone());
+        let id = opts.id.clone();
+        let agent = supervisor.engine.start_loop(opts).await?;
+        self.state().primary = Some(agent.clone());
+        let output = supervisor.drive(&agent, &id, input, &primary).await?;
+        primary.end(SpanEnd::output(output.clone()));
+        let loaded = loaded.unwrap_or_else(|| agent.skill_names());
+        trace.update(ContextUpdate {
+            output: Some(json!(output)),
+            metadata: Some(json!({"skills": loaded}).as_object().unwrap().clone()),
+            ..Default::default()
+        });
+        Ok(output)
+    }
+
+    // A loop that declares the signal's route runs as its primary loop with
+    // the defaults below, which its route header may change (`preset`,
+    // `confirm`). The rest of its first turn it gathers and sets up itself
+    // (agent.rs §4, `loop_setup`): the runtime starts it with the facts it
+    // has at hand, the session, the signal's source and its env addendum.
+    // Its failures reach the dispatcher's catch, as a route's do.
+    async fn loop_route(&self, name: &str, wf: &owf::model::Workflow, context: &Value) -> anyhow::Result<String> {
+        let signal = &self.signal;
+        let start = crate::flows::route_start(wf)?;
+        let session = self.session()?;
+        let mut opts = LoopOptions::new(format!("{}:{}", signal.source, signal.id), session.clone());
+        opts.workflow = name.to_owned();
+        opts.preset = start.preset;
+        opts.confirm = match start.confirm {
+            crate::flows::RouteConfirm::Conversation => conversation(signal).or_else(|| {
+                session
+                    .env
+                    .telegram_chat_id
+                    .clone()
+                    .map(|chat_id| crate::agent::ConfirmTarget { chat_id, message_thread_id: None })
+            }),
+            crate::flows::RouteConfirm::None => None,
+        };
+        let parts = [
+            Some(render_context(&session.env)?),
+            Some(format!("Signal source: {}", signal.source)),
+            signal.env_context.clone(),
+            context["handover"].as_str().map(str::to_owned),
+        ];
+        opts.system_prompt =
+            Some(parts.into_iter().flatten().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("\n\n"));
+        opts.signal = Some(signal_value(signal));
+        self.run_primary(opts, signal.content.clone(), None).await
     }
     fn session(&self) -> anyhow::Result<Session> {
         self.state().session.clone().ok_or_else(|| anyhow::anyhow!("signal_session has not run"))
@@ -761,6 +911,18 @@ impl SignalFunctions {
                         .span(SpanStart::new(format!("route:{name}"), SpanKind::Chain).metadata(
                             json!({"workflow":name,"workflow_version":version}).as_object().unwrap().clone(),
                         ));
+                // A loop is the channel's whole flow. A route on any other
+                // workflow (a signal route, calling primary_loop itself) is
+                // superseded by loop routes and runs below for the routes
+                // already active.
+                if crate::flows::is_loop_definition(&name, &definition) {
+                    let result = self.loop_route(&name, &wf, &args["context"]).await;
+                    match &result {
+                        Ok(output) => span.end(SpanEnd::output(json!(output))),
+                        Err(error) => span.end(SpanEnd::error(error.to_string())),
+                    }
+                    return Ok(json!({"routed":true,"output":result?}));
+                }
                 let mut functions = self.clone();
                 functions.routed = true;
                 let mut host = owf::run::Host {
@@ -801,60 +963,14 @@ impl SignalFunctions {
                 }
             }
             "signal_input" => {
-                let session = self.session()?;
-                let input = if let Some(b) = button(signal) {
-                    let mut telegram = signal.clone();
-                    telegram.source = "telegram".into();
-                    let pressed = format!("[button] {}", b.text.as_deref().unwrap_or(&b.data));
-                    let thread =
-                        b.message_thread_id.map(|t| format!(" (forum topic thread_id={t})")).unwrap_or_default();
-                    telegram.content =
-                        format!("Telegram message in chat {}{thread}.\nText: {}", b.chat_id, json!(pressed));
-                    let history = prepare_telegram_input(&telegram, &session, mcp, &scope, cancel).await?;
-                    format!(
-                        "{history}\n\nThe user pressed the button {} with data {} under message {} (chatId={}, messageThreadId={:?}).",
-                        json!(b.text),
-                        json!(b.data),
-                        b.message_id,
-                        b.chat_id,
-                        b.message_thread_id
-                    )
-                } else if signal.source == PEER_SOURCE {
-                    // Peer history currently survives only as rendered text.
-                    prepare_peer_input(signal, mcp, &scope, cancel).await?
-                } else {
-                    prepare_telegram_input(signal, &session, mcp, &scope, cancel).await?
-                };
-                // Capture structured Telegram user messages immediately after host
-                // preload, before any loop can change the working-memory copy.
-                if matches!(signal.source.as_str(), "telegram" | "telegram_button") {
-                    let history = session
-                        .memory
-                        .get(TELEGRAM_HISTORY_KEY)
-                        .ok()
-                        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                        .unwrap_or(Value::Null);
-                    self.state().earlier_user_messages = history["messages"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter(|m| m["role"] == "user")
-                        .filter_map(|m| m["text"].as_str().map(str::to_owned))
-                        .collect();
-                }
+                let (input, earlier) = signal_input(signal, &self.session()?, mcp, &scope, cancel).await?;
+                self.state().earlier_user_messages = earlier;
                 Ok(json!(input))
             }
             "recent_activity" => Ok(json!(load_recent_activity(mcp, &scope, cancel).await?)),
             "pending_confirmations" => {
                 let target = serde_json::from_value(args["target"].clone())?;
-                let pending = supervisor.flows.pending_confirmations(&target)?;
-                Ok(if pending.as_array().is_some_and(|p| !p.is_empty()) {
-                    json!(format!(
-                        "Pending confirmations in this conversation (information only; the cards are waiting for the user):\n{pending}"
-                    ))
-                } else {
-                    Value::Null
-                })
+                Ok(pending_text(supervisor.flows.pending_confirmations(&target)?))
             }
             "preselect_skills" => {
                 let text = |key: &str| args[key].as_str().unwrap_or_default().to_owned();
@@ -936,16 +1052,8 @@ impl SignalFunctions {
                 let preset = args["preset"].as_str().unwrap_or("smart");
                 let preset = crate::models::PresetName::selectable(preset)
                     .ok_or_else(|| anyhow::anyhow!("preset: unknown preset {preset}"))?;
-                let primary = trace.span(
-                    SpanStart::new("agent_loop", SpanKind::Chain)
-                        .metadata(json!({"activity":"primary_loop"}).as_object().unwrap().clone()),
-                );
-                self.state().span = Some(primary.clone());
                 let mut opts = LoopOptions::new(&id, self.session()?);
-                opts.cancel = cancel.clone();
-                opts.guard_request = Some(signal.content.clone());
                 opts.workflow = args["loop"].as_str().unwrap_or(crate::agent::AGENT_LOOP_NAME).to_owned();
-                opts.conversation = conversation(signal);
                 opts.confirm = args
                     .get("confirm")
                     .filter(|v| !v.is_null())
@@ -960,16 +1068,7 @@ impl SignalFunctions {
                 opts.allow_skill_writes = args["allow_skill_writes"].as_bool().unwrap_or(false);
                 opts.system_prompt = Some(strings(args, "system").join("\n\n"));
                 opts.preset = preset;
-                opts.trace_scope = Some(primary.clone());
-                let agent = engine.start_loop(opts).await?;
-                self.state().primary = Some(agent.clone());
-                let output = supervisor.drive(&agent, &id, input.to_owned(), &primary).await?;
-                primary.end(SpanEnd::output(output.clone()));
-                trace.update(ContextUpdate {
-                    output: Some(json!(output)),
-                    metadata: Some(json!({"skills": strings(args, "loaded")}).as_object().unwrap().clone()),
-                    ..Default::default()
-                });
+                let output = self.run_primary(opts, input.to_owned(), Some(strings(args, "loaded"))).await?;
                 Ok(json!({"output": output}))
             }
             _ => anyhow::bail!("unknown signal function {name}"),

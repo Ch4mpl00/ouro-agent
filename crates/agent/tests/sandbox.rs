@@ -1,5 +1,5 @@
-// The dry-run sandbox (sandbox.rs): a Telegram-shaped signal through draft
-// versions of the example route and loop (tests/fixtures), with real
+// The dry-run sandbox (sandbox.rs): a Telegram-shaped signal through a draft
+// version of the example loop that declares its route (tests/fixtures), with real
 // (scripted) model turns, real reads, the real guard workflow and mocked
 // writes; nothing it does may outlive the try.
 mod support;
@@ -16,8 +16,7 @@ use std::sync::{Arc, Mutex};
 use support::*;
 use tokio_util::sync::CancellationToken;
 
-const ROUTE: &str = include_str!("fixtures/signal-telegram.yaml");
-const LOOP: &str = include_str!("fixtures/agent-loop-telegram.yaml");
+const LOOP: &str = TELEGRAM_LOOP;
 const SKILLS: &[(&str, &str)] = &[
     ("telegram", "---\ntools: *\n---\nTELEGRAM"),
     ("worker", "---\ntools: *\n---\nWORKER"),
@@ -36,7 +35,8 @@ struct World {
 
 const READS: &[&str] =
     &["list_signals", "get_telegram_chat_history", "journal_tail", "read_doc", "get_timezone", "search_news"];
-const WRITES: &[&str] = &["send_telegram_message", "edit_telegram_message", "remember", "journal_append"];
+const WRITES: &[&str] =
+    &["send_telegram_message", "edit_telegram_message", "remember", "journal_append", "telegram_send_status"];
 
 impl World {
     fn names(&self) -> Vec<String> {
@@ -79,9 +79,8 @@ struct Sandbox {
     model: Arc<Scripted>,
 }
 
-// An engine whose guard answers `label`, with the example route and loop
-// active (versions that would answer differently) and their fixtures as
-// drafts on top.
+// An engine whose guard answers `label`, with the example loop active (a
+// version that would answer differently) and its fixture as a draft on top.
 fn sandbox(script: Vec<agent::providers::Message>, label: &str) -> Sandbox {
     let model = Arc::new(Scripted::new(script));
     let mut f = fixture(model.clone(), &[], SKILLS);
@@ -93,13 +92,10 @@ fn sandbox(script: Vec<agent::providers::Message>, label: &str) -> Sandbox {
     deps.decisions = Some(agent::decisions::decision_client("guard-test".into(), api));
     activate_definition(
         &f.engine,
-        "agent-loop-telegram",
+        "telegram-loop",
         &LOOP.replace("set: '${ { output: .reply } }'", "set: '${ { output: (\"active: \" + .reply) } }'"),
     );
-    activate_definition(&f.engine, "signal-telegram", &ROUTE.replace("loop: agent-loop-telegram", "loop: agent-loop"));
-    for (name, definition) in [("agent-loop-telegram", LOOP), ("signal-telegram", ROUTE)] {
-        f.engine.deps.workflows.save(name, definition, Some("draft")).unwrap();
-    }
+    f.engine.deps.workflows.save("telegram-loop", LOOP, Some("draft")).unwrap();
     Sandbox { f, world, model }
 }
 
@@ -128,14 +124,12 @@ impl Sandbox {
         assert_eq!(self.rows("memory"), 0, "no breaker, watermark or card wording");
         let names = self.world.names();
         assert!(!names.iter().any(|n| WRITES.contains(&n.as_str())), "a write reached MCP: {names:?}");
-        for name in ["agent-loop-telegram", "signal-telegram"] {
-            assert_eq!(self.f.engine.deps.workflows.active(name).unwrap().unwrap().version, 1, "{name} stays active");
-        }
+        assert_eq!(self.f.engine.deps.workflows.active("telegram-loop").unwrap().unwrap().version, 1, "stays active");
     }
 }
 
 fn telegram(confirm: Option<&str>) -> Value {
-    let mut args = json!({"name":"signal","drafts":["signal-telegram","agent-loop-telegram"],
+    let mut args = json!({"name":"signal","drafts":["telegram-loop"],
         "signal":{"source":"telegram","content":MESSAGE}});
     if let Some(confirm) = confirm {
         args["confirm"] = json!(confirm);
@@ -159,7 +153,7 @@ async fn a_telegram_signal_runs_the_draft_chain_with_real_reads_and_mocked_write
     let mut first = calls(&[("search_news", json!({"query":"rust"}))]);
     first.insert("reasoning_content".into(), json!("Look the news up first."));
     let s = sandbox(vec![first, send("Rust 2.0 is out")], "allow");
-    let untried = json!({"name":"agent-loop-telegram","version":2});
+    let untried = json!({"name":"telegram-loop","version":2});
     let refused = agent::flows::tool(&s.f.engine, "activate_workflow", untried.as_object().unwrap()).unwrap_err();
     assert!(refused.to_string().contains("has not completed a dry run"), "{refused}");
 
@@ -167,15 +161,16 @@ async fn a_telegram_signal_runs_the_draft_chain_with_real_reads_and_mocked_write
     assert_eq!(report["status"], "completed", "{report:#}");
     assert_eq!(report["output"], "Rust 2.0 is out", "the draft loop's reply, not the active one's");
     assert_eq!(report["ended"]["by"], "workflow rule");
-    assert_eq!(report["ended"]["at"], "reply");
+    assert_eq!(report["ended"]["at"], "clear");
+    // The loop's own status steps are direct writes, mocked like the model's.
+    let status = |text: &str| json!({"function":"telegram_send_status","arguments":{"id":"status:0","text":text,"chatId":"42","messageThreadId":7}});
     assert_eq!(
         report["writes"],
-        json!([{"function":"send_telegram_message","arguments":{"chatId":"42","messageThreadId":7,"text":"Rust 2.0 is out"}}])
+        json!([status("👀"),
+            {"function":"send_telegram_message","arguments":{"chatId":"42","messageThreadId":7,"text":"Rust 2.0 is out"}},
+            status("")])
     );
-    assert_eq!(
-        report["drafts"],
-        json!([{"name":"agent-loop-telegram","version":2,"ran":true},{"name":"signal-telegram","version":2,"ran":true}])
-    );
+    assert_eq!(report["drafts"], json!([{"name":"telegram-loop","version":2,"ran":true}]));
 
     // The path of each workflow, with every switch's case.
     let dispatcher = run(&report, "telegram:0/signal");
@@ -184,15 +179,14 @@ async fn a_telegram_signal_runs_the_draft_chain_with_real_reads_and_mocked_write
     for step in ["offer_button (skipped)", "after_button → ordinary", "route", "after_route → routed"] {
         assert!(path.contains(&step), "{step}: {path:?}");
     }
-    assert_eq!(run(&report, "telegram:0/signal-telegram")["version"], "draft v2");
     let primary = run(&report, "telegram:0/loop");
-    assert_eq!(
-        (primary["workflow"].as_str(), primary["version"].as_str()),
-        (Some("agent-loop-telegram"), Some("draft v2"))
-    );
-    let last: Vec<&str> =
-        primary["path"].as_array().unwrap().iter().rev().take(2).map(|p| p.as_str().unwrap()).collect();
-    assert_eq!(last, ["reply", "next[1] → replied"], "the second pass of `next` took `replied`");
+    assert_eq!((primary["workflow"].as_str(), primary["version"].as_str()), (Some("telegram-loop"), Some("draft v2")));
+    let path: Vec<&str> = primary["path"].as_array().unwrap().iter().map(|p| p.as_str().unwrap()).collect();
+    for step in ["input", "activity", "pending_confirmations", "preselect", "setup", "status"] {
+        assert!(path.contains(&step), "the loop gathers its own context: {step}: {path:?}");
+    }
+    let last: Vec<&str> = path.iter().rev().take(3).copied().collect();
+    assert_eq!(last, ["clear", "reply", "next[1] → replied"], "the second pass of `next` took `replied`");
 
     // Each turn: reasoning, calls with verdicts and results; reads real, writes mocked.
     let turns = primary["turns"].as_array().unwrap();
@@ -216,9 +210,7 @@ async fn a_telegram_signal_runs_the_draft_chain_with_real_reads_and_mocked_write
 
     // Nothing kept; the drafts that ran are tried, which activation needs.
     s.assert_nothing_kept();
-    for name in ["agent-loop-telegram", "signal-telegram"] {
-        assert!(s.f.engine.deps.workflows.get(name, Some(2)).unwrap().unwrap().tried, "{name}");
-    }
+    assert!(s.f.engine.deps.workflows.get("telegram-loop", Some(2)).unwrap().unwrap().tried);
     agent::flows::tool(&s.f.engine, "activate_workflow", untried.as_object().unwrap()).unwrap();
 
     // The builder's own trace holds the dry run, its write marked mock.
@@ -260,12 +252,16 @@ async fn confirmations_are_answered_on_the_spot_through_the_real_guard() {
             report["writes"].as_array().unwrap().iter().map(|w| w["function"].as_str().unwrap()).collect();
         if label == "allow" {
             assert_eq!(remembered["mock"], true);
-            assert_eq!(written, ["remember", "send_telegram_message"]);
+            assert_eq!(written, ["telegram_send_status", "remember", "send_telegram_message", "telegram_send_status"]);
             assert!(guard.contains(&"outcome"), "{guard:?}");
         } else {
             assert_eq!(remembered["ok"], false);
             assert!(remembered["result"].as_str().unwrap().starts_with("[guard] blocked:"));
-            assert_eq!(written, ["send_telegram_message"], "a refused write is not even mocked");
+            assert_eq!(
+                written,
+                ["telegram_send_status", "send_telegram_message", "telegram_send_status"],
+                "a refused write is not even mocked"
+            );
         }
         if label == "expired" {
             assert!(guard.iter().any(|p| p.starts_with("listen faulted: Timeout")), "{guard:?}");
@@ -297,7 +293,7 @@ async fn a_worker_inside_runs_dry_and_is_nested_in_the_trace() {
     assert_eq!(worker["ended"]["output"], "noted");
     let functions: Vec<&str> =
         report["writes"].as_array().unwrap().iter().map(|w| w["function"].as_str().unwrap()).collect();
-    assert_eq!(functions, ["remember", "send_telegram_message"]);
+    assert_eq!(functions, ["telegram_send_status", "remember", "send_telegram_message", "telegram_send_status"]);
     s.assert_nothing_kept();
 }
 
@@ -315,9 +311,7 @@ async fn an_empty_signal_discovers_types_without_a_draft_or_a_run() {
     assert!(report.get("runs").is_none());
     assert!(s.model.seen.lock().unwrap().is_empty());
     assert_eq!(s.world.names(), ["list_signals"]);
-    for name in ["signal-telegram", "agent-loop-telegram"] {
-        assert!(!s.f.engine.deps.workflows.get(name, Some(2)).unwrap().unwrap().tried);
-    }
+    assert!(!s.f.engine.deps.workflows.get("telegram-loop", Some(2)).unwrap().unwrap().tried);
     s.assert_nothing_kept();
 }
 
@@ -341,7 +335,7 @@ async fn a_signal_type_is_one_this_agent_receives() {
     // The old form refuses what runs on signals, and the author sees the types.
     let old = agent::flows::try_draft(
         &s.f.engine,
-        json!({"name":"agent-loop-telegram"}).as_object().unwrap(),
+        json!({"name":"telegram-loop"}).as_object().unwrap(),
         &context().env,
         &agent::tracing::null_scope(),
         &CancellationToken::new(),
@@ -364,22 +358,23 @@ async fn a_signal_type_is_one_this_agent_receives() {
 #[tokio::test]
 async fn a_jq_error_in_a_draft_names_the_expression_and_the_value_it_met() {
     let s = sandbox(vec![assistant("reported")], "allow");
-    let broken = ROUTE.replace("set: '${ [\"telegram\"] }'", "set: '${ $context.signal.content | .text }'");
-    assert_ne!(broken, ROUTE);
-    s.f.engine.deps.workflows.save("signal-telegram", &broken, None).unwrap();
+    let broken =
+        LOOP.replace("request: '${ $context.signal.content }'", "request: '${ $context.signal.content | .text }'");
+    assert_ne!(broken, LOOP);
+    s.f.engine.deps.workflows.save("telegram-loop", &broken, None).unwrap();
     let report = s.try_signal(telegram(None)).await.unwrap();
     assert_eq!(report["status"], "faulted", "{report:#}");
-    let route = run(&report, "telegram:0/signal-telegram");
-    assert_eq!(route["version"], "draft v3");
+    let primary = run(&report, "telegram:0/loop");
+    assert_eq!(primary["version"], "draft v3");
     let fault =
-        route["path"].as_array().unwrap().iter().find_map(|p| p.as_str().filter(|p| p.contains("faulted"))).unwrap();
+        primary["path"].as_array().unwrap().iter().find_map(|p| p.as_str().filter(|p| p.contains("faulted"))).unwrap();
     assert!(
-        fault.starts_with("own_skills faulted") && fault.contains(".text") && fault.contains("failed on"),
+        fault.starts_with("preselect faulted") && fault.contains(".text") && fault.contains("failed on"),
         "{fault}"
     );
-    assert!(!s.f.engine.deps.workflows.get("signal-telegram", Some(3)).unwrap().unwrap().tried);
+    assert!(!s.f.engine.deps.workflows.get("telegram-loop", Some(3)).unwrap().unwrap().tried);
     s.assert_nothing_kept();
-    assert!(s.f.engine.deps.memory.get("signal_telegram.breaker").unwrap().is_none(), "its fault counts nowhere");
+    assert!(s.f.engine.deps.memory.get("telegram_loop.breaker").unwrap().is_none(), "its fault counts nowhere");
 }
 
 // The dispatcher itself can be a draft: a peer signal takes its default path,

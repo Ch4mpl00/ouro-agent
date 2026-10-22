@@ -16,7 +16,7 @@ use agent::{
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
-use support::{AnySkill, NoCodex, PersistLog, Scripted, ToolMcp, TraceLog, recording, task_context};
+use support::{AnySkill, NoCodex, PersistLog, Scripted, TELEGRAM_LOOP, ToolMcp, TraceLog, recording, task_context};
 use tokio_util::sync::CancellationToken;
 
 // ── the store ───────────────────────────────────────────────────────────────
@@ -495,9 +495,10 @@ async fn the_author_can_inspect_signal_and_loop_hosts_but_probes_cannot_execute_
     let catalog = functions(&w.engine, &Map::new()).unwrap();
     // Follow the definitions an author actually copies, rather than a second
     // list of expected names that could omit the next host function too.
-    for definition in [agent::supervisor::SIGNAL, agent::agent::AGENT_LOOP] {
+    for definition in [agent::supervisor::SIGNAL, agent::agent::AGENT_LOOP, TELEGRAM_LOOP] {
         let wf = owf::model::parse_yaml(definition).unwrap();
-        for site in owf::model::call_sites(&wf) {
+        // The fixture's status steps call an MCP tool this world lacks.
+        for site in owf::model::call_sites(&wf).into_iter().filter(|s| s.function != "telegram_send_status") {
             let name = &site.function;
             assert!(catalog.lines().any(|line| line.starts_with(&format!("{name}("))), "missing {name}");
             let detail: Value =
@@ -513,7 +514,10 @@ async fn the_author_can_inspect_signal_and_loop_hosts_but_probes_cannot_execute_
         let detail: Value =
             serde_json::from_str(&functions(&w.engine, json!({"name":function.name}).as_object().unwrap()).unwrap())
                 .unwrap();
-        assert_eq!(detail["context"], "signal");
+        // The first-turn context functions serve a loop too.
+        let loop_context = ["signal_input", "recent_activity", "pending_confirmations", "preselect_skills"];
+        let context = if loop_context.contains(&function.name) { "signal|agent-loop" } else { "signal" };
+        assert_eq!(detail["context"], context, "{}", function.name);
         assert!(!detail["description"].as_str().unwrap().is_empty());
         assert_eq!(detail["parameters"]["required"], json!(function.needs));
         let error = probe(&w.engine, json!({"name":function.name}).as_object().unwrap(), &CancellationToken::new())
@@ -530,7 +534,7 @@ async fn the_author_can_inspect_signal_and_loop_hosts_but_probes_cannot_execute_
         serde_json::from_str(&functions(&w.engine, json!({"name":"primary_loop"}).as_object().unwrap()).unwrap())
             .unwrap();
     assert!(primary["parameters"]["properties"].get("loop").is_some());
-    for name in ["agent_turn", "tool", "agent_settle"] {
+    for name in ["agent_turn", "tool", "agent_settle", "loop_setup"] {
         assert!(
             probe(&w.engine, json!({"name":name}).as_object().unwrap(), &CancellationToken::new())
                 .await
