@@ -199,7 +199,7 @@ fn target(call: &ToolCall, context: &Context) -> Option<String> {
     let args: Value = serde_json::from_str(&call.arguments).ok()?;
     match call.name.as_str() {
         "send_telegram_message" => args.get("chatId").and_then(identifier).or_else(|| context.default_chat.clone()),
-        "edit_telegram_message" | "start_typing" | "send_telegram_chat_action" => {
+        "edit_telegram_message" | "start_typing" | "send_telegram_chat_action" | "telegram_send_status" => {
             args.get("chatId").and_then(identifier)
         }
         "reply_to_peer" => args.get("threadId").and_then(identifier),
@@ -449,6 +449,9 @@ mod tests {
         let label = |name: &str, args: Value| deterministic(&context, &call(name, args)).map(|v| v.label);
         assert_eq!(label("send_telegram_message", json!({"chatId":42,"text":"Draft: the cat ate"})).unwrap(), "allow");
         assert_eq!(label("start_typing", json!({"chatId":"42"})).unwrap(), "allow");
+        // The status bubble a Telegram loop opens before its first turn.
+        assert_eq!(label("telegram_send_status", json!({"id":"s","chatId":"42","text":"👀"})).unwrap(), "allow");
+        assert!(label("telegram_send_status", json!({"id":"s","chatId":"43","text":"👀"})).is_none());
         for text in ["see https://x.io", "www.example.com", "pic: cdn.example.org/a.png?d=1", "tg://resolve"] {
             assert!(label("send_telegram_message", json!({"chatId":42,"text":text})).is_none(), "{text}");
         }
