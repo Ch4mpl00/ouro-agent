@@ -33,6 +33,7 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -683,17 +684,17 @@ impl owf::run::Functions for Functions {
         let Value::Object(args) = args else {
             return Err(CallFailure::NotExecuted(invalid(name, "arguments must be an object")));
         };
-        let span = self.spans.scope(info.reference);
-        span.update(crate::tracing::ContextUpdate::input(json!({"tool":name,"args":args})));
-        let raw =
-            self.engine.deps.mcp.call_tool_once(name, args, info.cancel).await.map_err(|failure| match failure {
+        let span = self.spans.tool_call(name, &args, info);
+        let raw = trace_mcp_call(span, self.engine.deps.mcp.call_tool_once(name, args, info.cancel)).await.map_err(
+            |failure| match failure {
                 crate::mcp::ToolCallFailure::NotExecuted(error) => {
                     CallFailure::NotExecuted(WorkflowError::communication(503, error.to_string()))
                 }
                 crate::mcp::ToolCallFailure::Unknown(error) => {
                     CallFailure::Unknown(WorkflowError::communication(503, error.to_string()))
                 }
-            })?;
+            },
+        )?;
         if raw.starts_with("[tool error]") {
             return Err(CallFailure::Response(WorkflowError::communication(500, raw)));
         }
@@ -1006,22 +1007,36 @@ impl Functions {
                     .filter(|k| !k.is_empty())
                     .ok_or_else(|| invalid(name, "`key` must be a nonempty string"))?;
                 let value = text(&args, name, "value")?.ok_or_else(|| invalid(name, "`value` must be a string"))?;
-                if let Some(sandbox) = self.engine.sandbox() {
-                    return Ok(parse_tool_json(&sandbox.mock(name, args.clone())));
-                }
-                self.engine.deps.memory.set(key, value).map_err(failed)?;
-                Ok(json!({"ok":true,"key":key}))
+                let span = self.spans.tool_call(name, &args, info);
+                let result = if let Some(sandbox) = self.engine.sandbox() {
+                    Ok(parse_tool_json(&sandbox.mock(name, args.clone())))
+                } else {
+                    self.engine.deps.memory.set(key, value).map(|()| json!({"ok":true,"key":key}))
+                };
+                span.end(match &result {
+                    Ok(value) => SpanEnd::output(value.clone()),
+                    Err(error) => SpanEnd::error(error.to_string()).with_output(json!({"error":error.to_string()})),
+                });
+                result.map_err(failed)
             }
             tool => {
                 let Value::Object(args) = args else { return Err(invalid(tool, "arguments must be an object").into()) };
-                span.update(crate::tracing::ContextUpdate::input(json!({"tool":tool,"args":args})));
-                let raw = self
-                    .engine
-                    .deps
-                    .mcp
-                    .call_tool(tool, args, info.cancel)
+                let span = self.spans.tool_call(tool, &args, info);
+                let raw =
+                    trace_mcp_call(span, async {
+                        self.engine
+                            .deps
+                            .mcp
+                            .call_tool(tool, args, info.cancel)
+                            .await
+                            .map_err(crate::mcp::ToolCallFailure::Unknown)
+                    })
                     .await
-                    .map_err(|e| WorkflowError::communication(503, format!("{tool}: {e}")))?;
+                    .map_err(|failure| {
+                        let (crate::mcp::ToolCallFailure::Unknown(error)
+                        | crate::mcp::ToolCallFailure::NotExecuted(error)) = failure;
+                        WorkflowError::communication(503, format!("{tool}: {error}"))
+                    })?;
                 if raw.starts_with("[tool error]") {
                     return Err(WorkflowError::communication(500, raw).into());
                 }
@@ -1182,6 +1197,54 @@ impl Spans {
 
     fn take(&self, reference: &str) -> Option<Arc<dyn Span>> {
         self.open.lock().unwrap_or_else(|e| e.into_inner()).remove(reference)
+    }
+
+    fn tool_call(&self, name: &str, args: &impl Serialize, info: &CallInfo<'_>) -> Arc<dyn Span> {
+        let task = self.open.lock().unwrap_or_else(|e| e.into_inner()).get(info.reference).cloned();
+        let parent = task.as_ref().unwrap_or(&self.root);
+        let call = parent.span(
+            SpanStart::new(name, SpanKind::Tool)
+                .input(json!(args))
+                .metadata(metadata(json!({"tool":name,"reference":info.reference,"workflow_run":info.run_id}))),
+        );
+        if let Some(task) = task {
+            // The task still records its transformed output, but consumers
+            // count the actual tool call as the action, not its wrapper too.
+            task.update(crate::tracing::ContextUpdate::metadata(metadata(json!({"tool_span":call.id()}))));
+        }
+        call
+    }
+}
+
+// Calls need their own spans even when loop task scaffolding is silent.
+// Record the complete wire reply before YAML output transforms; never write
+// call arguments over the runner's admitted input. The future may be dropped
+// by the interpreter on cancellation, which must end the span too.
+async fn trace_mcp_call(
+    span: Arc<dyn Span>,
+    call: impl Future<Output = Result<String, crate::mcp::ToolCallFailure>>,
+) -> Result<String, crate::mcp::ToolCallFailure> {
+    let mut pending = PendingToolSpan(Some(span));
+    let result = call.await;
+    let end = match &result {
+        Ok(raw) if raw.starts_with("[tool error]") => SpanEnd::error(raw).with_output(json!(raw)),
+        Ok(raw) => SpanEnd::output(json!(raw)),
+        Err(crate::mcp::ToolCallFailure::NotExecuted(error) | crate::mcp::ToolCallFailure::Unknown(error)) => {
+            SpanEnd::error(error.to_string()).with_output(json!({"error":error.to_string()}))
+        }
+    };
+    pending.0.take().expect("call ends once").end(end);
+    result
+}
+
+struct PendingToolSpan(Option<Arc<dyn Span>>);
+
+impl Drop for PendingToolSpan {
+    fn drop(&mut self) {
+        if let Some(span) = self.0.take() {
+            let error = "Workflow tool call interrupted; outcome unknown";
+            span.end(SpanEnd::error(error).with_output(json!({"error":error})));
+        }
     }
 }
 
@@ -2032,6 +2095,13 @@ const OVERRIDE: &str = "override_version";
 /// caller that owns the run's journal itself (a test injecting crashes).
 pub fn loop_host(engine: &Arc<Engine>, root: &Arc<dyn Span>, input: Value) -> Host {
     host(engine, root, true, false, None, Some(input), None, Arc::default())
+}
+
+/// Existing standalone function adapters for an isolated host such as the
+/// optimizer workbench. This grants no admitted signal/loop context. The
+/// caller must restrict capabilities before invoking these adapters.
+pub fn standalone_host(engine: &Arc<Engine>, root: &Arc<dyn Span>) -> Host {
+    host(engine, root, false, false, None, None, None, Arc::default())
 }
 
 // `silent`: a loop's generations and tool calls trace themselves; spans for

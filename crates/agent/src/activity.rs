@@ -231,6 +231,7 @@ fn build_packet(
     for o in observations {
         if o.parent_observation_id.is_none()
             || !matches!(o.kind, ObservationType::Tool | ObservationType::Agent)
+            || o.meta("tool_span").is_some()
             || dry(o)
         {
             continue;

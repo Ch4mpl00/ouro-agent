@@ -248,6 +248,70 @@ async fn a_semi_deterministic_workflow_saves_tries_and_runs_on_a_scheduled_signa
 }
 
 #[tokio::test]
+async fn deterministic_calls_keep_full_results_and_model_calls_are_not_duplicated() {
+    for loop_metadata in [false, true] {
+        let a = agent(vec![send(), assistant("Sent the summary.")]);
+        let mut definition = pages()
+            .replace(
+                "with: { url: '${ $url }' }",
+                "with: { url: '${ $url }' }\n            output: { as: '${ {body: .body} }' }",
+            )
+            .replacen(
+                "do:\n",
+                "do:\n  - remember: { call: set_memory, with: { key: pages.checked, value: yes } }\n",
+                1,
+            );
+        if loop_metadata {
+            definition = definition.replace(
+                "name: pages, version: '1.0.0' }",
+                "name: pages, version: '1.0.0', metadata: {loop: {description: Pages with fixed steps}} }",
+            );
+        }
+        activate_definition(&a.f.engine, "pages", &definition);
+        let id = a.fire("pages", "Summarize the pages.").await;
+        let (trace, observations) = a.trace(&id);
+        let reads: Vec<_> = observations.iter().filter(|o| o.meta("tool") == Some(&json!("fetch_page"))).collect();
+        assert_eq!(reads.len(), 2, "metadata.loop={loop_metadata}: each fixed call has one span");
+        for read in reads {
+            let url = read.input["url"].as_str().unwrap();
+            assert_eq!(read.meta("workflow_run"), Some(&json!(id)));
+            let raw: Value = serde_json::from_str(read.output.as_str().unwrap()).unwrap();
+            assert_eq!(raw, json!({"url":url,"body":format!("Body of {url}")}));
+            assert_eq!(read.level, "DEFAULT");
+            assert!(!read.end_time.is_empty());
+            assert!(ancestors(&observations, read).contains(&"runner"));
+        }
+        assert_eq!(
+            observations.iter().filter(|o| o.meta("tool") == Some(&json!(SEND.0))).count(),
+            1,
+            "the model's existing tool span is not duplicated"
+        );
+        let remembered: Vec<_> = observations.iter().filter(|o| o.meta("tool") == Some(&json!("set_memory"))).collect();
+        assert_eq!(remembered.len(), 1);
+        assert_eq!(remembered[0].input, json!({"key":"pages.checked","value":"yes"}));
+        assert_eq!(remembered[0].output, json!({"ok":true,"key":"pages.checked"}));
+        let runner =
+            observations.iter().find(|o| o.name == "runner" && o.meta("workflow") == Some(&json!("pages"))).unwrap();
+        assert!(runner.input["loop"].is_object(), "fixed calls preserve the admitted input");
+        if !loop_metadata {
+            let tasks: Vec<_> = observations.iter().filter(|o| o.name == "call:page").collect();
+            assert_eq!(tasks.len(), 2);
+            for task in tasks {
+                assert!(task.output.get("url").is_none(), "task output is transformed, tool reply stays intact");
+                assert!(task.meta("tool_span").is_some());
+            }
+        }
+        let packet = agent::activity::project_trace(&trace, &observations, None, &Default::default());
+        assert_eq!(packet["actions"].as_array().unwrap().iter().filter(|a| a["tool"] == "fetch_page").count(), 2);
+        assert!(
+            !packet["actions"].as_array().unwrap().iter().any(|a| a["tool"] == "call:page"),
+            "the activity journal records the call, not its task wrapper again"
+        );
+        a.supervisor.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn agent_turns_need_the_guarded_round_and_steps_alone_need_none() {
     let a = agent(vec![]);
     let bare = "document: {dsl: '1.0.4', namespace: t, name: bare, version: '1.0.0'}\ndo: [{turn: {call: agent_turn, with: {messages: '${ .messages }'}}}]\n";

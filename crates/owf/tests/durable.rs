@@ -1390,3 +1390,51 @@ async fn a_listen_ceiling_takes_a_delivered_event_or_fires_the_timeout_at_once()
     let status = run::resume(&h, &wf, "run", json!({}), &CancellationToken::new(), &*inbox.journal).await.status;
     assert!(matches!(status, Status::Waiting { .. }), "{status:?}");
 }
+
+// A host stop is outside DSL try/catch in either execution mode. Existing
+// adapters' call errors remain ordinary catchable workflow responses.
+#[tokio::test]
+async fn ephemeral_and_durable_host_stops_cannot_be_caught_by_yaml() {
+    struct Stopping;
+    #[async_trait]
+    impl Functions for Stopping {
+        fn effect(&self, _: &str) -> Option<Effect> {
+            Some(Effect::Read)
+        }
+        async fn call(&self, _: &str, _: Value, _: &CallInfo<'_>) -> Result<Value, WorkflowError> {
+            Err(WorkflowError::communication(500, "ordinary response"))
+        }
+        async fn execute(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
+            if name == "stop" {
+                Err(CallFailure::Interrupted(WorkflowError::runtime("host requires input")))
+            } else {
+                self.call(name, args, info).await.map_err(CallFailure::Response)
+            }
+        }
+        async fn invoke(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
+            self.execute(name, args, info).await
+        }
+    }
+    let host = Host {
+        functions: Arc::new(Stopping),
+        clock: Arc::new(run::SystemClock),
+        observer: Arc::new(Silent),
+        limits: Limits::default(),
+        runtime: json!({}),
+    };
+    for name in ["response", "stop"] {
+        let wf = workflow(&format!(
+            "do:\n  - try:\n      try:\n        - call: {{call: {name}, with: {{}}}}\n      catch:\n        do:\n          - caught: {{set: {{status: swallowed}}}}\n"
+        ));
+        let ephemeral = run::run(&host, &wf, "ephemeral", json!({}), &CancellationToken::new()).await.status;
+        let durable =
+            run::resume(&host, &wf, "durable", json!({}), &CancellationToken::new(), &Store::default()).await.status;
+        for status in [ephemeral, durable] {
+            if name == "stop" {
+                assert!(matches!(status, Status::Interrupted(_)), "{status:?}");
+            } else {
+                assert_eq!(status, Status::Completed(json!({"status":"swallowed"})));
+            }
+        }
+    }
+}

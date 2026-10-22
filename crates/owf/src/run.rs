@@ -56,6 +56,12 @@ pub trait Functions: Send + Sync {
     async fn invoke(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
         self.call(name, args, info).await.map_err(CallFailure::Unknown)
     }
+    /// Ephemeral invocation, including a host-level stop that YAML cannot
+    /// catch. Ordinary adapters keep their existing catchable error contract.
+    /// A workbench, for example, interrupts when required test data is absent.
+    async fn execute(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
+        self.call(name, args, info).await.map_err(CallFailure::Response)
+    }
     async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError>;
     /// This invocation's effect: a function that dispatches by an argument
     /// (a tool by name) may differ per call. The function's by default.
@@ -1240,14 +1246,23 @@ impl Run<'_> {
         let info = CallInfo { run_id: self.run_id, reference, cancel: self.cancel, delivery };
         let cooperative = self.host.functions.cooperative(name);
         if self.journal.is_none() {
-            if cooperative {
-                let result = self.host.functions.call(name, args, &info).await;
-                return if self.cancel.is_cancelled() { Err(Fault::Cancelled) } else { result.map_err(Fault::Error) };
-            }
-            return tokio::select! {
-                _ = self.cancel.cancelled() => Err(Fault::Cancelled),
-                r = self.host.functions.call(name, args, &info) => r.map_err(Fault::Error),
+            let result = if cooperative {
+                self.host.functions.execute(name, args, &info).await
+            } else {
+                tokio::select! {
+                    _ = self.cancel.cancelled() => return Err(Fault::Cancelled),
+                    r = self.host.functions.execute(name, args, &info) => r,
+                }
             };
+            if self.cancel.is_cancelled() {
+                return Err(Fault::Cancelled);
+            }
+            return result.map_err(|failure| match failure {
+                CallFailure::Interrupted(error) => Fault::Interrupted(error),
+                CallFailure::Response(error) | CallFailure::NotExecuted(error) | CallFailure::Unknown(error) => {
+                    Fault::Error(error)
+                }
+            });
         }
         let result = if cooperative {
             self.host.functions.invoke(name, args.clone(), &info).await

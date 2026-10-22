@@ -302,8 +302,13 @@ async fn a_saved_workflow_runs_tools_and_model_steps_and_traces_each_task() {
     assert_eq!(runner.input["signal"]["content"], "Daily digest tick.");
     let search = named(&observations, "call:search");
     assert_eq!(search.parent_observation_id.as_deref(), Some(runner.id.as_str()));
-    assert_eq!(search.input, json!({"tool": "search_news", "args": {"query": "rust since ever"}}));
     assert_eq!(search.metadata.as_ref().unwrap()["reference"], "/do/0/search");
+    let call = named(&observations, "search_news");
+    assert_eq!(call.parent_observation_id.as_deref(), Some(search.id.as_str()));
+    assert_eq!(search.meta("tool_span"), Some(&json!(call.id)));
+    assert_eq!(call.meta("tool"), Some(&json!("search_news")));
+    assert_eq!(call.input, json!({"query": "rust since ever"}));
+    assert_eq!(serde_json::from_str::<Value>(call.output.as_str().unwrap()).unwrap()["items"][0]["title"], "Rust 2.0");
     // The compose generation sits under its task and is tagged for the judge.
     let compose = named(&observations, "call:compose");
     let generation = named(&observations, "llm_compose:compose");
@@ -444,6 +449,64 @@ do: [ { send: { call: send_telegram_message, with: { text: once }, metadata: { d
         Some(owf::run::Status::Faulted(ref error)) if error.is("outcome_unknown")));
     assert_eq!(w.calls().len(), 1);
     trace.end();
+    let observations = w.written.all().pop().unwrap().observations;
+    let calls: Vec<_> =
+        observations.iter().filter(|o| o.meta("tool") == Some(&json!("send_telegram_message"))).collect();
+    assert_eq!(calls.len(), 1, "resuming an unknown write must not fabricate a second call span");
+    assert_eq!(calls[0].input, json!({"text":"once"}));
+    assert_eq!(calls[0].level, "ERROR");
+    assert!(!calls[0].end_time.is_empty());
+    assert!(calls[0].status_message.as_deref().unwrap().contains("interrupted"));
+}
+
+#[tokio::test]
+async fn direct_loop_calls_record_reported_and_transport_errors_in_both_runners() {
+    use agent::flows::create_durable_flows;
+    for durable in [false, true] {
+        for transport in [false, true] {
+            let w = world(vec![]);
+            w.activate("failing", r#"document: { dsl: '1.0.4', namespace: t, name: failing, version: '1.0.0', metadata: {loop: {description: Fixed read}} }
+do: [{read: {call: search_news, with: {query: failing}}}]
+"#);
+            w.mcp.once(Box::new(move |_, _, _| {
+                Box::pin(async move {
+                    if transport {
+                        anyhow::bail!("connection reset")
+                    }
+                    Ok("[tool error] refused".into())
+                })
+            }));
+            let dir = tempfile::tempdir().unwrap();
+            let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
+            let flows =
+                if durable { create_durable_flows(w.engine.clone(), db) } else { create_flows(w.engine.clone()) };
+            let trace =
+                w.tracer.trace(TraceStart { id: "failed-call".into(), name: "test".into(), ..Default::default() });
+            let scope: Scope = trace.clone();
+            let signal = WorkflowSignal { id: 99, source: "scheduler".into(), content: "go".into(), env_context: None };
+            let result =
+                flows.run("failing", &signal, &task_context("scheduler:99"), &scope, &CancellationToken::new()).await;
+            assert!(matches!(result, FlowResult::Faulted { effects_started: false, .. }), "{result:?}");
+            trace.end();
+            let observations = w.written.all().pop().unwrap().observations;
+            let call = named(&observations, "search_news");
+            assert_eq!(call.meta("tool"), Some(&json!("search_news")));
+            assert_eq!(call.meta("workflow_run"), Some(&json!("scheduler:99")));
+            assert_eq!(call.meta("reference"), Some(&json!("/do/0/read")));
+            assert_eq!(call.input, json!({"query":"failing"}));
+            assert_eq!(call.level, "ERROR");
+            assert!(!call.end_time.is_empty());
+            if transport {
+                assert_eq!(call.output["error"], "connection reset");
+            } else {
+                assert_eq!(call.output, "[tool error] refused");
+            }
+            assert!(
+                named(&observations, "runner").input["loop"].is_object(),
+                "call tracing must not overwrite admission"
+            );
+        }
+    }
 }
 
 // A workflow sends to the user's chat from its input, not from an id
