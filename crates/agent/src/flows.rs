@@ -585,17 +585,11 @@ impl owf::run::Functions for Functions {
                 _ => error.or_failure(CallFailure::Response),
             });
         }
-        if self.loop_only
-            && !is_loop_function(name)
-            && (self.effect(name) != Some(Effect::Read)
-                || (self.engine.deps.mcp.tools().iter().any(|t| t.name == name)
-                    && self.engine.deps.mcp.open_world(name)))
-        {
-            return Err(CallFailure::NotExecuted(invalid(
-                name,
-                "agent-loop guarded calls must use tool so the host guard reviews them",
-            )));
-        }
+        // A call written into a loop's definition is trusted as any saved
+        // workflow's is: the user approved the definition after its dry run.
+        // Only the model's calls go through `tool` and the guard. What stays
+        // refused protects the dispatcher: its functions act on the one
+        // signal its run serves.
         if crate::supervisor::SIGNAL_FUNCTIONS.iter().any(|f| f.name == name) {
             return Err(CallFailure::NotExecuted(invalid(name, "only the signal workflow calls it")));
         }
@@ -653,13 +647,8 @@ impl Functions {
         if self.guard_only {
             return self.guard_step(name, args, info).await;
         }
-        if self.loop_only
-            && !is_loop_function(name)
-            && (owf::run::Functions::effect(self, name) != Some(Effect::Read)
-                || (self.engine.deps.mcp.tools().iter().any(|t| t.name == name)
-                    && self.engine.deps.mcp.open_world(name)))
-        {
-            return Err(invalid(name, "agent-loop guarded calls must use tool so the host guard reviews them").into());
+        if crate::supervisor::SIGNAL_FUNCTIONS.iter().any(|f| f.name == name) {
+            return Err(invalid(name, "only the signal workflow calls it").into());
         }
         let span = self.spans.scope(info.reference);
         let label = info.reference.rsplit('/').next().unwrap_or(name);

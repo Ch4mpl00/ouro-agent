@@ -504,3 +504,56 @@ async fn another_channels_loop_can_exit_from_generic_outcomes_without_host_chang
     assert!(matches!(run(&f,"peer","peer-loop",false).await,FlowResult::Completed(ref v) if v=="peer answer"));
     assert_eq!(model.seen.lock().unwrap().len(), 1);
 }
+
+// Fixed steps of a loop are the author's, trusted as a saved workflow's
+// calls: a direct write runs without a guard review and, recorded, is not
+// sent again when the run resumes. The model's calls still go through
+// `tool` and the guard.
+#[tokio::test]
+async fn a_loops_own_write_runs_unreviewed_and_once_while_the_models_calls_stay_guarded() {
+    let (started, has_started) = tokio::sync::oneshot::channel::<()>();
+    let turns = Turns::new(vec![
+        turn_async(move |_| async move {
+            started.send(()).unwrap();
+            std::future::pending::<anyhow::Result<agent::providers::Message>>().await
+        }),
+        turn(|_| calls(&[("send_telegram_message", json!({"chatId":"43","text":"elsewhere"}))])),
+        turn(|_| assistant("done")),
+    ]);
+    let mut f = fixture(turns.clone(), &["send_telegram_message"], WORKER);
+    let api = Arc::new(GuardApi::default());
+    *api.label.lock().unwrap() = Some("misaligned".into());
+    Arc::get_mut(&mut f.engine).unwrap().deps.decisions =
+        Some(agent::decisions::decision_client("guard-test".into(), api.clone()));
+    let direct = variant("direct-loop").replacen(
+        "do:\n",
+        "do:\n  - note:\n      call: send_telegram_message\n      with: { chatId: '42', text: fixed step }\n",
+        1,
+    );
+    activate(&f, "direct-loop", &direct);
+    let mut opts = LoopOptions::new("direct", context());
+    opts.workflow = "direct-loop".into();
+    opts.skills = vec!["worker".into()];
+    let input = f.engine.start_loop(opts).await.unwrap().workflow_input("go").await;
+    let flows = flows::create_durable_flows(f.engine.clone(), (*f.db).clone());
+    let stop = CancellationToken::new();
+    let running = {
+        let (flows, stop) = (flows.clone(), stop.clone());
+        tokio::spawn(async move { flows.run_loop("direct/loop", input, &null_scope(), &stop).await })
+    };
+    has_started.await.unwrap();
+    stop.cancel();
+    assert!(matches!(running.await.unwrap(), FlowResult::Interrupted { .. }));
+    f.engine.end_loop("direct").await;
+    assert_eq!(flows.recover_once(&CancellationToken::new()).await.unwrap(), 1);
+    let runs = agent::durable::RunStore::new((*f.db).clone());
+    assert_eq!(runs.get("direct/loop").unwrap().unwrap().outcome, Some(owf::run::Status::Completed(json!("done"))));
+    let sent: Vec<_> =
+        f.mcp.called.lock().unwrap().iter().filter(|(n, _)| n == "send_telegram_message").cloned().collect();
+    assert_eq!(sent.len(), 1, "the direct write once, the model's blocked: {sent:?}");
+    assert_eq!(sent[0].1["text"], "fixed step");
+    // The guard blocked the model's send to another chat; nothing reviewed the direct one.
+    assert!(!api.requests.lock().unwrap().iter().any(|r| r.to_string().contains("fixed step")));
+    let last = turns.requests.lock().unwrap().last().unwrap().clone();
+    assert!(serde_json::to_string(&last).unwrap().contains("[guard] blocked"), "{last:?}");
+}
