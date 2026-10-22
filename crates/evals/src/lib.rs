@@ -17,6 +17,7 @@ pub mod materials;
 pub mod monitor;
 pub mod node_judge;
 pub mod noise;
+pub mod optimizer;
 pub mod print;
 pub mod schema;
 pub mod scores;

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 agent = { path = "../agent" }
+owf = { path = "../owf" }
 anyhow = "1.0.104"
 async-trait = "0.1.92"
 base64 = "0.23.1"
