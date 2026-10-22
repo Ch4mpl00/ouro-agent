@@ -334,7 +334,9 @@ fn build_packet(
         .collect();
     let input = text(&trace.input);
     let mut packet = json!({"trace_id":trace.id,"source":trace.tags.first(),"started_at":utc_iso(&trace.timestamp),"completed_at":completed_at.map(utc_iso),"tags":trace.tags,"skills":trace.metadata.as_ref().and_then(|m|m.get("skills")).and_then(Value::as_array).map(|a|a.iter().filter(|s|s.is_string()).cloned().collect::<Vec<_>>()).unwrap_or_default(),"status":if trace.metadata.as_ref().and_then(|m|m.get("error"))==Some(&json!(true)){"error"}else{"ok"},"input":clip(&input,scaled(b.input_chars)),"actions":actions});
-    if let Some(primary) = observations.iter().find(|o| o.meta("activity") == Some(&json!("primary_loop"))) {
+    // The primary run that did the work: the last, as a scheduled workflow
+    // that handed its task to the agent loop comes before it.
+    if let Some(primary) = observations.iter().rev().find(|o| o.meta("activity") == Some(&json!("primary_loop"))) {
         let given = text(&primary.input);
         let context = if !input.is_empty() {
             given

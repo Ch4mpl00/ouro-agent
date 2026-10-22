@@ -224,8 +224,9 @@ pub struct LoopOptions {
     pub confirm: Option<ConfirmTarget>,
     pub earlier_user_messages: Vec<String>,
     pub loaded_skill_text: String,
-    // The signal a loop route started this loop for (the dispatcher's
-    // `$context.signal`): its input carries it, for its context functions.
+    // The signal the runtime started this run for, a route's or a scheduled
+    // task's (the dispatcher's `$context.signal`): its input carries it, for
+    // its context functions.
     pub signal: Option<Value>,
     pub session_id: Option<String>,
     pub tags: Option<Vec<String>>,
@@ -1188,8 +1189,8 @@ impl AgentLoop {
         input
     }
 
-    // A routed loop's input names its signal; any other has none, which is
-    // how its context steps tell a worker's run apart.
+    // A route's or a scheduled task's run names its signal; a worker's and
+    // the default path's loop have none, which is how context steps tell.
     fn with_signal(&self, mut input: Value) -> Value {
         if let Some(signal) = &self.opts.signal {
             input["signal"] = signal.clone();
@@ -1851,9 +1852,9 @@ pub async fn loop_settle(
     }))
 }
 
-/// The first-turn context a loop gathers itself (`signal_input`,
+/// The first-turn context a run gathers itself (`signal_input`,
 /// `recent_activity`, `pending_confirmations`, `preselect_skills`): the
-/// dispatcher's functions (supervisor.rs §1) on the signal its loop route
+/// dispatcher's functions (supervisor.rs §1) on the signal the runtime
 /// started it for, read from the admitted input, never from YAML. What they
 /// capture for the guard waits in the live loop for `loop_setup`. A restart
 /// between them and `loop_setup` replays their results without that
@@ -1874,7 +1875,7 @@ pub async fn loop_context(
         "signal_input" => {
             let signal = crate::supervisor::admitted_signal(&admitted["signal"]).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "signal_input reads the signal a loop route started this loop for, and this run has none (a worker's loop): skip the step with `if: '${{ $context.signal != null }}'`"
+                    "signal_input reads the signal the runtime started this run for (a route's or a scheduled task's), and this run has none (a worker's, or the default path's loop): skip the step with `if: '${{ $context.signal != null }}'`"
                 )
             })?;
             let (input, earlier) =

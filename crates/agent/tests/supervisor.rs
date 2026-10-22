@@ -4,10 +4,9 @@
 mod support;
 use agent::{
     db::TraceStore,
-    flows::WorkflowSignal,
     mcp::Mcp,
     providers::{ToolDef, assistant},
-    session::{EnvDeps, Session},
+    session::EnvDeps,
     supervisor::*,
     tracing::null_scope,
 };
@@ -265,11 +264,10 @@ async fn an_interrupted_saved_workflow_is_left_to_durable_recovery() {
     struct Interrupting;
     #[async_trait]
     impl agent::flows::FlowRun for Interrupting {
-        async fn run(
+        async fn run_loop(
             &self,
             _: &str,
-            _: &WorkflowSignal,
-            _: &Session,
+            _: Value,
             _: &agent::tracing::Scope,
             _: &CancellationToken,
         ) -> agent::flows::FlowResult {
@@ -278,6 +276,9 @@ async fn an_interrupted_saved_workflow_is_left_to_durable_recovery() {
     }
     let model = Arc::new(Scripted::new(vec![assistant("done"), assistant("done")]));
     let (f, mcp, _) = setup(model.clone());
+    let head = "document: { dsl: '1.0.4', namespace: agent, name: w, version: '1.0.0' }\n";
+    let saved = f.engine.deps.workflows.save("w", &format!("{head}do: [ {{ a: {{ set: {{ done: true }} }} }} ]"), None);
+    f.engine.deps.workflows.activate("w", saved.unwrap().version).unwrap();
     let supervisor = create_supervisor(
         f.engine.clone(),
         EnvDeps {
@@ -854,11 +855,10 @@ async fn an_abort_without_supervisor_shutdown_gets_no_recovery() {
     struct Aborting;
     #[async_trait]
     impl agent::flows::FlowRun for Aborting {
-        async fn run(
+        async fn run_loop(
             &self,
             _: &str,
-            _: &WorkflowSignal,
-            _: &Session,
+            _: Value,
             _: &agent::tracing::Scope,
             _: &CancellationToken,
         ) -> agent::flows::FlowResult {
@@ -867,6 +867,9 @@ async fn an_abort_without_supervisor_shutdown_gets_no_recovery() {
     }
     let model = Arc::new(Scripted::new(vec![]));
     let (f, mcp, _) = setup(model.clone());
+    let head = "document: { dsl: '1.0.4', namespace: agent, name: w, version: '1.0.0' }\n";
+    let saved = f.engine.deps.workflows.save("w", &format!("{head}do: [ {{ a: {{ set: {{ done: true }} }} }} ]"), None);
+    f.engine.deps.workflows.activate("w", saved.unwrap().version).unwrap();
     let supervisor = create_supervisor(
         f.engine.clone(),
         EnvDeps { mcp, memory: f.db.clone(), user_email: Some("user@test".into()), telegram_chat_id: None },
