@@ -6,7 +6,7 @@ mod support;
 use agent::{
     agent::{Engine, EngineDeps, Providers, create_engine},
     db::AgentDb,
-    flows::{FlowResult, FlowRun, MemoryWorkflows, Status, WorkflowSignal, WorkflowStore, check, create_flows},
+    flows::{FlowResult, MemoryWorkflows, Status, WorkflowSignal, WorkflowStore, check, create_flows},
     mcp::Mcp,
     models::{ModelPreset, Presets, ReasoningEffort},
     providers::{ToolDef, assistant},

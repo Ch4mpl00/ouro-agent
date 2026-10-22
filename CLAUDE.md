@@ -92,22 +92,31 @@ deletion.
    dispatches routes declared in `document.metadata.route.when`: source and
    top-level payload fields, with the most specific match winning (ties need
    distinct priorities at activation). Routes run after button delivery and
-   session setup. A route is declared by a loop: the dispatcher starts it as
-   the signal's primary loop (`supervisor.rs` `loop_route`), and the loop
-   gathers its own first-turn context (`signal_input`, `recent_activity`,
-   `pending_confirmations`, `preselect_skills`) and sets up its instructions
-   with `loop_setup` before its first turn (`agent.rs` §4), so a channel's
-   flow is one workflow. Signal routes (a non-loop workflow calling
+   session setup. **One kind of workflow, one launch path** (`supervisor.rs`
+   §2b `launch`): a route's workflow, a scheduled task's and the default
+   path's loop each start as the signal's primary run, admitted with the
+   model's parameters (`admission`: preset, confirmation target, conversation,
+   session context; `metadata.agent` or a route's `preset`/`confirm` may set
+   them) and driven by `FlowRun::run_loop`. Any workflow may therefore take
+   agent turns (`agent_turn` and the loop's host functions read only that
+   admitted input, never the YAML's, and a child a workflow starts itself is
+   never admitted); `metadata.loop` only lists a loop for workers. A routed
+   workflow gathers its own first-turn context (`signal_input`,
+   `recent_activity`, `pending_confirmations`, `preselect_skills`) and sets
+   up its instructions with `loop_setup` before its first turn (`agent.rs`
+   §4), so a channel's flow is one workflow. Signal routes (calling
    `primary_loop`) are superseded and kept for the ones already active.
    Telegram uses the default path below unless the agent activates a
    matching loop; none is built in. Calls written into a loop's YAML are
    trusted as a saved workflow's; only the model's calls go through `tool`
    and the guard.
    A `scheduler` signal whose payload names a saved workflow (`{"workflow": …}`, set by
-   `schedule_task(workflow: …)`) runs its active version (`flows.rs` over `crates/owf`, no
-   model deciding the steps); all other signals run the primary agent loop.
-   Scheduler signals use the `scheduler` skill and `base` preset. Recurring
-   deterministic work can become a saved workflow through `workflow-author`.
+   `schedule_task(workflow: …)`) runs its active version through the same launch
+   (`scheduler` skill and `base` preset unless it declares others); all other
+   signals run the primary agent loop. A recurring task can start as a copy
+   of `agent-loop` under its own name and be crystallised into deterministic
+   steps version by version (`workflow-author`); wherever `agent_turn`
+   appears, save and activation require agent-loop's guarded round.
    Every agent loop (primary, worker, recovery)
    is a run of a named OWF loop (`document.metadata.loop`), `agent-loop` by
    default; `primary_loop(loop: …)`, worker arguments or skill frontmatter

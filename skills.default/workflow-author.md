@@ -70,7 +70,8 @@ overrides need no cron task. For a runtime change follow the procedure and
    accepted reply names flows that are legal but usually a mistake: fix
    them too unless you meant exactly that.
 5. Try it: for a scheduled pipeline, `try_workflow(name)` runs the saved draft
-   on today's data as a scheduled fire would, with writes recorded. For a
+   on today's data as a scheduled fire would, with writes recorded; one that
+   takes agent turns, on a fire of its task (below). For a
    loop or `signal`, use `try_workflow` with `signal` and every changed draft,
    as described below. A completed run of the wrong loop does not test your
    change.
@@ -216,6 +217,25 @@ composed again inside the `try`), the run fails with a conflict and sends
 nothing, so keep each `try` narrow, around the call it retries, with the
 `llm_compose` before it. Reads and model steps run again on every attempt.
 
+## Tasks with agent turns
+
+Any workflow may take agent turns, not only loops: every run the runtime
+starts on a signal is admitted with the model's parameters (a scheduled
+task's: the `base` preset and the `scheduler` skill;
+`metadata.agent: { preset, confirm }` changes them). A recurring task that
+needs judgement starts as a copy of `agent-loop` under its own name:
+`read_workflow("agent-loop")`, rename `document.name`, `save_workflow`,
+dry-run it on a fire of its task (`try_workflow(name, signal: {source:
+scheduler, content: <the task's prompt>, payload: {workflow: <name>}})`),
+activate it once the user agrees, then `schedule_task(workflow: <name>)`.
+The task's prompt is the first user message. Later versions move what
+repeats into deterministic steps around the turns (a `for` calling a read
+directly, its results given to the model through `loop_setup`), leaving the
+model the judgement and the errors. Wherever `agent_turn` appears, keep
+agent-loop's guarded round (`turn`, the `guard` child, `tool`, `settle`):
+save and activation refuse a workflow without it. Three faults in a row
+hand the task to the agent loop until a new version is activated.
+
 ## Loops
 
 Every agent loop, the parent's and each worker's, runs a named loop
@@ -308,7 +328,7 @@ wins (default 0); activation refuses ties and names the conflicting
 workflow. A routed loop starts on the `smart` preset with the signal's
 conversation (else the default chat) as its confirmation target;
 `metadata.route.preset` (`base`, `smart`, `smartest`) and
-`metadata.route.confirm: none` change that. Its instructions start with the
+`metadata.route.confirm: none` (or the same under `metadata.agent`) change that. Its instructions start with the
 session context, the signal's source and its env addendum; its input carries
 `signal` (`id`, `source`, `content`, `env_context`, `payload`, `button`,
 `created_at`) besides `loop`, `messages`, `memory`. Telegram uses the

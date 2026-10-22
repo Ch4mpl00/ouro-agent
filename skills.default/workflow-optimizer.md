@@ -12,9 +12,11 @@ do not save, activate, schedule or execute anything. The author guide's
 save/probe/dry-run procedure describes later validation, not work you can do now.
 
 Start with the existing definition and the task in the trace. A task starts as
-the ordinary ReAct `agent-loop`; crystallisation produces a task-specific loop
-variant, with fixed steps before or around model turns, eventually possibly
-zero turns. Do not introduce an `agent` step or rewrite the shared `signal`
+the ordinary ReAct `agent-loop`, or as a copy of it saved under the task's own
+name and scheduled with `schedule_task(workflow:)`; crystallisation rewrites
+that workflow in place, with fixed steps before or around model turns,
+eventually possibly zero turns. Any workflow may take agent turns, so the kind
+never changes; keep the guarded round wherever `agent_turn` remains. Do not introduce an `agent` step or rewrite the shared `signal`
 dispatcher to optimise one task. Keep transport-specific behaviour in the
 appropriate loop, not in Rust.
 

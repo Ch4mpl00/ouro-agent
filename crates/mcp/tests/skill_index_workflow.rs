@@ -7,7 +7,7 @@ use agent::{
     agent::{EngineDeps, Providers, create_engine},
     db::AgentDb,
     flows::WorkflowSignal,
-    flows::{FlowResult, FlowRun, create_durable_flows, try_draft},
+    flows::{FlowResult, create_durable_flows, try_draft},
     mcp::{ConnectOptions, Mcp, McpClient, open_http},
     models::default_presets,
     providers::{ChatProvider, HttpApi, OPENAI_BASE_URL, ProviderKind, assistant, provider},

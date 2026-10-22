@@ -164,7 +164,7 @@ async fn every_named_loop_requires_the_guard_at_save_and_activation() {
     let f = fixture(Arc::new(Scripted::new(vec![])), &[], WORKER);
     for name in ["telegram-loop", "research-loop"] {
         let def = format!(
-            "document: {{dsl: '1.0.4', namespace: t, name: {name}, version: '1.0.0', metadata: {{loop: {{description: Research}}}}}}\ndo: [{{done: {{set: {{output: done}}}}}}]\n"
+            "document: {{dsl: '1.0.4', namespace: t, name: {name}, version: '1.0.0', metadata: {{loop: {{description: Research}}}}}}\ndo: [{{turn: {{call: agent_turn, with: {{messages: '${{ .messages }}'}}}}}}]\n"
         );
         let save = json!({"name":name,"definition":def});
         assert!(

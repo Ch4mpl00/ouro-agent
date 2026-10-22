@@ -1,13 +1,18 @@
-// Saved workflows: Open Workflow Specification definitions (`crates/owf`)
-// that run without a model deciding what to do next. 1. the store (agent.db
-// `workflows`); 2. the function catalog (MCP tools and the model steps);
-// 2b. model composition and signal input; 3. tracing (owf events → spans
-// under the signal's trace); 4. running one for a scheduler signal.
+// Saved workflows: Open Workflow Specification definitions (`crates/owf`).
+// 1. the store (agent.db `workflows`); 2. the function catalog (MCP tools,
+// the model steps, the agent loop's host functions); 2b. model composition
+// and signal input; 3. tracing (owf events → spans under the signal's
+// trace); 4. running one; 4b. which definition a run runs; 5. authoring.
 //
-// A scheduled task naming a workflow (`schedule_task` with `workflow`; its
-// fire's payload is `{ "workflow": "…" }`) runs its active version here.
-// The supervisor hands a run that faulted before any `Write` call to the
-// agent loop; one that faulted after goes to recovery, which only reports.
+// One kind of workflow: every run the runtime starts on a signal (a route,
+// a scheduled task's `{ "workflow": "…" }`, the primary loop) and every
+// worker is admitted with the model's parameters (`admitted_input`), so any
+// workflow may mix deterministic steps with agent turns, and a recurring
+// task can start as a copy of `agent-loop` and be rewritten step by step
+// without changing kind. `metadata.loop` only lists a workflow among the
+// loops a worker may run. The supervisor hands a scheduled run that faulted
+// before any `Write` call to the agent loop; one that faulted after goes to
+// recovery, which only reports.
 use crate::{
     agent::Engine,
     db::AgentDb,
@@ -341,8 +346,8 @@ struct Functions {
     // The store of the durable run these functions serve: a loop's
     // sub-agents become durable runs of their own in it.
     runs: Option<crate::durable::RunStore>,
-    loop_only: bool,
     guard_only: bool,
+    // The admitted model input of a run without a run store (in process).
     loop_input: Option<Value>,
     events: Option<Arc<dyn owf::run::Events>>,
     children: Arc<Children>,
@@ -449,8 +454,11 @@ fn failed(e: anyhow::Error) -> HostError {
 }
 
 // The agent loop's functions (`agent::AGENT_LOOP`): a turn, one tool call
-// by name, a round's settlement. They take the loop from the run's context,
-// so they belong to an `agent-loop` definition.
+// by name, a round's settlement. They read the model's parameters from the
+// run's admitted input (`admitted_input`), which the host gives every run it
+// starts on a signal and every worker: any such workflow may take agent
+// turns, a loop or not. The YAML passes the transcript; the spec it passes
+// is replaced by the admitted one.
 // `guard` and `confirm_request` remain executable for immutable runs admitted
 // before guard children. Remove them after those runs have drained. New
 // definitions cannot call confirm_request; only the reserved guard can.
@@ -460,7 +468,7 @@ const LOOP_FUNCTIONS: &[HostFunction] = &[
         Effect::Read,
         &["loop", "messages", "memory", "i", "extra_turn"],
         &["messages"],
-        "Generate the next model message in an admitted loop. Pass messages, working-memory snapshot and zero-based turn i; extra_turn allows one additional turn. Returns message, calls and content. Preserve the host's loop spec.",
+        "Generate the next model message with the run's admitted model parameters (any workflow the runtime starts on a signal, and workers). Pass messages, working-memory snapshot and zero-based turn i; extra_turn allows one additional turn. Returns message, calls and content. A workflow that calls it must start the guard child each round: copy agent-loop's guarded round.",
     ),
     host_function(
         "guard",
@@ -488,21 +496,21 @@ const LOOP_FUNCTIONS: &[HostFunction] = &[
         Effect::Read,
         &["loop", "call", "guard_run", "worker_run", "worker_loop", "i", "index", "memory", "outcome"],
         &["call"],
-        "Execute one admitted loop call under the host-verified guard verdict. Pass its round i and index, guard_run and any joined worker_run/worker_loop. Returns presented, failed, result and working-memory updates for agent_settle. Its actual effect depends on the called tool; keep the base loop's guard and worker joins.",
+        "Execute one of the model's calls under the host-verified guard verdict. Pass its round i and index, guard_run and any joined worker_run/worker_loop. Returns presented, failed, result and working-memory updates for agent_settle. Its actual effect depends on the called tool; keep the base loop's guard and worker joins.",
     ),
     host_function(
         "agent_settle",
         Effect::Read,
         &["loop", "calls", "results", "memory"],
         &["calls", "results"],
-        "Settle ordered tool results into the admitted loop's transcript and working memory. Returns replies, memory, finished, output and outcomes: {name, arguments, ok, result}. Use these facts in workflow exit rules.",
+        "Settle ordered tool results into the run's transcript and working memory. Returns replies, memory, finished, output and outcomes: {name, arguments, ok, result}. Use these facts in workflow exit rules.",
     ),
     host_function(
         "loop_setup",
         Effect::Read,
         &["system", "skills", "input"],
         &[],
-        "Set up the admitted loop's instructions, once and before its first agent_turn. system is an array of strings (null and empty entries are dropped) added to the system prompt; skills names skills loaded in full, with their tools; input replaces the first user message (a routed loop's is the signal's text, e.g. with signal_input's history). Returns messages and memory to export into $context, and setup (what a restart restores). Loaded skills and a preselect_skills block passed in system count for the guard.",
+        "Set up the admitted run's instructions, once and before its first agent_turn. system is an array of strings (null and empty entries are dropped) added to the system prompt; skills names skills loaded in full, with their tools; input replaces the first user message (a signal's run starts with the signal's text, e.g. with signal_input's history). Returns messages and memory to export into $context, and setup (what a restart restores). Loaded skills and a preselect_skills block passed in system count for the guard.",
     ),
 ];
 
@@ -510,13 +518,49 @@ fn is_loop_function(name: &str) -> bool {
     LOOP_FUNCTIONS.iter().any(|f| f.name == name)
 }
 
-// The signal workflow's context functions a loop may call too, before its
-// `loop_setup`: on the signal its route started it for (agent.rs §4).
+// The signal workflow's context functions any admitted run may call too,
+// before its `loop_setup`: on the signal it was started for (agent.rs §4).
 const LOOP_CONTEXT: &[&str] = &["signal_input", "recent_activity", "pending_confirmations", "preselect_skills"];
 
-// A host function of an admitted loop run.
+// A host function of an admitted run.
 fn is_loop_host(name: &str) -> bool {
     is_loop_function(name) || LOOP_CONTEXT.contains(&name)
+}
+
+// A function only the signal dispatcher runs (`signal.yaml`), on the
+// signal its run serves.
+fn is_dispatcher_function(name: &str) -> bool {
+    !LOOP_CONTEXT.contains(&name) && crate::supervisor::SIGNAL_FUNCTIONS.iter().any(|f| f.name == name)
+}
+
+const DISPATCHER_ONLY: &str = "only the signal dispatcher calls it";
+
+/// Whether a definition calls a dispatcher-only function: a signal route
+/// of the kind loop routes superseded (it calls `primary_loop` itself), run
+/// on the dispatcher's host with its context as input.
+pub fn calls_dispatcher(wf: &owf::model::Workflow) -> bool {
+    owf::model::call_sites(wf).iter().any(|s| is_dispatcher_function(&s.function))
+}
+
+// Whether a definition takes agent turns (or other steps that need the
+// run's admitted model input): it runs on a signal, never on the scheduled
+// form of a dry run.
+fn takes_turns(wf: &owf::model::Workflow) -> bool {
+    owf::model::call_sites(wf).iter().any(|s| is_loop_host(&s.function))
+}
+
+/// The admitted model input of a durable run, or None. The host admits a
+/// run it starts on a signal with the model's parameters (`loop`: the spec,
+/// with the confirmation target and the tools), the transcript and the
+/// guard's evidence (`AgentLoop::workflow_input`), and a worker's run the
+/// same way; `agent_turn`, `tool` and the rest read only this. A run started
+/// by a workflow's own `start_child` is never admitted, whatever its input
+/// says (`start_child` refuses an input naming `loop`, and older children
+/// are told apart by not being loops, which only the host starts as children).
+pub fn admitted_input(run: &crate::durable::SavedRun) -> Option<&Value> {
+    (run.input.get("loop").is_some_and(Value::is_object)
+        && (run.parent_run.is_none() || is_loop_definition(&run.name, &run.definition)))
+    .then_some(&run.input)
 }
 
 fn runtime_functions() -> impl Iterator<Item = (HostFunction, &'static str)> {
@@ -605,15 +649,13 @@ impl owf::run::Functions for Functions {
                 _ => error.or_failure(CallFailure::Response),
             });
         }
-        // A call written into a loop's definition is trusted as any saved
-        // workflow's is: the user approved the definition after its dry run.
-        // Only the model's calls go through `tool` and the guard. What stays
-        // refused protects the dispatcher: its functions act on the one
-        // signal its run serves (a loop has only its context subset).
-        if crate::supervisor::SIGNAL_FUNCTIONS.iter().any(|f| f.name == name)
-            && !(self.loop_only && LOOP_CONTEXT.contains(&name))
-        {
-            return Err(CallFailure::NotExecuted(invalid(name, "only the signal workflow or a loop calls it")));
+        // A call written into a definition is trusted: the user approved
+        // the definition after its dry run. Only the model's calls go through
+        // `tool` and the guard. What stays refused protects the dispatcher:
+        // its functions act on the one signal its run serves (an admitted
+        // run has only its context subset).
+        if is_dispatcher_function(name) {
+            return Err(CallFailure::NotExecuted(invalid(name, DISPATCHER_ONLY)));
         }
         if is_loop_host(name) {
             // A tool reports its own failures in its reply; an error here
@@ -664,15 +706,29 @@ impl owf::run::Functions for Functions {
 }
 
 impl Functions {
+    // The run's admitted model input: its record's in a run store, else the
+    // one the host handed this in-process run.
+    fn admitted(&self, name: &str, info: &CallInfo<'_>) -> Result<Value, HostError> {
+        let admitted = match &self.runs {
+            Some(runs) => runs.get(info.run_id).map_err(failed)?.as_ref().and_then(admitted_input).cloned(),
+            None => self.loop_input.clone(),
+        };
+        admitted.ok_or_else(|| {
+            invalid(
+                name,
+                "requires the host's admitted model input: a run the runtime started on a signal, or a worker; a child of start_child has none",
+            )
+            .into()
+        })
+    }
+
     // `call`, with a stop told apart from a failure for `invoke`.
     async fn host_call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, HostError> {
         if self.guard_only {
             return self.guard_step(name, args, info).await;
         }
-        if crate::supervisor::SIGNAL_FUNCTIONS.iter().any(|f| f.name == name)
-            && !(self.loop_only && LOOP_CONTEXT.contains(&name))
-        {
-            return Err(invalid(name, "only the signal workflow or a loop calls it").into());
+        if is_dispatcher_function(name) {
+            return Err(invalid(name, DISPATCHER_ONLY).into());
         }
         let span = self.spans.scope(info.reference);
         let label = info.reference.rsplit('/').next().unwrap_or(name);
@@ -693,15 +749,7 @@ impl Functions {
                 let engine = &self.engine;
                 // The run id is supplied by the interpreter, not by YAML.
                 // Rebuild from the admitted input, never a rewritten loop spec.
-                let admitted = match &self.runs {
-                    Some(runs) => runs
-                        .get(info.run_id)
-                        .map_err(failed)?
-                        .filter(|r| is_loop_definition(&r.name, &r.definition))
-                        .map(|r| r.input),
-                    None => self.loop_input.clone(),
-                }
-                .ok_or_else(|| invalid(name, "requires the host's admitted agent-loop input"))?;
+                let admitted = self.admitted(name, info)?;
                 let spec: crate::agent::LoopSpec =
                     serde_json::from_value(admitted["loop"].clone()).map_err(|e| invalid(name, e))?;
                 let live = engine.loop_for(&spec, &root, info.cancel).await.map_err(failed)?;
@@ -794,7 +842,12 @@ impl Functions {
                 }
                 .map_err(failed)
             }
-            "start_child" if self.loop_only => self.loop_child(args, info).await,
+            // The guard child and a worker (the model's `invoke_sub_agent`
+            // call) are the host's children of an admitted run; any other is
+            // a saved workflow of the author's.
+            "start_child" if args["workflow"] == "guard" || args.get("call").is_some_and(|c| !c.is_null()) => {
+                self.loop_child(args, info).await
+            }
             "start_child" => {
                 let workflow = text(&args, name, "workflow")?.ok_or_else(|| invalid(name, "workflow required"))?;
                 let key = text(&args, name, "key")?.ok_or_else(|| invalid(name, "key required"))?;
@@ -802,7 +855,15 @@ impl Functions {
                 let events = self.events.as_deref().ok_or_else(|| invalid(name, "requires events"))?;
                 let id = format!("{}/child/{}", info.run_id, crate::skills::hash_value(&json!([info.reference, key])));
                 if built_in(workflow).is_some() {
-                    return Err(invalid(name, "built-in child workflows require an admitted agent-loop").into());
+                    return Err(invalid(name, "a built-in child workflow is the host's: the guard, or a worker for the model's invoke_sub_agent `call`").into());
+                }
+                // The model's parameters are the host's, never a workflow's.
+                if args.get("input").is_some_and(|i| i.get("loop").is_some()) {
+                    return Err(invalid(
+                        name,
+                        "a child's input cannot carry `loop`: only the host admits the model's parameters",
+                    )
+                    .into());
                 }
                 let definition = self
                     .engine
@@ -813,7 +874,9 @@ impl Functions {
                     .ok_or_else(|| invalid(name, "workflow is not active"))?
                     .definition;
                 if is_loop_definition(workflow, &definition) {
-                    return Err(invalid(name, "loop children require an admitted agent-loop").into());
+                    return Err(
+                        invalid(name, "a loop child is a worker: pass the model's invoke_sub_agent `call`").into()
+                    );
                 }
                 let input = args.get("input").cloned().unwrap_or(json!({}));
                 self.start_child(
@@ -1222,21 +1285,12 @@ pub trait FlowRun: Send + Sync {
         self.deliver_event(type_, data)
     }
 
-    async fn run(
-        &self,
-        name: &str,
-        signal: &WorkflowSignal,
-        session: &Session,
-        scope: &Scope,
-        cancel: &CancellationToken,
-    ) -> FlowResult;
-
-    /// Drives an agent loop as a run `id` of the built-in `agent-loop`
-    /// definition on `input` (`AgentLoop::workflow_input`). `Missing` when
-    /// this runner does not drive loops: the caller runs the loop itself.
-    async fn run_loop(&self, _id: &str, _input: Value, _scope: &Scope, _cancel: &CancellationToken) -> FlowResult {
-        FlowResult::Missing
-    }
+    /// The one way a run starts: the workflow `input.loop.workflow` as run
+    /// `id` on the host's admitted input (`AgentLoop::workflow_input`),
+    /// driven to its next stop. A run the runtime starts on a signal may be
+    /// any workflow (`run_definition`); a worker's runs a loop. A run that
+    /// exists already continues on its own pinned input and definition.
+    async fn run_loop(&self, id: &str, input: Value, scope: &Scope, cancel: &CancellationToken) -> FlowResult;
 }
 
 // Runs the recovery worker resumes at once.
@@ -1282,8 +1336,10 @@ fn execute_saved<'a>(
     cancel: &'a CancellationToken,
 ) -> BoxFuture<'a, FlowResult> {
     async move {
-        let loop_run = is_loop_definition(&saved.name, &saved.definition);
-        let loop_version = saved.input.get(OVERRIDE).and_then(Value::as_i64);
+        // A run the host admitted (on a signal, or a worker) counts toward
+        // its definition's breaker and drives a live loop.
+        let admitted = admitted_input(&saved).is_some();
+        let version = saved.input.get(OVERRIDE).and_then(Value::as_i64);
         let guard_parent = if saved.name == "guard" {
             let parent = saved.parent_run.as_deref().map(|id| runs.get(id)).transpose().ok().flatten().flatten();
             let id = parent.and_then(|p| p.input["loop"]["id"].as_str().map(str::to_owned));
@@ -1297,7 +1353,7 @@ fn execute_saved<'a>(
         let children = Arc::new(Children::default());
         let lease = Arc::new(lease);
         let root = scope.span(SpanStart::new("runner", SpanKind::Chain).input(saved.input.clone())
-            .metadata(metadata(json!({"durable_run":saved.id,"durable_workflow":saved.name}))));
+            .metadata(metadata(json!({"durable_run":saved.id,"durable_workflow":saved.name,"workflow":saved.name}))));
         let mut stopped = false;
         let status = match owf::model::parse_yaml(&saved.definition) {
             Err(error) => (RunStatus::Interrupted(WorkflowError::validation(error.to_string())), true),
@@ -1314,11 +1370,11 @@ fn execute_saved<'a>(
                 );
                 if let Some(sandbox) = engine.sandbox() {
                     let version = match saved.name.as_str() {
-                        _ if loop_run => loop_version,
+                        _ if admitted => version,
                         "guard" => None,
                         name => engine.deps.workflows.active(name).ok().flatten().map(|w| w.version),
                     };
-                    let loop_id = saved.input["loop"]["id"].as_str().filter(|_| loop_run);
+                    let loop_id = saved.input["loop"]["id"].as_str().filter(|_| admitted);
                     sandbox.watch(&mut host, &saved.id, &saved.name, version, saved.parent_run.as_deref(), loop_id);
                 }
                 // Shutdown releases work for recovery; only explicit run
@@ -1350,8 +1406,8 @@ fn execute_saved<'a>(
         let (status, effects_started) = status;
         // Publish the breaker's decision before completion wakes the parent;
         // otherwise a fast parent can admit the next worker on a bad version.
-        if loop_run {
-            record_outcome(engine, &saved.name, loop_version, &flow_result(status.clone(), effects_started));
+        if admitted {
+            record_outcome(engine, &saved.name, version, &flow_result(status.clone(), effects_started));
         }
         // A host call cut short by a stop this attempt did not see first (a
         // worker's model turn aborted by shutdown or by its parent's release
@@ -1367,8 +1423,8 @@ fn execute_saved<'a>(
             Ok(status) => flow_result(status, effects_started),
             Err(error) => FlowResult::Interrupted { error: WorkflowError::runtime(error.to_string()) },
         };
-        if loop_run && interrupted && matches!(result, FlowResult::Faulted { .. }) {
-            record_outcome(engine, &saved.name, loop_version, &result);
+        if admitted && interrupted && matches!(result, FlowResult::Faulted { .. }) {
+            record_outcome(engine, &saved.name, version, &result);
         }
         root.update(crate::tracing::ContextUpdate::metadata(metadata(json!({"durable_terminal": matches!(result, FlowResult::Completed(_) | FlowResult::Faulted { .. } | FlowResult::Cancelled)}))));
         root.end(match &result {
@@ -1385,45 +1441,6 @@ fn execute_saved<'a>(
 }
 
 impl Flows {
-    async fn run_durable(
-        &self,
-        runs: &crate::durable::RunStore,
-        name: &str,
-        signal: &WorkflowSignal,
-        session: &Session,
-        scope: &Scope,
-        cancel: &CancellationToken,
-    ) -> anyhow::Result<FlowResult> {
-        let id = format!("{}:{}", signal.source, signal.id);
-        let mut started = None;
-        if runs.get(&id)?.is_none() {
-            let Some(saved) = self.engine.deps.workflows.active(name)? else { return Ok(FlowResult::Missing) };
-            if let Err(error) = check(&*self.engine.deps.mcp, &saved.definition) {
-                return Ok(FlowResult::Faulted { error: WorkflowError::validation(error), effects_started: false });
-            }
-            let mut input = Value::Object(signal_input(signal, &session.env));
-            // Recovery of named child workflows joins the admitted session,
-            // including callers whose session differs from the signal's id.
-            input["__session_id"] = json!(session.id);
-            started = runs.start_anchored(&id, name, &saved.definition, &input, scope.anchor().as_ref())?;
-        }
-        let saved = runs.get(&id)?.ok_or_else(|| anyhow::anyhow!("run {id} disappeared"))?;
-        anyhow::ensure!(saved.name == name, "run {id} belongs to another workflow");
-        if let Some(status) = saved.outcome {
-            return Ok(flow_result(status, true));
-        }
-        let lease = match started {
-            Some(lease) => lease,
-            None => match runs.claim(&id)? {
-                Some(lease) => lease,
-                None => {
-                    return Ok(FlowResult::Waiting { wake_at_ms: chrono::Utc::now().timestamp_millis() + 1_000 });
-                }
-            },
-        };
-        Ok(execute_saved(&self.engine, runs, saved, lease, scope, cancel).await)
-    }
-
     // Claims up to `limit` runs that are due: a passed deadline or an
     // expired lease.
     fn claim_due(
@@ -1451,11 +1468,11 @@ impl Flows {
         cancel: &CancellationToken,
     ) {
         let id = saved.id.clone();
-        let is_loop = is_loop_definition(&saved.name, &saved.definition);
+        let admitted = admitted_input(&saved).is_some();
         // Pre-anchor runs retain their fresh-trace/session-only recovery.
         // New runs attach an execution segment to their original scope.
         let admitted_session = |run: &crate::durable::SavedRun| {
-            let value = if is_loop_definition(&run.name, &run.definition) {
+            let value = if admitted_input(run).is_some() {
                 &run.input["loop"]["session"]
             } else if run.parent_run.is_none() {
                 &run.input["__session_id"]
@@ -1488,11 +1505,11 @@ impl Flows {
             metadata: Some(json!({"run": id}).as_object().expect("object").clone()),
             ..Default::default()
         });
-        if let Some(task) = saved.input["guard_context"]["task"].as_str().filter(|_| is_loop && !anchored) {
+        if let Some(task) = saved.input["guard_context"]["task"].as_str().filter(|_| admitted && !anchored) {
             trace.update(crate::tracing::ContextUpdate::input(task));
         }
         let scope: Scope = trace.clone();
-        let driven = is_loop.then(|| saved.input["loop"]["id"].as_str().map(str::to_owned)).flatten();
+        let driven = admitted.then(|| saved.input["loop"]["id"].as_str().map(str::to_owned)).flatten();
         let result = execute_saved(&self.engine, runs, saved, lease, &scope, cancel).await;
         if owns_output {
             match &result {
@@ -1644,7 +1661,21 @@ impl FlowRun for Flows {
         Ok(true)
     }
 
-    async fn run(
+    async fn run_loop(&self, id: &str, input: Value, scope: &Scope, cancel: &CancellationToken) -> FlowResult {
+        match &self.runs {
+            Some(runs) => run_loop_durable(&self.engine, runs, id, input, scope, cancel).await,
+            None => run_loop_here(&self.engine, id, input, scope, cancel).await,
+        }
+    }
+}
+
+impl Flows {
+    /// A scheduled fire of the saved workflow `name` without a supervisor
+    /// (tools, tests): the supervisor's scheduled launch (supervisor.rs,
+    /// `run_saved_workflow`) with its defaults and no context of its own,
+    /// so the same resolution, the same admission and the same `run_loop`
+    /// as run `<source>:<id>`. A run of that id that exists continues.
+    pub async fn run(
         &self,
         name: &str,
         signal: &WorkflowSignal,
@@ -1652,68 +1683,43 @@ impl FlowRun for Flows {
         scope: &Scope,
         cancel: &CancellationToken,
     ) -> FlowResult {
-        if let Some(runs) = &self.runs {
-            return self
-                .run_durable(runs, name, signal, session, scope, cancel)
-                .await
-                .unwrap_or_else(|error| FlowResult::Interrupted { error: WorkflowError::runtime(error.to_string()) });
+        let id = format!("{}:{}", signal.source, signal.id);
+        let exists = match self.runs.as_ref().map(|runs| runs.get(&id)).transpose() {
+            Ok(run) => run.flatten().is_some(),
+            Err(error) => return FlowResult::Interrupted { error: WorkflowError::runtime(error.to_string()) },
+        };
+        if exists {
+            return self.run_loop(&id, Value::Null, scope, cancel).await;
         }
-        let unchanged = |error| FlowResult::Faulted { error, effects_started: false };
-        let saved = match self.engine.deps.workflows.active(name) {
-            Ok(Some(saved)) => saved,
-            Ok(None) => return FlowResult::Missing,
-            Err(e) => return unchanged(WorkflowError::runtime(format!("loading workflow `{name}`: {e}"))),
+        if let Some(stop) = unrunnable(&self.engine, name) {
+            return stop;
+        }
+        let pending = crate::supervisor::PendingSignal {
+            id: signal.id,
+            source: signal.source.clone(),
+            content: signal.content.clone(),
+            env_context: signal.env_context.clone(),
+            created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            payload: Some(json!({"workflow": name})),
         };
-        let input = Value::Object(signal_input(signal, &session.env));
-        let root = scope.span(
-            SpanStart::new("runner", SpanKind::Chain)
-                .input(input.clone())
-                .metadata(metadata(json!({"workflow":name,"workflow_version":saved.version,"engine":"owf"}))),
-        );
-        let result = match check(&*self.engine.deps.mcp, &saved.definition) {
-            // A definition that no longer validates (a tool went away) changed nothing.
-            Err(problems) => unchanged(WorkflowError::validation(problems)),
-            Ok(wf) => {
-                let spans = Arc::new(Spans { root: root.clone(), open: Mutex::default() });
-                let host = Host {
-                    functions: Arc::new(Functions {
-                        engine: self.engine.clone(),
-                        spans: spans.clone(),
-                        runs: None,
-                        loop_only: false,
-                        guard_only: false,
-                        loop_input: None,
-                        events: None,
-                        children: Arc::default(),
-                    }),
-                    observer: spans,
-                    clock: Arc::new(SystemClock),
-                    limits: Limits::default(),
-                    runtime: json!({"name":"agent-supervisor","version":env!("CARGO_PKG_VERSION")}),
-                };
-                let run_id = format!("{}:{}", signal.source, signal.id);
-                let outcome = owf::run::run(&host, &wf, &run_id, input, cancel).await;
-                flow_result(outcome.status, outcome.effects_started)
+        let launch = crate::supervisor::Launch::Scheduled;
+        let admitted = async {
+            let mut opts = crate::supervisor::admission(&self.engine, &pending, session, name, launch, None).await?;
+            opts.cancel = cancel.clone();
+            opts.trace_scope = Some(scope.clone());
+            let agent = self.engine.start_loop(opts).await?;
+            Ok::<_, anyhow::Error>(crate::supervisor::run_input(&agent, &pending.content, &pending, session).await)
+        }
+        .await;
+        let result = match admitted {
+            Ok(input) => self.run_loop(&id, input, scope, cancel).await,
+            Err(error) if is_aborted(&error) => FlowResult::Cancelled,
+            Err(error) => {
+                FlowResult::Faulted { error: WorkflowError::runtime(error.to_string()), effects_started: false }
             }
         };
-        root.end(match &result {
-            FlowResult::Completed(output) => SpanEnd::output(output.clone()),
-            FlowResult::Faulted { error, effects_started } => {
-                SpanEnd::error(error.to_string()).with_output(json!({"error":error,"effects_started":effects_started}))
-            }
-            FlowResult::Cancelled => SpanEnd::error("cancelled"),
-            FlowResult::Waiting { wake_at_ms } => SpanEnd::output(json!({"waiting_until_ms":wake_at_ms})),
-            FlowResult::Interrupted { error } => SpanEnd::error(error.to_string()),
-            FlowResult::Missing => SpanEnd::default(),
-        });
+        self.engine.end_loop(&id).await;
         result
-    }
-
-    async fn run_loop(&self, id: &str, input: Value, scope: &Scope, cancel: &CancellationToken) -> FlowResult {
-        match &self.runs {
-            Some(runs) => run_loop_durable(&self.engine, runs, id, input, scope, cancel).await,
-            None => run_loop_here(&self.engine, id, input, scope, cancel).await,
-        }
     }
 }
 
@@ -1733,7 +1739,7 @@ pub async fn run_loop_durable(
         Ok(Some(saved)) => (saved.name, saved.definition, saved.input),
         Ok(None) => {
             let name = loop_name(&input).to_owned();
-            let (definition, version) = loop_definition_named(engine, &name);
+            let (definition, version) = run_definition(engine, &name, is_worker(&input));
             (name, definition, with_override(input, version))
         }
         Err(error) => return FlowResult::Interrupted { error: WorkflowError::runtime(error.to_string()) },
@@ -1797,18 +1803,7 @@ impl Functions {
             // Same worker preparation and id scheme as legacy durable_worker.
             return Box::pin(self.host_call("start_worker", args, info)).await;
         }
-        if workflow != "guard" {
-            return Err(invalid("start_child", "agent-loop may start only guard or worker children").into());
-        }
-        let admitted = match &self.runs {
-            Some(runs) => runs
-                .get(info.run_id)
-                .map_err(failed)?
-                .filter(|r| is_loop_definition(&r.name, &r.definition))
-                .map(|r| r.input),
-            None => self.loop_input.clone(),
-        }
-        .ok_or_else(|| invalid("start_child", "requires an admitted agent-loop"))?;
+        let admitted = self.admitted("start_child", info)?;
         args["loop"] = admitted["loop"].clone();
         let spec: crate::agent::LoopSpec = serde_json::from_value(admitted["loop"].clone()).map_err(failed_json)?;
         let live = self.engine.loop_for(&spec, &root, info.cancel).await.map_err(failed)?;
@@ -1870,9 +1865,10 @@ impl Functions {
         let admitted = runs
             .get(parent)
             .map_err(failed)?
-            .filter(|r| is_loop_definition(&r.name, &r.definition))
-            .ok_or_else(|| invalid(name, "guard requires an agent-loop parent"))?
-            .input;
+            .as_ref()
+            .and_then(admitted_input)
+            .cloned()
+            .ok_or_else(|| invalid(name, "guard requires an admitted parent"))?;
         let spec: crate::agent::LoopSpec = serde_json::from_value(admitted["loop"].clone()).map_err(failed_json)?;
         let live = self.engine.loop_for(&spec, &root, info.cancel).await.map_err(failed)?;
         live.admit_guard(&admitted).await.map_err(failed)?;
@@ -1994,9 +1990,7 @@ impl Functions {
             self.children.tasks.lock().await.spawn(async move {
                 let _permit = permit;
                 let saved_guard = saved.name == "guard";
-                let loop_id = (is_loop_definition(&saved.name, &saved.definition))
-                    .then(|| saved.input["loop"]["id"].as_str().map(str::to_owned))
-                    .flatten();
+                let loop_id = admitted_input(&saved).and_then(|i| i["loop"]["id"].as_str().map(str::to_owned));
                 let execution_scope: Scope = scope.clone();
                 let result = execute_saved(&engine, &runs, saved, lease, &execution_scope, &cancel).await;
                 if loop_id.is_some() || saved_guard {
@@ -2040,11 +2034,14 @@ pub fn loop_host(engine: &Arc<Engine>, root: &Arc<dyn Span>, input: Value) -> Ho
     host(engine, root, true, false, None, Some(input), None, Arc::default())
 }
 
+// `silent`: a loop's generations and tool calls trace themselves; spans for
+// its turn/round/settle tasks would only repeat them. Any other workflow's
+// tasks are spans, its agent turns among them.
 #[allow(clippy::too_many_arguments)]
 fn host(
     engine: &Arc<Engine>,
     root: &Arc<dyn Span>,
-    agent_loop: bool,
+    silent: bool,
     guard_only: bool,
     runs: Option<crate::durable::RunStore>,
     loop_input: Option<Value>,
@@ -2052,15 +2049,12 @@ fn host(
     children: Arc<Children>,
 ) -> Host {
     let spans = Arc::new(Spans { root: root.clone(), open: Mutex::default() });
-    // A loop's generations and tool calls trace themselves; spans for its
-    // turn/round/settle tasks would only repeat them.
-    let observer: Arc<dyn owf::run::Observer> = if agent_loop { Arc::new(owf::run::Silent) } else { spans.clone() };
+    let observer: Arc<dyn owf::run::Observer> = if silent { Arc::new(owf::run::Silent) } else { spans.clone() };
     Host {
         functions: Arc::new(Functions {
             engine: engine.clone(),
             spans,
             runs,
-            loop_only: agent_loop,
             guard_only,
             loop_input,
             events,
@@ -2118,8 +2112,9 @@ pub fn definition(engine: &Engine, name: &str) -> (String, Option<i64>) {
     (saved.definition, Some(saved.version))
 }
 
-// A workflow the runtime runs on a signal: the dispatcher, the loop, a loop
-// variant or a signal route (a scheduled workflow is not one).
+// A workflow the runtime runs on a signal of its own choosing: the
+// dispatcher, the loop, a loop variant or a route (a scheduled task's
+// workflow runs on its own fires).
 fn is_runtime_workflow(name: &str, wf: &owf::model::Workflow) -> bool {
     built_in(name).is_some()
         || workflow_metadata(wf).get("loop").is_some()
@@ -2151,6 +2146,54 @@ pub fn loop_definition_named(engine: &Engine, name: &str) -> (String, Option<i64
     } else {
         (crate::agent::AGENT_LOOP.to_owned(), None)
     }
+}
+
+/// The definition a new admitted run of `name` runs. A worker runs a loop
+/// (`loop_definition_named`). A run the runtime starts on a signal runs any
+/// workflow: a loop, a route, a scheduled task's (one copied from
+/// `agent-loop` included); while its version faults (the breaker) or no
+/// longer validates, its built-in one, else `agent-loop`. The dispatcher
+/// and the guard are never a signal's run.
+pub fn run_definition(engine: &Engine, name: &str, worker: bool) -> (String, Option<i64>) {
+    if worker {
+        return loop_definition_named(engine, name);
+    }
+    let (resolved, version) = definition(engine, name);
+    if resolved.is_empty() || name == crate::supervisor::SIGNAL_NAME || name == "guard" {
+        return (crate::agent::AGENT_LOOP.to_owned(), None);
+    }
+    (resolved, version)
+}
+
+// A worker's admitted input names its parent loop.
+fn is_worker(input: &Value) -> bool {
+    input["loop"]["parent_id"].is_string()
+}
+
+/// Why the saved workflow `name` cannot start on a scheduled signal now, as
+/// the outcome its run would have had, which changed nothing: no active
+/// version (`Missing`), one that no longer validates, or one whose breaker
+/// is open (three faults in a row; the task goes to the agent loop, as
+/// `run_definition` would put `agent-loop` in its place). None: it runs.
+pub fn unrunnable(engine: &Engine, name: &str) -> Option<FlowResult> {
+    let unchanged = |error| Some(FlowResult::Faulted { error, effects_started: false });
+    let saved = match engine.deps.workflows.active(name) {
+        Ok(Some(saved)) => saved,
+        Ok(None) => return Some(FlowResult::Missing),
+        Err(e) => return unchanged(WorkflowError::runtime(format!("loading workflow `{name}`: {e}"))),
+    };
+    // A definition that no longer validates (a tool went away) changed nothing.
+    if let Err(problems) = check(&*engine.deps.mcp, &saved.definition) {
+        return unchanged(WorkflowError::validation(problems));
+    }
+    let state = breaker(engine, name);
+    if state.open && state.version == saved.version {
+        return unchanged(WorkflowError::runtime(format!(
+            "version {} faulted {} times in a row, so it is set aside until a new version is activated",
+            saved.version, state.faults
+        )));
+    }
+    None
 }
 
 #[derive(Clone, Debug)]
@@ -2186,38 +2229,61 @@ fn route(wf: &owf::model::Workflow) -> anyhow::Result<Option<Route>> {
     Ok(Some(Route { when: fields, priority }))
 }
 
-/// What the confirmation target of a routed loop is.
+/// What the confirmation target of a signal's run is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RouteConfirm {
+pub enum Confirm {
     // The signal's conversation, else the default chat (the dispatcher's
     // default path does the same).
     Conversation,
     None,
 }
 
-/// How a routed loop starts: `metadata.route.preset` (default `smart`) and
-/// `metadata.route.confirm` (`conversation`, the default, or `none`).
-pub struct RouteStart {
-    pub preset: PresetName,
-    pub confirm: RouteConfirm,
+/// The model's parameters a workflow declares for the runs the runtime
+/// starts on a signal, pinned at admission: `metadata.agent.preset` (base,
+/// smart or smartest) and `metadata.agent.confirm` (`conversation` or
+/// `none`). A route may say the same under `metadata.route`, as loop routes
+/// always could. Unset, the launch decides (supervisor.rs `Launch`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AgentStart {
+    pub preset: Option<PresetName>,
+    pub confirm: Option<Confirm>,
 }
 
-pub fn route_start(wf: &owf::model::Workflow) -> anyhow::Result<RouteStart> {
-    let route = &workflow_metadata(wf)["route"];
-    let preset = match route.get("preset") {
-        None | Some(Value::Null) => PresetName::Smart,
-        Some(name) => name
-            .as_str()
-            .and_then(PresetName::selectable)
-            .ok_or_else(|| anyhow::anyhow!("metadata.route.preset must be base, smart or smartest"))?,
+// Where the parameters are declared, if anywhere: `metadata.agent`, else a
+// route's own.
+fn start_block(wf: &owf::model::Workflow) -> Option<(&'static str, &Value)> {
+    let metadata = workflow_metadata(wf);
+    if let Some(agent) = metadata.get("agent") {
+        return Some(("metadata.agent", agent));
+    }
+    let route = metadata.get("route")?;
+    (route.get("preset").is_some() || route.get("confirm").is_some()).then_some(("metadata.route", route))
+}
+
+pub fn agent_start(wf: &owf::model::Workflow) -> anyhow::Result<AgentStart> {
+    let Some((at, block)) = start_block(wf) else { return Ok(AgentStart::default()) };
+    anyhow::ensure!(block.is_object(), "{at} must be an object of preset and confirm");
+    if at == "metadata.agent"
+        && let Some(other) =
+            block.as_object().into_iter().flatten().map(|(k, _)| k).find(|k| *k != "preset" && *k != "confirm")
+    {
+        anyhow::bail!("{at} takes preset and confirm, not `{other}`");
+    }
+    let preset = match block.get("preset") {
+        None | Some(Value::Null) => None,
+        Some(name) => Some(
+            name.as_str()
+                .and_then(PresetName::selectable)
+                .ok_or_else(|| anyhow::anyhow!("{at}.preset must be base, smart or smartest"))?,
+        ),
     };
-    let confirm = match route.get("confirm").and_then(Value::as_str) {
-        None if route.get("confirm").is_none_or(Value::is_null) => RouteConfirm::Conversation,
-        Some("conversation") => RouteConfirm::Conversation,
-        Some("none") => RouteConfirm::None,
-        _ => anyhow::bail!("metadata.route.confirm must be `conversation` or `none`"),
+    let confirm = match block.get("confirm") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(c)) if c == "conversation" => Some(Confirm::Conversation),
+        Some(Value::String(c)) if c == "none" => Some(Confirm::None),
+        _ => anyhow::bail!("{at}.confirm must be `conversation` or `none`"),
     };
-    Ok(RouteStart { preset, confirm })
+    Ok(AgentStart { preset, confirm })
 }
 
 fn require_metadata(wf: &owf::model::Workflow) -> anyhow::Result<()> {
@@ -2228,14 +2294,18 @@ fn require_metadata(wf: &owf::model::Workflow) -> anyhow::Result<()> {
             "metadata.loop.description must be a nonempty string"
         );
     }
-    if let Some(route) = metadata.get("route") {
-        let starts = route.get("preset").is_some() || route.get("confirm").is_some();
-        anyhow::ensure!(
-            !starts || metadata.get("loop").is_some(),
-            "metadata.route.preset and metadata.route.confirm belong to a loop's route; a signal route passes them to primary_loop"
-        );
-        route_start(wf)?;
-    }
+    let route_starts = metadata.get("route").is_some_and(|r| r.get("preset").is_some() || r.get("confirm").is_some());
+    anyhow::ensure!(
+        !(route_starts && metadata.get("agent").is_some()),
+        "declare preset and confirm once: metadata.agent, or the route's own"
+    );
+    // A signal route runs on the dispatcher's host and passes them to
+    // primary_loop itself; nothing else would read them.
+    anyhow::ensure!(
+        !(calls_dispatcher(wf) && (route_starts || metadata.get("agent").is_some())),
+        "a workflow that calls the dispatcher's functions (primary_loop) passes preset and confirm to primary_loop; metadata.agent and metadata.route.preset/confirm are for the runs the runtime admits itself"
+    );
+    agent_start(wf)?;
     route(wf)?;
     anyhow::ensure!(
         wf.document.name != "signal" || metadata.get("route").is_none(),
@@ -2332,6 +2402,9 @@ pub fn record_outcome(engine: &Engine, name: &str, version: Option<i64>, result:
         state = Breaker { version, ..Breaker::default() };
     }
     match result {
+        // Nothing counted, nothing to write: a run that completes leaves no
+        // record of its own.
+        FlowResult::Completed(_) if state.faults == 0 && !state.open => return,
         FlowResult::Completed(_) => state.faults = 0,
         FlowResult::Faulted { error, .. } => {
             state.faults += 1;
@@ -2351,8 +2424,9 @@ pub fn record_outcome(engine: &Engine, name: &str, version: Option<i64>, result:
     }
 }
 
-/// Runs a loop in this process, without checkpoints: a worker's, a
-/// recovery's. `input` is `AgentLoop::workflow_input`'s.
+/// Runs an admitted run in this process, without checkpoints: a worker's,
+/// a recovery's, or any run of a runner without a store. `input` is
+/// `AgentLoop::workflow_input`'s.
 pub async fn run_loop_here(
     engine: &Arc<Engine>,
     id: &str,
@@ -2361,9 +2435,10 @@ pub async fn run_loop_here(
     cancel: &CancellationToken,
 ) -> FlowResult {
     let name = loop_name(&input).to_owned();
-    let (definition, version) = loop_definition_named(engine, &name);
+    let (definition, version) = run_definition(engine, &name, is_worker(&input));
     let root = scope.span(
         SpanStart::new("runner", SpanKind::Chain)
+            .input(input.clone())
             .metadata(metadata(json!({"workflow":name,"workflow_version":version,"engine":"owf"}))),
     );
     let result = match owf::model::parse_yaml(&definition) {
@@ -2371,7 +2446,8 @@ pub async fn run_loop_here(
             FlowResult::Faulted { error: WorkflowError::validation(error.to_string()), effects_started: false }
         }
         Ok(wf) => {
-            let mut host = host(engine, &root, true, false, None, Some(input.clone()), None, Arc::default());
+            let silent = is_loop_definition(&name, &definition);
+            let mut host = host(engine, &root, silent, false, None, Some(input.clone()), None, Arc::default());
             if let Some(sandbox) = engine.sandbox() {
                 sandbox.watch(&mut host, id, &name, version, None, input["loop"]["id"].as_str());
             }
@@ -2395,13 +2471,20 @@ pub async fn run_loop_here(
 // Synthetic tools of the agent loop for writing saved workflows. Saving
 // validates and stores a draft; only activation (after the user agreed in
 // the chat) lets a schedule run it.
-fn require_loop_guard(name: &str, wf: &owf::model::Workflow) -> anyhow::Result<()> {
+//
+// The model's calls go through `tool` and the guard: a workflow that takes
+// agent turns starts the guard child on each round's calls, whatever its
+// kind. The check is structural (it does not prove the round runs the
+// calls under the verdicts); `tool` itself still enforces a verdict for a
+// call that needs one, so an older stored definition stays guarded.
+fn require_guarded_turns(wf: &owf::model::Workflow) -> anyhow::Result<()> {
+    let sites = owf::model::call_sites(wf);
     anyhow::ensure!(
-        (name != crate::agent::AGENT_LOOP_NAME && workflow_metadata(wf).get("loop").is_none())
-            || owf::model::call_sites(wf)
+        !sites.iter().any(|s| s.function == "agent_turn")
+            || sites
                 .iter()
                 .any(|s| s.function == "start_child" && s.with.as_ref().is_some_and(|a| a["workflow"] == "guard")),
-        "loop workflow requires a `call: start_child` of workflow guard before its tool round; the host still enforces older overrides"
+        "a workflow that calls agent_turn requires a `call: start_child` of workflow guard before its tool round: copy agent-loop's guarded round (read_workflow agent-loop); the host still enforces older overrides"
     );
     Ok(())
 }
@@ -2561,17 +2644,24 @@ pub fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::R
                 "document.name is `{}` but the workflow is saved as `{name}`; make them the same",
                 wf.document.name
             );
-            require_loop_guard(name, &wf)?;
+            require_guarded_turns(&wf)?;
             require_metadata(&wf)?;
             let saved = store.save(name, definition, args.get("note").and_then(Value::as_str))?;
             let calls: Vec<Value> = owf::model::call_sites(&wf)
                 .into_iter()
                 .map(|c| json!({"reference":c.reference,"function":c.function,"effect":effect_name(mcp, &wf, &c.function)}))
                 .collect();
+            let then = "before the user sees it, then describe in words what it will do, the write calls above all; activate this version only after they confirm it in the chat.";
             let next = if is_runtime_workflow(name, &wf) {
-                "Dry-run it on a signal of the type it handles (try_workflow with `signal`, and `drafts` for the other drafts of the chain) before the user sees it, then describe in words what it will do, the write calls above all; activate this version only after they confirm it in the chat."
+                format!(
+                    "Dry-run it on a signal of the type it handles (try_workflow with `signal`, and `drafts` for the other drafts of the chain) {then}"
+                )
+            } else if takes_turns(&wf) {
+                format!(
+                    "Dry-run it on a fire of its task (try_workflow with signal {{source: scheduler, content: the task's prompt, payload: {{workflow: \"{name}\"}}}}) {then}"
+                )
             } else {
-                "Dry-run it (try_workflow) before the user sees it, then describe in words what it will do, the write calls above all; activate this version only after they confirm it in the chat."
+                format!("Dry-run it (try_workflow) {then}")
             };
             let mut reply = json!({
                 "ok": true, "name": name, "version": saved.version, "status": "draft", "calls": calls, "next": next,
@@ -2591,7 +2681,7 @@ pub fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::R
                 .ok_or_else(|| anyhow::anyhow!("no version {version} of workflow `{name}`"))?;
             // Tools may have changed since it was saved.
             let wf = check(mcp, &saved.definition).map_err(anyhow::Error::msg)?;
-            require_loop_guard(name, &wf)?;
+            require_guarded_turns(&wf)?;
             require_metadata(&wf)?;
             require_route_priority(store, name, &wf)?;
             if is_runtime_workflow(name, &wf) {
@@ -2603,8 +2693,8 @@ pub fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::R
                 );
                 store.activate(name, version)?;
                 let runs = match (is_loop_definition(name, &saved.definition), route(&wf)?.is_some()) {
-                    (true, true) => "A matching signal, and a loop selecting this name,",
-                    (true, false) => "A loop selecting this name",
+                    (true, true) => "A matching signal, a loop selecting this name or a task scheduled with it,",
+                    (true, false) => "A loop selecting this name, or a task scheduled with it,",
                     _ => "A matching signal",
                 };
                 return Ok(json!({
@@ -2620,7 +2710,7 @@ pub fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::R
             store.activate(name, version)?;
             Ok(json!({
                 "ok": true, "name": name, "version": version,
-                "next": format!("It runs whenever a task scheduled with schedule_task(workflow: \"{name}\") fires; create one if none exists. Existing schedules run the new version."),
+                "next": format!("It runs whenever a task scheduled with schedule_task(workflow: \"{name}\") fires; create one if none exists. Existing schedules run the new version; three faults in a row hand its task to the agent loop until a new version is activated."),
             })
             .to_string())
         }
@@ -2916,7 +3006,8 @@ impl Observer for DrySteps {
     }
 }
 
-/// `try_workflow`: runs a saved version (the latest by default) once on the
+/// `try_workflow` without a signal, for a workflow that takes no agent turn:
+/// runs a saved version (the latest by default) once on the
 /// session's input, as a scheduled fire would, except that nothing changes:
 /// every write is recorded and answered with a stub, waits and retry delays
 /// don't sleep, and nothing is journaled. Returns the steps, the writes it
@@ -2940,10 +3031,15 @@ pub async fn try_draft(
         engine.deps.workflows.get(name, version)?.ok_or_else(|| anyhow::anyhow!("no saved workflow `{name}`"))?;
     let wf = check(&*engine.deps.mcp, &saved.definition).map_err(anyhow::Error::msg)?;
     // A loop, a route or the dispatcher runs on a signal, never on a
-    // scheduled fire's empty input.
+    // scheduled fire's empty input; so does a workflow taking agent turns,
+    // which needs the input the host admits a signal's run with.
     anyhow::ensure!(
         !is_runtime_workflow(name, &wf),
         "`{name}` handles signals: try it with a signal (try_workflow with `signal`, and `drafts` for the rest of the chain)"
+    );
+    anyhow::ensure!(
+        !takes_turns(&wf),
+        "`{name}` takes agent turns, which run on the input the host admits a signal with: try it on a fire of its task (try_workflow with signal {{source: scheduler, content: the task's prompt, payload: {{workflow: \"{name}\"}}}})"
     );
     let signal = WorkflowSignal { id: 0, source: "scheduler".into(), content: String::new(), env_context: None };
     let input = Value::Object(signal_input(&signal, env));
@@ -2957,7 +3053,6 @@ pub async fn try_draft(
             engine: engine.clone(),
             spans: spans.clone(),
             runs: None,
-            loop_only: false,
             guard_only: false,
             loop_input: None,
             events: None,

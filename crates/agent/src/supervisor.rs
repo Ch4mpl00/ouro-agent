@@ -6,6 +6,7 @@ use crate::{
     errors::{aborted, check, is_aborted},
     flows::{FlowResult, FlowRun, WorkflowSignal},
     mcp::{Mcp, SharedMcp},
+    models::PresetName,
     session::{EnvDeps, Format, Session, gather_env_data, render_context, session},
     skills::{FindSkillsParams, append_patch, find_skills, read_skill_index},
     tool_results::is_tool_error,
@@ -430,7 +431,7 @@ pub fn pending_text(pending: Value) -> Value {
 }
 
 /// A signal as workflows see it (`$context.signal`): the dispatcher's input,
-/// and a routed loop's.
+/// and a signal's admitted run's.
 pub fn signal_value(signal: &PendingSignal) -> Value {
     json!({
         "id": signal.id, "source": signal.source, "content": signal.content,
@@ -439,7 +440,7 @@ pub fn signal_value(signal: &PendingSignal) -> Value {
     })
 }
 
-/// The signal a routed loop's admitted input carries, back.
+/// The signal a run's admitted input carries, back.
 pub fn admitted_signal(value: &Value) -> Option<PendingSignal> {
     Some(PendingSignal {
         id: value["id"].as_i64()?,
@@ -577,33 +578,6 @@ impl Supervisor {
             other => anyhow::bail!("the signal workflow did not end: {other:?}"),
         }
     }
-    // Runs the primary loop as a durable `agent-loop` run: a restart resumes
-    // it instead of losing the signal.
-    async fn drive(
-        &self,
-        agent: &Arc<AgentLoop>,
-        id: &str,
-        input: String,
-        primary: &Arc<dyn Span>,
-    ) -> anyhow::Result<String> {
-        let scope: Scope = primary.clone();
-        let run = agent.workflow_input(&input).await;
-        match self.flows.run_loop(&format!("{id}/loop"), run, &scope, &self.cancel).await {
-            FlowResult::Completed(output) => {
-                Ok(output.as_str().map(str::to_owned).unwrap_or_else(|| output.to_string()))
-            }
-            FlowResult::Missing => agent.send(input).await,
-            FlowResult::Cancelled => Err(aborted()),
-            FlowResult::Faulted { error, .. } => {
-                Err(anyhow::anyhow!(error.detail.clone().unwrap_or_else(|| error.to_string())))
-            }
-            // Released on shutdown or held elsewhere: the recovery worker resumes it.
-            FlowResult::Waiting { .. } | FlowResult::Interrupted { .. } => {
-                check(&self.cancel)?;
-                Ok(json!({"ok": true, "resumes": true}).to_string())
-            }
-        }
-    }
 }
 
 // ── 2b. the signal workflow ──────────────────────────────────────────────
@@ -612,6 +586,85 @@ impl Supervisor {
 // flows.rs §4b): the routing, the context the first turn gets, the primary
 // loop's skills and prompt, and the failure report. Its functions here act on the one signal its run
 // serves and trace under that signal's trace, as the code before them did.
+//
+// One kind of workflow, one way to run it on a signal (`launch`): a
+// scheduled task's workflow (`run_saved_workflow`), a route's (`route_signal`)
+// and the default path's loop (`primary_loop`) are each a run admitted with
+// the model's parameters (`admission`) and driven by `FlowRun::run_loop`.
+// Any of them may take agent turns; a workflow with none never calls the
+// model. What differs is the defaults (`Launch`) and what a failure means:
+// a route's reaches the dispatcher's catch, a scheduled task's that changed
+// nothing hands its task to the agent loop.
+
+/// How a run the runtime starts on a signal begins when its definition
+/// declares nothing (`flows::agent_start`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Launch {
+    /// A scheduled task's workflow: the `base` preset and the source's own
+    /// skill when it has one (`scheduler`), as the default path gives a
+    /// scheduled signal.
+    Scheduled,
+    /// A route's: the `smart` preset; the workflow sets up its skills itself.
+    Routed,
+}
+
+/// The model's parameters the host admits a run of workflow `name` on
+/// `signal` with, pinned for the whole run (`agent_turn` and `tool` read
+/// only these, never the YAML's): the preset and the confirmation target
+/// its definition declares or `launch`'s defaults, the conversation the
+/// signal came from, its skills, and instructions that say what the runtime
+/// knows (the session, the source, its env addendum, a handover's note).
+/// The rest of its first turn a workflow gathers and sets up itself
+/// (agent.rs §4, `loop_setup`).
+pub async fn admission(
+    engine: &Engine,
+    signal: &PendingSignal,
+    session: &Session,
+    name: &str,
+    launch: Launch,
+    handover: Option<&str>,
+) -> anyhow::Result<LoopOptions> {
+    let (definition, _) = crate::flows::run_definition(engine, name, false);
+    let start = crate::flows::agent_start(&owf::model::parse_yaml(&definition)?)?;
+    let mut opts = LoopOptions::new(format!("{}:{}", signal.source, signal.id), session.clone());
+    opts.workflow = name.to_owned();
+    opts.preset = start.preset.unwrap_or(match launch {
+        Launch::Scheduled => PresetName::Base,
+        Launch::Routed => PresetName::Smart,
+    });
+    opts.conversation = conversation(signal);
+    opts.confirm = match start.confirm.unwrap_or(crate::flows::Confirm::Conversation) {
+        crate::flows::Confirm::Conversation => conversation(signal).or_else(|| {
+            let chat_id = session.env.telegram_chat_id.clone()?;
+            Some(crate::agent::ConfirmTarget { chat_id, message_thread_id: None })
+        }),
+        crate::flows::Confirm::None => None,
+    };
+    if launch == Launch::Scheduled && engine.deps.skill_store.read_skill(&signal.source).await?.is_some() {
+        opts.skills = vec![signal.source.clone()];
+    }
+    opts.guard_request = Some(signal.content.clone());
+    let parts = [
+        Some(render_context(&session.env)?),
+        Some(format!("Signal source: {}", signal.source)),
+        signal.env_context.clone(),
+        handover.map(str::to_owned),
+    ];
+    opts.system_prompt = Some(parts.into_iter().flatten().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("\n\n"));
+    opts.signal = Some(signal_value(signal));
+    Ok(opts)
+}
+
+/// A signal's run input: the admitted input of `agent`, which has not run
+/// yet (`AgentLoop::workflow_input`, `text` its first user message), and
+/// `env`, the user's clock and watermarks as scheduled workflows read them.
+pub async fn run_input(agent: &AgentLoop, text: &str, signal: &PendingSignal, session: &Session) -> Value {
+    let mut input = agent.workflow_input(text).await;
+    if let Some(env) = crate::flows::signal_input(&signal.workflow_signal(), &session.env).remove("env") {
+        input["env"] = env;
+    }
+    input
+}
 
 pub const SIGNAL: &str = include_str!("../workflows/signal.yaml");
 pub const SIGNAL_NAME: &str = "signal";
@@ -639,7 +692,7 @@ pub const SIGNAL_FUNCTIONS: &[crate::flows::HostFunction] = {
             Write,
             &["name"],
             &["name"],
-            "Run the active saved workflow named by a scheduled signal, after signal_session. Returns done and output, or handover for the primary loop when a missing or failed workflow made no writes. The dispatcher does this before routing.",
+            "Run the active saved workflow named by a scheduled signal, after signal_session, admitted as the signal's primary run (base preset and the scheduler skill unless metadata.agent says otherwise; it may take agent turns). Returns done and output, or handover for the primary loop when a missing, set-aside or failed workflow made no writes. The dispatcher does this before routing.",
         ),
         host_function(
             "signal_input",
@@ -681,14 +734,14 @@ pub const SIGNAL_FUNCTIONS: &[crate::flows::HostFunction] = {
             Write,
             &["context"],
             &["context"],
-            "Dispatch the incoming signal to the most specific active metadata.route match by source and top-level payload fields. A loop declaring the route starts as the signal's primary loop (its failure reaches this workflow's catch); a signal route (superseded by loop routes) runs with context as its input. Pass context: $context after session setup. Returns routed and output when matched, or routed:false. Dispatcher only: a matching route cannot dispatch routes again.",
+            "Dispatch the incoming signal to the most specific active metadata.route match by source and top-level payload fields. The matching workflow starts as the signal's primary run, admitted like a scheduled task's but with the smart preset (its failure reaches this workflow's catch); a signal route that calls primary_loop itself (superseded) runs with context as its input. Pass context: $context after session setup. Returns routed and output when matched, or routed:false. Dispatcher only: a matching route cannot dispatch routes again.",
         ),
         host_function(
             "signal_transcript",
             Read,
             &[],
             &[],
-            "Read the bounded JSON transcript string of this signal's primary loop for recovery. Returns [] as a string when no primary loop was started.",
+            "Read the bounded JSON transcript string of this signal's primary run for recovery. Returns [] as a string when none was started or it took no turn.",
         ),
         host_function(
             "recovery_loop",
@@ -733,29 +786,66 @@ impl SignalFunctions {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    // The signal's primary loop, `opts` with the signal's own parts added,
-    // driven under the `agent_loop` span (the recovery report reads its
-    // transcript). `loaded`: the skills the trace names, else the loop's.
+    // The signal's primary span (`agent_loop`), also closed on workflow failure.
+    fn primary_span(&self) -> Arc<dyn Span> {
+        let span = self.trace.span(
+            SpanStart::new("agent_loop", SpanKind::Chain)
+                .metadata(json!({"activity":"primary_loop"}).as_object().unwrap().clone()),
+        );
+        self.state().span = Some(span.clone());
+        span
+    }
+
+    // The one way a workflow runs on this signal: run `run` admitted with
+    // `opts`, its first user message `text`, driven to its next stop in the
+    // signal's trace under `span`. Its loop is the signal's primary one: the
+    // recovery report reads its transcript.
+    async fn launch(
+        &self,
+        mut opts: LoopOptions,
+        run: &str,
+        text: &str,
+        span: &Arc<dyn Span>,
+    ) -> anyhow::Result<(Arc<AgentLoop>, FlowResult)> {
+        let supervisor = &self.supervisor;
+        opts.cancel = supervisor.cancel.clone();
+        opts.trace_scope = Some(span.clone());
+        let agent = supervisor.engine.start_loop(opts).await?;
+        self.state().primary = Some(agent.clone());
+        let input = run_input(&agent, text, &self.signal, &self.session()?).await;
+        let scope: Scope = span.clone();
+        Ok((agent, supervisor.flows.run_loop(run, input, &scope, &supervisor.cancel).await))
+    }
+
+    // The signal's primary run, `opts` with the signal's own parts added,
+    // as `<signal>/loop`: its output is the signal's. A restart resumes it
+    // instead of losing the signal. `loaded`: the skills the trace names,
+    // else the loop's.
     async fn run_primary(
         &self,
         mut opts: LoopOptions,
         input: String,
         loaded: Option<Vec<String>>,
     ) -> anyhow::Result<String> {
-        let (supervisor, signal, trace) = (&self.supervisor, &self.signal, &self.trace);
-        let primary = trace.span(
-            SpanStart::new("agent_loop", SpanKind::Chain)
-                .metadata(json!({"activity":"primary_loop"}).as_object().unwrap().clone()),
-        );
-        self.state().span = Some(primary.clone());
-        opts.cancel = supervisor.cancel.clone();
+        let (signal, trace) = (&self.signal, &self.trace);
+        let primary = self.primary_span();
         opts.guard_request = Some(signal.content.clone());
         opts.conversation = conversation(signal);
-        opts.trace_scope = Some(primary.clone());
-        let id = opts.id.clone();
-        let agent = supervisor.engine.start_loop(opts).await?;
-        self.state().primary = Some(agent.clone());
-        let output = supervisor.drive(&agent, &id, input, &primary).await?;
+        let run = format!("{}/loop", opts.id);
+        let (agent, result) = self.launch(opts, &run, &input, &primary).await?;
+        let output = match result {
+            FlowResult::Completed(output) => output.as_str().map(str::to_owned).unwrap_or_else(|| output.to_string()),
+            FlowResult::Cancelled => return Err(aborted()),
+            FlowResult::Faulted { error, .. } => {
+                anyhow::bail!(error.detail.clone().unwrap_or_else(|| error.to_string()))
+            }
+            // Released on shutdown or held elsewhere: the recovery worker resumes it.
+            FlowResult::Waiting { .. } | FlowResult::Interrupted { .. } => {
+                check(&self.supervisor.cancel)?;
+                json!({"ok": true, "resumes": true}).to_string()
+            }
+            FlowResult::Missing => anyhow::bail!("run {run} has no workflow to run"),
+        };
         primary.end(SpanEnd::output(output.clone()));
         let loaded = loaded.unwrap_or_else(|| agent.skill_names());
         trace.update(ContextUpdate {
@@ -766,39 +856,57 @@ impl SignalFunctions {
         Ok(output)
     }
 
-    // A loop that declares the signal's route runs as its primary loop with
-    // the defaults below, which its route header may change (`preset`,
-    // `confirm`). The rest of its first turn it gathers and sets up itself
-    // (agent.rs §4, `loop_setup`): the runtime starts it with the facts it
-    // has at hand, the session, the signal's source and its env addendum.
+    // A workflow that declares the signal's route runs as its primary run,
+    // admitted with the route's defaults (`Launch::Routed`). The rest of its
+    // first turn it gathers and sets up itself (agent.rs §4, `loop_setup`).
     // Its failures reach the dispatcher's catch, as a route's do.
-    async fn loop_route(&self, name: &str, wf: &owf::model::Workflow, context: &Value) -> anyhow::Result<String> {
-        let signal = &self.signal;
-        let start = crate::flows::route_start(wf)?;
-        let session = self.session()?;
-        let mut opts = LoopOptions::new(format!("{}:{}", signal.source, signal.id), session.clone());
-        opts.workflow = name.to_owned();
-        opts.preset = start.preset;
-        opts.confirm = match start.confirm {
-            crate::flows::RouteConfirm::Conversation => conversation(signal).or_else(|| {
-                session
-                    .env
-                    .telegram_chat_id
-                    .clone()
-                    .map(|chat_id| crate::agent::ConfirmTarget { chat_id, message_thread_id: None })
-            }),
-            crate::flows::RouteConfirm::None => None,
+    async fn route_launch(&self, name: &str, context: &Value) -> anyhow::Result<String> {
+        let engine = &self.supervisor.engine;
+        let handover = context["handover"].as_str();
+        let opts = admission(engine, &self.signal, &self.session()?, name, Launch::Routed, handover).await?;
+        self.run_primary(opts, self.signal.content.clone(), None).await
+    }
+
+    // A scheduled task's workflow, as the signal's primary run
+    // `<signal>` (`Launch::Scheduled`); `Missing`, or a fault, when it
+    // could not start. Its loop ends here: the agent loop may take the task
+    // over under the same loop id.
+    async fn scheduled_launch(&self, name: &str) -> anyhow::Result<FlowResult> {
+        let (supervisor, signal) = (&self.supervisor, &self.signal);
+        let engine = &supervisor.engine;
+        if let Some(stop) = crate::flows::unrunnable(engine, name) {
+            return Ok(stop);
+        }
+        let id = format!("{}:{}", signal.source, signal.id);
+        let span = self.primary_span();
+        let launched = async {
+            let opts = admission(engine, signal, &self.session()?, name, Launch::Scheduled, None).await?;
+            self.launch(opts, &id, &signal.content, &span).await
+        }
+        .await;
+        engine.end_loop(&id).await;
+        let result = match launched {
+            Ok((_, result)) => result,
+            Err(error) if is_aborted(&error) => return Err(error),
+            // It could not start (a skill it names went away): nothing changed.
+            Err(error) => FlowResult::Faulted {
+                error: owf::run::WorkflowError::runtime(error.to_string()),
+                effects_started: false,
+            },
         };
-        let parts = [
-            Some(render_context(&session.env)?),
-            Some(format!("Signal source: {}", signal.source)),
-            signal.env_context.clone(),
-            context["handover"].as_str().map(str::to_owned),
-        ];
-        opts.system_prompt =
-            Some(parts.into_iter().flatten().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("\n\n"));
-        opts.signal = Some(signal_value(signal));
-        self.run_primary(opts, signal.content.clone(), None).await
+        match &result {
+            FlowResult::Completed(output) => span.end(SpanEnd::output(output.clone())),
+            FlowResult::Waiting { .. } | FlowResult::Interrupted { .. } => span.end(SpanEnd::default()),
+            // The agent loop takes it over under a primary span of its own.
+            FlowResult::Faulted { error, effects_started: false } => {
+                self.state().span = None;
+                span.end(SpanEnd::error(error.to_string()));
+            }
+            // A failure after a write ends it as a primary loop's does: the
+            // recovery report, or the signal's error.
+            _ => {}
+        }
+        Ok(result)
     }
     fn session(&self) -> anyhow::Result<Session> {
         self.state().session.clone().ok_or_else(|| anyhow::anyhow!("signal_session has not run"))
@@ -827,8 +935,7 @@ impl SignalFunctions {
             // A saved workflow that failed before changing anything hands its task to the agent loop.
             "run_saved_workflow" => {
                 let name = args["name"].as_str().ok_or_else(|| anyhow::anyhow!("name: Required"))?;
-                let session = self.session()?;
-                let result = supervisor.flows.run(name, &signal.workflow_signal(), &session, &scope, cancel).await;
+                let result = self.scheduled_launch(name).await?;
                 check(cancel)?;
                 let (handover, failure) = match result {
                     FlowResult::Completed(output) => {
@@ -911,12 +1018,12 @@ impl SignalFunctions {
                         .span(SpanStart::new(format!("route:{name}"), SpanKind::Chain).metadata(
                             json!({"workflow":name,"workflow_version":version}).as_object().unwrap().clone(),
                         ));
-                // A loop is the channel's whole flow. A route on any other
-                // workflow (a signal route, calling primary_loop itself) is
-                // superseded by loop routes and runs below for the routes
-                // already active.
-                if crate::flows::is_loop_definition(&name, &definition) {
-                    let result = self.loop_route(&name, &wf, &args["context"]).await;
+                // The routed workflow is the channel's whole flow, started
+                // as any signal's run is. A signal route (calling
+                // primary_loop itself) is superseded and runs below on the
+                // dispatcher's host for the routes already active.
+                if !crate::flows::calls_dispatcher(&wf) {
+                    let result = self.route_launch(&name, &args["context"]).await;
                     match &result {
                         Ok(output) => span.end(SpanEnd::output(json!(output))),
                         Err(error) => span.end(SpanEnd::error(error.to_string())),
@@ -982,8 +1089,14 @@ impl SignalFunctions {
             }
             "signal_transcript" => {
                 let original = self.state().primary.clone();
-                let transcript = if let Some(original) = original {
-                    crate::generation::messages_json(&original.messages.lock().await).to_string()
+                // A run that took no turn (a scheduled workflow's steps) has
+                // only its instructions: no transcript.
+                let messages = match original {
+                    Some(original) => original.messages.lock().await.clone(),
+                    None => Vec::new(),
+                };
+                let transcript = if messages.iter().any(|m| crate::providers::role(m) != "system") {
+                    crate::generation::messages_json(&messages).to_string()
                 } else {
                     "[]".into()
                 };
