@@ -215,7 +215,10 @@ pub async fn test_pool() -> Option<PgPool> {
 #[cfg(test)]
 pub async fn fresh_test_pool() -> Option<PgPool> {
     let server = test_database_url()?;
-    let name = format!("t_{:016x}", rand::random::<u64>());
+    // `t<secs>_`: the test support's sweep drops it a day later.
+    let secs =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default();
+    let name = format!("t{secs}_{:016x}", rand::random::<u64>());
     connect(&server).ok()?.get().await.ok()?.batch_execute(&format!("CREATE DATABASE {name}")).await.ok()?;
     let mut config: tokio_postgres::Config = server.parse().ok()?;
     config.dbname(&name);

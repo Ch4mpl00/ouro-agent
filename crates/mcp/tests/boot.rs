@@ -24,6 +24,13 @@ fn env() -> &'static TestDatabase {
     ENV.get_or_init(|| runtime().block_on(support::test_database()))
 }
 
+// Every case makes a database; a failed case leaves its own to the sweep of
+// `t<secs>_` names a day later (support/container.rs).
+async fn drop_database(admin: &str, name: &str) {
+    let client = pg::connect(admin).unwrap().get().await.unwrap();
+    let _ = client.batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")).await;
+}
+
 async fn count(url: &str, sql: &str) -> i64 {
     pg::connect(url).unwrap().get().await.unwrap().query_one(sql, &[]).await.unwrap().get(0)
 }
@@ -34,8 +41,8 @@ fn the_state_database_is_created_and_migrated_once_and_every_instance_comes_up()
     TestRunner::new(Config::with_cases(12))
         .run(&(2usize..=6), |instances| {
             runtime().block_on(async {
-                let state_url =
-                    with_database(&db.url, &format!("state_{:012x}", rand::random::<u64>() & 0xffff_ffff_ffff));
+                let state_name = format!("{}_state", support::container::database_name());
+                let state_url = with_database(&db.url, &state_name);
                 let booted =
                     futures::future::join_all((0..instances).map(|_| Db::connect_state(&db.url, &state_url))).await;
                 let failures: Vec<String> =
@@ -68,6 +75,7 @@ fn the_state_database_is_created_and_migrated_once_and_every_instance_comes_up()
                 );
                 // The agent owns the schedule now; the state database seeds no tasks.
                 assert_eq!(count(&state_url, "SELECT count(*) FROM scheduled_tasks").await, 0);
+                drop_database(&db.url, &state_name).await;
             });
             Ok(())
         })
@@ -80,7 +88,7 @@ fn the_news_store_migrates_once_with_several_instances_racing() {
     TestRunner::new(Config::with_cases(8))
         .run(&(2usize..=5), |instances| {
             runtime().block_on(async {
-                let name = format!("news_{:012x}", rand::random::<u64>() & 0xffff_ffff_ffff);
+                let name = format!("{}_news", support::container::database_name());
                 pg::connect(&db.url)
                     .unwrap()
                     .get()
@@ -106,6 +114,8 @@ fn the_news_store_migrates_once_with_several_instances_racing() {
                     .map(|r| r.get(0))
                     .collect();
                 assert_eq!(hashes.len(), hashes.iter().collect::<HashSet<_>>().len(), "each migration recorded once");
+                drop(pools);
+                drop_database(&db.url, &name).await;
             });
             Ok(())
         })
