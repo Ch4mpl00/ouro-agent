@@ -375,7 +375,7 @@ locators, no `static` handles in business code.
 
 ## Task tracking
 
-Planned work and tech debt are GitHub issues in `Ch4mpl00/ouro`
+Planned work and tech debt are GitHub issues in `Ch4mpl00/ouro-agent`
 (`gh issue list`, `gh issue view N`), labelled `area:agent|mcp|owf|evals`,
 `P0`–`P3` and `tech-debt` / `feature` / `idea`. Scan the open issues before
 picking work. New tech debt agreed in a design discussion gets an issue
