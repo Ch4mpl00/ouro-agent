@@ -18,8 +18,9 @@ use agent::tracing::null_scope;
 use evals::env::{load_env, root};
 use evals::langfuse_api::{Langfuse, observation, trace_from};
 use evals::optimizer::{
-    Evidence, IterativeOptions, MAX_OPTIMIZER_TURNS, Meter, MeteredProvider, OptimizerTools, Scenario, Workbench,
-    compact_trace, isolated_engine, optimize_iterative, prompt, proposal_yaml, propose, workbench_prompt,
+    Evidence, IterativeOptions, MAX_OPTIMIZER_TURNS, Meter, MeteredProvider, OptimizerTools, Scenario, Trial,
+    Workbench, compact_trace, fenced_yaml, isolated_engine, optimize_iterative, prompt, proposal_yaml, propose,
+    workbench_prompt,
 };
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -129,6 +130,21 @@ fn configured_providers(meter: &Arc<Mutex<Meter>>, disabled: bool) -> Providers 
         gemini: family("gemini"),
         openrouter: Some(family("openrouter/provider/model")),
     }
+}
+
+/// The proposed definition and where it came from. A final message that only
+/// points back at a definition shown earlier ("the full YAML is above") still
+/// has one: the last candidate it ran.
+fn final_definition(report: &str, trials: &[Trial]) -> anyhow::Result<(String, &'static str)> {
+    let (yaml, source) = match fenced_yaml(report)? {
+        Some(yaml) => (yaml, "report"),
+        None => trials
+            .last()
+            .map(|t| (t.scenario.yaml.clone(), "last_trial"))
+            .ok_or_else(|| anyhow::anyhow!("optimizer returned no fenced YAML definition and ran no candidate"))?,
+    };
+    owf::model::parse_yaml(&yaml)?;
+    Ok((yaml, source))
 }
 
 #[tokio::main]
@@ -331,12 +347,19 @@ async fn main() -> anyhow::Result<()> {
             Err(error) => (String::new(), Some(format!("{error:#}")), "iterative"),
         }
     };
-    let yaml = if mode == "iterative" && error.is_none() { Some(proposal_yaml(&report)) } else { None };
-    let final_tested = yaml.as_ref().and_then(|y| y.as_ref().ok()).is_some_and(|y| {
+    let yaml = (mode == "iterative" && error.is_none()).then(|| final_definition(&report, &tools.trials()));
+    let found: Option<&(String, &str)> = yaml.as_ref().and_then(|y| y.as_ref().ok());
+    let final_tested = found.is_some_and(|(y, _)| {
         tools.trials().iter().any(|t| t.scenario.yaml.trim() == y.trim() && t.report["status"] == "completed")
     });
-    let artifact_value = json!({"version":1,"mode":mode,"report":report,"error":error,"final_candidate_completed":final_tested,"capabilities":workbench.capabilities(),"trials":tools.trials(),"usage":meter.lock().unwrap().clone(),"cost":null});
+    let artifact_value = json!({"version":1,"mode":mode,"report":report,"error":error,"definition":found.map(|(y, _)| y),"definition_source":found.map(|(_, s)| s),"final_candidate_completed":final_tested,"capabilities":workbench.capabilities(),"trials":tools.trials(),"usage":meter.lock().unwrap().clone(),"cost":null});
     std::fs::write(&artifact, serde_json::to_string_pretty(&artifact_value)?)?;
+    let report = match found {
+        Some((yaml, "last_trial")) => {
+            format!("{report}\n\n## Definition (the last candidate run)\n\n```yaml\n{yaml}```\n")
+        }
+        _ => report,
+    };
     println!("{report}");
     if let Some(path) = output {
         std::fs::write(path, &report)?;
@@ -348,7 +371,10 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("{error}");
     }
     if let Some(yaml) = yaml {
-        yaml?;
+        let (_, source) = yaml?;
+        if source == "last_trial" {
+            eprintln!("[optimize] the final message had no YAML; using the last candidate run");
+        }
         eprintln!("[optimize] final candidate completed in workbench: {final_tested}");
     }
     Ok(())

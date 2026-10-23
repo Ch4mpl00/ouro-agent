@@ -225,6 +225,14 @@ pub async fn propose(
 // ── 3. validation ──────────────────────────────────────────────────────────
 
 pub fn proposal_yaml(report: &str) -> anyhow::Result<String> {
+    let yaml = fenced_yaml(report)?.ok_or_else(|| anyhow::anyhow!("optimizer returned no fenced YAML definition"))?;
+    owf::model::parse_yaml(&yaml)?;
+    Ok(yaml)
+}
+
+/// The report's one fenced YAML block, `None` when it has none; several
+/// blocks or an unclosed fence are errors.
+pub fn fenced_yaml(report: &str) -> anyhow::Result<Option<String>> {
     let mut yaml = None;
     let mut fence = None;
     let mut body = String::new();
@@ -246,8 +254,6 @@ pub fn proposal_yaml(report: &str) -> anyhow::Result<String> {
         }
     }
     anyhow::ensure!(fence.is_none(), "optimizer returned an unclosed code fence");
-    let yaml = yaml.ok_or_else(|| anyhow::anyhow!("optimizer returned no fenced YAML definition"))?;
-    owf::model::parse_yaml(&yaml)?;
     Ok(yaml)
 }
 
