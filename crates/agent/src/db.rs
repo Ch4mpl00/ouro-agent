@@ -29,7 +29,6 @@ pub const DEFAULT_DB_PATH: &str = "packages/agent/data/agent.db";
 #[derive(Clone)]
 pub struct AgentDb {
     conn: Arc<Mutex<Connection>>,
-    pub(crate) notifications: Arc<Mutex<std::collections::BTreeMap<String, std::sync::Weak<tokio::sync::Notify>>>>,
 }
 
 impl AgentDb {
@@ -50,7 +49,7 @@ impl AgentDb {
         retry_boot_race(|| conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(())).map_err(anyhow::Error::from))?;
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL")?;
         retry_boot_race(|| migrate(&conn))?;
-        Ok(AgentDb { conn: Arc::new(Mutex::new(conn)), notifications: Arc::default() })
+        Ok(AgentDb { conn: Arc::new(Mutex::new(conn)) })
     }
 
     pub fn conn(&self) -> MutexGuard<'_, Connection> {
@@ -105,6 +104,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0012_child_runs", include_str!("../migrations/0012_child_runs.sql")),
     ("0013_guard_verdict_uses", include_str!("../migrations/0013_guard_verdict_uses.sql")),
     ("0014_trace_continuation", include_str!("../migrations/0014_trace_continuation.sql")),
+    ("0015_engine_runs", include_str!("../migrations/0015_engine_runs.sql")),
 ];
 
 pub struct Migration {
@@ -364,17 +364,6 @@ impl TraceStore for AgentDb {
               observations=excluded.observations,
               started_at=min(started_at,excluded.started_at)",
             params![t.id,t.name,t.source,t.skill,t.session_id,serde_json::to_string(&t.tags)?,json_column(t.input.as_ref()),json_column(t.output.as_ref()),t.metadata.as_ref().map(|m|Value::Object(m.clone()).to_string()),serde_json::to_string(&observations)?,t.started_at,continuation,t.output.is_some()])?;
-        // A terminal outcome becomes eligible for the activity journal only
-        // after the segment carrying its final runner span is in the mirror.
-        // This also covers a parent finishing concurrently with its child.
-        for o in &t.observations {
-            if let Some(m) = &o.metadata
-                && m.get("durable_terminal") == Some(&Value::Bool(true))
-                && let Some(run) = m.get("durable_run").and_then(Value::as_str)
-            {
-                tx.execute("UPDATE workflow_runs SET trace_recorded=1 WHERE id=?1 AND json_extract(trace_anchor,'$.trace_id')=?2 AND ended_ms IS NOT NULL",params![run,t.id])?;
-            }
-        }
         tx.commit()?;
         Ok(())
     }
@@ -445,8 +434,7 @@ impl AgentDb {
                      LEFT JOIN judgements ON judgements.trace_id = traces.id
                        AND judgements.provider = ?1 AND judgements.prompt_version = ?2
                      WHERE judgements.trace_id IS NULL
-                       AND NOT EXISTS (SELECT 1 FROM workflow_runs r WHERE json_extract(r.trace_anchor,'$.trace_id')=traces.id
-                         AND (r.ended_ms IS NULL OR (r.trace_recorded=0 AND r.state!='cancelled')))
+                       AND NOT EXISTS (SELECT 1 FROM run_trace r WHERE r.trace_id=traces.id AND r.recorded=0)
                      ORDER BY traces.started_at DESC LIMIT ?3",
                 )?
                 .query_map(params![provider, version, limit], map)?

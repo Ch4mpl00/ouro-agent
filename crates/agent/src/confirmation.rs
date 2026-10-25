@@ -76,7 +76,9 @@ impl Card {
 // ── 1. store ───────────────────────────────────────────────────────────────
 #[derive(Clone, Debug)]
 pub struct Pending {
+    // The guard run that asked, and the loop run whose call it is.
     pub run: String,
+    pub loop_run: Option<String>,
     pub key: String,
     pub yes: String,
     pub no: String,
@@ -86,18 +88,47 @@ pub struct Pending {
 }
 type ResolutionRow = (String, String, Option<i64>, String, Option<i64>, Option<String>);
 
+/// A button press the guard run consumed: the token pressed and the event's
+/// data (`Record::Event` in the run's journal).
+pub struct Consumed {
+    pub type_: String,
+    pub data: Value,
+}
+
 pub trait Store: Send + Sync {
     fn outcome(&self, run: &str, key: &str) -> anyhow::Result<Option<String>>;
     fn get(&self, run: &str, key: &str) -> anyhow::Result<Option<Pending>>;
-    fn pending(&self, target: &ConfirmTarget) -> anyhow::Result<Value>;
+    /// The card holding token `token`, answered or not.
+    fn by_token(&self, token: &str) -> anyhow::Result<Option<(Pending, Option<String>)>>;
+    /// Cards waiting in `target`, oldest first (liveness is the caller's).
+    fn waiting(&self, target: &ConfirmTarget) -> anyhow::Result<Vec<(String, Value)>>;
     fn insert(&self, pending: &Pending) -> anyhow::Result<()>;
     fn sent(&self, run: &str, key: &str, message: i64) -> anyhow::Result<()>;
-    /// Resolves using a consumed event, never a YAML claim of approval.
-    fn resolve(&self, run: &str, key: &str, claimed: &str) -> anyhow::Result<String>;
-    /// Moves a card's creation `by_ms` into the past: how a dry run, which
-    /// never waits a day, lets its card expire (`press`).
-    fn backdate(&self, run: &str, key: &str, by_ms: i64) -> anyhow::Result<()>;
+    /// Resolves using an event the guard run consumed, never a YAML claim of
+    /// approval; spent once.
+    fn resolve(&self, run: &str, key: &str, claimed: &str, consumed: &[Consumed]) -> anyhow::Result<String>;
+    /// Whether a card of a guard of `loop_run` still waits for `key`.
+    fn pending_loop_confirmation(&self, loop_run: &str, key: &str) -> anyhow::Result<bool>;
+    /// One reviewed call authorizes one host invocation (the engine call's
+    /// idempotency key): a loop cannot spend a confirmed verdict twice.
+    fn use_guard_verdict(&self, child: &str, call: &str, invocation: &str) -> anyhow::Result<bool>;
+    /// Cards created before `before_ms` and not answered: the cut-over's.
+    fn unanswered_before(&self, before_ms: i64) -> anyhow::Result<Vec<Pending>>;
+    fn expire(&self, run: &str, key: &str) -> anyhow::Result<()>;
 }
+fn pending_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Pending> {
+    Ok(Pending {
+        run: r.get(0)?,
+        key: r.get(1)?,
+        yes: r.get(2)?,
+        no: r.get(3)?,
+        target: ConfirmTarget { chat_id: r.get(4)?, message_thread_id: r.get(5)? },
+        message: r.get(6)?,
+        card: r.get(7)?,
+        loop_run: r.get(8)?,
+    })
+}
+const PENDING_COLUMNS: &str = "run_id,call_key,yes_type,no_type,chat_id,thread_id,message_id,card,loop_run";
 impl Store for AgentDb {
     fn outcome(&self, run: &str, key: &str) -> anyhow::Result<Option<String>> {
         Ok(self
@@ -109,29 +140,44 @@ impl Store for AgentDb {
             .flatten())
     }
 
-    fn pending(&self, target: &ConfirmTarget) -> anyhow::Result<Value> {
+    fn waiting(&self, target: &ConfirmTarget) -> anyhow::Result<Vec<(String, Value)>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT c.card,c.chat_id,c.thread_id,c.message_id,c.created_at_ms
-            FROM confirmations c JOIN workflow_runs r ON r.id = c.run_id
-            WHERE c.outcome IS NULL AND c.message_id IS NOT NULL AND r.ended_ms IS NULL
-            AND c.chat_id = ?1 AND c.thread_id IS ?2 ORDER BY c.created_at_ms LIMIT 10",
+            "SELECT run_id,card,chat_id,thread_id,message_id,created_at_ms FROM confirmations
+            WHERE outcome IS NULL AND message_id IS NOT NULL AND chat_id = ?1 AND thread_id IS ?2
+            ORDER BY created_at_ms",
         )?;
-        let cards = stmt.query_map(params![target.chat_id,target.message_thread_id], |r| Ok(json!({
-            "call":clip(&r.get::<_,String>(0)?,500),"chatId":r.get::<_,String>(1)?,"messageThreadId":r.get::<_,Option<i64>>(2)?,
-            "messageId":r.get::<_,i64>(3)?,"since":r.get::<_,i64>(4)?
-        })))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(json!(cards))
+        let cards = stmt.query_map(params![target.chat_id,target.message_thread_id], |r| Ok((r.get::<_,String>(0)?, json!({
+            "call":clip(&r.get::<_,String>(1)?,500),"chatId":r.get::<_,String>(2)?,"messageThreadId":r.get::<_,Option<i64>>(3)?,
+            "messageId":r.get::<_,i64>(4)?,"since":r.get::<_,i64>(5)?
+        }))))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(cards)
     }
 
     fn get(&self, run: &str, key: &str) -> anyhow::Result<Option<Pending>> {
-        Ok(self.conn().query_row("SELECT yes_type,no_type,chat_id,thread_id,message_id,card FROM confirmations WHERE run_id = ?1 AND call_key = ?2",
-            params![run,key], |r| Ok(Pending { run:run.into(),key:key.into(),yes:r.get(0)?,no:r.get(1)?,target:ConfirmTarget { chat_id:r.get(2)?, message_thread_id:r.get(3)? },message:r.get(4)?,card:r.get(5)? })).optional()?)
+        Ok(self
+            .conn()
+            .query_row(
+                &format!("SELECT {PENDING_COLUMNS} FROM confirmations WHERE run_id = ?1 AND call_key = ?2"),
+                params![run, key],
+                pending_row,
+            )
+            .optional()?)
+    }
+    fn by_token(&self, token: &str) -> anyhow::Result<Option<(Pending, Option<String>)>> {
+        Ok(self
+            .conn()
+            .query_row(
+                &format!("SELECT {PENDING_COLUMNS},outcome FROM confirmations WHERE yes_type = ?1 OR no_type = ?1"),
+                [token],
+                |r| Ok((pending_row(r)?, r.get(9)?)),
+            )
+            .optional()?)
     }
     fn insert(&self, p: &Pending) -> anyhow::Result<()> {
         self.conn().execute(
-            "INSERT INTO confirmations (run_id,call_key,yes_type,no_type,chat_id,thread_id,card,created_at_ms)
-            VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT INTO confirmations (run_id,call_key,yes_type,no_type,chat_id,thread_id,card,created_at_ms,loop_run)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 p.run,
                 p.key,
@@ -140,7 +186,8 @@ impl Store for AgentDb {
                 p.target.chat_id,
                 p.target.message_thread_id,
                 p.card,
-                chrono::Utc::now().timestamp_millis()
+                chrono::Utc::now().timestamp_millis(),
+                p.loop_run
             ],
         )?;
         Ok(())
@@ -152,7 +199,7 @@ impl Store for AgentDb {
         )?;
         Ok(())
     }
-    fn resolve(&self, run: &str, key: &str, claimed: &str) -> anyhow::Result<String> {
+    fn resolve(&self, run: &str, key: &str, claimed: &str, consumed: &[Consumed]) -> anyhow::Result<String> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let row: Option<ResolutionRow> = tx.query_row(
@@ -162,28 +209,19 @@ impl Store for AgentDb {
         if prior.is_some() {
             return Ok("unverified".into());
         }
-        let consumed: Option<(String, String)> = tx
-            .query_row(
-                "SELECT type,data FROM workflow_events WHERE run_id = ?1 AND type IN (?2,?3)
-            AND consumed_at_ms IS NOT NULL ORDER BY consumed_at_ms,id LIMIT 1",
-                params![run, yes, no],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let verified = consumed
-            .map(|(t, data)| -> anyhow::Result<Option<String>> {
-                let v: Value = serde_json::from_str(&data)?;
-                let same_chat =
-                    v["chatId"].as_str().map(str::to_owned).or_else(|| v["chatId"].as_i64().map(|i| i.to_string()))
-                        == Some(chat);
-                Ok((same_chat
-                    && v["messageId"].as_i64() == message
-                    && message.is_some()
-                    && v["messageThreadId"].as_i64() == thread)
-                    .then(|| if t == yes { "confirmed".into() } else { "declined".into() }))
-            })
-            .transpose()?
-            .flatten();
+        // The first press of this card's two tokens the run consumed, and only
+        // when it comes from the card's own chat, message and thread.
+        let verified = consumed.iter().find(|c| c.type_ == yes || c.type_ == no).and_then(|c| {
+            let v = &c.data;
+            let same_chat =
+                v["chatId"].as_str().map(str::to_owned).or_else(|| v["chatId"].as_i64().map(|i| i.to_string()))
+                    == Some(chat.clone());
+            (same_chat
+                && v["messageId"].as_i64() == message
+                && message.is_some()
+                && v["messageThreadId"].as_i64() == thread)
+                .then(|| if c.type_ == yes { "confirmed".to_owned() } else { "declined".to_owned() })
+        });
         // An early/forged expiry cannot close a live card. A real expiry is
         // determined by host time, independent of the workflow's outcome word.
         let old_enough: bool = tx.query_row(
@@ -197,18 +235,60 @@ impl Store for AgentDb {
             "UPDATE confirmations SET outcome = ?3 WHERE run_id = ?1 AND call_key = ?2",
             params![run, key, outcome],
         )?;
-        // Close both tokens, including the decline token if yes won.
-        tx.execute("DELETE FROM workflow_awaits WHERE run_id = ?1 AND type IN (?2,?3)", params![run, yes, no])?;
         tx.commit()?;
         Ok(outcome)
     }
-    fn backdate(&self, run: &str, key: &str, by_ms: i64) -> anyhow::Result<()> {
+    fn pending_loop_confirmation(&self, loop_run: &str, key: &str) -> anyhow::Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM confirmations WHERE loop_run = ?1 AND call_key = ?2 AND outcome IS NULL)",
+            params![loop_run, key],
+            |r| r.get(0),
+        )?)
+    }
+    fn use_guard_verdict(&self, child: &str, call: &str, invocation: &str) -> anyhow::Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO guard_verdict_uses (child_run,call_key,invocation,created_ms) VALUES (?1,?2,?3,?4) ON CONFLICT DO NOTHING",
+            params![child, call, invocation, chrono::Utc::now().timestamp_millis()],
+        )?;
+        let same = tx.query_row(
+            "SELECT invocation=?3 FROM guard_verdict_uses WHERE child_run=?1 AND call_key=?2",
+            params![child, call, invocation],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok(same)
+    }
+    fn unanswered_before(&self, before_ms: i64) -> anyhow::Result<Vec<Pending>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PENDING_COLUMNS} FROM confirmations WHERE outcome IS NULL AND created_at_ms < ?1 ORDER BY created_at_ms"
+        ))?;
+        Ok(stmt.query_map([before_ms], pending_row)?.collect::<rusqlite::Result<_>>()?)
+    }
+    fn expire(&self, run: &str, key: &str) -> anyhow::Result<()> {
         self.conn().execute(
-            "UPDATE confirmations SET created_at_ms = created_at_ms - ?3 WHERE run_id = ?1 AND call_key = ?2",
-            params![run, key, by_ms],
+            "UPDATE confirmations SET outcome = 'expired' WHERE run_id = ?1 AND call_key = ?2 AND outcome IS NULL",
+            params![run, key],
         )?;
         Ok(())
     }
+}
+
+/// `pending_confirmations`' cards: the ones waiting in `target` whose guard
+/// run is still live in the engine (at most ten).
+pub async fn pending(engine: &crate::agent::Engine, target: &ConfirmTarget) -> anyhow::Result<Value> {
+    let mut cards = Vec::new();
+    for (run, card) in Store::waiting(&engine.deps.db, target)? {
+        if engine.runtime.get(&run).await?.is_some_and(|r| r.ended_ms.is_none()) {
+            cards.push(card);
+        }
+        if cards.len() == 10 {
+            break;
+        }
+    }
+    Ok(json!(cards))
 }
 
 // ── 2. requests and resolution ─────────────────────────────────────────────
@@ -229,6 +309,7 @@ fn card(req: &Request<'_>, key: String) -> Pending {
         .unwrap_or_else(|| req.call.arguments.clone());
     Pending {
         run: req.run.into(),
+        loop_run: Some(req.loop_run.into()),
         key,
         yes: token(),
         no: token(),
@@ -244,16 +325,21 @@ fn card(req: &Request<'_>, key: String) -> Pending {
 }
 
 pub struct Request<'a> {
+    // The guard run asking, and the loop whose call it is.
     pub run: &'a str,
+    pub loop_run: &'a str,
     pub call: &'a ToolCall,
     pub target: &'a ConfirmTarget,
     pub guidance: &'a str,
     pub goal: &'a str,
     pub card: &'a Card,
 }
+
+/// Sends the card (once: `confirm_request` is at most once, and a stored
+/// card is never sent again). A press reaches the guard run as a targeted
+/// event (`deliver_event`), so nothing is registered here.
 pub async fn request(
     store: &dyn Store,
-    events: &dyn owf::run::Events,
     mcp: &dyn Mcp,
     req: Request<'_>,
     cancel: &CancellationToken,
@@ -265,7 +351,6 @@ pub async fn request(
     } else {
         let p = card(&req, key.clone());
         store.insert(&p)?;
-        events.register(req.run, &[p.yes.clone(), p.no.clone()])?;
         let raw = mcp
             .call_tool_once(
                 "send_telegram_message",
@@ -289,71 +374,6 @@ pub async fn request(
     Ok(json!({"required":true,"types":[p.yes,p.no]}))
 }
 
-/// How a dry run answers a card it does not send.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Answer {
-    Confirm,
-    Decline,
-    Expire,
-}
-
-impl Answer {
-    pub fn parse(word: Option<&str>) -> anyhow::Result<Answer> {
-        Ok(match word {
-            None | Some("accept") => Answer::Confirm,
-            Some("decline") => Answer::Decline,
-            Some("expire") => Answer::Expire,
-            Some(other) => anyhow::bail!("confirm: `{other}` is not one of accept, decline, expire"),
-        })
-    }
-    pub fn word(self) -> &'static str {
-        match self {
-            Answer::Confirm => "accept",
-            Answer::Decline => "decline",
-            Answer::Expire => "expire",
-        }
-    }
-}
-
-// The message id a dry card stands in for: no message exists.
-const DRY_CARD_MESSAGE: i64 = 0;
-
-/// A dry run's request: the card is stored and its tokens registered as for
-/// a real one, but nothing is sent. The answer is in place at once: a press
-/// of the button, delivered to the run as Telegram's would be, or, for an
-/// expiry, a card already a day old. The guard's listen and `resolve` then
-/// take and verify it exactly as in production.
-pub fn press(
-    runs: &crate::durable::RunStore,
-    events: &dyn owf::run::Events,
-    req: Request<'_>,
-    answer: Answer,
-) -> anyhow::Result<Value> {
-    let store = runs.confirmations();
-    let key = crate::guard::key(req.call);
-    if let Some(p) = store.get(req.run, &key)? {
-        return Ok(json!({"required":true,"types":[p.yes,p.no]}));
-    }
-    let p = card(&req, key.clone());
-    store.insert(&p)?;
-    store.sent(req.run, &key, DRY_CARD_MESSAGE)?;
-    events.register(req.run, &[p.yes.clone(), p.no.clone()])?;
-    let (pressed, label) = match answer {
-        Answer::Confirm => (&p.yes, &req.card.confirm),
-        Answer::Decline => (&p.no, &req.card.decline),
-        Answer::Expire => {
-            store.backdate(req.run, &key, 86_400_001)?;
-            return Ok(json!({"required":true,"types":[p.yes,p.no]}));
-        }
-    };
-    // The shape of a Telegram button press (supervisor's TelegramButton).
-    let chat = p.target.chat_id.parse::<i64>().map_or_else(|_| json!(p.target.chat_id), |id| json!(id));
-    let data = json!({"chatId":chat,"messageThreadId":p.target.message_thread_id,
-        "messageId":DRY_CARD_MESSAGE,"data":pressed,"text":label});
-    anyhow::ensure!(runs.deliver(pressed, &data)?, "the dry confirmation press found no waiting run");
-    Ok(json!({"required":true,"types":[p.yes,p.no]}))
-}
-
 pub async fn close_card(
     store: &dyn Store,
     mcp: &dyn Mcp,
@@ -363,10 +383,14 @@ pub async fn close_card(
     card: &Card,
     cancel: &CancellationToken,
 ) {
+    if let Some(p) = store.get(run, &crate::guard::key(call)).ok().flatten() {
+        edit_card(mcp, &p, outcome, card, cancel).await;
+    }
+}
+
+async fn edit_card(mcp: &dyn Mcp, p: &Pending, outcome: &str, card: &Card, cancel: &CancellationToken) {
     let edit = async {
-        if let Some(p) = store.get(run, &crate::guard::key(call))?
-            && let Some(message) = p.message
-        {
+        if let Some(message) = p.message {
             let label = card.outcome(outcome);
             let raw = mcp
                 .call_tool_once(
@@ -389,11 +413,37 @@ pub async fn close_card(
     }
 }
 
+/// The cut-over (design 03, R-L6): cards created before the first start on
+/// the engine belong to runs that are gone; each is edited to "expired" once.
+pub async fn expire_cut_over(
+    store: &dyn Store,
+    mcp: &dyn Mcp,
+    before_ms: i64,
+    card: &Card,
+    cancel: &CancellationToken,
+) -> anyhow::Result<usize> {
+    let cards = store.unanswered_before(before_ms)?;
+    for p in &cards {
+        store.expire(&p.run, &p.key)?;
+        edit_card(mcp, p, "expired", card, cancel).await;
+    }
+    Ok(cards.len())
+}
+
+/// Why a press found no card to answer (design 03, decision 8): the agent
+/// is told and decides what to say.
+pub fn undelivered(store: &dyn Store, token: &str) -> anyhow::Result<Option<&'static str>> {
+    Ok(match store.by_token(token)? {
+        None => Some("unknown_card"),
+        Some((_, Some(_))) => Some("already_answered"),
+        Some(_) => None,
+    })
+}
+
 // ── 3. tests ───────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
-    use owf::run::Events;
     #[test]
     fn a_stored_card_rewords_but_always_shows_the_call() {
         let db = AgentDb::open(":memory:").unwrap();
@@ -411,10 +461,9 @@ mod tests {
     fn approval_is_bound_to_run_exact_call_and_card_and_spent_once() {
         for foreign in [false, true] {
             let db = AgentDb::open(":memory:").unwrap();
-            let runs = crate::durable::RunStore::new(db.clone());
-            let lease = runs.start("r", "agent-loop", "x", &json!({})).unwrap().unwrap();
             let p = Pending {
                 run: "r".into(),
+                loop_run: Some("loop".into()),
                 key: "exact-key".into(),
                 yes: token(),
                 no: token(),
@@ -424,19 +473,19 @@ mod tests {
             };
             db.insert(&p).unwrap();
             db.sent("r", "exact-key", 100).unwrap();
-            lease.register("r", &[p.yes.clone(), p.no.clone()]).unwrap();
-            assert_eq!(db.resolve("r", "different-call", "confirmed").unwrap(), "unverified");
-            assert!(
-                runs.deliver(&p.yes, &json!({"chatId":if foreign {43} else {42},"messageThreadId":7,"messageId":100}))
-                    .unwrap()
-            );
-            assert!(lease.take("r", "listen#event", &[p.yes, p.no]).unwrap().is_some());
-            assert_eq!(db.resolve("other-run", "exact-key", "confirmed").unwrap(), "unverified");
+            assert!(db.pending_loop_confirmation("loop", "exact-key").unwrap());
+            let consumed = [Consumed {
+                type_: p.yes.clone(),
+                data: json!({"chatId":if foreign {43} else {42},"messageThreadId":7,"messageId":100}),
+            }];
+            assert_eq!(db.resolve("r", "different-call", "confirmed", &consumed).unwrap(), "unverified");
+            assert_eq!(db.resolve("other-run", "exact-key", "confirmed", &consumed).unwrap(), "unverified");
             assert_eq!(
-                db.resolve("r", "exact-key", "confirmed").unwrap(),
+                db.resolve("r", "exact-key", "confirmed", &consumed).unwrap(),
                 if foreign { "unverified" } else { "confirmed" }
             );
-            assert_eq!(db.resolve("r", "exact-key", "confirmed").unwrap(), "unverified");
+            assert_eq!(db.resolve("r", "exact-key", "confirmed", &consumed).unwrap(), "unverified");
+            assert!(!db.pending_loop_confirmation("loop", "exact-key").unwrap());
         }
     }
     #[test]

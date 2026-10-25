@@ -15,7 +15,6 @@
 // process died under it — a run may already have sent something.
 use crate::{
     db::AgentDb,
-    flows::WorkflowStore,
     mcp::Mcp,
     session::iso,
     supervisor::{PendingSignal, Supervisor},
@@ -547,7 +546,6 @@ fn upcoming_count(recurring: bool) -> usize {
 // `tz` is the session's zone (the user's, from MCP).
 pub async fn tool(
     store: &dyn ScheduleStore,
-    workflows: &dyn WorkflowStore,
     tz: &str,
     name: &str,
     args: &Map<String, Value>,
@@ -580,10 +578,10 @@ pub async fn tool(
                 }
                 (recurring, preview_next_fires(&cron, tz, upcoming_count(recurring), now))
             };
-            if let Some(workflow) = &workflow
-                && workflows.active(workflow)?.is_none()
-            {
-                return failure(format!("Workflow `{workflow}` has no active version; activate it first"));
+            // Saved workflows run again with the versions and schedules steps
+            // of the engine migration (design 03, R2-M5).
+            if workflow.is_some() {
+                return Ok(crate::flows::unavailable("schedule_task(workflow: …)", "schedules"));
             }
             let task = store
                 .insert(&NewTask {

@@ -156,8 +156,10 @@ pub fn fixture(provider: Arc<dyn ChatProvider>, definitions: &[&str], skills: &[
         tracer: Arc::new(local_recorder_tracer(db.clone())),
         codex: Arc::new(NoCodex),
         decisions: Some(allow_guard()),
-        workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
         schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
+        env: Default::default(),
+        db: (*db).clone(),
+        store: agent::runs::open_store(&root.path().join("agent.db")).unwrap(),
     });
     Fixture { root, db, skills: store, mcp, engine }
 }
@@ -464,8 +466,10 @@ impl Harness {
             tracer,
             codex: Arc::new(NoCodex),
             decisions: Some(allow_guard()),
-            workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
             schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
+            env: Default::default(),
+            db: agent::db::AgentDb::open(":memory:").unwrap(),
+            store: agent::runs::memory_store(),
         });
         Harness { engine, session, mcp, persist, model }
     }
@@ -540,17 +544,10 @@ pub fn allow_guard() -> Arc<agent::decisions::DecisionClient> {
 }
 
 // Reference workflows are agent-authored examples, never runtime built-ins.
-// Exercise both authoring checks, including guard references and route conflicts.
-pub fn activate_definition(engine: &Arc<Engine>, name: &str, definition: &str) -> i64 {
-    let args = json!({"name": name, "definition": definition});
-    let saved: Value =
-        serde_json::from_str(&agent::flows::tool(engine, "save_workflow", args.as_object().unwrap()).unwrap()).unwrap();
-    let version = saved["version"].as_i64().unwrap();
-    // Stands in for the dry run activation requires (sandbox tests try them).
-    engine.deps.workflows.mark_tried(name, version).unwrap();
-    let args = json!({"name": name, "version": version});
-    agent::flows::tool(engine, "activate_workflow", args.as_object().unwrap()).unwrap();
-    version
+// Saving and activating them return with the engine migration's versions
+// step (design 03, decision 9): the tests that use this are ignored until then.
+pub fn activate_definition(_engine: &Arc<Engine>, name: &str, _definition: &str) -> i64 {
+    panic!("activating `{name}` returns with the versions step (design 03, decision 9)")
 }
 // The reference flow of a channel: one loop that declares its route.
 pub const TELEGRAM_LOOP: &str = include_str!("../fixtures/telegram-loop.yaml");

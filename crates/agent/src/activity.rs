@@ -517,7 +517,7 @@ impl AgentDb {
     pub fn due_activity(&self, limit: usize, now: DateTime<Utc>) -> anyhow::Result<Vec<DueTrace>> {
         let cutoff = self.activity_cutoff(now)?;
         let conn = self.conn();
-        let mut stmt=conn.prepare("SELECT t.id,coalesce((SELECT max(json_extract(o.value,'$.endTime')) FROM json_each(t.observations) o),t.created_at) FROM traces t LEFT JOIN activity_projections p ON p.trace_id=t.id WHERE t.created_at >= ?1 AND json_extract(t.metadata,'$.activity')='run' AND NOT EXISTS (SELECT 1 FROM workflow_runs r WHERE json_extract(r.trace_anchor,'$.trace_id')=t.id AND (r.ended_ms IS NULL OR (r.trace_recorded=0 AND r.state!='cancelled'))) AND (p.trace_id IS NULL OR (p.status='pending' AND (p.next_attempt_at IS NULL OR p.next_attempt_at<=?2))) ORDER BY t.created_at,t.rowid LIMIT ?3")?;
+        let mut stmt=conn.prepare("SELECT t.id,coalesce((SELECT max(json_extract(o.value,'$.endTime')) FROM json_each(t.observations) o),t.created_at) FROM traces t LEFT JOIN activity_projections p ON p.trace_id=t.id WHERE t.created_at >= ?1 AND json_extract(t.metadata,'$.activity')='run' AND NOT EXISTS (SELECT 1 FROM run_trace r WHERE r.trace_id=t.id AND r.recorded=0) AND (p.trace_id IS NULL OR (p.status='pending' AND (p.next_attempt_at IS NULL OR p.next_attempt_at<=?2))) ORDER BY t.created_at,t.rowid LIMIT ?3")?;
         Ok(stmt
             .query_map(params![cutoff, iso(now), i64::try_from(limit)?], |r| {
                 Ok(DueTrace { trace_id: r.get(0)?, completed_at: r.get(1)? })

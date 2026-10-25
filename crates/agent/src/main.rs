@@ -7,7 +7,6 @@ use agent::{
     db::{AgentDb, DEFAULT_DB_PATH},
     decisions::{DecisionClient, OPENROUTER_DECISIONS_URL},
     errors::{is_aborted, or_cancel},
-    flows::create_durable_flows,
     langfuse::LangfuseTracer,
     local_recorder::local_recorder_tracer,
     mcp::{ConnectOptions, Mcp, McpClient, RETRY_UNTIL_UP, SharedMcp, open_from_env},
@@ -17,7 +16,7 @@ use agent::{
         openrouter_api, provider, with_retry,
     },
     schedule::{ScheduleStore, SupervisorSink, run_ticks},
-    session::{EnvDeps, parse_telegram_topics, telegram_env_note},
+    session::{EnvConfig, parse_telegram_topics, telegram_env_note},
     skills::FsSkillStore,
     supervisor::{ERROR_BACKOFF, NextSignal, create_supervisor_with_cancel, run_poll_loop},
     tracing::{Tracer, tee_tracer},
@@ -192,6 +191,8 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
         } else {
             local
         };
+        // The engine's store shares agent.db on a connection of its own.
+        let store = agent::runs::open_store(&config.db)?;
         let engine = create_engine(EngineDeps {
             providers,
             mcp: mcp.clone(),
@@ -199,8 +200,13 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
             skills: vec!["orchestrator".into()],
             skill_store: skills.clone(),
             memory: db.clone(),
-            workflows: db.clone(),
             schedule: db.clone(),
+            env: EnvConfig {
+                user_email: std::env::var("USER_EMAIL").ok(),
+                telegram_chat_id: config.telegram_chat_id.clone(),
+            },
+            db: (*db).clone(),
+            store,
             tracer,
             codex: codex_client(&std::env::var("CODEX_URL").unwrap_or_else(|_| "http://localhost:3010".into())),
             decisions: Some(Arc::new(
@@ -215,18 +221,12 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
             )),
         });
         let setup = async {
-            let flows = create_durable_flows(engine.clone(), (*db).clone());
-            let supervisor = create_supervisor_with_cancel(
-                engine.clone(),
-                EnvDeps {
-                    mcp: mcp.clone(),
-                    memory: db.clone(),
-                    user_email: std::env::var("USER_EMAIL").ok(),
-                    telegram_chat_id: config.telegram_chat_id.clone(),
-                },
-                flows.clone(),
-                stopping.child_token(),
-            );
+            // MCP answered its tools/list above: the snapshot grows by its
+            // tools, and only now does the engine worker start resuming runs
+            // (design 03, decision 10). The built-ins are installed first.
+            engine.refresh_tools()?;
+            engine.ready().await?;
+            let supervisor = create_supervisor_with_cancel(engine.clone(), stopping.child_token());
             let journal_cancel = CancellationToken::new();
             let mut journal = None;
             if config.journal && !once {
@@ -260,13 +260,6 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
                 });
                 let shared: SharedMcp = mcp.clone();
                 Some(tokio::spawn(run_ticks(store, sink, shared, tick_cancel.clone())))
-            } else {
-                None
-            };
-            let durable_cancel = stopping.child_token();
-            let recovery = if !once {
-                let cancel = durable_cancel.clone();
-                Some(tokio::spawn(async move { flows.worker(cancel).await }))
             } else {
                 None
             };
@@ -304,10 +297,6 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
             tick_cancel.cancel();
             if let Some(ticks) = ticks {
                 let _ = ticks.await;
-            }
-            durable_cancel.cancel();
-            if let Some(recovery) = recovery {
-                let _ = recovery.await;
             }
             journal_cancel.cancel();
             if let Some(task) = journal {
