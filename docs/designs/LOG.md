@@ -73,3 +73,20 @@ or reverses each entry.
   child, a crash re-dispatch joins; link conflicts are typed; host-data size
   checked after the join; CHANGELOG re-cut as 0.2.0 (the #22/#20/#7 entries
   moved under 0.1.0); crate versions 0.2.0.
+
+## Status at the end of the night run (usage limit reached)
+
+- Engine: designs 01–04 merged on ouro main (9aca1de). Pre-tag fixes (hashed
+  per-attempt child ids, CHANGELOG 0.1.0/0.2.0, crates 0.2.0) are on branch
+  `fix/child-ids` (worktree ouro.worktrees/childids), green per its agent
+  (315 tests, Postgres on a native server) but NOT yet verified by the elephant
+  nor merged; `v0.2.0` not tagged.
+- Open engine decision: a parent waiting on a waiting child is re-driven on
+  every worker pass (pending_wanted keeps waking it); proposed fix: ignore
+  `waiting:` notices no explicit listen asked for.
+- Docker Desktop's VM filesystem went read-only (disk was 97% full); restart
+  attempted, daemon not answering yet — needs a manual restart/check.
+- Agent migration: step 1 done; step 2 executor stopped at the limit — see
+  `feat/engine` commits for how far phases A–F got; continue from the design
+  `03-runs-on-the-engine.md` and the executor report if present
+  (scratchpad agent-step2-report.md).
