@@ -38,3 +38,8 @@ or reverses each entry.
 - **Engine design 04 (breaker policy):** three-state `Breaker` with a serde
   default (no definitions layout bump); queued refusals stop pinning a
   threshold (resolved at promotion); `off` adds no new reporting.
+- **Agent design 03 (runs on the engine):** one signal at a time kept; run id
+  `signal:<mcp signal id>` as the idempotency key; loop-running host functions
+  become child starters joined by `listen`/`child_outcome`; function access
+  checked in handlers by definition and host data; a second press of a card is
+  answered "already answered"; capacity formulas documented in operations.
