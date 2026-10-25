@@ -1,6 +1,6 @@
 # 03. Step 2: runs on the engine
 
-Status: reviewed (round 1 resolved; round 2 pending) · Overview: [01](01-engine-migration.md) step 2 · Branch: `feat/engine`
+Status: approved (rounds 1–2 resolved; round-2 items marked R2-) · Overview: [01](01-engine-migration.md) step 2 · Branch: `feat/engine`
 Engine prerequisites: ouro designs 03 (host data, host-started children, with
 "first commit wins" joins for host children) and 04 (breaker policy) merged;
 engine pinned to that revision. Review findings are referenced as (R-Hn/Mn/Ln).
@@ -83,6 +83,52 @@ Added by this document (logged in LOG.md):
 10. **Engine worker starts after MCP (R-M12)**: after the first successful
     `tools/list` (the snapshot is the registry until then; nothing resumes
     before it).
+
+11. **Round-2 rules (R2-).**
+    - **Evidence lifetime (R2-H1):** evidence rows and `run_evidence(run_id,
+      digest)` links are written **before** the engine start; the sweep
+      deletes links of ended runs past retention and evidence rows with no
+      links left — never by age alone.
+    - **Recovery outside the tree (R2-H2):** `recovery_loop` starts an
+      independent root `recovery:<signal id>` with `Runtime::start_with`
+      (the handler holds the runtime) and returns at once; the signal then
+      raises as today. The report never shares an exhausted budget. Loop
+      calls are routed with `if:` (not `switch`), so routing spends no jump.
+      Test 14 also covers a *worker* exhausting the budget.
+    - **Starters are side-effect-safe (R2-M1):** child starters never build or
+      cache an `AgentLoop` (the child builds its loop on its first
+      `agent_turn`); `run_trace`/`run_evidence` inserts are insert-or-ignore
+      keeping the first values; `guarded` comes from the joined child's stored
+      input.
+    - **Child ids and handles (R2-M2):** the id comes from the engine helper
+      `FunctionContext::child_id(key)` (engine design 03) so `run_trace` can be
+      written first; the model sees short handles (`w<round>.<index>`) for
+      workers, resolved by `read_run` within the loop's own tree, never raw ids.
+    - **`tool_repeat` refuses writes itself (R2-M3)** by the same rule as
+      `classify` (definite error result), so invariant 4 doesn't depend on YAML.
+    - **Loop host data also carries** `env` (default chat, timezone, the
+      session clock snapshot), the working-memory `session` id and the
+      worker's `guard_request` (R2-M4).
+    - **Remaining workflow tools in step 2 (R2-M5):** `list_workflows`,
+      `read_workflow` show the engine catalog's built-ins; `workflow_functions`,
+      `probe_function` work on the registry; `schedule_task(workflow: …)`
+      answers "unavailable until the schedules step"; loop-variant names fall
+      back to `agent-loop`; the old `workflows` table is dropped by the
+      migration.
+    - **Capacity for two trees (R2-M6):** drives ≥ 68 (a resumed tree plus the
+      next signal's), function slots ≥ 2 × drives.
+    - **Smaller rules (R2-L):** the quiescence predicate counts a `Waiting` run
+      whose `wake_at_ms` has passed as runnable and an operator-held run as
+      quiescent; Decision 3 reads "live state may be read on the first
+      dispatch; a re-dispatch joins what the first committed"; `settle_child`
+      answers `{action: done|handover|raise, output?, error?, handover?}` for
+      the kinds that can occur; button event data comes from the signal's
+      input, not YAML arguments; an orphan `run_trace` is closed only when its
+      signal run has ended and no engine run exists; `set_memory` refuses the
+      reserved `engine.` key prefix (`engine.builtin_digests.<name>`,
+      `engine.migrated_at`); `guard_verdict_uses` is keyed by the engine call's
+      idempotency key; `read_run` never shows host data; the signal's
+      `created_ms` is the signal's own timestamp.
 
 ## Design
 
@@ -171,13 +217,13 @@ Added by this document (logged in LOG.md):
 ### C. Runtime wiring
 
 - `Runtime::new(sqlite adapter on agent.db, registry, Config {…}, clock,
-  tracer)`; capacity: drives ≥ 34 (primary + guard + 16 workers + 16 worker
-  guards; the signal holds none), function slots ≥ 2 × drives, `max_jumps` per
+  tracer)`; capacity: drives ≥ 68 (two trees of primary + guard + 16 workers + 16
+  worker guards; the signal holds none — R2-M6), function slots ≥ 2 × drives, `max_jumps` per
   Decision 7; numbers and record-size estimate in `docs/operations.md`.
 - Built-ins at boot (R-M7): read `definitions(name)`; reuse the version whose
   digest equals the built-in's, else save; activate only when nothing is
   active or the active digest is one of the known built-in digests (kept in
-  memory KV `builtin_digests.<name>` until step 3's `workflow_meta`).
+  memory KV `engine.builtin_digests.<name>` until step 3's `workflow_meta`).
 - Engine worker in a restart loop with backoff, started after MCP (Decision 10).
 - `--once` mode drives the engine until the supervisor's predicate holds (R-L8).
 - `signal:<id>` ids: MCP ids and scheduled fire ids (> 10⁹) don't collide
@@ -197,7 +243,7 @@ Added by this document (logged in LOG.md):
 - `pending_confirmations`, card cleanup and `pending_child_confirmation` use
   `confirmations` (+ `loop_run`) and `Runtime::get` liveness.
 - Cut-over (R-L6): a boot task edits cards created before the migration
-  marker (`memory` KV `engine_migrated_at`) to "expired" once.
+  marker (`memory` KV `engine.migrated_at`) to "expired" once.
 
 ### E. Journal readers
 

@@ -55,3 +55,9 @@ or reverses each entry.
 - **Deferred to the maintainer:** the signal-loss window between
   `get_next_signal` and admission stays as today; an MCP lease/ack protocol is
   filed as 63 (needs a `.feature` scenario first).
+- **Agent design 03, round-2 review resolved:** evidence linked per run
+  (`run_evidence`), swept by links not age; the recovery report runs as an
+  independent root outside the signal tree (budget can't block it); loop
+  routing uses `if:` (no jump); model sees short worker handles; capacity
+  sized for two concurrent trees; `engine.` memory-key prefix reserved. Engine
+  design 03 gains `FunctionContext::child_id(key)` (asked of its implementer).
