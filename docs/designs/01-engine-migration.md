@@ -1,9 +1,11 @@
 # 01. Run the agent on the ouro engine
 
-Status: draft · Epic: #62 · Engine: Ch4mpl00/ouro (target tag v0.2.0)
+Status: approved (overview) · Epic: #62 · Engine: Ch4mpl00/ouro (pinned rev on main until v0.2.0)
+Review: goldfish round 1 (2026-10-25), findings resolved below; decisions log: [LOG.md](LOG.md)
 
-This is the overview: target shape, decisions, the remaining engine gaps and
-the order of steps. Each step gets its own document (02…) before it is built.
+This is the overview: target shape, decisions, engine prerequisites, the order
+of steps and the agent invariants every step must keep. Each step gets its own
+document (02…) before it is built.
 
 ## Problem
 
@@ -13,156 +15,176 @@ sync journal traits), its own SQLite run store (`agent/src/durable.rs`,
 as read/write from MCP's `readOnlyHint`, an in-process child driver, a
 memory-KV breaker with per-run fallback to built-in text, a cron table with a
 30 s tick (`schedule.rs`), and a sandbox that builds a second engine
-(`sandbox.rs`). About 9.5k lines in those files plus `owf`. The same design
-now lives, generalised, verified (Quint contract, conformance on three stores,
-crash injection) and maintained, in the ouro engine. Keeping two copies means
-every fix lands twice and the agent's copy is the weaker one.
+(`sandbox.rs`). The same design now lives, generalised and verified (Quint
+contract, conformance on three stores, crash injection), in the ouro engine.
+Two copies means every fix lands twice and the agent's copy is the weaker one.
 
-## Decisions (maintainer, 2026-10-24/25)
+## Decisions
+
+Maintainer (2026-10-24/25):
 
 1. **Dependency:** `ows`, `ouro-durable`, `ouro-runtime` as git dependencies
-   pinned to a tag (v0.2.0 or later). Engine changes needed by the agent go
-   into the engine (its own issues/designs), never patched in the agent.
+   pinned to a revision of engine `main` until `v0.2.0` is tagged, then the tag.
+   Engine changes the agent needs go into the engine, never patched here.
 2. **No migration of runs or saved workflows.** Current runs are dropped;
    agent-authored saved workflows are deleted and recreated by the agent;
-   scheduled tasks are recreated by hand. No compatibility code. Old tables
-   are dropped by a new migration (applied migrations never change).
-3. **Store:** the engine's SQLite adapter inside `agent.db` (its own
-   `ouro_*` tables, schema tracked in `ouro_migrations`, engine#27). Separate
-   connection: no shared transactions with the agent's tables.
-4. **Schedules move onto engine triggers** ("use the engine to the maximum"):
-   one definition per task, `metadata.ouro.timezone`, one-shot `at`,
-   `$run.schedule` (engine#24). `schedule.rs` rows and the tick go away.
-5. **`signal` becomes a durable engine run** (one kind of workflow, one launch path).
-6. **Tracing via the engine's observer seam** (engine#26): Langfuse, the local
-   trace mirror and the activity journal are observers; replayed history is
-   never re-emitted. Langfuse stays in the agent; the engine only knows OTel.
-7. **Breaker fallback is agent logic:** on a trip the agent runs its built-in
-   version for that run with `Runtime::start_at` (engine#23); the user's
-   version stays active. A trip refuses only the tripped content (digest rule).
-8. **Delivery is chosen by the agent at registration** per MCP tool (from
-   `readOnlyHint`: writes at-most-once); a YAML call may tighten with
-   `metadata.ouro.delivery`. Ambiguous write failures are answered as unknown
-   outcomes (engine#25), so the engine never resends them.
-9. **Admission trust stays agent-side:** model parameters given by the host
-   (preset, confirmation target, conversation, session context) live in an
-   agent table keyed by run id; host functions read them by
-   `FunctionContext::run_id`. No engine seam.
-10. **Evals optimizer** keeps using the engine interpreter in memory
-    (`ows::run::run`).
-11. **Worker failure** restarts the engine worker in place with a backoff;
-    the process does not exit.
+   scheduled tasks are recreated by hand. No compatibility code. Old tables are
+   dropped by a new migration (applied migrations never change).
+3. **Store:** the engine's SQLite adapter inside `agent.db` (`ouro_*` tables,
+   `ouro_migrations`), its own connection: no shared transactions.
+4. **Schedules on engine triggers:** one definition per task,
+   `metadata.ouro.timezone`, one-shot `at`, `$run.schedule`.
+5. **`signal` is a durable engine run.**
+6. **Tracing:** Langfuse stays in the agent; the engine knows only OTel.
+7. **Breaker fallback is agent logic:** on a trip of a *user* version the agent
+   runs its built-in version for that run with `Runtime::start_at`; the user's
+   version stays active (digest rule).
+8. **Delivery chosen at registration** per MCP tool from `readOnlyHint` (writes
+   at-most-once); YAML may tighten with `metadata.ouro.delivery`; ambiguous
+   write failures are unknown outcomes, never resent.
+9. **Host-vouched run parameters live in the engine admission** (engine design
+   03, host data): the agent puts preset, confirmation target, conversation and
+   session context in the run's host data; host functions read
+   `FunctionContext::host()`; host functions start vouched children with
+   `FunctionContext::start_child`. Workflow-started children get none. No agent
+   side table. *(Revised from "agent table" after review H2.)*
+10. **Built-in definitions opt out of the breaker** (engine design 04,
+    `metadata.ouro.breaker: off` on `signal`, `agent-loop`, `guard`,
+    `recovery`): a provider outage must not stop the agent. *(Review H3.)*
+11. **Evals optimizer** keeps the engine interpreter in memory (`ows::run::run`).
+12. **Worker failure** restarts the engine worker in place with a backoff.
+
+Elephant (this session, logged in [LOG.md](LOG.md), reversible):
+
+13. **One integration branch `feat/engine`;** each step lands on it with its
+    suites green; **no prod deploy** until the maintainer decides (deploy is
+    deferred, not part of the night run).
+14. **Tracing split** (review H4): `agent_turn`/`tool` handlers keep writing
+    their own generation/tool spans with full payloads through the agent's
+    Tracer, parented to the engine's call span (`FunctionContext::span`);
+    engine observers carry run/task lifecycle only. Durable derived state
+    (activity journal projection, mirror run-end, judge readiness) is
+    reconciled from the store — `Control::history`/`list` with an end-time
+    watermark — not from observer events (at-most-once).
+15. **Saved workflow sources live in an agent table too** (`workflow_meta`:
+    name, version, YAML, note, created, tried, builtin, activation history), so
+    an engine store-version bump can be re-seeded from it (review M7).
+16. **Gap workarounds** (review Q1): cooperative cancellation — accept, close
+    spans from `Drop` guards; dry runs — a second in-memory `Runtime` with
+    drafts activated, a dry registry and its own observer; run ends — store
+    reconciliation (14); missing function on resume — a persisted last-known
+    tool snapshot as a stable superset with permissive schemas, absent tools
+    answer `not_executed`, `check()` runs on save.
+17. **`emit` is refused in agent-saved workflows** for now (app-side check on
+    save), and the reserved built-in names (`signal`, `agent-loop`, `guard`,
+    `recovery`) can't be saved by the agent.
 
 ## Target shape
 
 ```
-supervisor ─ signal ─► Runtime::start("signal:<id>", "signal", input)
-                         │  (engine store in agent.db, engine worker drives)
+supervisor ─ signal ─► Runtime::start_with("signal:<id>", "signal", input, host)
+                         │ (engine store in agent.db; engine worker drives)
                          ▼
              engine interpreter ── calls ──► Registry (agent-built):
-                                              MCP tools (delivery by readOnlyHint),
-                                              agent_turn / tool / guard host functions,
-                                              decisions, compose, memory, skills …
-             engine observers ──► Langfuse · trace mirror · activity journal
-             engine triggers  ──► scheduled task definitions
-             trip notice      ──► agent: start_at(built-in) for that run
-agent tables: admitted_runs, run_trace, workflow_meta, confirmations,
-              guard_verdict_uses, memory, traces, judgements, activity …
+                                              MCP tools (snapshot superset,
+                                                delivery by readOnlyHint),
+                                              agent_turn / classify / tool_once /
+                                                tool_repeat / guard / confirm …,
+                                              decisions, compose, memory, skills
+             host functions ── FunctionContext::start_child ──► vouched children
+             handlers ──► Tracer (generations, tool spans, full payloads)
+             observers ──► lifecycle spans
+             store reconciliation ──► activity journal · mirror · judge readiness
+             trip notice (user versions) ──► start_at(built-in) for that run
+agent tables: workflow_meta, run_trace, confirmations, guard_verdict_uses,
+              memory, traces, judgements, activity …
 ```
 
-## What maps directly (no engine work)
+## Engine prerequisites
 
-Interpreter and validation (`ows::model`; the built-in `agent-loop`, `guard`,
-`signal` YAML parse and validate unchanged — checked), durable runs, leases,
-children (`run: workflow` / `start_child`), event waits and targeted delivery
-(CloudEvents with ids: Telegram callback id as `id`), versions/activation,
-breaker reports, dry run with host mocks, control API (hold/cancel/pause for
-the console), annotations (token usage), schedules with time zones and
-one-shots, typed call outcomes, observers.
-
-## Remaining engine gaps (to settle before the step that needs them)
-
-| Gap | Needed by | Options |
+| Engine change | Design | Needed by |
 |---|---|---|
-| Cooperative cancellation: the runtime drops a cancelled handler without waiting; agent turns end their spans and child loops first today | step 3 | engine `Function::cooperative` (wait for the handler on stop, bounded), or accept: the observer's `run_interrupted` closes spans |
-| Dry runs are silent to host observers and return no per-task path/outputs; the sandbox report needs them | step 6 | engine: dry run accepts an observer and returns records; or the agent runs drafts on a second in-memory `Runtime` with its own observer |
-| No events for runs cancelled while no execution holds them (cascade-cancelled children); the journal waits for "all runs of a trace ended" | step 4 | engine run-ended notice to the event sink; or the agent polls `Runtime::get` for the runs in `run_trace` |
-| Built-in definitions can be tripped by a provider outage (three faulted loops in a row) | step 5 | engine per-definition breaker opt-out/threshold in `metadata.ouro`; or the agent re-runs built-ins pinned after every trip |
-| A function missing on resume faults the run (counts toward the breaker); MCP tools come and go with the connection | step 2 | agent registers a stable superset with permissive schemas and answers `not_executed` when a tool is gone; optional engine option to interrupt instead of fault |
+| Host data at admission, host-started children | ouro 03 (#34) | step 3 |
+| Breaker threshold per definition (`off`) | ouro 04 (#35) | step 3 |
+| Tag `v0.2.0` after 03/04 and the pre-tag drift review | — | step 3 pins it |
 
-## Steps (each leaves the suite green and deployable)
+## Agent invariants every step keeps (each step document names its tests)
 
-1. **Interpreter and model types.** Depend on the engine; replace `owf::model`
-   uses with `ows::model`; move the read/write classification out of the
-   interpreter into an agent table. Ephemeral paths on `ows::run::run`.
-2. **Registry.** Build the engine `Registry` from MCP `tools/list` (stable
-   superset, permissive schemas, delivery by `readOnlyHint`) plus all host
-   functions; handlers answer typed outcomes; swap with `set_registry` on
-   reconnect. Split the loop's `tool` step so delivery is static
-   (`classify` → `tool_once` (AMO) | `tool_repeat` (ALO)).
-3. **Runs on the engine** (largest). `Runtime` over the SQLite adapter in
-   `agent.db`; replace `durable.rs`, `execute_saved`, the agent's worker,
-   resume, child driver with `Runtime::start/drive/worker`; `signal` as a
-   durable run; children via the engine; button presses via
-   `Runtime::deliver` with ids; `admitted_runs` table; capacity config
-   (`max_concurrency`, `max_function_concurrency`, `limits.max_jumps`) sized
-   for a primary loop with guard and workers; migration dropping the old run
-   tables.
-4. **Observers.** Langfuse, mirror and activity journal as engine observers;
-   `run_trace` table replaces the anchor columns; journal/judge readiness
-   without SQL joins to runs.
-5. **Versions and breaker.** `workflow_meta` (note, created, tried, builtin);
-   save/activate/try tools over `Runtime::save/activate`; built-ins saved at
-   boot; trip handling with `start_at`; delete the memory-KV breaker and
-   built-in text fallbacks.
-6. **Sandbox.** Signal-chain dry run on a second in-memory `Runtime` (or engine
-   dry run with observer); remove run-time `engine.sandbox()` branches in
-   favour of a dry registry.
-7. **Schedules.** One definition per task; `fire_scheduled` host function;
-   synthetic tools rewritten; `schedule.rs` tables and tick removed.
-8. **Remove `crates/owf`**; evals optimizer on `ows::run::run`; docs
-   (`CLAUDE.md`, `docs/architecture.md`, `docs/operations.md`).
+1. A confirmation is honoured only from a consumed event bound to the run, the
+   call key, the chat, the message and the thread — read from the guard run's
+   recorded event (`Runtime::records`), never from a YAML output.
+2. Every model write is reviewed by the guard round.
+3. Model parameters come only from the host (host data), never from YAML or a
+   workflow-started child.
+4. An at-most-once tool call is never resent after a crash, shutdown, hold or
+   trip; an unknown outcome reaches the model as "may have happened".
+5. Workers inherit the confirmation target.
+6. A card whose send outcome is unknown is never resent.
 
-## Contract and model
+## Steps (on `feat/engine`; suites green after each)
 
-The engine's contract covers runs, calls, children, triggers and the breaker.
-The agent keeps its own invariants (confirmation verification only by a
-consumed event, guard review of model calls, the admitted-input rule) and their
-tests; each step's document lists which agent tests pin them.
+1. **Dependency and dialect.** Pin the engine; parse every built-in YAML with
+   `ows` in tests asserting the effective extensions; prepare `metadata.ouro`
+   versions of the built-ins and the DSL-teaching skills text
+   (`workflow-author`, tool descriptions) — switched over in step 3, since the
+   running `owf` reads the flat keys.
+2. **Runs on the engine** (the core; one step, several commits): `Runtime`
+   over the SQLite adapter in `agent.db`; registry from the tool snapshot plus
+   host functions with typed outcomes, swapped on reconnect; the loop's `tool`
+   split into `classify → tool_once | tool_repeat` with a `catch` for
+   `call.unknown`; host functions gated by `FunctionContext::definition`
+   (`confirm_request`, `resolve_review`, dispatcher functions); `signal` as a
+   durable run started with host data; `primary_loop`/`recovery_loop`/worker/
+   guard starts as host-started children (`FunctionContext::start_child`);
+   supervisor waits on the run's end (one signal at a time kept); targeted
+   button delivery with Telegram callback ids; built-ins saved and activated at
+   boot with `breaker: off`; capacity config (`max_concurrency`,
+   `max_function_concurrency`, `limits.max_jumps`) sized and documented;
+   tracing split (decision 14) including `run_trace` and store reconciliation;
+   migration dropping the old run tables.
+3. **Versions and breaker:** `workflow_meta` (decision 15); save/activate/try
+   tools over `Runtime::save/activate`; trip notice handling for user versions
+   with `start_at`; delete the memory-KV breaker and built-in text fallbacks.
+4. **Sandbox:** the second in-memory `Runtime` (decision 16); `try_workflow`
+   and the activation gate on it; remove run-time `engine.sandbox()` branches
+   in favour of a dry registry. (Until this step, activation of agent-authored
+   versions is refused on the branch.)
+5. **Schedules:** one definition per task, `fire_scheduled` host function,
+   synthetic tools rewritten; per-task overlap/catch-up chosen; a tripped
+   scheduled definition's notice becomes a signal the agent can act on
+   ("the runtime informs, the agent decides"); time-zone change re-saves task
+   definitions; `schedule.rs` tables and tick removed.
+6. **Remove `crates/owf`;** evals on `ows::run::run`; check `crates/evals` for
+   `workflow_runs` dependencies; docs (`CLAUDE.md`, `docs/architecture.md`,
+   `docs/operations.md`).
 
 ## Failure modes and risks
 
-- **Delivery binding:** a tool registered at-least-once is resent after a
-  crash; writes must be at-most-once. Changing a tool's `readOnlyHint` changes
-  its binding: in-flight runs see a binding mismatch (interrupt, then fault).
-- **Schema binding:** exact schema comparison on resume → register permissive
-  schemas, validate arguments in the agent's `check()` and in MCP.
-- **Capacity:** a parent waiting on its guard/worker children can starve them
-  at the default 4 drives / 16 function calls.
-- **Jump budget:** one unit per loop round across the whole tree; default 100
-  is too low for a long primary loop with workers.
-- **One file, two connections:** formerly transactional pairs (trace mirror vs
-  run end, card vs run, sweep) become eventually consistent; each needs a test.
-- **Child latency:** a child starts on the next worker tick, not inside the
-  parent's call.
-
-## Tests
-
-Per step, in its document. The existing agent suites that cover each layer
-today: `flows.rs`, `workflow_kinds.rs`, `agent_loop.rs`, `loop_variants.rs`,
-`durable*.rs`, `loop_durability.rs`, `supervisor*.rs`, `sandbox.rs`,
-`schedule.rs`, `tracing.rs`, `activity_*.rs`, `confirmation_properties.rs`,
-`tool_results.rs`. A step is done when its suites pass on the engine and the
-replaced code is deleted.
+- **Delivery binding:** writes must be at-most-once; changing a tool's
+  `readOnlyHint` changes its binding (in-flight runs interrupt, then fault).
+- **Schema binding:** permissive schemas + `check()` on save (decision 16).
+- **Capacity:** a parent waiting on guard/worker children can starve them at
+  the defaults (4 drives, 16 function calls); a 15-minute `hold` keeps a drive
+  permit.
+- **Jump budget:** one unit per loop round across the tree; default 100 is too
+  low; set and document.
+- **Storage growth:** each loop record stores the transcript; bounded by the
+  jump budget and the 7-day sweep — state the numbers in step 2.
+- **One file, two connections:** formerly transactional pairs become
+  eventually consistent; each gets a test.
+- **Store upgrades:** an engine store-version bump re-creates the store;
+  workflows re-seeded from `workflow_meta`, schedules re-generated; back up with
+  `sqlite3 .backup` first.
+- **Pending confirmations at cut-over** are dropped (decision 2); their cards
+  are edited to "expired" once at first start.
 
 ## Rollout
 
-Deploy after each step that changes runtime behaviour (3, 4, 5, 7). Before
-step 3: back up `agent.db`; old runs and saved workflows are dropped by design.
-After step 7: recreate scheduled tasks by hand.
+Nothing deploys during the night run. The maintainer deploys `feat/engine`
+after review; before it: back up `agent.db`, expect old runs and saved
+workflows gone, recreate scheduled tasks after step 5.
 
 ## Open questions
 
-1. Each engine gap in the table: engine change or agent workaround?
-2. Is the step order right, or should observers (4) come together with runs
-   (3) so tracing never regresses on prod between deploys?
+None for the overview. Step documents may raise their own; any decision
+needed while the maintainer is away is taken reversibly and logged in LOG.md.
