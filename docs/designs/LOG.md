@@ -27,3 +27,14 @@ or reverses each entry.
 - **Step order restructured** per review H5: dependency + dialect, then one
   core step (runs + registry + observers + built-ins), then versions/breaker,
   sandbox, schedules, `owf` removal.
+- **Engine design 03 (host data), resolved review findings without the
+  maintainer:** host data stored as `admission.runtime["host"]` (no struct
+  change, no state bump); the control API redacts it except in `inspect`;
+  host-started children use a `hostchild:` id prefix keyed by the call's
+  idempotency key; child-starting functions must be at-least-once; refusals
+  map to `not_executed`; mismatch checked in the shared store engine; the
+  "workflow child has no host data" rule is pinned by conformance tests, not
+  Quint; scheduled runs carry no host data.
+- **Engine design 04 (breaker policy):** three-state `Breaker` with a serde
+  default (no definitions layout bump); queued refusals stop pinning a
+  threshold (resolved at promotion); `off` adds no new reporting.
