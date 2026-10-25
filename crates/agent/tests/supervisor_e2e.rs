@@ -16,7 +16,6 @@ use agent::{
     mcp::{Client, ConnectOptions, McpClient, Open, SharedMcp},
     models::{ModelPreset, Presets, ReasoningEffort},
     providers::{ChatProvider, CompletionParams, CompletionResult, Message, ProviderKind, role},
-    session::EnvDeps,
     skills::FsSkillStore,
     supervisor::{create_supervisor, run_poll_loop},
     tracing::TokenUsage,
@@ -123,12 +122,7 @@ fn expected(id: i64, p: &Plan) -> Expected {
         let mut texts = Vec::new();
         for (i, act) in acts.iter().enumerate() {
             match act {
-                Act::Send(true) => {
-                    texts.push(send_text(id, i, true));
-                    if p.source() == "telegram" {
-                        break;
-                    }
-                }
+                Act::Send(true) => texts.push(send_text(id, i, true)),
                 Act::Send(false) => {}
                 Act::Crash => {
                     texts.push(recovery_text(id));
@@ -389,15 +383,12 @@ async fn run(plans: &[(i64, Plan)]) -> Run {
         tracer: Arc::new(local_recorder_tracer(db.clone())),
         codex: Arc::new(NoCodex),
         decisions: Some(support::allow_guard()),
-        workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
+        env: agent::session::EnvConfig { user_email: None, telegram_chat_id: Some(CHAT.to_string()) },
+        db: (*db).clone(),
+        store: agent::runs::memory_store(),
         schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
     });
-    support::activate_telegram_loop(&engine);
-    let supervisor = create_supervisor(
-        engine.clone(),
-        EnvDeps { mcp: mcp.clone(), memory: db.clone(), user_email: None, telegram_chat_id: Some(CHAT.to_string()) },
-        agent::flows::create_flows(engine.clone()),
-    );
+    let supervisor = create_supervisor(engine.clone());
     run_poll_loop(mcp, supervisor.clone(), world.drained.clone(), std::time::Duration::ZERO).await.unwrap();
 
     let traced = plans

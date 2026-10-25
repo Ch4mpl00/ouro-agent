@@ -16,7 +16,6 @@ mod wall_cron;
 
 use agent::{
     db::AgentDb,
-    flows::{MemoryWorkflows, WorkflowStore},
     mcp::Mcp,
     providers::ToolDef,
     schedule::{self, FIRST_FIRE_ID, Fire, FireSink, Fired, MemorySchedule, NewTask, ScheduleStore, TaskRow},
@@ -160,24 +159,9 @@ fn parse_header(fire: &Fire) -> Header {
     }
 }
 
-// The one saved workflow with an active version.
-fn workflows() -> MemoryWorkflows {
-    let store = MemoryWorkflows::default();
-    let saved = store.save("digest", "definition", None).unwrap();
-    store.activate("digest", saved.version).unwrap();
-    store
-}
-
-async fn call(
-    db: &AgentDb,
-    workflows: &dyn WorkflowStore,
-    tz: &str,
-    name: &str,
-    args: Value,
-    now: i64,
-) -> anyhow::Result<Value> {
+async fn call(db: &AgentDb, tz: &str, name: &str, args: Value, now: i64) -> anyhow::Result<Value> {
     let args = args.as_object().cloned().unwrap_or_default();
-    let raw = schedule::tool(db, workflows, tz, name, &args, at(now)).await?;
+    let raw = schedule::tool(db, tz, name, &args, at(now)).await?;
     Ok(serde_json::from_str(&raw).unwrap())
 }
 
@@ -360,7 +344,6 @@ fn witness(w: &'static str) {
 
 struct World {
     db: AgentDb,
-    workflows: MemoryWorkflows,
     recorder: Recorder,
     zone: &'static str,
     clock: i64,
@@ -387,7 +370,7 @@ async fn step(w: &mut World, o: &Op) -> Vec<String> {
             if let Some(workflow) = workflow {
                 args["workflow"] = json!(workflow);
             }
-            let reply = call(&w.db, &w.workflows, w.zone, "schedule_task", args, w.clock).await.unwrap();
+            let reply = call(&w.db, w.zone, "schedule_task", args, w.clock).await.unwrap();
             let after = tasks(&w.db);
             tasks_frame(&mut v, "schedule frame: existing tasks untouched", &before, &after, &none);
             if reply["ok"] == false {
@@ -417,9 +400,11 @@ async fn step(w: &mut World, o: &Op) -> Vec<String> {
                 v.check("schedule: an invalid cron is refused", reply["ok"] == false, || format!("{cron:?} {reply}"));
                 return v.0;
             }
-            if *workflow == Some("missing") {
-                witness("a workflow without an active version is refused");
-                v.check("schedule: a workflow needs an active version", reply["ok"] == false, || reply.to_string());
+            // Saved workflows run on schedules again with the engine
+            // migration's schedules step (design 03, R2-M5).
+            if workflow.is_some() {
+                witness("a workflow is refused until the schedules step");
+                v.check("schedule: a workflow is refused", reply["ok"] == false, || reply.to_string());
                 return v.0;
             }
             v.check("schedule: a valid cron is accepted", reply["ok"] == true, || format!("{cron:?} {reply}"));
@@ -484,8 +469,7 @@ async fn step(w: &mut World, o: &Op) -> Vec<String> {
             } else {
                 ids.iter().copied().max().unwrap_or(0).max(0) + 1 + (pick % 5) as i64
             };
-            let reply =
-                call(&w.db, &w.workflows, w.zone, "cancel_scheduled_task", json!({ "id": id }), w.clock).await.unwrap();
+            let reply = call(&w.db, w.zone, "cancel_scheduled_task", json!({ "id": id }), w.clock).await.unwrap();
             let after = tasks(&w.db);
             let existed = before.contains_key(&id);
             v.check("cancel: reply shape", keys(&reply) == set(&["ok", "id"]), || reply.to_string());
@@ -507,7 +491,7 @@ async fn step(w: &mut World, o: &Op) -> Vec<String> {
             tasks_frame(&mut v, "timezone frame: tasks untouched", &before, &tasks(&w.db), &none);
         }
         Op::List => {
-            let reply = call(&w.db, &w.workflows, w.zone, "list_scheduled_tasks", json!({}), w.clock).await.unwrap();
+            let reply = call(&w.db, w.zone, "list_scheduled_tasks", json!({}), w.clock).await.unwrap();
             tasks_frame(&mut v, "list frame: listing changes nothing", &before, &tasks(&w.db), &none);
             v.check("list: reply shape", keys(&reply) == set(&["timezone", "count", "tasks"]), || reply.to_string());
             let mut expected: Vec<i64> = before.values().filter(|t| active(t)).map(|t| t.id).collect();
@@ -670,7 +654,7 @@ fn keeps_every_rule_across_generated_schedules_cancels_zone_changes_and_ticks() 
             |(t0, zone, ops)| {
                 rt.block_on(async {
                     let (_dir, db) = store();
-                    let mut w = World { db, workflows: workflows(), recorder: Recorder::default(), zone, clock: t0 };
+                    let mut w = World { db, recorder: Recorder::default(), zone, clock: t0 };
                     for (i, o) in ops.iter().enumerate() {
                         let violations = step(&mut w, o).await;
                         assert!(
@@ -689,14 +673,13 @@ fn keeps_every_rule_across_generated_schedules_cancels_zone_changes_and_ticks() 
         WITNESSED.lock().unwrap().iter().copied().collect::<Vec<_>>(),
         [
             "a fire in a non-UTC zone",
-            "a fire runs a saved workflow",
             "a late tick catches up",
             "a one-shot fires",
             "a recurring task fires again",
             "a seeded task fires under its own source",
             "a task is cancelled",
             "a tick with nothing due",
-            "a workflow without an active version is refused",
+            "a workflow is refused until the schedules step",
             "an invalid cron is refused",
         ]
     );
@@ -827,7 +810,7 @@ async fn a_one_shot_task_fires_once_and_is_gone() {
         schedule::tick(&db, &recorder, Tz::UTC, at(ms(now))).await.unwrap();
     }
     assert_eq!(recorder.fires.lock().unwrap().len(), 1);
-    let listed = call(&db, &workflows(), "UTC", "list_scheduled_tasks", json!({}), ms("2026-10-02T14:41:00Z")).await;
+    let listed = call(&db, "UTC", "list_scheduled_tasks", json!({}), ms("2026-10-02T14:41:00Z")).await;
     assert_eq!(listed.unwrap()["count"], 0);
 }
 
@@ -838,11 +821,12 @@ async fn a_one_shot_task_fires_once_and_is_gone() {
 async fn a_now_task_fires_once_on_the_next_tick() {
     let (_dir, db) = store();
     let created = ms("2026-10-02T14:30:10Z");
-    let args = json!({"cron_expr": "now", "recurring": true, "prompt": "run the digest", "workflow": "digest"});
-    let reply = call(&db, &workflows(), "Europe/Kiev", "schedule_task", args, created).await.unwrap();
+    // Saved workflows come back with the schedules step: the task is plain.
+    let args = json!({"cron_expr": "now", "recurring": true, "prompt": "run the digest"});
+    let reply = call(&db, "Europe/Kiev", "schedule_task", args, created).await.unwrap();
     assert_eq!((&reply["ok"], &reply["task"]["recurring"]), (&json!(true), &json!(0)), "{reply}");
     assert_eq!(reply["upcoming_fires"], json!([iso(created)]));
-    let listed = call(&db, &workflows(), "Europe/Kiev", "list_scheduled_tasks", json!({}), created + 1_000).await;
+    let listed = call(&db, "Europe/Kiev", "list_scheduled_tasks", json!({}), created + 1_000).await;
     assert_eq!(listed.unwrap()["tasks"][0]["upcoming_fires"], json!([iso(created + 1_000)]));
 
     let recorder = Recorder::default();
@@ -854,9 +838,9 @@ async fn a_now_task_fires_once_on_the_next_tick() {
     }
     let fires = recorder.fires.lock().unwrap().clone();
     assert_eq!(fires.len(), 1, "{fires:?}");
-    assert_eq!(fires[0].workflow.as_deref(), Some("digest"));
+    assert_eq!(fires[0].workflow, None);
     assert!(fires[0].content.contains("run the digest"), "{}", fires[0].content);
-    let listed = call(&db, &workflows(), "Europe/Kiev", "list_scheduled_tasks", json!({}), created + 90_000).await;
+    let listed = call(&db, "Europe/Kiev", "list_scheduled_tasks", json!({}), created + 90_000).await;
     assert_eq!(listed.unwrap()["count"], 0);
 }
 
@@ -870,16 +854,15 @@ async fn schedule_task_refuses_what_would_never_fire_as_written() {
         (json!({ "cron_expr": "0 9 31 11 *", "recurring": true, "prompt": "x" }), "never matches"),
         (
             json!({ "cron_expr": "0 9 * * *", "recurring": true, "prompt": "x", "workflow": "missing" }),
-            "no active version",
+            "until the engine migration's schedules step",
         ),
     ];
     for (args, reason) in refused {
-        let reply = call(&db, &workflows(), "UTC", "schedule_task", args.clone(), now).await.unwrap();
+        let reply = call(&db, "UTC", "schedule_task", args.clone(), now).await.unwrap();
         assert_eq!(reply["ok"], false, "{args}");
         assert!(reply["error"].as_str().unwrap().contains(reason), "{args}: {reply}");
     }
-    let missing =
-        call(&db, &workflows(), "UTC", "schedule_task", json!({ "cron_expr": "0 9 * * *", "prompt": "x" }), now).await;
+    let missing = call(&db, "UTC", "schedule_task", json!({ "cron_expr": "0 9 * * *", "prompt": "x" }), now).await;
     assert!(missing.unwrap_err().to_string().contains("recurring"));
     assert!(tasks(&db).is_empty(), "nothing refused was stored");
 }
@@ -961,7 +944,7 @@ async fn a_task_cancelled_while_a_tick_is_in_flight_does_not_fire() {
     let recorder = Recorder::default();
     let in_flight = schedule::tick(&gated, &recorder, Tz::UTC, at(created + 10 * HOUR));
     let cancel = async {
-        let reply = call(&db, &workflows(), "UTC", "cancel_scheduled_task", json!({ "id": row.id }), created).await;
+        let reply = call(&db, "UTC", "cancel_scheduled_task", json!({ "id": row.id }), created).await;
         assert_eq!(reply.unwrap()["ok"], true);
         gated.gate.as_ref().unwrap().notify_one();
     };

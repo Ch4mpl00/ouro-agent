@@ -339,18 +339,22 @@ pub struct Request<'a> {
 /// card is never sent again). A press reaches the guard run as a targeted
 /// event (`deliver_event`), so nothing is registered here.
 pub async fn request(
-    store: &dyn Store,
+    db: &AgentDb,
     mcp: &dyn Mcp,
     req: Request<'_>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Value> {
     let key = crate::guard::key(req.call);
+    // A write may wait for the engine's lock on agent.db (runs.rs §2).
+    let (run, lookup) = (req.run.to_owned(), key.clone());
+    let stored = db.write(move |db| Store::get(db, &run, &lookup)).await?;
     // A request with unknown send outcome is never dispatched a second time.
-    let p = if let Some(p) = store.get(req.run, &key)? {
+    let p = if let Some(p) = stored {
         p
     } else {
         let p = card(&req, key.clone());
-        store.insert(&p)?;
+        let row = p.clone();
+        db.write(move |db| Store::insert(db, &row)).await?;
         let raw = mcp
             .call_tool_once(
                 "send_telegram_message",
@@ -367,7 +371,8 @@ pub async fn request(
         let result: Value = serde_json::from_str(&raw)?;
         let message =
             result["messageId"].as_i64().ok_or_else(|| anyhow::anyhow!("confirmation card returned no messageId"))?;
-        store.sent(req.run, &key, message)?;
+        let (run, sent) = (req.run.to_owned(), key.clone());
+        db.write(move |db| Store::sent(db, &run, &sent, message)).await?;
         Pending { message: Some(message), ..p }
     };
     anyhow::ensure!(p.message.is_some(), "confirmation card outcome unknown; it will not be sent again");

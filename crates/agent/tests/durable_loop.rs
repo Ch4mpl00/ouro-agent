@@ -90,7 +90,9 @@ fn engine_on(
         tracer,
         codex: Arc::new(NoCodex),
         decisions: Some(support::allow_guard()),
-        workflows: Arc::new(MemoryWorkflows::default()),
+        env: Default::default(),
+        db: agent::db::AgentDb::open(":memory:").unwrap(),
+        store: agent::runs::memory_store(),
         schedule: Arc::new(agent::schedule::MemorySchedule::default()),
     })
 }
@@ -107,7 +109,7 @@ fn scope(engine: &Engine) -> Scope {
     engine.deps.tracer.trace(TraceStart { id: "t".into(), name: "t".into(), ..Default::default() })
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_loop_run_answers_like_the_loop_and_settles_its_rounds() {
     let llm = Arc::new(Scripted::new(vec![
         calls(&[("search", json!({"q": "rust"})), ("working_memory_put", json!({"key": "note", "value": "kept"}))]),
@@ -132,7 +134,7 @@ async fn a_loop_run_answers_like_the_loop_and_settles_its_rounds() {
     assert_eq!(third.last().unwrap()["content"], "kept", "{third:?}");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_plain_answer_ends_the_run() {
     let llm = Arc::new(Scripted::new(vec![assistant("hello")]));
     let engine = engine(llm, Arc::new(World { calls: Mutex::default(), stop: None }));
@@ -142,7 +144,7 @@ async fn a_plain_answer_ends_the_run() {
     assert!(matches!(result, FlowResult::Completed(ref v) if v == "hello"), "{result:?}");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_round_cut_by_a_restart_resumes_without_regenerating_or_resending() {
     let dir = tempfile::tempdir().unwrap();
     let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
@@ -199,7 +201,7 @@ async fn a_round_cut_by_a_restart_resumes_without_regenerating_or_resending() {
 // that started it. A restart in the middle of the sub-agent's round resumes
 // that run; the resumed parent joins it instead of starting a second worker,
 // and neither regenerates a turn nor resends the child's write.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sub_agent_cut_by_a_restart_is_resumed_and_joined_by_its_parent() {
     let dir = tempfile::tempdir().unwrap();
     let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
@@ -253,7 +255,7 @@ async fn a_sub_agent_cut_by_a_restart_is_resumed_and_joined_by_its_parent() {
 // recorded for the turn, no `done:` for the parent) instead of faulting, the
 // next process asks that turn again and only that one, and the parent gets
 // the worker's real answer, not "sub-agent crashed".
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_turn_aborted_by_shutdown_is_asked_again_not_reported_as_a_crash() {
     let dir = tempfile::tempdir().unwrap();
     let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
@@ -341,7 +343,7 @@ async fn a_worker_turn_aborted_by_shutdown_is_asked_again_not_reported_as_a_cras
 
 // Explicit cancellation stays terminal: a run cancelled while its turn is in
 // flight ends Cancelled when the turn then aborts, and recovery leaves it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_explicitly_cancelled_run_stays_cancelled_when_its_turn_aborts() {
     let dir = tempfile::tempdir().unwrap();
     let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
@@ -380,7 +382,7 @@ async fn an_explicitly_cancelled_run_stays_cancelled_when_its_turn_aborts() {
 // The agent may replace the loop: the version it activates under
 // `agent-loop` (after a dry run) drives every loop started after.
 // LOOP_BREAKER faults in a row of that version put the built-in loop back.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_activated_agent_loop_runs_and_three_faults_in_a_row_put_the_built_in_one_back() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(AgentDb::open(dir.path().join("agent.db")).unwrap());
@@ -422,7 +424,7 @@ async fn an_activated_agent_loop_runs_and_three_faults_in_a_row_put_the_built_in
     assert!(matches!(run(6).await, FlowResult::Completed(ref v) if v == "v2 hello"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_parent_reads_what_its_durable_worker_did() {
     let dir = tempfile::tempdir().unwrap();
     let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
@@ -482,7 +484,7 @@ async fn read_history(engine: &Arc<Engine>, input: &Value, runs: Option<&RunStor
     .unwrap()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn read_run_refuses_other_workflows_and_explains_absent_history() {
     let dir = tempfile::tempdir().unwrap();
     let runs = RunStore::new(AgentDb::open(dir.path().join("agent.db")).unwrap());
@@ -502,7 +504,7 @@ async fn read_run_refuses_other_workflows_and_explains_absent_history() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_in_process_loop_reports_no_run_history() {
     let llm = Arc::new(Scripted::new(vec![calls(&[("read_run", json!({}))]), assistant("done")]));
     let engine = engine(llm.clone(), Arc::new(World { calls: Mutex::default(), stop: None }));
@@ -515,7 +517,7 @@ async fn an_in_process_loop_reports_no_run_history() {
     assert!(seen[1].messages.last().unwrap()["content"].as_str().unwrap().contains("No run history is available"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn read_run_pages_the_longest_checkpoint_and_bounds_text_and_failed_replies() {
     use owf::durable::{Journal, Record, StepOutcome, TaskResult};
     let dir = tempfile::tempdir().unwrap();
@@ -593,7 +595,7 @@ async fn read_run_pages_the_longest_checkpoint_and_bounds_text_and_failed_replie
     assert!(list["presented"].as_str().unwrap().contains("original task"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn read_run_bounds_worker_lists_and_an_oversized_parallel_turn() {
     use owf::durable::{Journal, Record, StepOutcome, TaskResult};
     let dir = tempfile::tempdir().unwrap();
@@ -695,7 +697,7 @@ fn without_guard() -> String {
     format!("{}{}", &definition[..a], &definition[b..]).replace("- act: { then: guard }", "- act: { then: round }")
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reads_skip_decisions_and_a_round_of_two_writes_is_one_request() {
     let (engine, world, api, _) = guarded(
         vec![
@@ -711,7 +713,7 @@ async fn reads_skip_decisions_and_a_round_of_two_writes_is_one_request() {
     assert_eq!(world.calls.lock().unwrap().iter().filter(|n| *n == "send").count(), 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn instrumental_notes_reach_jev_with_only_the_host_goal_skills_and_call_chain() {
     let mut search = calls(&[("search", json!({"q":"climate news"}))]);
     search.insert("content".into(), json!("ASSISTANT_RATIONALE_SHOULD_NOT_REACH_JEV"));
@@ -749,7 +751,7 @@ async fn instrumental_notes_reach_jev_with_only_the_host_goal_skills_and_call_ch
     assert_eq!(options.keys().map(String::as_str).collect::<Vec<_>>(), ["allow", "misaligned", "needs_confirmation"]);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chain_marks_blocked_attempts_and_caps_the_recent_calls() {
     let reads: Vec<_> = (0..70).map(|i| ("search", json!({"q":i}))).collect();
     let (engine, _, api, _) = guarded(
@@ -770,7 +772,7 @@ async fn chain_marks_blocked_attempts_and_caps_the_recent_calls() {
     assert_eq!(state["chain"][0]["arguments"], "{\"q\":6}");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn blocked_attempts_remain_marked_in_the_next_question() {
     let (engine, _, api, _) = guarded(
         vec![calls(&[("send", json!({"q":"first"}))]), calls(&[("send", json!({"q":"second"}))]), assistant("done")],
@@ -782,7 +784,7 @@ async fn blocked_attempts_remain_marked_in_the_next_question() {
     assert!(!requests[1].to_string().contains("[guard] blocked:"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn blocked_writes_never_dispatch_and_finish_does_not_end_the_round() {
     let (engine, world, api, model) = guarded(
         vec![
@@ -804,7 +806,7 @@ async fn blocked_writes_never_dispatch_and_finish_does_not_end_the_round() {
     assert!(replies.contains("[finish error] not finished: send failed"), "{replies}");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn guardless_overrides_are_refused_early_but_old_stored_ones_are_enforced_by_the_host() {
     let (engine, world, api, _) = guarded(vec![calls(&[("send", json!({"q":"x"}))]), assistant("done")], "misaligned");
     let definition = without_guard();
@@ -826,7 +828,7 @@ async fn guardless_overrides_are_refused_early_but_old_stored_ones_are_enforced_
     assert_eq!(api.requests.lock().unwrap().len(), 1, "tool supplied the missing guard");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn arguments_swapped_after_guard_require_a_new_verdict_and_yaml_cannot_change_the_task() {
     for name in ["send", "remote_read"] {
         let (engine, world, api, _) = guarded(vec![], "allow");
@@ -861,7 +863,7 @@ do:
 // A call written into the loop's definition is the author's, trusted as a
 // saved workflow's (the user approved the definition): it runs as a step,
 // unreviewed. Only the model's calls go through `tool` and the guard.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_loops_own_calls_run_as_workflow_steps_without_a_review() {
     for name in ["send", "remote_read"] {
         let (engine, world, api, _) = guarded(vec![], "misaligned");
@@ -876,7 +878,7 @@ async fn a_loops_own_calls_run_as_workflow_steps_without_a_review() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn override_calls_are_in_the_host_chain_even_without_assistant_messages() {
     let (engine, world, api, _) = guarded(vec![], "allow");
     let definition = r#"
@@ -904,7 +906,7 @@ do:
     assert!(!requests[0].to_string().contains("search ok"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unavailable_guard_permits_current_conversation_replies_only() {
     for missing_client in [true, false] {
         let model = Arc::new(Scripted::new(vec![
@@ -935,7 +937,7 @@ async fn unavailable_guard_permits_current_conversation_replies_only() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restart_after_guard_rechecks_against_admitted_input_before_dispatch() {
     use owf::durable::{CallState, Journal, Record, check_transition};
     use std::collections::BTreeMap;
@@ -998,7 +1000,7 @@ async fn a_restart_after_guard_rechecks_against_admitted_input_before_dispatch()
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn call_chain_and_the_root_request_reach_a_durable_worker_after_restart() {
     let dir = tempfile::tempdir().unwrap();
     let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
@@ -1051,7 +1053,7 @@ do:
     assert!(!requests[1].to_string().contains("send ok"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn open_world_reads_and_writes_share_one_request_after_local_and_secret_checks() {
     let (engine, world, api, model) = guarded(
         vec![
@@ -1105,7 +1107,7 @@ async fn open_world_reads_and_writes_share_one_request_after_local_and_secret_ch
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unavailable_or_malformed_decisions_fail_open_only_for_clean_reads_and_existing_reply_exception() {
     for mode in ["missing", "broken", "malformed"] {
         let (mut engine, world, api, model) = guarded(
@@ -1133,7 +1135,7 @@ async fn unavailable_or_malformed_decisions_fail_open_only_for_clean_reads_and_e
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_legacy_loop_without_a_guard_step_cannot_dispatch_a_blocked_remote_read() {
     let (engine, world, api, _) =
         guarded(vec![calls(&[("remote_read", json!({"q":"private data"}))]), assistant("done")], "misaligned");
@@ -1144,7 +1146,7 @@ async fn a_legacy_loop_without_a_guard_step_cannot_dispatch_a_blocked_remote_rea
     assert_eq!(api.requests.lock().unwrap().len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fast_guard_and_worker_children_never_suspend_the_parent() {
     for mode in ["guard", "worker", "local"] {
         let replies = match mode {
@@ -1183,7 +1185,7 @@ async fn fast_guard_and_worker_children_never_suspend_the_parent() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_guard_child_result_cannot_authorize_another_invocation() {
     let (engine, world, _, _) = guarded(vec![], "allow");
     let dir = tempfile::tempdir().unwrap();
@@ -1214,7 +1216,7 @@ do:
     assert_eq!(*world.calls.lock().unwrap(), ["send"]);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_children_keep_the_active_loop_version_and_its_breaker() {
     let model = Arc::new(Scripted::new(vec![
         calls(&[("invoke_sub_agent", json!({"prompt":"first"}))]),

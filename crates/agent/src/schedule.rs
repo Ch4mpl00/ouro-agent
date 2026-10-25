@@ -126,8 +126,11 @@ fn insert_task(conn: &rusqlite::Connection, t: &NewTask) -> rusqlite::Result<Tas
 
 #[async_trait]
 impl ScheduleStore for AgentDb {
+    // The schedule tools run inside a loop's call: a write may wait for the
+    // engine's lock on agent.db, so it waits on the blocking pool (runs.rs §2).
     async fn insert(&self, task: &NewTask) -> anyhow::Result<TaskRow> {
-        Ok(insert_task(&self.conn(), task)?)
+        let task = task.clone();
+        self.write(move |db| Ok(insert_task(&db.conn(), &task)?)).await
     }
 
     async fn list_active(&self) -> anyhow::Result<Vec<TaskRow>> {
@@ -147,7 +150,7 @@ impl ScheduleStore for AgentDb {
     }
 
     async fn delete(&self, id: i64) -> anyhow::Result<bool> {
-        Ok(self.conn().execute("DELETE FROM scheduled_tasks WHERE id = ?1", params![id])? > 0)
+        self.write(move |db| Ok(db.conn().execute("DELETE FROM scheduled_tasks WHERE id = ?1", params![id])? > 0)).await
     }
 
     async fn record_fire(&self, task_id: i64, slot: i64) -> anyhow::Result<i64> {
@@ -160,7 +163,7 @@ impl ScheduleStore for AgentDb {
 
     async fn initialize(&self, tasks: &[NewTask]) -> anyhow::Result<bool> {
         let mut conn = self.conn();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let done = tx.query_row("SELECT 1 FROM memory WHERE key = ?1", params![INITIALIZED], |_| Ok(())).optional()?;
         if done.is_some() {
             return Ok(false);

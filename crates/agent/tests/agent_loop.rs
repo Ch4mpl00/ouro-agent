@@ -9,10 +9,9 @@ use agent::{
     db::{MemoryStore, TraceStore},
     errors::is_aborted,
     langfuse::{Attr, FinishedSpan, LangfuseTracer, SpanSink},
-    mcp::Mcp,
     models::default_presets,
     providers::{ChatProvider, CompletionParams, CompletionResult, ProviderKind, assistant},
-    session::{EnvDeps, Format},
+    session::Format,
     skills::{FsSkillStore, SkillStore, SkillTools},
     supervisor::{PendingSignal, create_supervisor},
     trace_model::ObservationType,
@@ -37,7 +36,7 @@ fn mentions(messages: &[agent::providers::Message], text: &str) -> bool {
 
 // ── AgentLoop working memory ────────────────────────────────────────────────
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn saves_small_mcp_and_synthetic_outputs_without_changing_mcp_schemas_or_arguments() {
     let session = task_context("task");
     let (s1, s2) = (session.clone(), session.clone());
@@ -76,7 +75,7 @@ fn obj(v: Value) -> Map<String, Value> {
     v.as_object().unwrap().clone()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keeps_large_results_out_of_the_next_llm_turn_and_allows_an_explicit_full_read() {
     let payload = "news ".repeat(2_000) + "secret tail";
     let session = task_context("task");
@@ -104,7 +103,7 @@ async fn keeps_large_results_out_of_the_next_llm_turn_and_allows_an_explicit_ful
     assert_eq!(session.memory.list().len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supports_put_get_list_delete_without_creating_recursive_memory_entries() {
     let session = task_context("task");
     let h = Harness::new(
@@ -149,7 +148,7 @@ async fn supports_put_get_list_delete_without_creating_recursive_memory_entries(
     assert!(h.persist.0.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn validates_memory_tool_arguments_before_writing() {
     for args in
         [json!({"key":"","value":"x"}), json!({"key":"x","value":42}), json!({"key":"x","value":"x","format":"yaml"})]
@@ -172,7 +171,7 @@ async fn validates_memory_tool_arguments_before_writing() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn passes_references_directly_to_a_child_and_shares_memory_without_copying_parent_history() {
     let payload = "source ".repeat(2_000) + "source tail";
     let session = task_context("task");
@@ -219,7 +218,7 @@ async fn passes_references_directly_to_a_child_and_shares_memory_without_copying
     assert_eq!(session.memory.list().len(), 3);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reports_a_missing_input_ref_without_starting_a_child() {
     let (tracer, written) = recording();
     let h = Harness::new(
@@ -244,7 +243,7 @@ async fn reports_a_missing_input_ref_without_starting_a_child() {
     assert_eq!(h.requests(), 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stores_a_large_sub_agent_answer_without_adding_it_to_the_parents_context() {
     let payload = "child answer ".repeat(1_000) + "child tail";
     let session = task_context("task");
@@ -268,7 +267,7 @@ async fn stores_a_large_sub_agent_answer_without_adding_it_to_the_parents_contex
     h.start().await.send("delegate".into()).await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn returns_invalid_arguments_as_a_recoverable_tool_reply() {
     for raw in ["null", "[]", "{broken"] {
         let h = Harness::new(
@@ -294,7 +293,7 @@ async fn returns_invalid_arguments_as_a_recoverable_tool_reply() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keeps_independent_tasks_isolated_even_on_the_same_engine() {
     let session = task_context("task");
     let h = Harness::new(session.clone(), Vec::new(), "found", null());
@@ -307,7 +306,7 @@ async fn keeps_independent_tasks_isolated_even_on_the_same_engine() {
     assert!(second.opts.session.memory.list().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keeps_persistent_set_memory_writes_separate_from_temporary_result_storage() {
     let session = task_context("task");
     let h = Harness::new(
@@ -322,7 +321,7 @@ async fn keeps_persistent_set_memory_writes_separate_from_temporary_result_stora
     assert_eq!(session.memory.list().len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stores_parallel_calls_under_distinct_keys_and_preserves_message_order() {
     let session = task_context("task");
     let h = Harness::new(
@@ -360,7 +359,7 @@ async fn stores_parallel_calls_under_distinct_keys_and_preserves_message_order()
     assert_eq!(session.memory.list().len(), 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn returns_parallel_successes_and_failures_to_the_model_for_its_next_decision() {
     let session = task_context("task");
     let h = Harness::new(
@@ -390,7 +389,7 @@ async fn returns_parallel_successes_and_failures_to_the_model_for_its_next_decis
     assert_eq!(session.memory.get(&entries[0].key).unwrap(), "completed result");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supports_a_general_worker_without_a_domain_skill() {
     let (tracer, written) = recording();
     let h = Harness::new(
@@ -413,7 +412,7 @@ async fn supports_a_general_worker_without_a_domain_skill() {
 
 // ── AgentLoop lifecycle ─────────────────────────────────────────────────────
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn aborts_a_pending_generation_and_ignores_its_late_tool_calls_after_close() {
     let (started, signal) = oneshot::channel::<CancellationToken>();
     let (late, pending) = oneshot::channel::<agent::providers::Message>();
@@ -449,7 +448,7 @@ async fn aborts_a_pending_generation_and_ignores_its_late_tool_calls_after_close
     assert!(is_aborted(&loop_.send("closed".into()).await.unwrap_err()));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancels_a_child_loop_and_closes_its_observations_before_the_parent_trace() {
     let (started, signal) = oneshot::channel::<CancellationToken>();
     let (tracer, written) = recording();
@@ -481,7 +480,7 @@ async fn cancels_a_child_loop_and_closes_its_observations_before_the_parent_trac
     assert!(session.memory.list().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn aborts_the_active_mcp_call_and_never_starts_queued_tools() {
     let (started, signal) = oneshot::channel::<CancellationToken>();
     let started = Mutex::new(Some(started));
@@ -513,7 +512,7 @@ async fn aborts_the_active_mcp_call_and_never_starts_queued_tools() {
     assert!(session.memory.list().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bounds_tool_concurrency_and_preserves_reply_order_when_completions_arrive_out_of_order() {
     let h = Harness::new(
         task_context("task"),
@@ -584,7 +583,7 @@ async fn bounds_tool_concurrency_and_preserves_reply_order_when_completions_arri
     assert_eq!(peak.load(Ordering::SeqCst), 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn times_out_a_generation_aborts_its_request_and_records_the_failure() {
     let (started, signal) = oneshot::channel::<CancellationToken>();
     let (tracer, written) = recording();
@@ -624,16 +623,10 @@ fn signal(source: &str, content: &str) -> PendingSignal {
 const SIGNAL_CONTENT: &str = "chatId=42: summarize";
 
 fn supervisor(h: &Harness) -> Arc<agent::supervisor::Supervisor> {
-    activate_telegram_loop(&h.engine);
-    let timezone: Arc<dyn Mcp> = ToolMcp::returning(Vec::new(), "{\"timezone\":\"UTC\"}");
-    create_supervisor(
-        h.engine.clone(),
-        EnvDeps { mcp: timezone, memory: h.persist.clone(), user_email: None, telegram_chat_id: None },
-        agent::flows::create_flows(h.engine.clone()),
-    )
+    create_supervisor(h.engine.clone())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn waits_for_cancellation_and_trace_cleanup_on_shutdown_without_starting_recovery() {
     for source in ["telegram", "scheduler"] {
         let (started, has_started) = oneshot::channel::<()>();
@@ -674,7 +667,7 @@ async fn waits_for_cancellation_and_trace_cleanup_on_shutdown_without_starting_r
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn loads_telegram_history_before_the_first_generation_and_shares_its_reference_with_workers() {
     let (tracer, written) = recording();
     let history = json!({"messages":[
@@ -728,7 +721,7 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
     assert_eq!(trace.observations.iter().filter(|o| o.kind == ObservationType::Generation).count(), 4);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn guard_gets_only_preloaded_user_messages_and_raw_signal_for_parent_and_worker() {
     let history = json!({"messages":[
         {"id":1,"chat_id":42,"thread_id":null,"role":"user","text":"Yesterday: keep a weekly summary","created_at":"2026-09-06 11:58:00"},
@@ -767,7 +760,7 @@ async fn guard_gets_only_preloaded_user_messages_and_raw_signal_for_parent_and_w
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn runs_a_signal_directly_and_records_parent_worker_tool_io_memory_references_and_per_iteration_usage() {
     let (primary, primary_written) = recording();
     let (mirror, mirror_written) = recording();
@@ -837,7 +830,7 @@ async fn runs_a_signal_directly_and_records_parent_worker_tool_io_memory_referen
     assert!(!trace.observations.iter().any(|o| compiler.is_match(&o.name)));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn records_tool_and_child_failures_as_errors_then_lets_the_parent_continue() {
     let (tracer, written) = recording();
     let h = Harness::new(
@@ -859,7 +852,7 @@ async fn records_tool_and_child_failures_as_errors_then_lets_the_parent_continue
     assert_eq!(failed.kind, ObservationType::Generation);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recovers_a_failed_primary_loop_in_the_same_trace_and_releases_both_loops() {
     let (tracer, written) = recording();
     let h = Harness::new(
@@ -891,7 +884,7 @@ async fn recovers_a_failed_primary_loop_in_the_same_trace_and_releases_both_loop
     assert_eq!(recovery.meta("parent_id"), Some(&json!("telegram:1")));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn discovers_domain_skills_without_preloading_them_into_the_parent() {
     let (tracer, written) = recording();
     let h = Harness::new(task_context("task"), vec![turn(|_| answer("done"))], "unused", tracer);
@@ -901,7 +894,7 @@ async fn discovers_domain_skills_without_preloading_them_into_the_parent() {
     assert!(system.contains("Call find_skills only when the task needs something specific"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn loads_the_shipped_orchestration_and_worker_prompts_with_valid_frontmatter() {
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let skills =
@@ -929,7 +922,7 @@ fn attr<'a>(span: &'a FinishedSpan, key: &str) -> Option<&'a str> {
     })
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exports_the_primary_loop_and_nested_worker_through_the_langfuse_adapter() {
     let (local, local_written) = recording();
     let exported = Arc::new(Exported::default());
@@ -1010,7 +1003,9 @@ fn engine_with(openrouter: Option<Arc<dyn ChatProvider>>) -> Arc<agent::agent::E
         tracer: null(),
         codex: Arc::new(NoCodex),
         decisions: None,
-        workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
+        env: Default::default(),
+        db: agent::db::AgentDb::open(":memory:").unwrap(),
+        store: agent::runs::memory_store(),
         schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
     })
 }
@@ -1044,7 +1039,7 @@ fn text(reply: &str) -> String {
     value["content"].as_str().unwrap_or_default().to_owned()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn whitelist_intersects_skill_tools_and_blocks_hallucinated_calls() {
     for (fm, whitelist, expected) in [
         ("*", Some(vec!["a"]), vec!["a"]),
@@ -1075,7 +1070,7 @@ async fn whitelist_intersects_skill_tools_and_blocks_hallucinated_calls() {
         f.engine.shutdown().await;
     }
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bounded_tools_keep_call_order_and_trace_raw_outputs() {
     let model = Arc::new(Scripted::new(vec![
         calls(&[
@@ -1111,7 +1106,7 @@ async fn bounded_tools_keep_call_order_and_trace_raw_outputs() {
     }
     f.engine.shutdown().await;
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn working_memory_reads_stay_full_and_persistent_state_is_separate() {
     let big = "я🦊".repeat(2000);
     let model = Arc::new(Scripted::new(vec![
@@ -1136,7 +1131,7 @@ async fn working_memory_reads_stay_full_and_persistent_state_is_separate() {
     drop(seen);
     f.engine.shutdown().await;
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn workers_receive_refs_and_isolated_history_and_cannot_delegate() {
     let model = Arc::new(Scripted::new(vec![
         calls(&[("invoke_sub_agent", json!({"prompt":"process","input_refs":["raw"]}))]),
@@ -1170,7 +1165,7 @@ async fn workers_receive_refs_and_isolated_history_and_cannot_delegate() {
 // The workflow-author worker alone is offered the function catalog, the
 // probe and the dry run: every other loop would pay for their schemas on
 // every turn. It runs on `smart` at least, whatever preset the parent left.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn only_the_workflow_author_is_offered_the_catalog_and_the_probe() {
     let model = Arc::new(Scripted::new(vec![
         calls(&[("invoke_sub_agent", json!({"skills":["workflow-author"],"prompt":"draft"}))]),
@@ -1197,7 +1192,7 @@ async fn only_the_workflow_author_is_offered_the_catalog_and_the_probe() {
     f.engine.shutdown().await;
 }
 // A non-writing worker asking for an already loaded skill gets a note.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reading_a_skill_the_loop_already_runs_returns_a_note() {
     let model = Arc::new(Scripted::new(vec![
         calls(&[("read_skill", json!({"name":"author"})), ("read_skill", json!({"name":"other"}))]),
@@ -1225,7 +1220,7 @@ async fn reading_a_skill_the_loop_already_runs_returns_a_note() {
     drop(seen);
     f.engine.shutdown().await;
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn skill_write_authorization_cannot_be_created_by_model_arguments() {
     for authorized in [false, true] {
         let content = "---\ntools: []\n---\nrevised\n";
@@ -1253,7 +1248,7 @@ async fn skill_write_authorization_cannot_be_created_by_model_arguments() {
         f.engine.shutdown().await;
     }
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn writes_reject_broken_frontmatter_unknown_tools_and_escaping_names() {
     for (name, body) in [
         ("telegram", "no frontmatter"),
@@ -1278,7 +1273,7 @@ async fn writes_reject_broken_frontmatter_unknown_tools_and_escaping_names() {
         f.engine.shutdown().await;
     }
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn malformed_arguments_still_leave_error_spans_and_never_call_mcp() {
     for args in ["{broken", "null", "[]", "42"] {
         let message=json!({"role":"assistant","content":null,"tool_calls":[{"id":"bad","type":"function","function":{"name":"echo","arguments":args}}]}).as_object().unwrap().clone();
@@ -1294,7 +1289,7 @@ async fn malformed_arguments_still_leave_error_spans_and_never_call_mcp() {
         f.engine.shutdown().await;
     }
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn budget_duplicate_ids_and_missing_skills_fail_loudly() {
     let model = Arc::new(Scripted::new(vec![calls(&[("working_memory_list", json!({}))])]));
     let f = fixture(model, &[], &[]);
@@ -1313,7 +1308,7 @@ async fn budget_duplicate_ids_and_missing_skills_fail_loudly() {
     assert_eq!(f.mcp.closed.load(Ordering::SeqCst), 1);
     assert!(f.engine.start_loop(LoopOptions::new("later", context())).await.is_err());
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn close_cancels_active_round_joins_tools_and_closes_trace_once() {
     let model =
         Arc::new(Scripted::new(vec![calls(&[("wait", json!({"delay":60000})), ("wait", json!({"delay":60000}))])]));
@@ -1344,7 +1339,7 @@ async fn close_cancels_active_round_joins_tools_and_closes_trace_once() {
 // wait_for_signal blocks on the signal queue; a model that called it would
 // stall its run. It is never offered, even under `tools: *`, and a call to it
 // by name is refused without reaching MCP.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_model_is_never_offered_or_allowed_the_supervisors_wait_for_signal() {
     let model = Arc::new(Scripted::new(vec![calls(&[("wait_for_signal", json!({}))]), assistant("done")]));
     let f = fixture(model.clone(), &["a", "wait_for_signal"], &[("domain", "---\ntools: *\n---\n# domain\n")]);
@@ -1361,7 +1356,7 @@ async fn a_model_is_never_offered_or_allowed_the_supervisors_wait_for_signal() {
     f.engine.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn primary_discovers_and_reads_effective_skill_instructions_in_the_same_loop() {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("skills.default")).unwrap();
@@ -1427,7 +1422,7 @@ fn harness(turns: Vec<Turn>) -> Harness {
     Harness::new(task_context("finish"), turns, "found", null())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn finish_alongside_the_last_action_ends_the_session_without_another_turn() {
     let h = harness(vec![turn(|_| calls(&[("search_news", json!({})), ("finish", json!({"result":"sent"}))]))]);
     let loop_ = h.start().await;
@@ -1441,14 +1436,14 @@ async fn finish_alongside_the_last_action_ends_the_session_without_another_turn(
     h.engine.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn finish_alone_or_without_a_result_ends_with_an_empty_answer() {
     let h = harness(vec![turn(|_| call("finish", json!({})))]);
     assert_eq!(h.start().await.send("go".into()).await.unwrap(), "");
     h.engine.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_call_in_the_round_keeps_the_session_going() {
     let h = harness(vec![
         turn(|_| calls(&[("search_news", json!({})), ("finish", json!({"result":"sent"}))])),
@@ -1462,7 +1457,7 @@ async fn a_failed_call_in_the_round_keeps_the_session_going() {
     h.engine.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_finishes_in_one_round_end_nothing() {
     let h = harness(vec![
         turn(|_| calls(&[("finish", json!({"result":"a"})), ("finish", json!({"result":"b"}))])),
@@ -1477,7 +1472,7 @@ async fn two_finishes_in_one_round_end_nothing() {
     h.engine.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_invalid_finish_is_an_error_the_model_reads() {
     let h = harness(vec![
         turn(|_| call("finish", json!({"result": 5}))),
@@ -1490,7 +1485,7 @@ async fn an_invalid_finish_is_an_error_the_model_reads() {
     h.engine.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_that_finishes_hands_its_result_to_the_parent() {
     let h = harness(vec![
         turn(|_| call("invoke_sub_agent", json!({"skills":["test"],"prompt":"do it"}))),

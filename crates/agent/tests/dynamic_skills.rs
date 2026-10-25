@@ -44,7 +44,7 @@ impl Mcp for MemoryOnly {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn primary_saves_live_rules_then_a_new_session_discovers_them_alongside_domain_skills() {
     let root = tempfile::tempdir().unwrap();
     let defaults = root.path().join("skills.default");

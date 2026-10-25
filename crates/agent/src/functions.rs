@@ -322,16 +322,22 @@ pub fn signal_run(id: i64) -> String {
 
 // The child's trace: a span under the starter's scope, which the child's
 // functions trace into while it lives in this process.
-fn anchor_child(engine: &Engine, child: &str, span: Arc<dyn Span>, session: Option<String>) -> anyhow::Result<()> {
+async fn anchor_child(
+    engine: &Engine,
+    child: &str,
+    span: Arc<dyn Span>,
+    session: Option<String>,
+) -> anyhow::Result<()> {
     if let Some(anchor) = span.anchor() {
-        engine.deps.db.insert_run_trace(&crate::runs::RunTrace {
+        let row = crate::runs::RunTrace {
             run_id: child.into(),
             trace_id: anchor.trace_id,
             session_id: session.or(anchor.session_id),
             parent_span_id: Some(anchor.parent_span_id),
             recorded: false,
             created_ms: crate::runs::now_ms(),
-        })?;
+        };
+        engine.deps.db.write(move |db| db.insert_run_trace(&row)).await?;
     }
     if engine.scopes.current(child).is_none() {
         engine.scopes.own(child, span);
@@ -368,10 +374,13 @@ async fn start_guard(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> 
             parent_loop: ctx.run_id.clone(),
             round,
             confirm: live.opts.confirm.clone(),
-            evidence: engine.deps.db.put_evidence(&id, &serde_json::to_string(&context)?)?,
+            evidence: {
+                let (run, body) = (id.clone(), serde_json::to_string(&context)?);
+                engine.deps.db.write(move |db| db.put_evidence(&run, &body)).await?
+            },
         };
         let span = live.scope().span(SpanStart::new("guard", SpanKind::Chain).input(input.clone()));
-        anchor_child(&engine, &id, span, live.opts.session_id.clone())?;
+        anchor_child(&engine, &id, span, live.opts.session_id.clone()).await?;
         let child = ctx
             .start_child(ChildStart {
                 key: "guard".into(),
@@ -450,8 +459,9 @@ async fn start_worker(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
             crate::runs::WORKER,
             &id,
             &prepared.skill_text(&opts.loaded_skill_text),
-        )?;
-        anchor_child(&engine, &id, span, live.opts.session_id.clone())?;
+        )
+        .await?;
+        anchor_child(&engine, &id, span, live.opts.session_id.clone()).await?;
         let child = ctx
             .start_child(ChildStart {
                 key,
@@ -518,11 +528,12 @@ async fn primary_loop(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
             "memory": session.memory.snapshot(),
         });
         let loop_host =
-            crate::agent::loop_host(&engine, &opts, PRIMARY, &id, &prepared.skill_text(&opts.loaded_skill_text))?;
+            crate::agent::loop_host(&engine, &opts, PRIMARY, &id, &prepared.skill_text(&opts.loaded_skill_text))
+                .await?;
         let scope = engine.scope_for(&ctx.run_id, &ctx.definition);
         let span = scope
             .span(SpanStart::new("agent_loop", SpanKind::Chain).metadata(metadata(json!({"activity":"primary_loop"}))));
-        anchor_child(&engine, &id, span, Some(session.id.clone()))?;
+        anchor_child(&engine, &id, span, Some(session.id.clone())).await?;
         let child = ctx
             .start_child(ChildStart {
                 key: key.into(),
@@ -576,11 +587,12 @@ async fn recovery_loop(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -
             "memory": [],
         });
         let loop_host =
-            crate::agent::loop_host(&engine, &opts, RECOVERY, &id, &prepared.skill_text(&opts.loaded_skill_text))?;
+            crate::agent::loop_host(&engine, &opts, RECOVERY, &id, &prepared.skill_text(&opts.loaded_skill_text))
+                .await?;
         let scope = engine.scope_for(&ctx.run_id, &ctx.definition);
         let span =
             scope.span(SpanStart::new("recovery", SpanKind::Agent).metadata(metadata(json!({"skill":"recovery"}))));
-        anchor_child(&engine, &id, span, Some(session.id.clone()))?;
+        anchor_child(&engine, &id, span, Some(session.id.clone())).await?;
         engine
             .runtime
             .start_with(
@@ -793,15 +805,23 @@ async fn resolve_review(engine: Arc<Engine>, args: Value, ctx: FunctionContext) 
         let (call, key, verdict, records) = reviewed(&engine, &ctx, &args).await?;
         let verdict = if verdict.label == "needs_confirmation" && host.confirm.is_some() {
             let store: &dyn crate::confirmation::Store = &engine.deps.db;
-            let outcome = match store.outcome(&ctx.run_id, &key)? {
-                Some(outcome) => outcome,
-                None => store.resolve(
-                    &ctx.run_id,
-                    &key,
-                    args["outcome"].as_str().unwrap_or("unverified"),
-                    &consumed(&records),
-                )?,
-            };
+            let (run, card_key, claimed, events) = (
+                ctx.run_id.clone(),
+                key.clone(),
+                args["outcome"].as_str().unwrap_or("unverified").to_owned(),
+                consumed(&records),
+            );
+            let outcome = engine
+                .deps
+                .db
+                .write(move |db| {
+                    let store: &dyn crate::confirmation::Store = db;
+                    match store.outcome(&run, &card_key)? {
+                        Some(outcome) => Ok(outcome),
+                        None => store.resolve(&run, &card_key, &claimed, &events),
+                    }
+                })
+                .await?;
             crate::confirmation::close_card(
                 store,
                 &*engine.deps.mcp,
@@ -958,7 +978,8 @@ fn trace_delivery(engine: &Engine, ctx: &FunctionContext, target: &str, token: &
         metadata: Some(metadata(json!({"run": target}))),
         ..Default::default()
     });
-    trace.end();
+    // Its write may wait for the engine's lock on agent.db (runs.rs §2).
+    tokio::task::spawn_blocking(move || trace.end());
 }
 
 /// `signal_transcript { ref }`: the bounded JSON transcript of this run's
@@ -1015,7 +1036,12 @@ async fn set_memory(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> R
             .input(args.clone())
             .metadata(metadata(json!({"tool":name,"reference":ctx.task_path,"workflow_run":ctx.run_id}))),
     );
-    let result = engine.deps.memory.set(key, value).map(|()| json!({"ok":true,"key":key}));
+    // A write may wait for the engine's lock on agent.db (runs.rs §2).
+    let (memory, stored, written) = (engine.deps.memory.clone(), key.to_owned(), value.to_owned());
+    let result = match tokio::task::spawn_blocking(move || memory.set(&stored, &written)).await {
+        Ok(set) => set.map(|()| json!({"ok":true,"key":key})),
+        Err(error) => Err(anyhow::Error::from(error)),
+    };
     span.end(match &result {
         Ok(value) => SpanEnd::output(value.clone()),
         Err(error) => SpanEnd::error(error.to_string()).with_output(json!({"error":error.to_string()})),

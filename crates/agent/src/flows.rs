@@ -410,9 +410,7 @@ const PROBE_MAX_CHARS: usize = 6000;
 /// The answer of a tool whose feature returns in a later step of the engine
 /// migration (design 03, decision 9).
 pub fn unavailable(tool: &str, step: &str) -> String {
-    json!({"ok": false, "unavailable": true,
-        "error": format!("{tool} is unavailable until the engine migration's {step} step")})
-    .to_string()
+    json!({"ok": false, "error": format!("{tool} is unavailable until the engine migration's {step} step")}).to_string()
 }
 
 pub async fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::Result<String> {

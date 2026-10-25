@@ -243,6 +243,17 @@ impl Engine {
         ids.sort();
         ids
     }
+    /// Stops the engine's background work and waits for it: the worker
+    /// releases its runs for recovery (shutdown is not an end), and the
+    /// loops' calls in flight are dropped, ending their spans as aborted.
+    pub async fn halt(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        self.stop.cancel();
+        let background = self.background.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(background) = background {
+            let _ = background.await;
+        }
+    }
     pub fn stopping(&self) -> &CancellationToken {
         &self.stop
     }
@@ -252,12 +263,7 @@ impl Engine {
         if *done {
             return;
         }
-        // The worker releases its runs for recovery: shutdown is not an end.
-        self.stop.cancel();
-        let background = self.background.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(background) = background {
-            let _ = background.await;
-        }
+        self.halt().await;
         let loops: Vec<_> = self.loops.lock().await.drain().map(|(_, l)| l).collect();
         // Cancel everyone first, then join their finalizers before clients close.
         for loop_ in &loops {
@@ -596,21 +602,22 @@ impl AgentLoop {
                 .to_owned();
             (json!({"messages": *messages, "memory": self.opts.session.memory.snapshot()}), task)
         };
-        self.admit_guard(self.guard_context(&task)).await;
-        let host = loop_host(&engine, &self.opts, crate::runs::LOOP, &run, &self.loaded_skills)?;
+        self.admit_task(&task).await;
+        let host = loop_host(&engine, &self.opts, crate::runs::LOOP, &run, &self.loaded_skills).await?;
         if run != self.opts.id {
             engine.loops.lock().await.insert(run.clone(), self.clone());
         }
         let scope = self.scope();
         if let Some(anchor) = scope.anchor() {
-            engine.deps.db.insert_run_trace(&crate::runs::RunTrace {
+            let row = crate::runs::RunTrace {
                 run_id: run.clone(),
                 trace_id: anchor.trace_id,
                 session_id: anchor.session_id,
                 parent_span_id: Some(anchor.parent_span_id),
                 recorded: false,
                 created_ms: crate::runs::now_ms(),
-            })?;
+            };
+            engine.deps.db.write(move |db| db.insert_run_trace(&row)).await?;
         }
         engine.scopes.borrow(&run, scope);
         let started = engine
@@ -832,9 +839,16 @@ impl AgentLoop {
                 Ok(crate::skills::catalog_snapshot(&*engine.deps.skill_store).await?.to_string())
             }
             "set_memory" => {
-                let key = string_arg(args, "key", true)?;
-                let value = string_arg(args, "value", false)?;
-                engine.deps.memory.set(key, value)?;
+                let key = string_arg(args, "key", true)?.to_owned();
+                let value = string_arg(args, "value", false)?.to_owned();
+                anyhow::ensure!(
+                    !key.starts_with(crate::runs::RESERVED_MEMORY_PREFIX),
+                    "`{key}` is a key the runtime keeps"
+                );
+                // A write may wait for the engine's lock on agent.db (runs.rs §2).
+                let memory = engine.deps.memory.clone();
+                let stored = key.clone();
+                tokio::task::spawn_blocking(move || memory.set(&stored, &value)).await??;
                 Ok(format!("ok — stored {key}"))
             }
             "working_memory_put" => {
@@ -1282,18 +1296,36 @@ impl Engine {
 /// The host data a loop run of `opts` is admitted with (`kind`), its
 /// evidence stored and linked to `run` first. `skill_text`: the skills and
 /// the preselected block the loop is told (the guard's evidence).
-pub fn loop_host(
+pub async fn loop_host(
     engine: &Engine,
     opts: &LoopOptions,
     kind: &str,
     run: &str,
     skill_text: &str,
 ) -> anyhow::Result<crate::runs::LoopHost> {
-    let db = &engine.deps.db;
-    let put = |body: Option<&str>| -> anyhow::Result<Option<String>> {
-        body.filter(|b| !b.is_empty()).map(|b| db.put_evidence(run, b)).transpose()
-    };
     let earlier = (!opts.earlier_user_messages.is_empty()).then(|| json!(opts.earlier_user_messages).to_string());
+    let bodies = [
+        opts.root_request.clone(),
+        opts.guard_request.clone(),
+        Some(skill_text.to_owned()),
+        earlier,
+        Some(opts.loaded_skill_text.clone()),
+        opts.system_prompt.clone(),
+    ];
+    let run_id = run.to_owned();
+    let [root_request, guard_request, skills, earlier, preselect, system] = engine
+        .deps
+        .db
+        .write(move |db| {
+            let mut digests = Vec::new();
+            for body in bodies {
+                digests.push(body.filter(|b| !b.is_empty()).map(|b| db.put_evidence(&run_id, &b)).transpose()?);
+            }
+            Ok::<_, anyhow::Error>(digests)
+        })
+        .await?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("six evidence digests"))?;
     let mut whitelist = opts.tool_whitelist.as_ref().map(|w| w.iter().cloned().collect::<Vec<_>>());
     if let Some(w) = &mut whitelist {
         w.sort();
@@ -1314,15 +1346,10 @@ pub fn loop_host(
         tool_whitelist: whitelist,
         include_engine_skills: opts.include_engine_skills,
         parent_id: opts.parent_id.clone(),
-        root_request_digest: put(opts.root_request.as_deref())?,
-        guard_request: put(opts.guard_request.as_deref())?,
+        root_request_digest: root_request,
+        guard_request,
         signal_id: opts.signal_id,
-        evidence: crate::runs::LoopEvidence {
-            skills: put(Some(skill_text))?,
-            earlier: put(earlier.as_deref())?,
-            preselect: put(Some(&opts.loaded_skill_text))?,
-            system: put(opts.system_prompt.as_deref())?,
-        },
+        evidence: crate::runs::LoopEvidence { skills, earlier, preselect, system },
     })
 }
 
@@ -1394,6 +1421,12 @@ impl AgentLoop {
                 loaded.names.push(name);
             }
         }
+    }
+
+    /// The guard's evidence for a loop the host runs itself, from its
+    /// options and its first user message `task` (once).
+    pub async fn admit_task(&self, task: &str) {
+        self.admit_guard(self.guard_context(task)).await;
     }
 
     // Only the host sets this evidence: from the loop's options, or from a

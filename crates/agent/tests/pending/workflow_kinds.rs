@@ -177,7 +177,7 @@ fn send() -> agent::providers::Message {
     calls(&[(SEND.0, json!({"chatId":"999","text":SEND.1}))])
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_semi_deterministic_workflow_saves_tries_and_runs_on_a_scheduled_signal() {
     let a = agent(vec![send(), assistant("Sent the summary."), send(), assistant("Sent the summary.")]);
     let definition = pages();
@@ -247,7 +247,7 @@ async fn a_semi_deterministic_workflow_saves_tries_and_runs_on_a_scheduled_signa
     a.supervisor.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deterministic_calls_keep_full_results_and_model_calls_are_not_duplicated() {
     for loop_metadata in [false, true] {
         let a = agent(vec![send(), assistant("Sent the summary.")]);
@@ -311,7 +311,7 @@ async fn deterministic_calls_keep_full_results_and_model_calls_are_not_duplicate
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agent_turns_need_the_guarded_round_and_steps_alone_need_none() {
     let a = agent(vec![]);
     let bare = "document: {dsl: '1.0.4', namespace: t, name: bare, version: '1.0.0'}\ndo: [{turn: {call: agent_turn, with: {messages: '${ .messages }'}}}]\n";
@@ -345,7 +345,7 @@ async fn agent_turns_need_the_guarded_round_and_steps_alone_need_none() {
 
 // The model's parameters are the host's: a child a workflow starts itself is
 // never admitted, and cannot be handed a spec through its input.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_child_a_workflow_starts_is_never_admitted() {
     let a = agent(vec![]);
     let activate = |name: &str, body: &str| {
@@ -382,7 +382,7 @@ async fn a_child_a_workflow_starts_is_never_admitted() {
     assert!(a.model.seen.lock().unwrap().is_empty(), "no turn was taken");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_task_copied_from_agent_loop_runs_as_the_primary_loop_and_falls_back_after_three_faults() {
     let mut script = vec![calls(&[("fetch_page", json!({"url":"https://c.example"}))]), assistant("Daily summary: C")];
     script.extend((1..=4).map(|n| assistant(&format!("handled {n}"))));
@@ -433,7 +433,7 @@ async fn a_task_copied_from_agent_loop_runs_as_the_primary_loop_and_falls_back_a
 
 // A scheduled task's admission: what its definition declares, else the
 // scheduled defaults, pinned in the run's input.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_workflow_declares_the_model_parameters_it_is_admitted_with() {
     let a = agent(vec![]);
     let declared = "document: {dsl: '1.0.4', namespace: t, name: declared, version: '1.0.0', metadata: {agent: {preset: smartest, confirm: none}}}\ndo: [{page: {call: fetch_page, with: {url: x}}}]\n";

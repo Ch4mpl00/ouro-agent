@@ -10,7 +10,6 @@ use agent::{
     mcp::Mcp,
     models::default_presets,
     providers::{ChatProvider, CompletionParams, CompletionResult, Message, ProviderKind, ToolDef, assistant, role},
-    session::EnvDeps,
     skills::FsSkillStore,
     supervisor::{PendingSignal, create_supervisor},
     tracing::NullTracer,
@@ -88,7 +87,9 @@ fn engine(model: Model, tools: &[&str], store: Arc<FsSkillStore>) -> Arc<agent::
         tracer: Arc::new(NullTracer),
         codex: Arc::new(NoCodex),
         decisions: Some(support::allow_guard()),
-        workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
+        env: Default::default(),
+        db: agent::db::AgentDb::open(":memory:").unwrap(),
+        store: agent::runs::memory_store(),
         schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
     })
 }
@@ -103,7 +104,7 @@ fn live_files(dir: &Path) -> Vec<String> {
 
 // Loading a skill is not authorization. A model may request dreaming in any
 // signal, but only the supervisor's actual dreaming signal authorizes a worker.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delegating_to_dreaming_only_writes_for_an_authorized_signal() {
     for source in ["telegram", "scheduler", "news-digest", "dreaming"] {
         let dir = tempfile::tempdir().unwrap();
@@ -136,16 +137,7 @@ async fn delegating_to_dreaming_only_writes_for_an_authorized_signal() {
         }));
         let store = Arc::new(FsSkillStore { live_dir: live_dir.clone(), defaults_dir });
         let engine = engine(model, &[], store.clone());
-        let supervisor = create_supervisor(
-            engine.clone(),
-            EnvDeps {
-                mcp: engine.deps.mcp.clone(),
-                memory: engine.deps.memory.clone(),
-                user_email: None,
-                telegram_chat_id: None,
-            },
-            agent::flows::create_flows(engine.clone()),
-        );
+        let supervisor = create_supervisor(engine.clone());
         supervisor
             .run_signal(&PendingSignal {
                 id: 1,

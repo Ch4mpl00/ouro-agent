@@ -99,12 +99,24 @@ impl RunTrace {
 }
 
 impl AgentDb {
+    /// Runs `f` (a write) on the blocking pool. The engine's store shares
+    /// this file and holds its write lock across the awaits of a commit, so
+    /// a write that waits for that lock must never block the task or thread
+    /// that polls the engine's runs (the worker drives them all in one task).
+    pub async fn write<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&AgentDb) -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<T> {
+        let db = self.clone();
+        tokio::task::spawn_blocking(move || f(&db)).await?
+    }
+
     /// Stores `body` (immutable, content-addressed) and links it to `run`,
     /// before the engine admits the run (design 03, R2-H1). Returns its digest.
     pub fn put_evidence(&self, run: &str, body: &str) -> anyhow::Result<String> {
         let digest = digest(body);
         let mut conn = self.conn();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO evidence (digest, body, created_ms) VALUES (?1, ?2, ?3) ON CONFLICT(digest) DO NOTHING",
             params![digest, body, now_ms()],
@@ -179,7 +191,7 @@ impl AgentDb {
     /// never faults on a missing function at resume (design 01, decision 16).
     pub fn snapshot_tools(&self, tools: &[(String, bool)]) -> anyhow::Result<()> {
         let mut conn = self.conn();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         for (name, read_only) in tools {
             tx.execute(
                 "INSERT INTO tool_snapshot (name, read_only, seen_ms) VALUES (?1, ?2, ?3)
@@ -583,7 +595,7 @@ impl AgentDb {
     /// no run links any more (never by age alone, R2-H1).
     pub fn sweep_runs(&self, ended: &[String]) -> anyhow::Result<usize> {
         let mut conn = self.conn();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut deleted = 0;
         for run in ended {
             deleted += tx.execute("DELETE FROM run_trace WHERE run_id = ?1 AND recorded = 1", [run])?;

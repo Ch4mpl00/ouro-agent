@@ -184,7 +184,9 @@ fn engine(model: Arc<Model>, world: Arc<World>) -> Arc<Engine> {
         tracer: Arc::new(agent::tracing::NullTracer),
         codex: Arc::new(NoCodex),
         decisions: Some(support::allow_guard()),
-        workflows: Arc::new(MemoryWorkflows::default()),
+        env: Default::default(),
+        db: agent::db::AgentDb::open(":memory:").unwrap(),
+        store: agent::runs::memory_store(),
         schedule: Arc::new(agent::schedule::MemorySchedule::default()),
     })
 }

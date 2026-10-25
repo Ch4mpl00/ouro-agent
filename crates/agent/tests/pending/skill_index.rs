@@ -173,7 +173,7 @@ impl Sandbox {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn installed_workflow_indexes_once_then_only_changed_skills_and_removes_deleted() {
     let s = Sandbox::new(&["Alpha routing", "Beta routing", "Alpha revised"]);
     let first = s.completed(1).await;
@@ -203,7 +203,7 @@ async fn installed_workflow_indexes_once_then_only_changed_skills_and_removes_de
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prompt_changes_invalidate_descriptions_and_edits_survive_database_reopen() {
     let s = Sandbox::new(&["Alpha", "Beta", "New alpha", "New beta"]);
     s.completed(1).await;
@@ -223,7 +223,7 @@ async fn prompt_changes_invalidate_descriptions_and_edits_survive_database_reope
     assert_eq!(count, 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn generation_failure_does_not_discard_other_results_and_next_run_retries_it() {
     let s = Sandbox::new(&["", "Beta", "Alpha recovered"]);
     let first = s.completed(1).await;
@@ -234,7 +234,7 @@ async fn generation_failure_does_not_discard_other_results_and_next_run_retries_
     assert_eq!(second["indexed"], 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_document_edit_is_not_overwritten() {
     let s = Sandbox::new(&["Alpha", "Beta"]);
     s.memory.lock().unwrap().conflict = true;
@@ -242,7 +242,7 @@ async fn concurrent_document_edit_is_not_overwritten() {
     assert_eq!(s.memory.lock().unwrap().doc.as_ref().unwrap()["body"], "other writer");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dry_run_generates_without_writing_memory() {
     let s = Sandbox::new(&["Alpha", "Beta"]);
     let trace =
@@ -267,7 +267,7 @@ async fn dry_run_generates_without_writing_memory() {
     trace.end();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_tracks_overlay_patch_tools_and_routable_without_timestamp_noise() {
     let s = Sandbox::new(&[]);
     let before = catalog_snapshot(&*s.skills).await.unwrap();
@@ -280,7 +280,7 @@ async fn snapshot_tracks_overlay_patch_tools_and_routable_without_timestamp_nois
     assert_eq!(hash_value(&json!({"a":1,"nested":{"x":2,"y":3}})), hash_value(&json!({"nested":{"y":3,"x":2},"a":1})));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lost_write_response_and_replaying_a_completed_run_do_not_duplicate_writes_or_generations() {
     let s = Sandbox::new(&["Alpha", "Beta"]);
     let wf = s.db.active("skill-index").unwrap().unwrap();
@@ -293,7 +293,7 @@ async fn lost_write_response_and_replaying_a_completed_run_do_not_duplicate_writ
     assert_eq!(s.llm.seen.lock().unwrap().len(), 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn changed_source_is_not_published_from_an_old_generation() {
     let s = Sandbox::new(&["Old alpha", "Beta"]);
     let path = s.dir.path().join("skills.default/alpha.md");
@@ -304,7 +304,7 @@ async fn changed_source_is_not_published_from_an_old_generation() {
     assert!(s.index()["skills"].get("alpha").is_none());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn excluded_skills_are_removed_without_model_calls_and_invalid_metadata_is_rejected() {
     let s = Sandbox::new(&["Alpha", "Beta"]);
     s.completed(1).await;
@@ -315,7 +315,7 @@ async fn excluded_skills_are_removed_without_model_calls_and_invalid_metadata_is
     assert!(s.skills.save_skill("alpha", "---\nroutable: maybe\ntools: []\n---\nalpha").await.is_err());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_corrupt_document_is_never_overwritten() {
     let s = Sandbox::new(&[]);
     s.memory.lock().unwrap().doc = Some(json!({"body":"{broken json","version":1,"searchable":false}));

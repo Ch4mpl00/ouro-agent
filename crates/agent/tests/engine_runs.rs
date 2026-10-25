@@ -4,7 +4,7 @@ mod support;
 use serde_json::json;
 use support::*;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_loop_answers_as_an_engine_run() {
     let (tracer, _written) = recording();
     let h = Harness::new(task_context("t1"), vec![turn(|_| answer("hello"))], "ok", tracer);
@@ -15,7 +15,7 @@ async fn a_loop_answers_as_an_engine_run() {
     assert_eq!(run.admission.host().unwrap()["kind"], "loop");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_loop_calls_a_read_and_answers() {
     let (tracer, _written) = recording();
     let h = Harness::new(
@@ -41,7 +41,7 @@ fn signal(id: i64, source: &str, content: &str) -> agent::supervisor::PendingSig
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_signal_runs_its_primary_loop_as_a_child_of_its_run() {
     let provider = std::sync::Arc::new(Scripted::new(vec![agent::providers::assistant("done")]));
     let f = fixture(provider, &[], &[("scheduler", "---\ntools: *\n---\nscheduled")]);
@@ -53,7 +53,7 @@ async fn a_signal_runs_its_primary_loop_as_a_child_of_its_run() {
     supervisor.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_runs_as_a_host_child_and_its_answer_reaches_the_parent() {
     let (tracer, _written) = recording();
     let h = Harness::new(

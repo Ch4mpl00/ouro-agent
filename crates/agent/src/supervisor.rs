@@ -3,7 +3,7 @@
 use crate::{
     activity::ACTIVITY_STREAM,
     agent::{Engine, EngineDeps},
-    errors::{aborted, check, is_aborted},
+    errors::{aborted, check},
     mcp::{Mcp, SharedMcp},
     session::{Format, Session},
     skills::{FindSkillsParams, append_patch, find_skills, read_skill_index},
@@ -501,7 +501,7 @@ impl Supervisor {
     // signal's when it ended; a suspended tree answers that it resumes.
     async fn run_active(self: &Arc<Self>, signal: &PendingSignal) -> anyhow::Result<String> {
         let engine = &self.engine;
-        engine.ready().await?;
+        engine.ready().await.map_err(|e| e.context("booting the engine"))?;
         let run = crate::functions::signal_run(signal.id);
         let id = format!("{}:{}", signal.source, signal.id);
         let saved = signal.saved_workflow();
@@ -510,14 +510,18 @@ impl Supervisor {
         let started = async {
             // The anchor and the evidence go in before the engine admits it.
             if let Some(anchor) = trace.anchor() {
-                engine.deps.db.insert_run_trace(&crate::runs::RunTrace {
-                    run_id: run.clone(),
-                    trace_id: anchor.trace_id,
-                    session_id: anchor.session_id,
-                    parent_span_id: Some(anchor.parent_span_id),
-                    recorded: false,
-                    created_ms: crate::runs::now_ms(),
-                })?;
+                engine
+                    .deps
+                    .db
+                    .insert_run_trace(&crate::runs::RunTrace {
+                        run_id: run.clone(),
+                        trace_id: anchor.trace_id,
+                        session_id: anchor.session_id,
+                        parent_span_id: Some(anchor.parent_span_id),
+                        recorded: false,
+                        created_ms: crate::runs::now_ms(),
+                    })
+                    .map_err(|e| e.context("anchoring the signal run"))?;
             }
             let host = crate::runs::SignalHost {
                 kind: crate::runs::SIGNAL.into(),
@@ -536,11 +540,19 @@ impl Supervisor {
                     json!({ "signal": signal_value(signal) }),
                     ouro_runtime::Start { version: None, host: serde_json::to_value(&host)? },
                 )
-                .await?;
+                .await
+                .map_err(|e| e.context("admitting the signal run"))?;
             let recovery = format!("{}:{}", crate::runs::RECOVERY, signal.id);
-            crate::runs::wait_quiescent(engine, &[run.clone(), recovery], &self.cancel).await
+            crate::runs::wait_quiescent(engine, &[run.clone(), recovery], &self.cancel)
+                .await
+                .map_err(|e| e.context("waiting for the signal's tree"))
         }
         .await;
+        if self.cancel.is_cancelled() {
+            // Shutdown: the runs are released for recovery first, so their
+            // calls in flight end (as aborted) before the trace does.
+            engine.halt().await;
+        }
         let ended = engine.runtime.get(&run).await.ok().flatten().and_then(|r| r.outcome);
         let outcome = match (started, &ended) {
             (Err(error), _) => Err(error),
@@ -554,7 +566,7 @@ impl Supervisor {
         };
         match (&ended, &outcome) {
             (Some(status), _) => trace.update(crate::runs::final_output(status)),
-            (None, Err(error)) if !is_aborted(error) => trace.update(ContextUpdate {
+            (None, Err(error)) => trace.update(ContextUpdate {
                 output: Some(json!({"error":error.to_string()})),
                 metadata: Some(json!({"error":true}).as_object().unwrap().clone()),
                 ..Default::default()
@@ -564,7 +576,7 @@ impl Supervisor {
         engine.scopes.release(&run);
         trace.end();
         if ended.is_some() {
-            engine.deps.db.mark_recorded(&run)?;
+            engine.deps.db.mark_recorded(&run).map_err(|e| e.context("recording the signal run"))?;
         }
         check(&self.cancel)?;
         outcome

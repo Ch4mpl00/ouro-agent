@@ -149,7 +149,7 @@ fn setup_with(
     );
     (f, mcp, supervisor)
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn signals_without_saved_workflows_run_the_primary_loop_with_the_source_context() {
     for source in ["scheduler", "telegram", "dreaming", "new-domain"] {
         let model = Arc::new(Scripted::new(vec![assistant("done"), assistant("done")]));
@@ -185,7 +185,7 @@ async fn signals_without_saved_workflows_run_the_primary_loop_with_the_source_co
 // A scheduled task naming a saved workflow runs it without a model. A
 // run that faulted before any write hands the task to the agent loop; one
 // that faulted after a write only recovers, as a failed execution does.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_saved_workflow_runs_and_faults_hand_over_by_effect() {
     const HEAD: &str = "document: { dsl: '1.0.4', namespace: agent, name: w, version: '1.0.0' }\n";
     let cases = [
@@ -259,7 +259,7 @@ async fn a_saved_workflow_runs_and_faults_hand_over_by_effect() {
 }
 // An interrupted saved workflow is still the durable worker's to finish:
 // the signal ends without a recovery report and without the agent loop.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_interrupted_saved_workflow_is_left_to_durable_recovery() {
     struct Interrupting;
     #[async_trait]
@@ -300,7 +300,7 @@ async fn an_interrupted_saved_workflow_is_left_to_durable_recovery() {
 // A scheduled fire runs on the supervisor like a queued signal: with the
 // environment note one carries, and its saved workflow when the task names
 // one. A supervisor that is stopping starts nothing: the slot goes back.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_scheduled_fire_runs_as_a_signal_with_mcps_note_and_its_workflow() {
     use agent::schedule::{FIRST_FIRE_ID, Fire, FireSink, Fired, SupervisorSink};
     let model = Arc::new(Scripted::new(vec![assistant("done"), assistant("done")]));
@@ -334,7 +334,7 @@ async fn a_scheduled_fire_runs_as_a_signal_with_mcps_note_and_its_workflow() {
     assert_eq!(sink.fire(fire(3, "scheduler", None)).await, Fired::NotStarted);
     assert!(f.db.get_trace(&format!("scheduler:{}", FIRST_FIRE_ID + 3)).unwrap().is_none());
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn history_scopes_chat_topic_and_time_excludes_current_and_keeps_memory() {
     let mcp = ContextMcp::default();
     mcp.history.lock().unwrap().extend([
@@ -364,7 +364,7 @@ async fn history_scopes_chat_topic_and_time_excludes_current_and_keeps_memory() 
         json!({"chatId":"-10042","limit":20,"threadId":7}).as_object().unwrap().clone()
     );
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nontelegram_and_spoofed_headers_do_not_fetch_history() {
     for source in ["scheduler", "new-domain", "dreaming"] {
         let mcp = ContextMcp::default();
@@ -388,7 +388,7 @@ async fn nontelegram_and_spoofed_headers_do_not_fetch_history() {
 }
 // A peer signal runs on the parent with its own skill, like Telegram: the
 // thread's earlier turns come before the message, Telegram history never.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_peer_signal_loads_its_skill_and_the_earlier_turns_of_its_thread() {
     let model = Arc::new(Scripted::new(vec![assistant("done"), assistant("done")]));
     let (_f, mcp, supervisor) = setup(model.clone());
@@ -417,7 +417,7 @@ async fn a_peer_signal_loads_its_skill_and_the_earlier_turns_of_its_thread() {
 // With durable flows, a signal's primary loop runs as an `agent-loop` run:
 // the same answer, the same trace for the judge and the journal, and a
 // completed run in agent.db.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_signal_with_durable_flows_runs_its_loop_as_an_agent_loop_run() {
     let model = Arc::new(Scripted::new(vec![assistant("done"), assistant("done")]));
     let mut f = fixture(model.clone(), &[], SKILLS);
@@ -475,7 +475,7 @@ fn jev(broken: bool) -> (Arc<Jev>, Arc<agent::decisions::DecisionClient>) {
 }
 // The skills a message needs are chosen before the first turn and inlined,
 // so the model starts with the channel's rules instead of searching for them.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_signal_starts_with_the_skills_jev_selects_for_it() {
     let model = Arc::new(Scripted::new(vec![assistant("done"), assistant("done")]));
     let (api, client) = jev(false);
@@ -498,7 +498,7 @@ async fn a_signal_starts_with_the_skills_jev_selects_for_it() {
     assert_eq!(search.meta("automatic"), Some(&json!(true)));
     supervisor.shutdown().await;
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_preselection_leaves_the_search_to_the_model() {
     let model = Arc::new(Scripted::new(vec![assistant("done"), assistant("done")]));
     let (_api, client) = jev(true);
@@ -513,7 +513,7 @@ async fn a_failed_preselection_leaves_the_search_to_the_model() {
     assert!(obs.iter().any(|o| o.name == "find_skills" && o.level == "ERROR"));
     supervisor.shutdown().await;
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_new_peer_thread_is_the_message_alone() {
     let mcp = ContextMcp::default();
     mcp.thread.lock().unwrap().push(peer_message(1, "in", "And times 3?", "2026-09-06 12:00:00"));
@@ -538,7 +538,7 @@ fn oversized_history_prefers_recent_whole_messages_and_utf8_safe_tail() {
     assert!(inline[0]["text"].as_str().unwrap().ends_with("Collect for the week?"));
     assert_eq!(inline[0]["truncated"], true);
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recent_activity_is_bounded_oldest_first_and_stays_out_of_user_history() {
     let model = Arc::new(Scripted::new(vec![assistant("done"), assistant("done")]));
     let (f, mcp, supervisor) = setup(model.clone());
@@ -572,7 +572,7 @@ impl agent::providers::ChatProvider for PendingProvider {
         std::future::pending().await
     }
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_cancels_generation_without_recovery_and_closes_trace_before_clients() {
     let model = Arc::new(PendingProvider { started: tokio::sync::Notify::new(), cancel: Mutex::new(None) });
     let (f, mcp, supervisor) = setup(model.clone());
@@ -588,7 +588,7 @@ async fn shutdown_cancels_generation_without_recovery_and_closes_trace_before_cl
     assert!(obs.iter().any(|o| o.name == "iter-0" && o.level == "ERROR"));
     assert!(supervisor.run_signal(&signal("telegram", 43)).await.is_err());
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn queue_polling_handles_signals_serially_and_survives_bad_polls() {
     let model = Arc::new(Scripted::new(vec![assistant("first"), assistant("second")]));
     let (f, mcp, supervisor) = setup(model.clone());
@@ -646,7 +646,7 @@ fn queue_contract_requires_nullable_fields_and_integer_counts() {
 // Rust-only: with an empty queue the loop waits on wait_for_signal and takes
 // the signal the moment the wait ends — no poll interval in between (it is
 // an hour here, so a sleep would show).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_empty_queue_is_waited_on_and_a_new_signal_taken_at_once() {
     let model = Arc::new(Scripted::new(vec![assistant("handled")]));
     let (f, mcp, supervisor) = setup(model.clone());
@@ -683,7 +683,7 @@ async fn an_empty_queue_is_waited_on_and_a_new_signal_taken_at_once() {
 // Rust-only: a wait that fails (MCP down, a reply of the wrong shape) is an
 // error like any other — the loop backs off instead of spinning on
 // get_next_signal.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_wait_backs_off_instead_of_spinning() {
     let model = Arc::new(Scripted::new(vec![]));
     let (_f, mcp, supervisor) = setup(model);
@@ -702,7 +702,7 @@ async fn a_failed_wait_backs_off_instead_of_spinning() {
 // The agent may replace how signals are handled: the version it activates
 // under `signal` (after a dry run) handles every signal after it, and three
 // faults of it in a row put the built-in one back.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_activated_signal_workflow_handles_signals_until_its_breaker_opens() {
     let model = Arc::new(Scripted::new((0..4).map(|_| assistant("done")).collect()));
     let (f, _mcp, supervisor) = setup(model.clone());
@@ -740,7 +740,7 @@ async fn an_activated_signal_workflow_handles_signals_until_its_breaker_opens() 
 
 // Recovery policy belongs to the activated signal definition, even though
 // the host keeps the same report span and loop lifecycle.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_activated_signal_override_changes_the_recovery_prompt() {
     let model = Arc::new(Scripted::new(vec![assistant("reported")]));
     let (f, _, supervisor) = setup(model.clone());
@@ -789,7 +789,7 @@ do:
     supervisor.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recovery_failure_keeps_the_primary_error_and_transcript() {
     for invalid_preset in [false, true] {
         let model = Arc::new(Scripted::new(vec![calls(&[("t1", json!({"marker":"primary transcript marker"}))])]));
@@ -821,7 +821,7 @@ async fn recovery_failure_keeps_the_primary_error_and_transcript() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_signal_override_without_a_catch_gets_no_automatic_recovery() {
     let model = Arc::new(Scripted::new(vec![]));
     let (f, _, supervisor) = setup(model.clone());
@@ -835,7 +835,7 @@ async fn a_signal_override_without_a_catch_gets_no_automatic_recovery() {
     supervisor.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_catch_before_signal_session_cannot_start_recovery() {
     let model = Arc::new(Scripted::new(vec![]));
     let (f, _, supervisor) = setup(model.clone());
@@ -850,7 +850,7 @@ async fn a_catch_before_signal_session_cannot_start_recovery() {
     supervisor.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_abort_without_supervisor_shutdown_gets_no_recovery() {
     struct Aborting;
     #[async_trait]
@@ -885,7 +885,7 @@ async fn an_abort_without_supervisor_shutdown_gets_no_recovery() {
     supervisor.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn button_routing_delivers_without_a_model_and_falls_back_with_telegram_context() {
     use owf::run::Events;
     let model = Arc::new(Scripted::new(vec![
@@ -947,7 +947,7 @@ fn confirmation_fixture(model: Arc<Scripted>, mcp: Arc<ContextMcp>) -> Fixture {
     f
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn confirmation_holds_exact_call_frees_supervisor_and_resumes_after_press_or_expiry() {
     for mode in ["confirmed", "declined", "expired", "restart"] {
         let args = json!({"recipient":"original@example.test","body":"exact original arguments"});
@@ -1111,7 +1111,7 @@ async fn confirmation_holds_exact_call_frees_supervisor_and_resumes_after_press_
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_override_cannot_forge_confirmation_without_a_consumed_event() {
     let model = Arc::new(Scripted::new(vec![
         calls(&[("t1", json!({"amount":5}))]),
@@ -1147,7 +1147,7 @@ async fn an_override_cannot_forge_confirmation_without_a_consumed_event() {
     supervisor.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_next_session_knows_pending_cards_in_its_conversation_only() {
     let model = Arc::new(Scripted::new(vec![
         calls(&[("t1", json!({"operation":"pending action"}))]),
@@ -1184,7 +1184,7 @@ async fn the_next_session_knows_pending_cards_in_its_conversation_only() {
     supervisor.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_confirmation_sleeps_its_parent_and_survives_restart() {
     for restart in [false, true] {
         let args = json!({"recipient":"worker@example.test","body":"held exactly once"});
@@ -1260,7 +1260,7 @@ async fn a_worker_confirmation_sleeps_its_parent_and_survives_restart() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn confirmation_during_the_hold_finishes_without_any_saved_waiting_state() {
     let model =
         Arc::new(Scripted::new(vec![calls(&[("t1", json!({"body":"held"}))]), assistant("done"), assistant("done")]));
@@ -1310,7 +1310,7 @@ async fn confirmation_during_the_hold_finishes_without_any_saved_waiting_state()
     supervisor.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn activated_signal_routes_share_the_session_and_trace_and_take_precedence_over_default() {
     let model = Arc::new(Scripted::new(vec![assistant("route answer")]));
     let (f, _, supervisor) = setup(model.clone());
@@ -1341,7 +1341,7 @@ output: {as: '${ .output }'}
     supervisor.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_signal_route_has_its_own_breaker_and_reports_each_failure_once() {
     let model = Arc::new(Scripted::new(vec![
         assistant("report 1"),
@@ -1373,7 +1373,7 @@ do:
     supervisor.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn telegram_without_an_active_route_keeps_the_default_first_turn_and_loop() {
     for source in ["telegram", "telegram_button"] {
         let model = Arc::new(Scripted::new(vec![assistant("default answer")]));
@@ -1433,7 +1433,7 @@ async fn telegram_without_an_active_route_keeps_the_default_first_turn_and_loop(
 // A loop that declares the Telegram route handles the signal alone: no
 // signal route, its own context, its own setup, and the guard sees what it
 // was told and what the user wrote before.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_telegram_signal_runs_the_loop_that_declares_its_route() {
     let model = Arc::new(Scripted::new(vec![
         calls(&[("t1", json!({"note":"go ahead"}))]),
@@ -1499,7 +1499,7 @@ async fn a_telegram_signal_runs_the_loop_that_declares_its_route() {
 
 // What loop_setup added survives a restart: a loop rebuilt from its journal
 // still runs the skills it loaded and gives the guard the same evidence.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_rebuilt_routed_loop_keeps_what_its_setup_added() {
     let model = Arc::new(Scripted::new(vec![
         calls(&[("t1", json!({"n":1}))]),
