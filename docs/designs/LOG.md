@@ -68,3 +68,8 @@ or reverses each entry.
 - **Engine design 03 implementation choices accepted:** first-commit-wins for
   every child join at the store level (roots keep the full comparison);
   `dry_run_with` added beside `dry_run`; no state version bump.
+- **Engine pre-tag drift review (2026-10-26):** child ids become per-attempt
+  and hashed (`child:`/`hostchild:` + 32 hex) — a DSL retry starts its own
+  child, a crash re-dispatch joins; link conflicts are typed; host-data size
+  checked after the join; CHANGELOG re-cut as 0.2.0 (the #22/#20/#7 entries
+  moved under 0.1.0); crate versions 0.2.0.
