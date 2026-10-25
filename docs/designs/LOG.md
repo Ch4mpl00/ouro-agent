@@ -43,3 +43,15 @@ or reverses each entry.
   become child starters joined by `listen`/`child_outcome`; function access
   checked in handlers by definition and host data; a second press of a card is
   answered "already answered"; capacity formulas documented in operations.
+- **Agent design 03, round-1 review resolved without the maintainer:**
+  supervisor waits until the signal's tree is quiescent (not until it ends);
+  host data small + content-addressed `evidence` table; "first commit wins"
+  joins for host children (engine design 03 amended); dispatcher state from
+  the run's own journal; jump budget as a wide backstop, `max_iterations`
+  binding; `settle_child` host function for outcome mapping; button events
+  keyed `telegram_button:<signal id>`, undelivered presses fall through to the
+  agent with a reason (no runtime-authored reply); saved-workflow features
+  disabled during step 2; engine worker starts after MCP.
+- **Deferred to the maintainer:** the signal-loss window between
+  `get_next_signal` and admission stays as today; an MCP lease/ack protocol is
+  filed as 63 (needs a `.feature` scenario first).
