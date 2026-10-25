@@ -1,4 +1,4 @@
-document: { dsl: '1.0.4', namespace: agent, name: signal, version: '1.0.0' }
+document: { dsl: '1.0.4', namespace: agent, name: signal, version: '1.0.0', metadata: { ouro: { breaker: 'off' } } }
 # How one signal is handled, as a durable engine run `signal:<id>` admitted
 # with the signal as host data: a button press goes to the guard round that
 # waits for it; a saved workflow a scheduled task names (none until the
@@ -6,7 +6,7 @@ document: { dsl: '1.0.4', namespace: agent, name: signal, version: '1.0.0' }
 # with the context gathered for its first turn. Its catch starts a failure
 # report outside this run's tree; reporting never retries the original actions.
 # Input: { signal: { id, source, content, env_context, workflow, button, payload, created_at } }.
-# TODO(engine design 04): metadata.ouro.breaker: off once the engine has it.
+# Built-ins never trip (design 01, decision 10): a provider outage must not stop the agent.
 do:
   - handle:
       try:

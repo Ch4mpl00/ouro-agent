@@ -42,17 +42,12 @@ pub const MAX_JUMPS: u64 = 20_000;
 /// Task executions per run: a loop round enters about seven tasks per call.
 pub const MAX_TASKS: usize = 50_000;
 
-/// The runtime's configuration: capacity and budget above; the breaker never
-/// trips. TODO(engine design 04): every definition the agent runs in step 2
-/// is a built-in (no user versions exist until the versions step), so the
-/// threshold is lifted instead of writing `metadata.ouro.breaker: off`, which
-/// the pinned engine rejects. Replace it with the per-definition key once the
-/// engine revision that has it is pinned.
+/// The runtime's configuration: capacity and budget above. The built-ins
+/// opt out of the breaker themselves (`metadata.ouro.breaker: off`).
 pub fn config() -> ouro_runtime::Config {
     ouro_runtime::Config {
         max_concurrency: DRIVES,
         max_function_concurrency: FUNCTION_SLOTS,
-        breaker_threshold: u32::MAX,
         limits: ouro_runtime::ows::run::Limits { max_jumps: MAX_JUMPS, max_tasks: MAX_TASKS, ..Default::default() },
         metadata: json!({"name":"agent-supervisor","version":env!("CARGO_PKG_VERSION")}),
         ..Default::default()

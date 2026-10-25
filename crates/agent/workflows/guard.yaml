@@ -1,9 +1,9 @@
-document: { dsl: '1.0.4', namespace: agent, name: guard, version: '1.0.0' }
+document: { dsl: '1.0.4', namespace: agent, name: guard, version: '1.0.0', metadata: { ouro: { breaker: 'off' } } }
 # A loop's round review, a host child of the loop (design 03): only its
 # host-owned review evidence and consumed button events authorize a call.
 # A card whose send outcome is unknown is never sent again: its call
 # resolves unverified and the round's other verdicts stand.
-# TODO(engine design 04): metadata.ouro.breaker: off once the engine has it.
+# Built-ins never trip (design 01, decision 10): a provider outage must not stop the agent.
 do:
   - review:
       call: review

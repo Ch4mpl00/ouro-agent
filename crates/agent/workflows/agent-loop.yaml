@@ -1,9 +1,9 @@
-document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '1.0.0', metadata: { loop: { description: 'General ReAct loop with guarded tools and workers.' } } }
+document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '1.0.0', metadata: { loop: { description: 'General ReAct loop with guarded tools and workers.' }, ouro: { breaker: 'off' } } }
 # The ReAct loop as a durable engine run. The host admits it with the model's
 # parameters as host data; its input carries the transcript (`messages`) and
 # the working memory, its context the turn count; every task record is a
 # checkpoint, so a restart resumes the loop where it was.
-# TODO(engine design 04): metadata.ouro.breaker: off once the engine has it.
+# Built-ins never trip (design 01, decision 10): a provider outage must not stop the agent.
 input:
   from: '${ . + { i: 0 } }'
 do:
