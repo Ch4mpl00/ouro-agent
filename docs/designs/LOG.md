@@ -61,3 +61,10 @@ or reverses each entry.
   routing uses `if:` (no jump); model sees short worker handles; capacity
   sized for two concurrent trees; `engine.` memory-key prefix reserved. Engine
   design 03 gains `FunctionContext::child_id(key)` (asked of its implementer).
+- **Engine design 04 implementation deviation accepted:** queued refusals keep
+  the host default threshold (needed to resolve `Inherit` at promotion); the
+  active version's policy still decides; no `Queued` layout bump. Alternative
+  (default in the store's `Policy`) left for later.
+- **Engine design 03 implementation choices accepted:** first-commit-wins for
+  every child join at the store level (roots keep the full comparison);
+  `dry_run_with` added beside `dry_run`; no state version bump.
