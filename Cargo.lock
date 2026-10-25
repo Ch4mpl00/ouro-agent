@@ -53,7 +53,10 @@ dependencies = [
  "dotenvy",
  "futures",
  "hex",
+ "ouro-durable",
+ "ouro-runtime",
  "owf",
+ "ows",
  "proptest",
  "rand 0.10.3",
  "regex",
@@ -62,6 +65,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "sha2 0.11.0",
  "tempfile",
  "thiserror",
@@ -3184,6 +3188,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "opentelemetry"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b84bcd6ae87133e903af7ef497404dda70c60d0ea14895fc8a5e6722754fc2a0"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "js-sys",
+ "pin-project-lite",
+ "thiserror",
+]
+
+[[package]]
 name = "os_info"
 version = "3.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3196,6 +3213,51 @@ dependencies = [
  "objc2-foundation",
  "objc2-ui-kit",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ouro-durable"
+version = "0.1.0"
+source = "git+https://github.com/Ch4mpl00/ouro?rev=903ce3b#903ce3b454d1d4342cbb8f2c1296c011a79e2c51"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "deadpool-postgres",
+ "futures",
+ "ows",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.11.0",
+ "tokio",
+ "tokio-postgres",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "ouro-runtime"
+version = "0.1.0"
+source = "git+https://github.com/Ch4mpl00/ouro?rev=903ce3b#903ce3b454d1d4342cbb8f2c1296c011a79e2c51"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "chrono-tz",
+ "croner",
+ "futures",
+ "jsonschema",
+ "opentelemetry",
+ "ouro-durable",
+ "ows",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]
@@ -3223,6 +3285,30 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "ows"
+version = "0.1.0"
+source = "git+https://github.com/Ch4mpl00/ouro?rev=903ce3b#903ce3b454d1d4342cbb8f2c1296c011a79e2c51"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "chrono-tz",
+ "croner",
+ "futures",
+ "jaq-core",
+ "jaq-json",
+ "jaq-std",
+ "jsonschema",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]
