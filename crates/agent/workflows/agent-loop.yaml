@@ -35,6 +35,7 @@ do:
                 - wait_worker:
                     if: '${ $context.worker != null }'
                     listen:
+                      read: envelope
                       to:
                         any:
                           - with: { type: '${ "done:" + $context.worker }' }
@@ -75,6 +76,7 @@ do:
                 - wait_guard:
                     if: '${ $context.guard_run != null }'
                     listen:
+                      read: envelope
                       to:
                         any:
                           - with: { type: '${ "done:" + $context.guard_run }' }

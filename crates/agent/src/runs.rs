@@ -10,8 +10,9 @@ use crate::{
     db::AgentDb,
     tracing::{Scope, Span, SpanEnd, Trace, TraceAnchor, TraceStart},
 };
-use ouro_runtime::durable::{RunState, SavedRun, control::Runs};
-use ouro_runtime::ows::run::Status;
+pub use ouro_runtime::durable::control::Runs;
+use ouro_runtime::durable::{RunState, SavedRun};
+pub use ouro_runtime::ows::run::Status;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -50,6 +51,9 @@ pub fn config() -> ouro_runtime::Config {
         max_function_concurrency: FUNCTION_SLOTS,
         limits: ouro_runtime::ows::run::Limits { max_jumps: MAX_JUMPS, max_tasks: MAX_TASKS, ..Default::default() },
         metadata: json!({"name":"agent-supervisor","version":env!("CARGO_PKG_VERSION")}),
+        // A child starts at the worker's next tick: a signal is a chain of
+        // three or four starts (signal, primary, guard, worker).
+        poll_interval: std::time::Duration::from_millis(50),
         ..Default::default()
     }
 }
@@ -629,7 +633,7 @@ pub async fn wait_end(
             _ = cancel.cancelled() => return Err(crate::errors::aborted()),
             _ = tokio::time::sleep(pause) => {}
         }
-        pause = (pause * 2).min(std::time::Duration::from_millis(100));
+        pause = (pause * 2).min(std::time::Duration::from_millis(50));
     }
 }
 
@@ -661,7 +665,7 @@ pub async fn wait_quiescent(
             _ = cancel.cancelled() => return Err(crate::errors::aborted()),
             _ = tokio::time::sleep(pause) => {}
         }
-        pause = (pause * 2).min(std::time::Duration::from_millis(100));
+        pause = (pause * 2).min(std::time::Duration::from_millis(50));
     }
     flushed(engine, std::time::Duration::from_secs(2)).await;
     Ok(())

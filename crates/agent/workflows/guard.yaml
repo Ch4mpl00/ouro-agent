@@ -33,6 +33,7 @@ do:
             try:
               - listen:
                   listen:
+                    read: envelope
                     to:
                       any:
                         - with: { type: '${ $context.request.types[0] }' }

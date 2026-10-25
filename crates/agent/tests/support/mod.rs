@@ -123,6 +123,17 @@ pub struct Fixture {
     pub engine: Arc<Engine>,
 }
 pub fn fixture(provider: Arc<dyn ChatProvider>, definitions: &[&str], skills: &[(&str, &str)]) -> Fixture {
+    fixture_on(provider, definitions, skills, |_| {})
+}
+/// A fixture whose engine dependencies `configure` changes before the engine
+/// is built (its registry is built from them, and handlers hold it weakly, so
+/// it cannot be changed after).
+pub fn fixture_on(
+    provider: Arc<dyn ChatProvider>,
+    definitions: &[&str],
+    skills: &[(&str, &str)],
+    configure: impl FnOnce(&mut EngineDeps),
+) -> Fixture {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("skills.default")).unwrap();
     for (name, body) in skills {
@@ -141,7 +152,7 @@ pub fn fixture(provider: Arc<dyn ChatProvider>, definitions: &[&str], skills: &[
             .collect(),
         ..Default::default()
     });
-    let engine = create_engine(EngineDeps {
+    let mut deps = EngineDeps {
         providers: Providers {
             openai: provider.clone(),
             gemini: provider.clone(),
@@ -160,7 +171,9 @@ pub fn fixture(provider: Arc<dyn ChatProvider>, definitions: &[&str], skills: &[
         env: Default::default(),
         db: (*db).clone(),
         store: agent::runs::open_store(&root.path().join("agent.db")).unwrap(),
-    });
+    };
+    configure(&mut deps);
+    let engine = create_engine(deps);
     Fixture { root, db, skills: store, mcp, engine }
 }
 

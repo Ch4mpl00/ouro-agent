@@ -819,7 +819,9 @@ pub fn isolated_engine(
         tracer: Arc::new(agent::tracing::NullTracer),
         codex: Arc::new(NoCode),
         decisions: None,
-        workflows: Arc::new(agent::flows::MemoryWorkflows::default()),
+        env: Default::default(),
+        db: agent::db::AgentDb::open(":memory:")?,
+        store: agent::runs::memory_store(),
         schedule: Arc::new(agent::schedule::MemorySchedule::default()),
     }))
 }

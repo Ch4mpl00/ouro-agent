@@ -90,9 +90,19 @@ do:
                   $context.button.note
                 ] | map(select(. != null and . != "")) }
             export: { as: '${ $context + { primary: . } }' }
-        - primary_done:
+        - primary_wait:
             # No hold: the signal suspends until its primary ends, and the
             # supervisor takes the next signal once the tree is quiescent.
+            # The engine reports a child that suspends (`waiting:`) too: it
+            # is taken here, then the end is waited for.
+            listen:
+              read: envelope
+              to:
+                any:
+                  - with: { type: '${ $context.primary.done }' }
+                  - with: { type: '${ $context.primary.waiting }' }
+        - primary_done:
+            if: '${ .[0].type == $context.primary.waiting }'
             listen: { to: { one: { with: { type: '${ $context.primary.done }' } } } }
         - primary_outcome:
             call: child_outcome

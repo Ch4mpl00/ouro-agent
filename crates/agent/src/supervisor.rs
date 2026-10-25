@@ -508,27 +508,34 @@ impl Supervisor {
         let trace=engine.deps.tracer.trace(TraceStart{id:id.clone(),name:format!("signal:{}",signal.source),kind:SpanKind::Agent,session_id:Some(id.clone()),tags:Some(vec![signal.source.clone(),if saved.is_some(){"saved-workflow"}else{"agent-loop"}.into()]),metadata:Some(json!({"signal_id":signal.id,"signal_source":signal.source,"signal_created_at":signal.created_at,"activity":"run"}).as_object().unwrap().clone()),..Default::default()});
         trace.update(ContextUpdate::input(signal.content.clone()));
         let started = async {
-            // The anchor and the evidence go in before the engine admits it.
-            if let Some(anchor) = trace.anchor() {
-                engine
-                    .deps
-                    .db
-                    .insert_run_trace(&crate::runs::RunTrace {
-                        run_id: run.clone(),
-                        trace_id: anchor.trace_id,
-                        session_id: anchor.session_id,
-                        parent_span_id: Some(anchor.parent_span_id),
-                        recorded: false,
-                        created_ms: crate::runs::now_ms(),
-                    })
-                    .map_err(|e| e.context("anchoring the signal run"))?;
-            }
+            // The anchor and the evidence go in before the engine admits it;
+            // a write may wait for the engine's lock on agent.db (runs.rs §2).
+            let row = trace.anchor().map(|anchor| crate::runs::RunTrace {
+                run_id: run.clone(),
+                trace_id: anchor.trace_id,
+                session_id: anchor.session_id,
+                parent_span_id: Some(anchor.parent_span_id),
+                recorded: false,
+                created_ms: crate::runs::now_ms(),
+            });
+            let (evidence_run, content) = (run.clone(), signal.content.clone());
+            let content = engine
+                .deps
+                .db
+                .write(move |db| {
+                    if let Some(row) = &row {
+                        db.insert_run_trace(row)?;
+                    }
+                    db.put_evidence(&evidence_run, &content)
+                })
+                .await
+                .map_err(|e| e.context("anchoring the signal run"))?;
             let host = crate::runs::SignalHost {
                 kind: crate::runs::SIGNAL.into(),
                 signal_id: signal.id,
                 source: signal.source.clone(),
                 created_ms: timestamp(&signal.created_at).unwrap_or_else(crate::runs::now_ms),
-                evidence: crate::runs::SignalEvidence { content: engine.deps.db.put_evidence(&run, &signal.content)? },
+                evidence: crate::runs::SignalEvidence { content },
             };
             let scope: Scope = trace.clone();
             engine.scopes.borrow(&run, scope);
@@ -574,10 +581,16 @@ impl Supervisor {
             _ => {}
         }
         engine.scopes.release(&run);
-        trace.end();
-        if ended.is_some() {
-            engine.deps.db.mark_recorded(&run).map_err(|e| e.context("recording the signal run"))?;
-        }
+        let recorded = ended.is_some().then(|| run.clone());
+        engine
+            .deps
+            .db
+            .write(move |db| {
+                trace.end();
+                recorded.map(|run| db.mark_recorded(&run)).transpose()
+            })
+            .await
+            .map_err(|e| e.context("recording the signal run"))?;
         check(&self.cancel)?;
         outcome
     }
