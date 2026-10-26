@@ -24,7 +24,7 @@ flowchart LR
     end
 
     subgraph agent ["crates/agent — supervisor"]
-        C[Schedule<br/>cron, 30 s tick] -->|fire| S
+        C[Schedule<br/>engine triggers, fire drain] -->|fire| S
         Q -->|get_next_signal<br/>wait_for_signal| S[Supervisor<br/>one signal at a time]
         S -->|scheduler task<br/>naming a workflow| W[Saved workflow<br/>crates/owf]
         S -->|all other signals| L[Agent loop<br/>skills · sub-agents]
@@ -126,7 +126,7 @@ mcp-tools/
 | `telegram` | Bot `getUpdates` poller in `crates/mcp` (accepts only `TELEGRAM_DEFAULT_CHAT_ID`) | long-poll |
 | `nashdom-bill` | Gmail poller in `crates/mcp`; one entry in `gmail.rs` `SUBSCRIPTIONS` per mail-driven source | 1 min |
 | `peer` | Another agent calling `ask_ouro` (see [Peer messaging](#peer-messaging)) | on demand |
-| `scheduler` (or a task's own source, e.g. `dreaming`) | The agent's own schedule (`crates/agent/src/schedule.rs`), handed straight to the supervisor without the queue | 30 s tick |
+| `scheduler` (or a task's own source, e.g. `dreaming`) | The agent's own schedule (`crates/agent/src/schedule.rs`): engine triggers record fires, the supervisor's drain runs them without the queue | at the slot |
 
 The MCP server also runs a **news harvester**. It polls Hacker News every
 15 min, Habr every 30 min, and the user's subscribed Telegram channels (through
@@ -371,16 +371,20 @@ export composes the skill the same way, and
 
 ### The schedule
 
-The agent owns the schedule (`crates/agent/src/schedule.rs`). Tasks are cron
-rows in agent.db, evaluated on the user's wall clock (`set_timezone`). A
-30 s tick claims each slot exactly once and hands the fire to the
-supervisor. A fire that started is never repeated, even if it failed.
-`schedule_task` takes a 5-field cron expression, `recurring: false` for a
-one-shot, `cron_expr: "now"` to run right away, and `workflow: <name>` to run
-a saved workflow instead of planning the task. On its first start the agent
-imports the tasks MCP used to hold. A fresh install instead gets the system
-task, the nightly `dreaming` review. It has no digests until the user asks the
-agent to schedule them: user-specific prompts live in agent.db, not in git.
+The agent owns the schedule (`crates/agent/src/schedule.rs`, design 06). A
+task is an engine definition `task-<id>` that `schedule_task` generates: a
+cron on the user's wall clock (`set_timezone`; a watch moves recurring tasks
+when it changes) or a one-shot instant. The engine's trigger fires each slot
+once, across restarts; its run only records the fire in agent.db, and the
+supervisor's drain runs it as a signal. A fire whose signal run started is
+never repeated, even if it failed. After downtime a task fires once, for its
+oldest missed slot. `schedule_task` takes a 5-field cron expression,
+`recurring: false` for a one-shot, `cron_expr: "now"` to run right away, and
+`workflow: <name>` to run a saved workflow instead of planning the task. The
+first start seeds the system task, the nightly `dreaming` review; the tasks
+MCP used to hold are not imported. There are no digests until the user asks
+the agent to schedule them: user-specific prompts live in the engine's store,
+not in git.
 
 ### Workflows written once, run without a model deciding
 
@@ -478,7 +482,7 @@ The rules that protect documents:
 
 | Database | Owner | Holds |
 | --- | --- | --- |
-| `mcp_state` (Postgres, same server as the news store) | MCP | OAuth tokens and the userbot session, Gmail watermarks, the Telegram cursor and chat log, the `signals` queue, peer threads, settings (time zone), and the legacy `scheduled_tasks` the agent imports once |
+| `mcp_state` (Postgres, same server as the news store) | MCP | OAuth tokens and the userbot session, Gmail watermarks, the Telegram cursor and chat log, the `signals` queue, peer threads, settings (time zone), and the legacy `scheduled_tasks` (no longer read) |
 | Postgres + pgvector (`DATABASE_URL`) | MCP | `news_items` (HN, Habr, channel posts) and unified memory (`memory_*`, `memory_index`) |
 | `agent.db` (sqlite) | agent | The `memory` KV, the trace mirror and per-node judgements, `improver_state`, activity-journal progress, the schedule, saved workflows and their durable runs |
 
@@ -508,7 +512,7 @@ group below is a **toolset** that an instance can register.
 | `knowledge` | `add_note`, `find_notes` (legacy notes) |
 | `skills` | `list_skills`, `read_skill` (an export for external clients; the agent has its own) |
 | `signals` · `dreaming` | `get_next_signal`, `wait_for_signal` · `list_signals` |
-| `scheduler` | `get_timezone`, `set_timezone`, `list_scheduled_tasks` (read once by the agent's import) |
+| `scheduler` | `get_timezone`, `set_timezone`, `list_scheduled_tasks` (MCP's legacy tasks, supervisor-only, no longer read) |
 | `peer` · `peer-reply` | `ask_ouro`, `read_replies` · `reply_to_peer`, `get_peer_thread` |
 
 **`MCP_TOOLSETS`** narrows an instance to the named groups. Narrowing works

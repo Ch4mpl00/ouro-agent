@@ -70,16 +70,23 @@ deletion.
    Telegram bot getUpdates (long-poll), userbot channels (30 min).
 2. When it sees something new, it records a signal (`Signals::record`),
    which inserts a row into the `signals` queue in the `mcp_state` Postgres
-   database. Scheduled tasks are the agent's own (`crates/agent/src/schedule.rs`):
-   cron rows in agent.db, a 30 s tick that claims each slot once and hands
-   the fire straight to the supervisor as a `scheduler` (or the task's own
-   source) signal, with the `envContext` a queued signal carries (the agent
-   builds it from the same `TELEGRAM_DEFAULT_CHAT_ID` / `TELEGRAM_TOPICS_JSON`
-   in its own env). Fire ids start above 10⁹, so `scheduler:<id>` never lands
-   on an older MCP signal's trace. The first start imports the tasks MCP held
-   (`list_scheduled_tasks`, kept read-only for that) or seeds the system one
-   (the nightly `dreaming` tick). Digests are user-specific: they live in
-   agent.db once the user asks for them, never in the seed.
+   database. Scheduled tasks are the agent's own (`crates/agent/src/schedule.rs`,
+   design 06): each is an engine definition `task-<id>` that `schedule_task`
+   generates (never the model's YAML), a `cron` on the user's zone or a
+   one-shot `metadata.ouro.at`, `breaker: off`. Its trigger's run calls
+   `fire_scheduled`, which records one fire per slot in agent.db's
+   `scheduled_fires` and ends at once; the supervisor's drain runs each
+   fire as a `scheduler` (or the task's own source) signal, one at a time
+   with every other signal, with the `envContext` a queued signal carries
+   (the agent builds it from the same `TELEGRAM_DEFAULT_CHAT_ID` /
+   `TELEGRAM_TOPICS_JSON` in its own env). Fire ids start above 10⁹, so
+   `scheduler:<id>` never lands on an older MCP signal's trace. A zone watch
+   (60 s) moves recurring tasks when the user's zone changes; after downtime
+   a task fires once, for its oldest missed slot. The first start seeds the
+   system task (the nightly `dreaming` tick) once; MCP's old tasks are not
+   imported. Digests are user-specific: they are tasks once the user asks
+   for them, never in the seed. The engine's store is the only copy of the
+   tasks: export them before re-creating it (design 06, Rollout).
 3. The supervisor (`crates/agent/src/supervisor.rs`, composed in `main.rs`)
    loops on `get_next_signal`. With an empty queue it blocks on
    `wait_for_signal`, which MCP answers the moment a poller records a signal
@@ -206,8 +213,9 @@ mcp-tools/
     │   ├── src/functions.rs                the engine's registry: MCP tools, host functions, steps
     │   ├── src/sandbox.rs                  dry runs on the engine's dry run: a signal through the draft
     │   │                                   chain, real turns, reads and guard, writes mocked, nothing kept
-    │   ├── src/schedule.rs                 scheduled tasks: cron rows, the 30 s tick, the schedule
-    │   │                                   tools, the first start's import
+    │   ├── src/schedule.rs                 scheduled tasks: `task-<id>` definitions on engine triggers,
+    │   │                                   the fire table and its drain, the zone watch, the schedule
+    │   │                                   tools, the system task's seed
     │   ├── src/agent.rs                    the engine, the loop's turn/tool/settle, synthetic tools
     │   ├── src/guard.rs                    loop write/open-world policy, deterministic rules, batched verdicts
     │   ├── guard/                          compiled guard instructions and reason data (git-owned)
@@ -256,8 +264,7 @@ data directory remains under `packages/`, gitignored.
   `crates/mcp/src/db.rs`) — MCP's private state: OAuth tokens and the userbot
   session, Gmail watermarks, the Telegram cursor and chat log, the `signals`
   queue, peer threads (`peer_threads` / `peer_messages`), settings (the user's time zone), and the `scheduled_tasks` MCP
-  fired before the agent owned the schedule, read once by the agent's first
-  start. The server derives it from
+  fired before the agent owned the schedule (no longer read). The server derives it from
   `DATABASE_URL` (same server, database name `mcp_state`;
   `STATE_DATABASE_URL` overrides) and creates + migrates it on boot (versioned
   migrations inline in `db.rs`). It replaced the sqlite `tokens.db`
@@ -266,8 +273,8 @@ data directory remains under `packages/`, gitignored.
 - **`packages/agent/data/agent.db`** (sqlite) — agent's domain state:
   `memory` (freeform KV, e.g. `news_digest.last_read_at`), the local trace
   mirror (`traces` + per-node `judgements`), `improver_state`, the
-  activity journal's progress, the schedule (`scheduled_tasks`,
-  `scheduled_fires`), and what the agent keeps beside the engine's runs
+  activity journal's progress, the schedule's fires and task ids
+  (`scheduled_fires`, `task_ids`; the tasks are engine definitions), and what the agent keeps beside the engine's runs
   (`run_trace`, `evidence`, `tool_snapshot`, `confirmations`,
   `workflow_meta`). The engine's own store (every workflow run, every
   workflow version and its breaker) is `engine.db` beside it, `ouro_*`
@@ -421,7 +428,7 @@ also see them when running `claude` locally with `.mcp.json` registered.
   other's waiters through Postgres `LISTEN/NOTIFY` (`db.rs`, wake-ups).
   Decisions: `.claude/tasks/done/peer-messaging.md`.
 - **Scheduler** — `list_scheduled_tasks` (supervisor only: the tasks MCP
-  held, read by the agent's first start). `schedule_task`,
+  held before the agent owned the schedule, no longer read). `schedule_task`,
   `list_scheduled_tasks` and `cancel_scheduled_task` as a model sees them
   are the agent's synthetic tools (`schedule.rs`).
 - **Env** — `get_timezone`, `set_timezone`

@@ -406,3 +406,59 @@ Deviations 1 and 2):
   re-creation (design 06, Rollout).
 - A cap of 50 live tasks. Reversible.
 - Design 05's open question on the no-signal try's input closes unchanged.
+
+## 2026-10-26 (step 5 (executor))
+
+Choices taken while implementing design 06 where the document is silent,
+each reversible:
+
+- **Cap raised to 100 by the maintainer** (decision 15 and test 13 say 100
+  now; `schedule::MAX_LIVE_TASKS`). Paused tasks count as live.
+- **The seam** is `schedule::Schedules { fires: Arc<dyn FireStore>, the
+  write mutex, the wake-up }`; `FireStore` (agent.db, `MemoryFires`, the
+  sandbox's read-through `DryFires`) also hands out task ids (`task_ids`)
+  and the seed's id (`seed_id`, one transaction: read the key, else
+  allocate and store it). Test fixtures on a fixture's agent.db use its
+  table; the others and the evals optimizer use `Schedules::in_memory()`.
+- **Replies:** `schedule_task` answers `{ok, task: {id, cron_expr,
+  recurring, prompt, workflow, timezone}, next_fire}` (R2-L9's shape;
+  `next_fire` is the engine summary's due time, ISO UTC like every time in
+  the list). `cancel_scheduled_task` adds `error` to `ok: false`. The list
+  adds `consumed: true` for a fired one-shot whose fire is pending,
+  `faults` and `last_error` (latest failed run of the definition, none in
+  a dry run, whose store reads no runs) when the count is above zero, and
+  `paused` (the operator's note) for a manual pause: with `breaker: off`
+  that is the only trip a task can meet.
+- **The task block** keeps the zone for one-shots too (`timezone`: the
+  zone the instant was computed on); only recurring tasks carry
+  `metadata.ouro.timezone`. Every task activation is attributed to actor
+  `agent` with a note (`scheduled`, `cancelled`, `time zone A → B`,
+  `seeded`); an identical text reuses its version (digest).
+- **The drain** stops a round at the first fire left pending (oldest first
+  stays oldest first) and waits out the backoff without listening to the
+  wake-up; a round errors into the same backoff. `user_zone` reads
+  `get_timezone` for the seed (UTC when unreadable) and the watch (skip).
+- **`start_named_child` refuses a `task-` name** (so `launch` does); the
+  gate refuses `fire_scheduled` by the reserved contexts
+  (`functions::RESERVED_CONTEXTS`), and a `start_child` whose `name` is a
+  literal `task-…` string.
+- **Removed with the tick:** `tests/schedule.rs` (the tick's property suite,
+  a port of MCP's scheduler tests) and `tests/support/wall_cron.rs`: the
+  cron rule is the engine's now, pinned by ouro's tests and test 14.
+- **Test 6** moves the clock a minute while the held signal's run is in a
+  model call; a jump past the engine's 30 s lease stalls the engine's
+  worker, so the test walks the clock in 10 s steps with a 50 ms
+  heartbeat (`support::fixture_configured`).
+- **Test 2** also schedules a prompt that is a whole expression
+  (`${ .x }`), which the engine would evaluate if it reached `with`.
+- **Restored skill-index tests** (test 9) run on fires recorded into the
+  table and drained; `main`'s "lost write reply, retried and verified"
+  case now pins the engine's at-most-once answer (the run faults with
+  `call.unknown`, the next fire writes nothing), and the reopen case lists
+  the task instead of counting `scheduled_tasks` rows. The MCP sandbox test
+  includes the agent's test support, so `mcp-tools` has `ouro-runtime` as a
+  dev-dependency at the agent's tag; its server serves `memory,scheduler`
+  (the signal session reads `get_timezone`).
+- **Hand mutants** (once each, scratch worktree): all seven the design
+  names are caught; "the prompt written into `with`" is caught at save (the
+  engine refuses `${` embedded in text, so the first prompt never fires).

@@ -164,7 +164,7 @@ decides trip notices".
     digest). Not in `--once`.
     MCP's import goes (overview decision 2); `list_scheduled_tasks` stays in
     `SUPERVISOR_ONLY_TOOLS`.
-15. **A cap (R-H3).** `schedule_task` refuses past 50 live tasks (not
+15. **A cap (R-H3).** `schedule_task` refuses past 100 live tasks (not
     cancelled, not consumed): the list and the zone watch stay small.
 16. **Removed and migrated (R-L4, R-M3).**
     - Code: `ScheduleStore` and its two implementations, `tick`,
@@ -332,7 +332,7 @@ manual clock (`tests/support` `fixture_clocked`, `Engine.clock`; R-L3).
     start seeds nothing; a cancelled dreaming stays cancelled; a crash
     after the key was written and before activation completes the same
     task on the next start (no second one); `--once` seeds nothing.
-13. Validation: 6 fields, `0 0 31 11 *`, the 51st live task → `ok: false`,
+13. Validation: 6 fields, `0 0 31 11 *`, the 101st live task → `ok: false`,
     nothing saved.
 14. DST (`schedule.rs` unit): non-recurring `30 2 * * *` in `Europe/Berlin`
     created on 2027-03-27 → `at` 2027-03-28T03:00:00+02:00, the engine's
@@ -366,4 +366,10 @@ maintainer.
 
 ## Open questions
 
-None blocking. Reversible: the cap of 50 (decision 15).
+None blocking. Reversible: the cap of 100 (decision 15).
+
+## Deviations
+
+None found against the code: the step 5 executor implemented the decisions
+as written. Choices the document leaves open are in [LOG.md](LOG.md),
+"step 5 (executor)".

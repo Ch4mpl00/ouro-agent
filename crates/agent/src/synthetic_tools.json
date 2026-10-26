@@ -352,7 +352,7 @@
     "type": "function",
     "function": {
       "name": "schedule_task",
-      "description": "Register a cron-driven task. When the cron matches, the agent gets a `scheduler` signal with the given prompt and acts on it (send a Telegram message, run a check, etc). Cron is standard 5-field (minute hour day-of-month month day-of-week) evaluated in the user's configured timezone. For one-shot reminders set `recurring: false` and use a specific cron like '30 14 12 5 *' (14:30 on May 12); the task auto-deactivates after the first fire. For repeating tasks use a generic cron like '0 9 * * *' (every day 9:00). Convert natural-language times into cron syntax before calling this tool. To run something once right away (\"run it now\"), set `cron_expr: \"now\"`: it fires within half a minute, after the current conversation turn ends. With `workflow`, each fire runs that saved workflow's active version instead of planning the task.",
+      "description": "Register a cron-driven task. When the cron matches, the agent gets a `scheduler` signal with the given prompt and acts on it (send a Telegram message, run a check, etc). Cron is standard 5-field (minute hour day-of-month month day-of-week) evaluated in the user's configured timezone; a recurring task follows the user's timezone when it changes. For one-shot reminders set `recurring: false` and use a specific cron like '30 14 12 5 *' (14:30 on May 12): it fires once, at that cron's next match. For repeating tasks use a generic cron like '0 9 * * *' (every day 9:00). Convert natural-language times into cron syntax before calling this tool. To run something once right away (\"run it now\"), set `cron_expr: \"now\"`: it fires at once, after the signal running now ends. With `workflow`, each fire runs that saved workflow's active version instead of planning the task. At most 100 tasks may be scheduled at a time. Returns { ok, task: { id, cron_expr, recurring, prompt, workflow, timezone }, next_fire } (next_fire in UTC), or { ok: false, error }.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -388,7 +388,7 @@
     "type": "function",
     "function": {
       "name": "list_scheduled_tasks",
-      "description": "Show every task that may still fire — recurring tasks (always) and one-shots that haven't been triggered yet. Each row includes the cron expression, prompt, the saved workflow it runs (if any), last fire time, and the next 1-3 upcoming fire timestamps in the user's timezone for sanity-checking.",
+      "description": "Show every task that may still fire: recurring tasks, and one-shots that have not fired yet (a one-shot whose fire is waiting to run is shown with consumed: true; it leaves the list once it ran). Each row has id, cron_expr, recurring, prompt, source, the saved workflow it runs (if any), timezone, created_at, next_fire (the next due time) and last_fire (the slot it last fired for), both UTC; a task whose recording failed shows faults and last_error, and one an operator paused shows paused.",
       "parameters": {
         "type": "object",
         "properties": {},
@@ -400,7 +400,7 @@
     "type": "function",
     "function": {
       "name": "cancel_scheduled_task",
-      "description": "Permanently remove a task by id. Use this when the user says 'forget about that reminder' or 'stop the daily X'. Returns { ok: true, id } on success, { ok: false, id } if no such task.",
+      "description": "Cancel a task by id: it never fires again (a fire already due still runs). Use this when the user says 'forget about that reminder' or 'stop the daily X'. Returns { ok: true, id } on success, { ok: false, id, error } for an unknown id, a task already cancelled or a one-shot that already fired. Ids are never reused.",
       "parameters": {
         "type": "object",
         "properties": {
