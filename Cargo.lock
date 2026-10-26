@@ -3217,8 +3217,8 @@ dependencies = [
 
 [[package]]
 name = "ouro-durable"
-version = "0.1.0"
-source = "git+https://github.com/Ch4mpl00/ouro?rev=9aca1de#9aca1de30830fe920c027896d8d44203379e0aac"
+version = "0.2.1"
+source = "git+https://github.com/Ch4mpl00/ouro?tag=v0.2.1#810ba9b43f675353eb01de807bba91643576377c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3239,8 +3239,8 @@ dependencies = [
 
 [[package]]
 name = "ouro-runtime"
-version = "0.1.0"
-source = "git+https://github.com/Ch4mpl00/ouro?rev=9aca1de#9aca1de30830fe920c027896d8d44203379e0aac"
+version = "0.2.1"
+source = "git+https://github.com/Ch4mpl00/ouro?tag=v0.2.1#810ba9b43f675353eb01de807bba91643576377c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3255,6 +3255,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "sha2 0.11.0",
  "tokio",
  "tokio-util",
  "uuid",
@@ -3289,8 +3290,8 @@ dependencies = [
 
 [[package]]
 name = "ows"
-version = "0.1.0"
-source = "git+https://github.com/Ch4mpl00/ouro?rev=9aca1de#9aca1de30830fe920c027896d8d44203379e0aac"
+version = "0.2.1"
+source = "git+https://github.com/Ch4mpl00/ouro?tag=v0.2.1#810ba9b43f675353eb01de807bba91643576377c"
 dependencies = [
  "anyhow",
  "async-trait",
