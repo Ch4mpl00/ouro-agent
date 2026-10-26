@@ -115,9 +115,30 @@ deletion.
    generation and tool spans; a run's spans nest under the span its starter
    opened (`run_trace`), resumed executions in continuation segments; the
    reconciler (`runs.rs` §8) records run ends from the engine's history for
-   the activity journal and the judge. Until the engine migration's later
-   steps, saved workflows, routes, loop variants and dry runs answer that
-   they are unavailable (design 03, decision 9).
+   the activity journal and the judge.
+   **The agent's own versions** (docs/designs/04): the engine is the version
+   store (`save`, `activate_as`, `definitions`); agent.db keeps only
+   `workflow_meta` (note, dry-run `tried`, built-in flag, by content).
+   `save_workflow`/`activate_workflow` pass one gate (`flows::gate`: the
+   engine's validation, a deny-list of `schedule`, `emit`, `run: workflow`
+   and `metadata.ouro.breaker`, argument names, the guarded round, launch
+   metadata); only `guard` is reserved, so `agent-loop` and `signal` are the
+   agent's to override, and activating the built-in's current text undoes
+   an override. Activation needs a tried version (dry runs return with the
+   sandbox step). Routes (`metadata.route`) start as the signal's primary
+   run (`route_signal`, most specific first), a scheduled task's saved
+   workflow likewise (`run_saved_workflow`); a worker or the primary may run
+   a loop variant (the YAML's `start_worker { loop }`, the call's `loop`,
+   a skill's `loop:`, else `agent-loop`). **The breaker is the engine's**:
+   three faults of a version's runs in a row trip it; built-ins declare
+   `breaker: off`, agent versions declare none. Every start of a name the
+   agent may have overridden goes through `runs::start_named_root/child`
+   (§10): a tripped, operator-paused or no longer admissible version gives
+   way, for that run, to the built-in pinned in its place (same id, same
+   trace), a route to the next route or the default path, a saved workflow
+   to a handover; the run that runs instead carries a `fallback` record (span
+   metadata, host data) and one line in its instructions saying what was set
+   aside and why. The agent never lifts an operator's pause.
    The agent-loop path loads:
    - `skills/orchestrator.md` + `skills/routing.md` — always; how to use
      working memory and when to delegate to a domain skill.
@@ -174,10 +195,11 @@ mcp-tools/
     ├── agent/
     │   ├── src/main.rs                     composition root (agent-supervisor)
     │   ├── src/supervisor.rs               poll loop, per-signal routing, tg history preload
-    │   ├── src/flows.rs                    saved workflows: store, function catalog, tracing,
-    │   │                                   scheduled runs, the authoring tools
+    │   ├── src/flows.rs                    workflows: built-ins, workflow_meta, the gate, routes and
+    │   │                                   loops, the authoring tools, the evals adapter
     │   ├── src/runs.rs                     runs on the ouro engine: config, agent tables, host data,
-    │   │                                   trace scopes, quiescence, built-ins, reconciler
+    │   │                                   trace scopes, quiescence, built-ins, reconciler, named
+    │   │                                   starts and their fallbacks
     │   ├── src/functions.rs                the engine's registry: MCP tools, host functions, steps
     │   ├── src/sandbox.rs                  dry runs (unavailable until the migration's sandbox step)
     │   ├── src/schedule.rs                 scheduled tasks: cron rows, the 30 s tick, the schedule
@@ -187,7 +209,8 @@ mcp-tools/
     │   ├── guard/                          compiled guard instructions and reason data (git-owned)
     │   ├── workflows/                      built-in OWF: agent-loop.yaml, signal.yaml (dispatcher),
     │   │                                   guard.yaml (reserved round review and confirmation);
-    │   │                                   agents may activate their own loops (with routes)
+    │   │                                   the agent may override agent-loop and signal and
+    │   │                                   activate its own loops (with routes)
     │   ├── src/activity.rs                 traces → ouro/activity journal notes (background
     │   │                                   task inside the supervisor)
     │   ├── src/providers.rs                ChatProviders: openai, gemini, deepseek, openrouter
@@ -241,9 +264,11 @@ data directory remains under `packages/`, gitignored.
   mirror (`traces` + per-node `judgements`), `improver_state`, the
   activity journal's progress, the schedule (`scheduled_tasks`,
   `scheduled_fires`), and what the agent keeps beside the engine's runs
-  (`run_trace`, `evidence`, `tool_snapshot`, `confirmations`). The engine's
-  own store (every workflow run) is `engine.db` beside it, `ouro_*` tables
-  migrated by the engine (`runs.rs` §1). Migrations live in `crates/agent/migrations`
+  (`run_trace`, `evidence`, `tool_snapshot`, `confirmations`,
+  `workflow_meta`). The engine's own store (every workflow run, every
+  workflow version and its breaker) is `engine.db` beside it, `ouro_*`
+  tables migrated by the engine (`runs.rs` §1); back the two files up
+  together. Migrations live in `crates/agent/migrations`
   (drizzle's sqlite format and journal, applied on boot by `AgentDb::open`
   under the same race-tolerant boot the TS client had); a new one is a new
   `.sql` file plus a journal entry, and an applied one never changes (a test

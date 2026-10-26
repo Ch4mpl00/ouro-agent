@@ -105,6 +105,32 @@ every operation, and agent.db's writes starved behind it (docs/designs/LOG.md). 
 `agent-loop` and `guard` are saved and activated at boot, with
 `metadata.ouro.breaker: off`.
 
+**Workflow versions** (docs/designs/04-versions-and-breaker.md): the engine
+is also the version store. Every version the agent saves, its text and
+activation history, the active version and its breaker live in `engine.db`;
+agent.db's `workflow_meta` keeps only the agent's notes on them by content
+(the note, whether a dry run tried it, whether it is a built-in text). Nothing
+copies the versions back: **back up `engine.db` together with `agent.db`**
+(both with `sqlite3 <file> ".backup <copy>"`, one after the other while the
+agent is stopped, or accept that the two copies are a few seconds apart).
+An engine store-version bump migrates `engine.db` in place.
+
+The boot activates a built-in's new text only while the active version is a
+built-in text: a version the agent activated (an override of `agent-loop` or
+`signal`) stays across restarts and upgrades. A name an operator paused is
+left alone at boot, and the agent cannot activate a version of it either,
+since an activation would lift the pause; while `agent-loop` is paused no
+loop and no failure report can start (the log names the pause). Inspect and
+operate with the engine's control API (`ouro_runtime::control::Control`):
+`definitions`/`definition` show versions, the trip and the pause; `pause`
+and `resume` act on a name.
+
+An agent version's breaker is the runtime's (3 faults in a row); a tripped
+version stays active and is set aside for each run until a version is
+activated again: the built-in runs in its place (the run's trace carries a
+`fallback` record). A name keeps at most 20 never-activated versions; pruning
+them belongs to the engine (Ch4mpl00/ouro#36).
+
 **Capacity** (`runs::config`): one run tree is a primary loop, its guard
 round and up to 16 workers with theirs, 34 drives; the signal holds none
 while it waits. Two trees can be live at once (a resumed one and the next

@@ -199,3 +199,75 @@ Decisions and findings while finishing step 2, each reversible:
   20-version cap counts only never-activated versions; `call: start_child`
   stays allowed, `run: workflow` and any `schedule` are refused in agent
   versions until step 5.
+
+## 2026-10-26 (step 3 (executor))
+
+Choices taken while implementing design 04 where the document is silent or
+ambiguous, each reversible:
+
+- **Argument names are checked by the agent at the gate**, against MCP's
+  current schemas and the host functions' own lists: the engine's bindings
+  of MCP tools are permissive (design 01, decision 16), so its validation
+  does not see them. The `owf` `check` stays for the evals workbench only.
+  The deny-list also refuses the guard round's private functions
+  (`review`, `confirm_request`, `resolve_review`), as `main` did.
+- **A loop's input tells its own steps `conversation` and `confirm`**
+  (`agent::loop_input`), and a route's or saved run's input also carries
+  `signal` and `env`: informational for the YAML (the reference Telegram
+  loop decides delivery and status on them); host functions read host data
+  only. Workers have no conversation. The fixture reads
+  `$context.conversation` where `main`'s read `$context.loop.conversation`.
+- **Step 1 also sets aside a version whose trip stands** before building
+  anything (the same outcome the engine's refusal would give); the
+  refusal mapping stays for a start that races an activation or a trip.
+- **The fallback record:** in a loop's host data (`LoopHost.fallback`) and
+  its span's metadata, with a `fallback` event; for `signal`,
+  `signal.fallback` is the line and the record is `input.fallback` and the
+  trace's metadata. A start refused after its anchor was written takes the
+  anchor back (`AgentDb::forget_run_trace`).
+- **Traces of route and saved launches** nest the primary run's
+  `agent_loop` span in a `route:<name>` or `runner` span (ended with it,
+  `Scopes::own_wrapped`), as `main`'s traces had.
+- **A saved workflow's completed answer** is `{ok, workflow, output}` as an
+  object (the signal's output and trace output), as `main`; its handover
+  text is "This task names the saved workflow `x`. <the line> Do the task
+  yourself."; a primary run that took no turn has no transcript for the
+  report, as `main`.
+- **`read_workflow` without a version** reads the active one, else the
+  newest (`main`: the newest); statuses are `active`/`retired`/`draft` plus
+  `builtin` (`main` said `built-in`).
+- **The draft cap** counts the versions never activated that are not a
+  built-in text.
+- **`runs::ChildStarts`**, a seam over `FunctionContext::start_child`, lets
+  a test stand in for a re-dispatched starter (design test 12).
+- **Small behaviour kept from `main`** while restoring its tests: the
+  recovery report's span opens before its setup (an unknown preset is an
+  ERROR observation), `primary_loop` checks its `input` before the session,
+  and a loop the host runs writes its run's answer into its trace (a variant
+  answering from a step).
+- **Restored tests, adapted:** a signal route calling `primary_loop` is
+  refused by the gate now, so `activated_signal_routes_*` routes to a loop
+  and asserts the refusal; with no `FlowRun` on the engine,
+  `an_interrupted_saved_workflow_*` leaves a saved workflow waiting on an
+  event; the `owf` task spans (`call:<task>`) are gone by design 01,
+  decision 14, so those assertions read the call spans; the memory-KV
+  breaker's assertions read the engine's trip; `schedule_task(workflow:)`
+  stays unavailable until step 5, so tests fire saved workflows through the
+  schedule's sink. The dry-run halves stay parked for step 4
+  (`tests/pending/{flows,workflow_kinds,sandbox,skill_index}.rs`), and the
+  `owf`-era Telegram loop is kept as `tests/fixtures/telegram-loop.flat.yaml`
+  for the dialect test.
+- **Step 2's tests that waited for this step:** the process test's journal
+  run takes the reference Telegram loop again (activated through the gate
+  into the files the binary opens) and ends on its reply, with no closing
+  turn, as on `main`; the Telegram history test gains its routed variant
+  beside the default path's. A routed signal's trace carries no `skills`
+  metadata (design 04: `settle_child { kind: route }`), where `main`
+  recorded the routed loop's skills, so the activity journal's packet of a
+  routed signal lists none: left open for the maintainer.
+- **Test-first, by mutants:** this run wrote the step's code before the
+  design's tests; each test was then seen failing on a scratch copy of the
+  commit with the code behind it removed (one mutant per piece: fallback,
+  tools, launches, built-ins, loop selection, meta, gate, pinning,
+  handover, re-dispatch join, cap and reuse, catalog, route priority,
+  transcript). The executor's report lists which mutant fails which test.
