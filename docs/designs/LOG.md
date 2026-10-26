@@ -61,6 +61,18 @@ or reverses each entry.
   routing uses `if:` (no jump); model sees short worker handles; capacity
   sized for two concurrent trees; `engine.` memory-key prefix reserved. Engine
   design 03 gains `FunctionContext::child_id(key)` (asked of its implementer).
+- **Engine design 04 implementation deviation accepted:** queued refusals keep
+  the host default threshold (needed to resolve `Inherit` at promotion); the
+  active version's policy still decides; no `Queued` layout bump. Alternative
+  (default in the store's `Policy`) left for later.
+- **Engine design 03 implementation choices accepted:** first-commit-wins for
+  every child join at the store level (roots keep the full comparison);
+  `dry_run_with` added beside `dry_run`; no state version bump.
+- **Engine pre-tag drift review (2026-10-26):** child ids become per-attempt
+  and hashed (`child:`/`hostchild:` + 32 hex) — a DSL retry starts its own
+  child, a crash re-dispatch joins; link conflicts are typed; host-data size
+  checked after the join; CHANGELOG re-cut as 0.2.0 (the #22/#20/#7 entries
+  moved under 0.1.0); crate versions 0.2.0.
 
 ## 2026-10-26 (night run: step 2, runs on the engine)
 
@@ -563,3 +575,31 @@ above, measured with one full `scripts/test.py` run, and **reverted**:
 - **What one file would need**: every agent.db write off the runtime
   threads (the blocking pool), or the agent's tables written through the
   engine's connection. Left to the maintainer.
+## Status at the end of the night run (usage limit reached)
+
+- Engine: designs 01–04 merged on ouro main (9aca1de). Pre-tag fixes (hashed
+  per-attempt child ids, CHANGELOG 0.1.0/0.2.0, crates 0.2.0) are on branch
+  `fix/child-ids` (worktree ouro.worktrees/childids), green per its agent
+  (315 tests, Postgres on a native server) but NOT yet verified by the elephant
+  nor merged; `v0.2.0` not tagged.
+- Open engine decision: a parent waiting on a waiting child is re-driven on
+  every worker pass (pending_wanted keeps waking it); proposed fix: ignore
+  `waiting:` notices no explicit listen asked for.
+- Docker Desktop's VM filesystem went read-only (disk was 97% full); restart
+  attempted, daemon not answering yet — needs a manual restart/check.
+- Agent migration: step 1 done; step 2 executor stopped at the limit — see
+  `feat/engine` commits for how far phases A–F got; continue from the design
+  `03-runs-on-the-engine.md` and the executor report if present
+  (scratchpad agent-step2-report.md).
+
+## 2026-10-26 (continued)
+
+- **ouro v0.2.0 tagged** (137767a) after verifying `fix/child-ids` on a working
+  Docker (315 tests). Docker Desktop needed a full restart (VM filesystem had
+  gone read-only); `mcp-tools-test-pg` started again by hand.
+- **Engine design 05 (waiting parents stay asleep):** one `wakes()` rule for
+  all wake sites; lifecycle notices wake only an exact current listen (not `*`,
+  not internal `child:*` listeners); `notify` gated; pinned by conformance only
+  (Quint models no wake condition). Target release 0.2.1.
+- **Step 2 continuation** started with a fresh executor (the previous one was
+  stopped at 68 passed / 31 failed).
