@@ -557,8 +557,10 @@ impl Supervisor {
         .await;
         if self.cancel.is_cancelled() {
             // Shutdown: the runs are released for recovery first, so their
-            // calls in flight end (as aborted) before the trace does.
+            // calls in flight end (as aborted), and their spans with them,
+            // before the trace does.
             engine.halt().await;
+            engine.scopes.stop_all();
         }
         let ended = engine.runtime.get(&run).await.ok().flatten().and_then(|r| r.outcome);
         let outcome = match (started, &ended) {

@@ -309,6 +309,9 @@ impl Engine {
             loop_.cancel.cancel();
         }
         futures::future::join_all(loops.iter().map(|l| l.close())).await;
+        // What the runs traced in this process, written before the tracer
+        // closes; a resumed run continues in a segment of its own.
+        self.scopes.stop_all();
         self.deps.tracer.shutdown().await;
         self.deps.mcp.close().await;
         *done = true;

@@ -536,6 +536,8 @@ async fn bounds_tool_concurrency_and_preserves_reply_order_when_completions_arri
         "unused",
         null(),
     );
+    // Each call answers when the test releases it; the calls of a round
+    // start in any order (each is an engine call of its own).
     let mut senders = Vec::new();
     let mut receivers = Vec::new();
     for _ in 0..3 {
@@ -544,20 +546,16 @@ async fn bounds_tool_concurrency_and_preserves_reply_order_when_completions_arri
         receivers.push(Some(rx));
     }
     let receivers = Arc::new(Mutex::new(receivers));
-    let (second_started_tx, second_started) = oneshot::channel::<()>();
-    let (third_started_tx, third_started) = oneshot::channel::<()>();
-    let starts = Arc::new(Mutex::new([None, Some(second_started_tx), Some(third_started_tx)]));
+    let started = Arc::new(Mutex::new(Vec::<usize>::new()));
     let active = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
     {
-        let (active, peak) = (active.clone(), peak.clone());
+        let (active, peak, started) = (active.clone(), peak.clone(), started.clone());
         h.mcp.always(Arc::new(move |_, args, _| {
             let i: usize = args["query"].as_str().unwrap().parse().unwrap();
             let now = active.fetch_add(1, Ordering::SeqCst) + 1;
             peak.fetch_max(now, Ordering::SeqCst);
-            if let Some(tx) = starts.lock().unwrap()[i].take() {
-                tx.send(()).unwrap();
-            }
+            started.lock().unwrap().push(i);
             let rx = receivers.lock().unwrap()[i].take().unwrap();
             let active = active.clone();
             Box::pin(async move {
@@ -567,21 +565,33 @@ async fn bounds_tool_concurrency_and_preserves_reply_order_when_completions_arri
             })
         }));
     }
+    let until_started = |n: usize| {
+        let started = started.clone();
+        async move {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while started.lock().unwrap().len() < n {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("calls start");
+            started.lock().unwrap().clone()
+        }
+    };
     let mut opts = h.options();
     opts.max_concurrent_tools = 2;
     let loop_ = h.engine.start_loop(opts).await.unwrap();
     let sent = tokio::spawn(loop_.send("parallel".into()));
-    second_started.await.unwrap();
-    assert_eq!(h.mcp.calls.lock().unwrap().len(), 2);
-    senders[1].take().unwrap().send("second".into()).unwrap();
-    // The third starts while the first still runs: a slot frees as soon as
-    // any call finishes.
-    tokio::time::timeout(std::time::Duration::from_secs(5), third_started)
-        .await
-        .expect("the third call waited for the first")
-        .unwrap();
-    senders[2].take().unwrap().send("third".into()).unwrap();
-    senders[0].take().unwrap().send("first".into()).unwrap();
+    let first_two = until_started(2).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(started.lock().unwrap().len(), 2, "the third waits for a slot");
+    // A slot frees as soon as any call finishes: the later of the two.
+    let answer = |i: usize| ["first", "second", "third"][i].to_owned();
+    senders[first_two[1]].take().unwrap().send(answer(first_two[1])).unwrap();
+    let all = until_started(3).await;
+    for i in [all[2], first_two[0]] {
+        senders[i].take().unwrap().send(answer(i)).unwrap();
+    }
     assert_eq!(sent.await.unwrap().unwrap(), "done");
     assert_eq!(peak.load(Ordering::SeqCst), 2);
 }

@@ -427,6 +427,27 @@ impl Scopes {
         }
     }
 
+    /// Ends every scope this registry ends (not the borrowed ones) at a
+    /// shutdown, so what the runs traced is written: a run's span ends as
+    /// stopped (the run resumes at the next start, in a continuation).
+    pub fn stop_all(&self) {
+        let stopped: Vec<Live> = {
+            let mut live = self.lock();
+            let owned: Vec<String> =
+                live.iter().filter(|(_, l)| !matches!(l, Live::Borrowed(_))).map(|(run, _)| run.clone()).collect();
+            owned.into_iter().filter_map(|run| live.remove(&run)).collect()
+        };
+        for scope in stopped {
+            match scope {
+                Live::Span(span) => {
+                    span.end(SpanEnd::error("stopped by a shutdown; the run resumes at the next start"))
+                }
+                Live::Segment(trace) => trace.end(),
+                Live::Borrowed(_) => {}
+            }
+        }
+    }
+
     pub fn open(&self) -> Vec<String> {
         let mut runs: Vec<String> = self.lock().keys().cloned().collect();
         runs.sort();
@@ -821,11 +842,14 @@ async fn handle(engine: &std::sync::Arc<crate::agent::Engine>, event: ouro_runti
     }
 }
 
-/// Whether a run's outcome is its trace's: a root run, except a recovery
-/// report, which is a root of its own (outside the signal's tree, R2-H2)
-/// but traces as a span of the signal's trace, whose outcome is the signal's.
+/// Whether the reconciler writes a run's outcome into its trace: a root run
+/// whose creator may be gone when it ends (a signal that suspended), except
+/// a recovery report, a root of its own (outside the signal's tree, R2-H2)
+/// that traces as a span of the signal's trace, whose outcome is the
+/// signal's, and a loop the host runs itself (`AgentLoop::send`), whose
+/// caller writes its outcome.
 pub fn trace_root(run: &SavedRun) -> bool {
-    run.child.is_none() && host_kind(run.admission.host()) != Some(RECOVERY)
+    run.child.is_none() && !matches!(host_kind(run.admission.host()), Some(RECOVERY | LOOP))
 }
 
 // A run that ended: its live scope ends with the outcome; a child is
