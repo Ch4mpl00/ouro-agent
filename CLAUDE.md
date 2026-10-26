@@ -385,6 +385,39 @@ locators, no `static` handles in business code.
   handler's inputs must be its contract.
 - `unsafe` (transmutes above all) to get past the borrow checker.
 
+## Token-efficient development
+
+Classify a change as SMALL, MEDIUM or CRITICAL before starting.
+
+- **SMALL:** localized fixes. No design document and no review, unless a
+  durable contract changes.
+- **MEDIUM:** changes spanning several modules. Write a short implementation
+  plan, implement it in the current session (not through a fresh subagent,
+  which re-reads everything), run targeted tests. Delegate only a large,
+  cleanly separable part; a plain execution task goes to Sonnet.
+- **CRITICAL:** persistence semantics, replay, concurrency, leases, recovery,
+  delivery (anything that can lose or duplicate an action) or a public
+  contract. The full Elephant-Goldfish process: a design document, a
+  zero-context review on Codex Sol (`codex exec -m gpt-6.1-sol -c
+  model_reasoning_effort='"high"'`), one round, a second only if the first
+  found high-severity issues; then an executor, test-first, with 1–3 hand
+  mutants for the design's key rules (never a mutation tool).
+
+Rules for every class:
+
+- Don't spawn subagents for plain code exploration, single-file edits or
+  routine test fixes. Prefer direct grep and targeted file reads; read only
+  the relevant files and widen the scope when the evidence asks for it.
+- Tests: targeted ones while working; `cargo fmt` and `cargo clippy
+  --all-targets -- -D warnings` before finishing; the full suite once before
+  a merge to main, not after every change.
+- Read the summary of a command, a log or a subagent's report; open the
+  detailed output only for a failure, and then only its failing part.
+- Never weaken a test or an invariant check to save tokens. A test that is
+  unstable under load is rewritten to assert what it means, never deleted.
+- Keep responses short: the changed files, the verification results and the
+  unresolved risks.
+
 ## Task tracking
 
 Planned work and tech debt are GitHub issues in `Ch4mpl00/ouro-agent`
