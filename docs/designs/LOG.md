@@ -475,3 +475,19 @@ each reversible:
   read against the design; 106/107 binaries in the executor's full run, the
   one failure the sandbox confirmation test's wall-clock bound under load
   (24/24 alone), covered by the item above.
+
+## 2026-10-26 (fixes: journal skills, clock tests)
+
+- **A routed signal's trace carries the routed loop's skills again.**
+  `settle_child { kind: route }` now writes `skills` (host skills, the
+  engine's unless excluded, then `loop_setup`'s added and preselected, read
+  from the route's run: `agent::loop_skill_names`) instead of an empty list;
+  the telegram-loop test pins the trace metadata and the journal's packet.
+- **Two wall-clock tests assert what they mean.** The empty-queue test waits
+  for `get_next_signal` right after the wait ends (60 s, far below the
+  hour), the signal's handling has only a loose bound. The sandbox
+  confirmation test drops the baseline comparison for a 60 s backstop (a
+  round's PT60S join or a worker's PT15M still fail it; the engine's dry run
+  exposes no record of a hold's timeout, so the PT5S answer wait is the
+  engine's own test). Mutant once (`max_hold` left unset in the engine's dry
+  run): the test failed at 122 s.

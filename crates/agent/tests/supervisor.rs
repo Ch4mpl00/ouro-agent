@@ -552,17 +552,28 @@ async fn an_empty_queue_is_waited_on_and_a_new_signal_taken_at_once() {
     .unwrap();
     let asked = mcp.calls.lock().unwrap().iter().find(|(n, _)| n == "wait_for_signal").unwrap().1.clone();
     assert_eq!(asked["timeoutMs"], json!(25_000), "one wait round is 25 s");
+    let polls = || mcp.calls.lock().unwrap().iter().filter(|(n, _)| n == "get_next_signal").count();
+    let before = polls();
     mcp.queue.lock().unwrap().push_back(json!({"signal":signal("dreaming",7),"pendingAfter":0}));
     mcp.arrived.notify_waiters();
-    // The signal's run takes the engine's starts (seconds under the whole
-    // suite's load); an hour's poll interval would still show.
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    // What this pins is the call, not the engine's speed: the loop asks for
+    // the signal as the wait ends. The poll interval is an hour, so any
+    // timeout far below it still tells a sleep from a prompt call.
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while polls() == before {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("get_next_signal is called right after the wait, not an interval later");
+    // The run itself takes the engine's starts (seconds under load): no tight bound.
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
         while f.db.get_trace("dreaming:7").unwrap().is_none() {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     })
     .await
-    .expect("the signal is handled right after the wait, not an interval later");
+    .expect("the signal is handled");
     stop.cancel();
     mcp.arrived.notify_waiters();
     tokio::time::timeout(std::time::Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
@@ -1402,6 +1413,12 @@ async fn a_telegram_signal_runs_the_loop_that_declares_its_route() {
     assert_eq!(trace.output, "all done");
     assert!(observations.iter().any(|o| o.name == "route:telegram-loop"));
     assert!(observations.iter().any(|o| o.name == "find_skills" && o.meta("automatic") == Some(&json!(true))));
+    // The routed loop's skills are on the signal's trace, as on `main`, and
+    // so the activity journal's packet lists them.
+    let skills = json!(["orchestrator", "routing", "telegram"]);
+    assert_eq!(trace.metadata.as_ref().unwrap()["skills"], skills);
+    let packet = agent::activity::project_trace(&trace, &observations, None, &Default::default());
+    assert_eq!(packet["skills"], skills);
     supervisor.shutdown().await;
 }
 

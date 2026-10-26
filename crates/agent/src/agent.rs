@@ -2275,6 +2275,22 @@ pub async fn loop_setup(
     }))
 }
 
+/// The skills a loop run (a route's) ran, as `AgentLoop::skill_names` names
+/// them live: its host's skills, the engine's unless excluded, then what
+/// `loop_setup` added and preselected, read from the run's journal.
+pub fn loop_skill_names(engine: &Engine, host: &crate::runs::LoopHost, records: &Records) -> Vec<String> {
+    let engine_skills = if host.include_engine_skills { engine.deps.skills.as_slice() } else { &[] };
+    let setup = setup_record(records);
+    let setup = setup.iter().flat_map(|s| string_list(&s["skills"]).into_iter().chain(string_list(&s["preselected"])));
+    let mut names: Vec<String> = Vec::new();
+    for name in host.skills.iter().cloned().chain(engine_skills.iter().cloned()).chain(setup) {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
 // The `setup` a completed `loop_setup` recorded in a run's journal.
 fn setup_record(records: &Records) -> Option<Value> {
     recorded_output(records, "loop_setup").map(|output| output["setup"].clone())

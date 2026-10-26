@@ -361,13 +361,14 @@ async fn a_telegram_signal_runs_the_draft_chain_with_real_reads_and_mocked_write
 // memory does, and the guard asks the user about it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn confirmations_are_answered_on_the_spot_through_the_real_guard() {
-    // The same chain without a card: what a try costs here, now (design 05,
-    // deviation 3). A confirmed one costs less than that plus the guard's
-    // 5 s hold, which a dry run never waits.
-    let (s, _) = sandbox(vec![calls(&[("remember", json!({"text":"likes Rust"}))]), send("done")], "allow").await;
-    let start = Instant::now();
-    assert_eq!(s.try_signal(telegram(None)).await.unwrap()["status"], "completed");
-    let baseline = start.elapsed();
+    // What a try must not do is wait out a hold. The engine's dry run cuts
+    // them (`Limits::max_hold` is zero there, and a join's child is not
+    // driven in real time), and the dry run exposes no record of a wait that
+    // ended by its timeout, so the structural side is the engine's own test
+    // (ouro's `a_dry_run_cuts_holds_short_...`). Here a wall-clock bound
+    // stays only as a backstop, far above any load: it catches a round's
+    // PT60S join and a worker's PT15M (each alone exceeds it), not the
+    // guard's PT5S answer wait (design 05, deviation 3).
     for (confirm, label) in [(None, "allow"), (Some("decline"), "declined"), (Some("expire"), "expired")] {
         let (s, _) =
             sandbox(vec![calls(&[("remember", json!({"text":"likes Rust"}))]), send("done")], "needs_confirmation")
@@ -375,7 +376,7 @@ async fn confirmations_are_answered_on_the_spot_through_the_real_guard() {
         let start = Instant::now();
         let report = s.try_signal(telegram(confirm)).await.unwrap();
         let took = start.elapsed();
-        assert!(took < baseline + Duration::from_secs(4), "{label}: the guard did not wait ({took:?}, {baseline:?})");
+        assert!(took < Duration::from_secs(60), "{label}: the try waited out a hold ({took:?})");
         assert_eq!(report["status"], "completed", "{label}: {report:#}");
         no_refusals(&report);
         assert_eq!(report["output"], "done");
