@@ -54,7 +54,7 @@ async fn primary_saves_live_rules_then_a_new_session_discovers_them_alongside_do
     std::fs::copy(shipped.join("orchestrator.md"), defaults.join("orchestrator.md")).unwrap();
     std::fs::write(defaults.join("news-query.md"), "---\ntools: []\n---\n# News\n\nFind topical news.").unwrap();
     let content = "---\nroutable: true\ntools: *\n---\n# Telegram\n\nApply to every Telegram message, regardless of topic.\n\nReply briefly in Russian, without tables.\n";
-    let mut h = Harness::new(
+    let h = Harness::configured(
         task_context("save"),
         vec![
             turn(move |p| {
@@ -98,12 +98,13 @@ async fn primary_saves_live_rules_then_a_new_session_discovers_them_alongside_do
         ],
         "unused",
         Arc::new(NullTracer),
+        |deps| {
+        deps.skills = vec!["orchestrator".into()];
+        deps.skill_store = Arc::new(FsSkillStore::new(root.path()));
+        deps.mcp = Arc::new(MemoryOnly);
+        deps.decisions = Some(decision_client("jev-test".into(), Arc::new(Scorer)));
+        },
     );
-    let engine = Arc::get_mut(&mut h.engine).unwrap();
-    engine.deps.skills = vec!["orchestrator".into()];
-    engine.deps.skill_store = Arc::new(FsSkillStore::new(root.path()));
-    engine.deps.mcp = Arc::new(MemoryOnly);
-    engine.deps.decisions = Some(decision_client("jev-test".into(), Arc::new(Scorer)));
     let mut opts = h.options();
     opts.skills.clear();
     assert_eq!(

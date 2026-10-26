@@ -92,6 +92,44 @@ sqlite3 -json packages/agent/data/agent.db "SELECT * FROM memory"
 docker compose exec postgres psql -U mcp -d mcp_state -c "SELECT * FROM signals ORDER BY id DESC LIMIT 5"
 ```
 
+## Workflow runs on the engine
+
+Every workflow run of the agent (a signal, its primary loop, workers, guard
+rounds, a recovery report) is a run of the ouro engine, stored in agent.db's
+`ouro_*` tables on a connection of its own (`crates/agent/src/runs.rs`;
+docs/designs/03-runs-on-the-engine.md). The built-ins `signal`,
+`agent-loop` and `guard` are saved and activated at boot, with
+`metadata.ouro.breaker: off`.
+
+**Capacity** (`runs::config`): one run tree is a primary loop, its guard
+round and up to 16 workers with theirs, 34 drives; the signal holds none
+while it waits. Two trees can be live at once (a resumed one and the next
+signal's), so the worker drives up to **68 runs** (`max_concurrency`) with
+**136 handler slots** (`max_function_concurrency`). A child starts at the
+worker's next tick (`poll_interval`, 50 ms).
+
+**Jump budget** (`limits.max_jumps`, per run tree): a backstop, not the
+binding limit, which is each loop's `max_iterations`. One agent-loop round
+takes two jumps plus one per guarded call; the dispatcher takes at most
+three: Σ loops `max_iterations × (2 + guarded calls per round) + 3`. With
+the primary's 100 iterations and 16 workers of 50, each with up to 16
+guarded calls a round, that is 16 203; the ceiling is **20 000**. The
+recovery report runs as a root of its own (`recovery:<signal id>`), so an
+exhausted tree budget never stops it. `max_tasks` per run is 50 000.
+
+**Record sizes:** every task record of a loop carries its context, the
+transcript included, so a loop's records grow with rounds × transcript
+size; a call's checkpointed reply is clipped to 64 Ki UTF-16 units. The
+engine sweeps the records of runs that ended more than 7 days ago; the
+reconciler (every minute) sweeps the agent's own rows of those runs
+(`run_trace`, `confirmations`, `guard_verdict_uses`, `run_evidence`, and
+`evidence` no run links). Host data is at most a few KiB: large evidence
+(skill text, earlier messages) is content-addressed in `evidence`.
+
+**Signal loss window:** `get_next_signal` takes a signal before the engine
+admits its run; a crash in between loses that signal, as before (design 03,
+decision 5).
+
 ## Tests
 
 | Command | What it runs |

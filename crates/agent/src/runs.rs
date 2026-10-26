@@ -366,9 +366,9 @@ impl Scopes {
             ..Default::default()
         });
         let mut live = self.lock();
-        // Another handler of the run may have opened one meanwhile.
+        // Another handler of the run may have opened one meanwhile: this
+        // one is dropped unwritten (nothing traced into it).
         if let Some(scope) = current(&live, run) {
-            trace.end();
             return Some(scope);
         }
         live.insert(run.into(), Live::Segment(trace.clone()));

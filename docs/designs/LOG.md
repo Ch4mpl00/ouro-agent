@@ -61,3 +61,54 @@ or reverses each entry.
   routing uses `if:` (no jump); model sees short worker handles; capacity
   sized for two concurrent trees; `engine.` memory-key prefix reserved. Engine
   design 03 gains `FunctionContext::child_id(key)` (asked of its implementer).
+
+## 2026-10-26 (night run: step 2, runs on the engine)
+
+Decisions taken while implementing design 03 that the design does not
+cover, each reversible:
+
+- **AgentDb writes from engine handlers go to the blocking pool**
+  (`AgentDb::write`). The engine's SQLite adapter shares agent.db and holds
+  its write lock across the awaits of a commit, and the worker drives every
+  run in one task: a synchronous write that waited for that lock inside a
+  handler (or on a current-thread runtime) blocked the very task that would
+  release it ("database is locked" after 5 s). Engine tests run on the
+  multi-thread runtime, as the binary does. Alternative kept for the
+  maintainer: the engine store in a file of its own (overview decision 3
+  says agent.db).
+- **The signal takes its primary's `waiting:` event** before listening for
+  `done:` (`signal.yaml`): an owned child's waiting notice that the parent
+  never consumes keeps the parent due, and it busy-loops. Built-in listens
+  that switch on an event's type read envelopes (`read: envelope`); the
+  engine's default is the event data.
+- **`run_saved_workflow` and `route_signal` start nothing in step 2**
+  (decision 9): they answer handover / not routed directly, without the
+  listen / child_outcome / settle_child sequence a starter gets. That
+  sequence is used for the primary.
+- **Recovery waits:** the supervisor's quiescence predicate covers the
+  signal's tree and its `recovery:<id>` root, so a report is finished (or
+  waiting) before the next signal starts.
+- **Loop host data also carries `guard_request`** (a digest) for every loop
+  kind, not only workers: the primary's guard task is the signal's content.
+- **Live loops** are ended on `run_ended` only for loops the engine built
+  for a run (`loop_for`); a loop a caller started (`start_loop`, tests and
+  evals) is the caller's. A run's live trace scope ends when its execution
+  stops; a later execution opens a continuation segment.
+- **`AgentLoop::send` is kept** (tests, evals) and runs the loop as an
+  engine run of kind `loop`; repeated sends use run ids `<id>#n`.
+- **The evals workbench keeps an `owf` adapter** (`flows::standalone_host`)
+  over the engine's workflow steps until step 6; it is not the agent's
+  running path.
+- **The worker's poll interval is 50 ms** (engine default 100 ms): a child
+  starts at the next tick and a signal is a chain of three or four starts.
+- **Suites that need saved workflows, loop variants, signal overrides or
+  the sandbox are parked** in `crates/*/tests/pending/` (not compiled) with
+  a pointer to the step that restores them; the old durability and
+  confirmation property suites (`durable_loop`, `loop_durability`,
+  `confirmation_properties`) are parked too and covered by the design's
+  tests in `tests/engine_runs.rs`, to be rewritten on the engine.
+- **MCP's tool list is read once at boot** (`Engine::refresh_tools` after
+  the first successful `tools/list`); the registry is not swapped on a
+  reconnect, as MCP's tools are fixed at boot (mcp.rs).
+- **Engine pinned at 9aca1de** (design 04 merged): the built-ins carry
+  `metadata.ouro.breaker: off`; the interim lifted threshold is gone.

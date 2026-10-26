@@ -727,7 +727,8 @@ async fn guard_gets_only_preloaded_user_messages_and_raw_signal_for_parent_and_w
         {"id":1,"chat_id":42,"thread_id":null,"role":"user","text":"Yesterday: keep a weekly summary","created_at":"2026-09-06 11:58:00"},
         {"id":2,"chat_id":42,"thread_id":null,"role":"assistant","text":"BOT_HISTORY_MUST_STAY_OUT","created_at":"2026-09-06 11:59:00"},
     ]});
-    let mut h = Harness::new(
+    let api = Arc::new(GuardApi::default());
+    let h = Harness::configured(
         task_context("task"),
         vec![
             turn(|_| call("invoke_sub_agent", json!({"prompt":"prepare notes","input_refs":["telegram.history"]}))),
@@ -739,10 +740,11 @@ async fn guard_gets_only_preloaded_user_messages_and_raw_signal_for_parent_and_w
         ],
         &history.to_string(),
         null(),
+        |deps| {
+        deps.decisions =
+            Some(agent::decisions::decision_client("guard-test".into(), api.clone()));
+        },
     );
-    let api = Arc::new(GuardApi::default());
-    Arc::get_mut(&mut h.engine).unwrap().deps.decisions =
-        Some(agent::decisions::decision_client("guard-test".into(), api.clone()));
     let content = "Telegram message in chat 42.\nText: \"do what I asked yesterday\"";
     assert_eq!(supervisor(&h).run_signal(&signal("telegram", content)).await.unwrap(), "done");
     let requests = api.requests.lock().unwrap();
@@ -765,7 +767,7 @@ async fn runs_a_signal_directly_and_records_parent_worker_tool_io_memory_referen
     let (primary, primary_written) = recording();
     let (mirror, mirror_written) = recording();
     let payload = "article ".repeat(2_000) + "source tail";
-    let mut h = Harness::new(
+    let h = Harness::configured(
         task_context("task"),
         vec![
             turn(|_| call("search_news", json!({"query":"latest"}))),
@@ -778,8 +780,10 @@ async fn runs_a_signal_directly_and_records_parent_worker_tool_io_memory_referen
         ],
         &payload,
         Arc::new(tee_tracer(primary, mirror)),
+        |deps| {
+        deps.skills = vec!["orchestrator".into()];
+        },
     );
-    Arc::get_mut(&mut h.engine).unwrap().deps.skills = vec!["orchestrator".into()];
     let runner = supervisor(&h);
     assert_eq!(runner.run_signal(&signal("telegram", SIGNAL_CONTENT)).await.unwrap(), "finished");
     assert_eq!(primary_written.len(), 1);
@@ -928,7 +932,7 @@ async fn exports_the_primary_loop_and_nested_worker_through_the_langfuse_adapter
     let exported = Arc::new(Exported::default());
     let langfuse = Arc::new(LangfuseTracer::with_sink(exported.clone()));
     let tracer = Arc::new(tee_tracer(langfuse, local));
-    let mut h = Harness::new(
+    let h = Harness::configured(
         task_context("task"),
         vec![
             turn(|_| call("search_news", json!({"query":"latest"}))),
@@ -941,8 +945,10 @@ async fn exports_the_primary_loop_and_nested_worker_through_the_langfuse_adapter
         ],
         &"large result ".repeat(1_000),
         tracer.clone(),
+        |deps| {
+        deps.skills = vec!["orchestrator".into()];
+        },
     );
-    Arc::get_mut(&mut h.engine).unwrap().deps.skills = vec!["orchestrator".into()];
     supervisor(&h).run_signal(&signal("telegram", SIGNAL_CONTENT)).await.unwrap();
     let spans = exported.0.lock().unwrap().clone();
     let by_name = |name: &str| spans.iter().find(|s| s.name == name).unwrap().clone();
@@ -1372,7 +1378,15 @@ async fn primary_discovers_and_reads_effective_skill_instructions_in_the_same_lo
         .unwrap()
         .to_owned();
     let expected = hash.clone();
-    let mut h = Harness::new(
+    struct Scorer;
+    #[async_trait]
+    impl agent::providers::JsonApi for Scorer {
+        async fn post(&self, _: &str, _: Value, _: &CancellationToken) -> anyhow::Result<Value> {
+            Ok(json!({"model":"jev-test","answers":{"skill_0":{"type":"noul","noul":0.9}}}))
+        }
+    }
+    let mcp = ToolMcp::returning(vec![], &json!({"ok":false,"error":"doc_not_found"}).to_string());
+    let h = Harness::configured(
         task_context("discovery"),
         vec![
             turn(|p| {
@@ -1393,20 +1407,13 @@ async fn primary_discovers_and_reads_effective_skill_instructions_in_the_same_lo
         ],
         "unused",
         null(),
+        |deps| {
+            deps.mcp = mcp.clone();
+            deps.decisions = Some(agent::decisions::decision_client("jev-test".into(), Arc::new(Scorer)));
+            deps.skill_store = store;
+            deps.skills = vec!["orchestrator".into()];
+        },
     );
-    struct Scorer;
-    #[async_trait]
-    impl agent::providers::JsonApi for Scorer {
-        async fn post(&self, _: &str, _: Value, _: &CancellationToken) -> anyhow::Result<Value> {
-            Ok(json!({"model":"jev-test","answers":{"skill_0":{"type":"noul","noul":0.9}}}))
-        }
-    }
-    let mcp = ToolMcp::returning(vec![], &json!({"ok":false,"error":"doc_not_found"}).to_string());
-    let engine = Arc::get_mut(&mut h.engine).unwrap();
-    engine.deps.mcp = mcp.clone();
-    engine.deps.decisions = Some(agent::decisions::decision_client("jev-test".into(), Arc::new(Scorer)));
-    engine.deps.skill_store = store;
-    engine.deps.skills = vec!["orchestrator".into()];
     let mut opts = h.options();
     opts.skills = vec![];
     let loop_ = h.engine.start_loop(opts).await.unwrap();

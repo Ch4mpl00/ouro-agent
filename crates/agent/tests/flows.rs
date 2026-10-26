@@ -268,8 +268,8 @@ async fn the_author_can_inspect_signal_and_loop_hosts_but_probes_cannot_execute_
     // Follow the definitions an author actually copies, rather than a second
     // list of expected names that could omit the next host function too.
     for definition in [agent::supervisor::SIGNAL, agent::agent::AGENT_LOOP] {
-        let wf = owf::model::parse_yaml(definition).unwrap();
-        for site in owf::model::call_sites(&wf) {
+        let wf = ouro_runtime::ows::model::parse_yaml(definition).unwrap();
+        for site in ouro_runtime::ows::model::call_sites(&wf) {
             let name = &site.function;
             assert!(catalog.lines().any(|line| line.starts_with(&format!("{name}("))), "missing {name}");
             let detail: Value =

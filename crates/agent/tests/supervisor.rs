@@ -541,7 +541,9 @@ async fn an_empty_queue_is_waited_on_and_a_new_signal_taken_at_once() {
     assert_eq!(asked["timeoutMs"], json!(25_000), "one wait round is 25 s");
     mcp.queue.lock().unwrap().push_back(json!({"signal":signal("dreaming",7),"pendingAfter":0}));
     mcp.arrived.notify_waiters();
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    // The signal's run takes the engine's starts; an hour's poll interval
+    // would still show.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while f.db.get_trace("dreaming:7").unwrap().is_none() {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }

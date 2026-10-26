@@ -459,12 +459,24 @@ pub struct Harness {
 
 impl Harness {
     pub fn new(session: Session, turns: Vec<Turn>, tool_result: &str, tracer: Arc<dyn Tracer>) -> Harness {
+        Self::configured(session, turns, tool_result, tracer, |_| {})
+    }
+
+    /// A harness whose engine dependencies `configure` changes before the
+    /// engine is built (handlers hold it weakly: it cannot change after).
+    pub fn configured(
+        session: Session,
+        turns: Vec<Turn>,
+        tool_result: &str,
+        tracer: Arc<dyn Tracer>,
+        configure: impl FnOnce(&mut EngineDeps),
+    ) -> Harness {
         let model = Turns::new(turns);
         let status = ToolDef::new(STATUS_TOOL, STATUS_TOOL, json!({"type":"object"}));
         let mcp = ToolMcp::returning(vec![search_tool(), status], tool_result);
         let persist = Arc::new(PersistLog::default());
         let provider: Arc<dyn ChatProvider> = model.clone();
-        let engine = create_engine(EngineDeps {
+        let mut deps = EngineDeps {
             providers: Providers {
                 openai: provider.clone(),
                 gemini: provider.clone(),
@@ -483,7 +495,9 @@ impl Harness {
             env: Default::default(),
             db: agent::db::AgentDb::open(":memory:").unwrap(),
             store: agent::runs::memory_store(),
-        });
+        };
+        configure(&mut deps);
+        let engine = create_engine(deps);
         Harness { engine, session, mcp, persist, model }
     }
 

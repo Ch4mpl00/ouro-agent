@@ -9,7 +9,9 @@ use evals::optimizer::{compact_trace, prompt, proposal_yaml, propose};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-const DEFINITION: &str = include_str!("../../agent/workflows/agent-loop.yaml");
+// A definition in the interpreter dialect the workbench runs (owf, until
+// the engine migration removes it); the built-ins are engine definitions.
+const DEFINITION: &str = include_str!("../../agent/tests/fixtures/telegram-loop.yaml");
 
 fn observation(id: &str, kind: ObservationType, parent: Option<&str>) -> Observation {
     Observation {

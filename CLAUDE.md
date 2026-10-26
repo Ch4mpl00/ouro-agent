@@ -86,80 +86,48 @@ deletion.
    (25 s rounds), so a signal starts at once instead of on the next poll. The
    wait never takes a signal: a wait abandoned by a dead supervisor can't
    lose one. `wait_for_signal` is supervisor-only — never offered to a model
-   (`agent::mcp::SUPERVISOR_ONLY_TOOLS`). Each signal runs the OWF workflow
-   `signal` (`workflows/signal.yaml`, its functions in `supervisor.rs` §2b; the agent
-   may activate its own version, with the same breaker as `agent-loop`), which
-   dispatches routes declared in `document.metadata.route.when`: source and
-   top-level payload fields, with the most specific match winning (ties need
-   distinct priorities at activation). Routes run after button delivery and
-   session setup. **One kind of workflow, one launch path** (`supervisor.rs`
-   §2b `launch`): a route's workflow, a scheduled task's and the default
-   path's loop each start as the signal's primary run, admitted with the
-   model's parameters (`admission`: preset, confirmation target, conversation,
-   session context; `metadata.agent` or a route's `preset`/`confirm` may set
-   them) and driven by `FlowRun::run_loop`. Any workflow may therefore take
-   agent turns (`agent_turn` and the loop's host functions read only that
-   admitted input, never the YAML's, and a child a workflow starts itself is
-   never admitted); `metadata.loop` only lists a loop for workers. A routed
-   workflow gathers its own first-turn context (`signal_input`,
-   `recent_activity`, `pending_confirmations`, `preselect_skills`) and sets
-   up its instructions with `loop_setup` before its first turn (`agent.rs`
-   §4), so a channel's flow is one workflow. Signal routes (calling
-   `primary_loop`) are superseded and kept for the ones already active.
-   Telegram uses the default path below unless the agent activates a
-   matching loop; none is built in. Calls written into a loop's YAML are
-   trusted as a saved workflow's; only the model's calls go through `tool`
-   and the guard.
-   A `scheduler` signal whose payload names a saved workflow (`{"workflow": …}`, set by
-   `schedule_task(workflow: …)`) runs its active version through the same launch
-   (`scheduler` skill and `base` preset unless it declares others); all other
-   signals run the primary agent loop. A recurring task can start as a copy
-   of `agent-loop` under its own name and be crystallised into deterministic
-   steps version by version (`workflow-author`); wherever `agent_turn`
-   appears, save and activation require agent-loop's guarded round.
-   Every agent loop (primary, worker, recovery)
-   is a run of a named OWF loop (`document.metadata.loop`), `agent-loop` by
-   default; `primary_loop(loop: …)`, worker arguments or skill frontmatter
-   choose variants. The host supplies ordered tool outcomes and the incoming
-   conversation identity; YAML decides exit rules. Workers have no conversation.
-   Host functions live in `agent.rs` §4. The primary loop is durable, so a
-   restart resumes it from its last round. Durable runs persist a private trace anchor: resumed
-   segments nest under their original span in the signal trace, and the primary
-   run's final output updates that trace. Delivered events are recorded there;
-   the delivery signal keeps its own trace in the request's session. Old runs
-   without anchors retain separate resume traces. The activity journal waits
-   for every anchored run to end and its final spans to reach the mirror, then
-   projects the request once. The agent may activate its own version of
-   any loop (or route) once a dry run of it on a signal completed
-   (`src/sandbox.rs`); three faults of a name in a row fall back to its
-   built-in one (a loop without one falls back to `agent-loop`; `flows.rs` §4b). A worker of the durable primary loop is a durable run of
-   its own, started immediately as an owned child. The parent joins it with
-   `listen` (15 minute in-memory hold); a worker waiting for confirmation lets
-   the parent sleep durably and the supervisor take the next signal. Workers
-   inherit the admitted confirmation target. A round's guard is a reserved
-   built-in child workflow (`workflows/guard.yaml`): Rust reviews the calls,
-   YAML sequences concurrent cards and event waits, and `tool` reads the
-   verified final verdicts from its owned child's stored outcome. Fast guard
-   results use a 60 second hold and never suspend the parent; rounds with only
-   local reads skip the guard child. Existing runs retain their definitions.
-   A missing saved workflow or one that
-   faulted before any write call hands over to the agent loop in the same
-   trace; a saved workflow that faulted after a write goes to `recovery`
-   instead of being retried. Writes are the MCP tools without `readOnlyHint` (plus `set_memory`). The agent-loop path loads:
+   (`agent::mcp::SUPERVISOR_ONLY_TOOLS`). **Every workflow run is a run of
+   the ouro engine** (`crates/agent/src/runs.rs`; docs/designs/03): its store
+   is `ouro_*` tables in agent.db on a connection of its own; the engine
+   worker (started after MCP's first `tools/list`) drives every run. Each
+   signal is the durable run `signal:<id>` of the built-in `signal`
+   (`workflows/signal.yaml`), admitted with the signal as **host data** (what
+   the host vouches for; YAML can neither read nor set it). The supervisor
+   starts signals one at a time and waits until the signal's run tree is
+   quiescent (ended, or every live run waits on an event or a timer); a
+   suspended tree goes on in the worker when its event arrives (a button
+   press a later signal delivers to the waiting guard round). The registry
+   (`functions.rs`) holds every MCP tool the snapshot ever held (at most once
+   unless `readOnlyHint`; an absent one answers `not_executed`) and the host
+   functions, each serving only the runs its host data names. Host
+   functions start the vouched children: `primary_loop` (the signal's
+   primary loop), `start_worker` (the model's `invoke_sub_agent`, inheriting
+   the confirmation target), `start_guard` (the round's review, the reserved
+   `workflows/guard.yaml`) and `recovery_loop` (a failure report, a root of
+   its own). Every loop is a run of `agent-loop` (`workflows/agent-loop.yaml`),
+   its parameters in host data and large evidence content-addressed in the
+   `evidence` table; a restart resumes it from its last checkpoint. The
+   model's calls go `classify` → `tool_once` (writes and confirmed
+   open-world reads, at most once; an unknown outcome is caught in YAML and
+   told to the model) or `tool_repeat`; their verdicts come from the round's
+   own guard child's stored outcome. Live loops are a cache, rebuilt from
+   host data and the run's journal. Tracing: handlers write their own
+   generation and tool spans; a run's spans nest under the span its starter
+   opened (`run_trace`), resumed executions in continuation segments; the
+   reconciler (`runs.rs` §8) records run ends from the engine's history for
+   the activity journal and the judge. Until the engine migration's later
+   steps, saved workflows, routes, loop variants and dry runs answer that
+   they are unavailable (design 03, decision 9).
+   The agent-loop path loads:
    - `skills/orchestrator.md` + `skills/routing.md` — always; how to use
      working memory and when to delegate to a domain skill.
    - `skills/<signal.source>.md` (with `skills.default/` fallback) — for `peer`
-     and `scheduler` on the default path. Telegram rules can be preselected or
-     loaded by an activated loop's `loop_setup`; domain work is delegated to a sub-agent
-     with that source's skill.
+     and `scheduler` on the default path. Domain work is delegated to a
+     sub-agent with that source's skill.
 
-   The built-in `signal` workflow's `try`/`catch` requests a recovery report
-   through `recovery_loop`, then raises the signal failure again. Its prompt,
-   skills, preset, iteration limit and system context live in YAML;
-   `signal_transcript` reads the primary loop's bounded transcript tail.
-   Rust guards cancellation, aborts and missing sessions, traces the report
-   under `recovery`, and cleans up its loop. Reporting errors cannot replace
-   the signal error. A `signal` override without a catch chooses no report.
+   The built-in `signal` workflow's `try`/`catch` starts a recovery report
+   through `recovery_loop`, then raises the signal failure again. Reporting
+   errors cannot replace the signal error.
 4. Plus a session-context block (local time, tz, watermarks) and the signal's
    `envContext` (per-source env addendum, e.g. default Telegram chat id).
    For `telegram` signals the supervisor also preloads recent chat/topic
@@ -208,9 +176,10 @@ mcp-tools/
     │   ├── src/supervisor.rs               poll loop, per-signal routing, tg history preload
     │   ├── src/flows.rs                    saved workflows: store, function catalog, tracing,
     │   │                                   scheduled runs, the authoring tools
-    │   ├── src/durable.rs                  saved workflows' run state: admission, leases, checkpoints
-    │   ├── src/sandbox.rs                  dry runs: a signal through the draft chain, real turns,
-    │   │                                   reads and guard, writes mocked, nothing kept
+    │   ├── src/runs.rs                     runs on the ouro engine: config, agent tables, host data,
+    │   │                                   trace scopes, quiescence, built-ins, reconciler
+    │   ├── src/functions.rs                the engine's registry: MCP tools, host functions, steps
+    │   ├── src/sandbox.rs                  dry runs (unavailable until the migration's sandbox step)
     │   ├── src/schedule.rs                 scheduled tasks: cron rows, the 30 s tick, the schedule
     │   │                                   tools, the first start's import
     │   ├── src/agent.rs                    the engine, the loop's turn/tool/settle, synthetic tools

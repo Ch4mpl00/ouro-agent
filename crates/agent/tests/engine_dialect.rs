@@ -190,13 +190,12 @@ do:
   - tick: { call: tick }
 "#;
 
+// The definitions still written with flat keys: the Telegram loop fixture
+// (parked with the loop variants) and a synthetic one. The built-ins are
+// written in the engine's dialect since step 2 (below).
 fn builtins() -> Vec<(&'static str, String)> {
-    let workflows = concat!(env!("CARGO_MANIFEST_DIR"), "/workflows");
     let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
-    let mut files: Vec<(&'static str, String)> = ["agent-loop.yaml", "signal.yaml", "guard.yaml"]
-        .into_iter()
-        .map(|n| (n, std::fs::read_to_string(format!("{workflows}/{n}")).expect("built-in")))
-        .collect();
+    let mut files: Vec<(&'static str, String)> = Vec::new();
     files.push((
         "telegram-loop.yaml",
         std::fs::read_to_string(format!("{fixtures}/telegram-loop.yaml")).expect("fixture"),
@@ -217,8 +216,23 @@ fn converted_workflows_mean_the_same_task_by_task() {
             with_extensions += 1;
         }
     }
-    // agent-loop, guard and the synthetic one carry extensions.
-    assert!(with_extensions >= 3, "{with_extensions}");
+    // The fixture and the synthetic one carry extensions.
+    assert!(with_extensions >= 2, "{with_extensions}");
+}
+
+// Since step 2 the built-ins are engine definitions: they keep their
+// extensions under `metadata.ouro`, the conversion leaves them as they are,
+// and they opt out of the breaker.
+#[test]
+fn the_built_ins_are_written_in_the_engine_dialect() {
+    for (name, yaml) in agent::flows::builtins() {
+        let tasks = ows_tasks(yaml);
+        assert_eq!(ows_tasks(&to_engine_dialect(yaml)), tasks, "{name}");
+        let wf = ows_workflow(yaml);
+        assert_eq!(wf.definition["document"]["metadata"]["ouro"]["breaker"], "off", "{name}");
+    }
+    assert!(has_extensions(&ows_tasks(agent::agent::AGENT_LOOP)));
+    assert!(has_extensions(&ows_tasks(agent::flows::GUARD)));
 }
 
 #[test]
