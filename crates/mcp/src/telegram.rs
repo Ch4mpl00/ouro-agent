@@ -550,10 +550,21 @@ impl Typing {
 // that the bubble animates itself — trailing dots cycle 0 → . → .. → ... —
 // so "aliveness" is MCP's job, not the workflow's. Never written to the chat
 // log: it is ephemeral progress, not conversation.
+//
+// Order is MCP's job too (docs/designs/08-telegram-loop.md, decision 7): an
+// update may carry a `seq`. One whose `seq` is not greater than the last one
+// applied to its id is dropped (`stale`), and once an id was cleared every
+// later sequenced update to it is dropped (`cleared`, a tombstone), so a
+// status line that arrives late (an observer cancelled mid-send) can't
+// overwrite a newer line or bring the bubble back after the reply. An update
+// without a `seq` behaves as it always did, after a clear too: an agent or a
+// saved workflow that reuses an id keeps working. The marks live in memory
+// for an hour (a restart forgets them: one stray bubble at worst).
 #[derive(Clone)]
 pub struct StatusBubbles {
     bot: BotApi,
     entries: Arc<Mutex<HashMap<String, StatusEntry>>>,
+    marks: Arc<Mutex<HashMap<String, StatusMark>>>,
     // Calls for one id run one after another. An agent's tool calls run in
     // parallel, and two that both found no bubble each sent one — the first
     // was forgotten and stayed in the chat for good.
@@ -576,6 +587,16 @@ struct StatusEntry {
     animating: bool,
 }
 
+// What a status id's sequenced updates left behind (see StatusBubbles).
+#[derive(Clone, Copy)]
+struct StatusMark {
+    seq: Option<u64>,
+    cleared: bool,
+    at: Instant,
+}
+
+const STATUS_MARK_TTL: Duration = Duration::from_secs(60 * 60);
+
 const STATUS_TICK: Duration = Duration::from_secs(1);
 const STATUS_TTL: Duration = Duration::from_secs(3 * 60);
 const STATUS_BACKOFF: Duration = Duration::from_secs(5);
@@ -592,8 +613,11 @@ fn render_status(base: &str, frame: usize) -> String {
 
 #[derive(Debug, Serialize)]
 pub struct StatusResult {
-    // created · updated · deleted · noop (clear with nothing tracked)
+    // created · updated · deleted · noop (clear with nothing tracked) ·
+    // dropped (with `reason`: stale or cleared)
     action: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
     id: String,
     #[serde(rename = "chatId", skip_serializing_if = "Option::is_none")]
     chat_id: Option<String>,
@@ -606,7 +630,7 @@ pub struct StatusResult {
 
 impl StatusBubbles {
     pub fn new(bot: BotApi) -> Self {
-        Self { bot, entries: Arc::default(), queues: Arc::default() }
+        Self { bot, entries: Arc::default(), marks: Arc::default(), queues: Arc::default() }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, StatusEntry>> {
@@ -619,11 +643,30 @@ impl StatusBubbles {
         text: &str,
         chat_id: &str,
         thread_id: Option<i64>,
+        seq: Option<u64>,
     ) -> Result<StatusResult, TelegramError> {
         let queue = self.queues.lock().unwrap_or_else(|p| p.into_inner()).entry(id.to_owned()).or_default().clone();
         let result = {
+            // Compared and recorded in the id's turn: two racing updates
+            // can't both pass.
             let _turn = queue.lock().await;
-            self.send_now(id, text, chat_id, thread_id).await
+            match self.dropped(id, seq) {
+                Some(reason) => Ok(StatusResult {
+                    action: "dropped",
+                    reason: Some(reason),
+                    id: id.into(),
+                    chat_id: None,
+                    message_id: None,
+                    message_thread_id: None,
+                }),
+                None => {
+                    let sent = self.send_now(id, text, chat_id, thread_id).await;
+                    if sent.is_ok() {
+                        self.mark(id, seq, text.trim().is_empty());
+                    }
+                    sent
+                }
+            }
         };
         // Forget the queue once nobody else is waiting on it.
         let mut queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
@@ -631,6 +674,30 @@ impl StatusBubbles {
             queues.remove(id);
         }
         result
+    }
+
+    // Why a sequenced update of `id` is dropped, if it is.
+    fn dropped(&self, id: &str, seq: Option<u64>) -> Option<&'static str> {
+        let seq = seq?;
+        let mut marks = self.marks.lock().unwrap_or_else(|p| p.into_inner());
+        marks.retain(|_, m| m.at.elapsed() < STATUS_MARK_TTL);
+        let mark = marks.get(id)?;
+        if mark.cleared {
+            Some("cleared")
+        } else if mark.seq.is_some_and(|last| seq <= last) {
+            Some("stale")
+        } else {
+            None
+        }
+    }
+
+    // An applied update: its `seq`, and a clear's tombstone.
+    fn mark(&self, id: &str, seq: Option<u64>, cleared: bool) {
+        let mut marks = self.marks.lock().unwrap_or_else(|p| p.into_inner());
+        let mark = marks.entry(id.to_owned()).or_insert(StatusMark { seq: None, cleared: false, at: Instant::now() });
+        mark.seq = seq.or(mark.seq);
+        mark.cleared |= cleared;
+        mark.at = Instant::now();
     }
 
     async fn send_now(
@@ -647,6 +714,7 @@ impl StatusBubbles {
             let Some(existing) = existing else {
                 return Ok(StatusResult {
                     action: "noop",
+                    reason: None,
                     id: id.into(),
                     chat_id: None,
                     message_id: None,
@@ -661,6 +729,7 @@ impl StatusBubbles {
             }
             return Ok(StatusResult {
                 action: "deleted",
+                reason: None,
                 id: id.into(),
                 chat_id: Some(existing.chat_id),
                 message_id: Some(existing.message_id),
@@ -685,6 +754,7 @@ impl StatusBubbles {
                     refresh(&mut self.lock(), true);
                     return Ok(StatusResult {
                         action: "updated",
+                        reason: None,
                         id: id.into(),
                         chat_id: Some(existing.chat_id),
                         message_id: Some(edited.message_id),
@@ -699,6 +769,7 @@ impl StatusBubbles {
                     refresh(&mut self.lock(), false);
                     return Ok(StatusResult {
                         action: "updated",
+                        reason: None,
                         id: id.into(),
                         chat_id: Some(existing.chat_id),
                         message_id: Some(existing.message_id),
@@ -725,6 +796,7 @@ impl StatusBubbles {
         );
         Ok(StatusResult {
             action: "created",
+            reason: None,
             id: id.into(),
             chat_id: Some(chat_id.to_owned()),
             message_id: Some(sent.message_id),
@@ -1248,6 +1320,10 @@ struct StatusParams {
     chat_id: Option<ChatId>,
     /// Forum topic thread_id (used when first creating the bubble).
     message_thread_id: Option<i64>,
+    /// Optional order of this update: one whose seq is not greater than the
+    /// last applied for this id, or that comes after the id was cleared, is
+    /// dropped. Omit it to update unconditionally.
+    seq: Option<u64>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -1344,7 +1420,7 @@ impl McpTools {
             async {
                 let target = p.chat_id.map(ChatId::into_string).or_else(|| tg.config.default_chat_id.clone());
                 let target = target.ok_or_else(|| anyhow::anyhow!(NO_CHAT_TARGET))?;
-                Ok(tg.status.send(&p.id, &p.text, &target, p.message_thread_id).await?)
+                Ok(tg.status.send(&p.id, &p.text, &target, p.message_thread_id, p.seq).await?)
             }
             .await,
         )
