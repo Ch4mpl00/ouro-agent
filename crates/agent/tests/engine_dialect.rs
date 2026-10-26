@@ -1,9 +1,10 @@
 //! The built-in workflows under the engine's dialect (migration step 1).
 //!
-//! The running `owf` reads its extensions as flat `metadata` keys; the engine
-//! (`ows`) reads them only under `metadata.ouro` and silently ignores flat
-//! ones. `to_engine_dialect` is the conversion step 2 applies to the files; here
-//! it is shown to preserve what each task means.
+//! The engine (`ows`) reads its extensions only under `metadata.ouro` and
+//! silently ignores flat `metadata` keys, the dialect of the interpreter the
+//! agent ran before (removed in step 6, design 07). `to_engine_dialect` is the
+//! conversion step 2 applied to the built-ins; it is kept as the check that no
+//! flat key is left in them, since the engine would drop one without a word.
 
 use serde_yaml_ng::{Mapping, Value as Yaml};
 
@@ -71,51 +72,36 @@ struct Effective {
     concurrency: Option<usize>,
 }
 
-macro_rules! effective {
-    ($engine:ident, $name:ident) => {
-        fn $name(tasks: &$engine::model::TaskList, at: &str, out: &mut Vec<Effective>) {
-            use $engine::model::Kind;
-            for (name, task) in tasks {
-                let path = format!("{at}/{name}");
-                let concurrency = match &task.kind {
-                    Kind::For { concurrency, .. } => *concurrency,
-                    _ => None,
-                };
-                out.push(Effective {
-                    path: path.clone(),
-                    kind: task.kind.name(),
-                    delivery: format!("{:?}", task.delivery),
-                    hold_ms: task.hold.as_millis(),
-                    concurrency,
-                });
-                match &task.kind {
-                    Kind::Do(inner) | Kind::For { tasks: inner, .. } => $name(inner, &path, out),
-                    Kind::Fork { branches, .. } => $name(branches, &path, out),
-                    Kind::Try { tasks: inner, catch } => {
-                        $name(inner, &path, out);
-                        if let Some(handler) = &catch.tasks {
-                            $name(handler, &format!("{path}/catch"), out);
-                        }
-                    }
-                    _ => {}
+fn ows_effective(tasks: &ows::model::TaskList, at: &str, out: &mut Vec<Effective>) {
+    use ows::model::Kind;
+    for (name, task) in tasks {
+        let path = format!("{at}/{name}");
+        let concurrency = match &task.kind {
+            Kind::For { concurrency, .. } => *concurrency,
+            _ => None,
+        };
+        out.push(Effective {
+            path: path.clone(),
+            kind: task.kind.name(),
+            delivery: format!("{:?}", task.delivery),
+            hold_ms: task.hold.as_millis(),
+            concurrency,
+        });
+        match &task.kind {
+            Kind::Do(inner) | Kind::For { tasks: inner, .. } => ows_effective(inner, &path, out),
+            Kind::Fork { branches, .. } => ows_effective(branches, &path, out),
+            Kind::Try { tasks: inner, catch } => {
+                ows_effective(inner, &path, out);
+                if let Some(handler) = &catch.tasks {
+                    ows_effective(handler, &format!("{path}/catch"), out);
                 }
             }
+            _ => {}
         }
-    };
+    }
 }
-effective!(owf, owf_effective);
-effective!(ows, ows_effective);
 
 struct AcceptAll;
-
-impl owf::model::Catalog for AcceptAll {
-    fn has(&self, _: &str) -> bool {
-        true
-    }
-    fn events(&self) -> bool {
-        true
-    }
-}
 
 impl ows::model::Catalog for AcceptAll {
     fn has(&self, _: &str) -> bool {
@@ -130,14 +116,6 @@ impl ows::model::Catalog for AcceptAll {
     fn children(&self) -> bool {
         true
     }
-}
-
-fn owf_tasks(text: &str) -> Vec<Effective> {
-    let workflow = owf::model::parse_yaml(text).expect("owf parses");
-    owf::model::validate(&workflow, &AcceptAll).expect("owf validates");
-    let mut out = Vec::new();
-    owf_effective(&workflow.tasks, "", &mut out);
-    out
 }
 
 fn ows_workflow(text: &str) -> ows::model::Workflow {
@@ -190,35 +168,17 @@ do:
   - tick: { call: tick }
 "#;
 
-// The definitions written with flat keys: the Telegram loop as the `owf`
-// era wrote it (tests/fixtures/telegram-loop.flat.yaml; the reference loop
-// itself is in the engine's dialect since the versions step) and a synthetic
-// one. The built-ins are written in the engine's dialect since step 2 (below).
-fn builtins() -> Vec<(&'static str, String)> {
-    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
-    let mut files: Vec<(&'static str, String)> = Vec::new();
-    files.push((
-        "telegram-loop.flat.yaml",
-        std::fs::read_to_string(format!("{fixtures}/telegram-loop.flat.yaml")).expect("fixture"),
-    ));
-    files.push(("synthetic", SYNTHETIC.to_string()));
-    files
-}
-
+// What the synthetic definition's flat keys mean, read under
+// `metadata.ouro`: every extension it carries.
 #[test]
-fn converted_workflows_mean_the_same_task_by_task() {
-    let mut with_extensions = 0;
-    for (name, original) in builtins() {
-        let converted = to_engine_dialect(&original);
-        let flat = owf_tasks(&original);
-        let nested = ows_tasks(&converted);
-        assert_eq!(flat, nested, "{name}");
-        if has_extensions(&flat) {
-            with_extensions += 1;
-        }
-    }
-    // The fixture and the synthetic one carry extensions.
-    assert!(with_extensions >= 2, "{with_extensions}");
+fn converted_flat_keys_reach_the_engine() {
+    let tasks = ows_tasks(&to_engine_dialect(SYNTHETIC));
+    let each = tasks.iter().find(|t| t.path == "/each").expect("each");
+    assert_eq!(each.concurrency, Some(2));
+    let send = tasks.iter().find(|t| t.path == "/each/send").expect("send");
+    assert_eq!(send.delivery, "AtMostOnce");
+    let wait = tasks.iter().find(|t| t.path == "/wait").expect("wait");
+    assert_eq!(wait.hold_ms, 7000);
 }
 
 // Since step 2 the built-ins are engine definitions: they keep their
@@ -236,17 +196,13 @@ fn the_built_ins_are_written_in_the_engine_dialect() {
     assert!(has_extensions(&ows_tasks(agent::flows::GUARD)));
 }
 
+// Why the check above matters: a flat key is no error to the engine, it is
+// dropped.
 #[test]
 fn the_engine_silently_drops_flat_keys() {
-    for (name, original) in builtins() {
-        let flat = owf_tasks(&original);
-        if !has_extensions(&flat) {
-            continue;
-        }
-        let unconverted = ows_tasks(&original);
-        assert!(!has_extensions(&unconverted), "{name}: ows read a flat key");
-        assert_ne!(flat, unconverted, "{name}");
-    }
+    let unconverted = ows_tasks(SYNTHETIC);
+    assert!(!has_extensions(&unconverted), "ows read a flat key");
+    assert_ne!(unconverted, ows_tasks(&to_engine_dialect(SYNTHETIC)));
 }
 
 #[test]

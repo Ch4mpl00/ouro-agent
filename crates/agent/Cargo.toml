@@ -21,7 +21,6 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 sha2 = "0.11.0"
 hex = "0.4.3"
-owf = { path = "../owf" }
 ows = { git = "https://github.com/Ch4mpl00/ouro", tag = "v0.3.0" }
 ouro-durable = { git = "https://github.com/Ch4mpl00/ouro", tag = "v0.3.0" }
 ouro-runtime = { git = "https://github.com/Ch4mpl00/ouro", tag = "v0.3.0" }

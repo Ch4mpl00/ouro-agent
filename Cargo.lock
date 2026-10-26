@@ -55,7 +55,6 @@ dependencies = [
  "hex",
  "ouro-durable",
  "ouro-runtime",
- "owf",
  "ows",
  "proptest",
  "rand 0.10.3",
@@ -1363,7 +1362,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "futures",
- "owf",
+ "ows",
  "regex",
  "reqwest",
  "rusqlite",
@@ -3267,27 +3266,6 @@ name = "outref"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
-
-[[package]]
-name = "owf"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "futures",
- "jaq-core",
- "jaq-json",
- "jaq-std",
- "jsonschema",
- "proptest",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "thiserror",
- "tokio",
- "tokio-util",
-]
 
 [[package]]
 name = "ows"

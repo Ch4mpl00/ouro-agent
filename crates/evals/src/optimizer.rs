@@ -142,7 +142,7 @@ fn assemble_prompt(
     } else {
         "No execution has been requested."
     };
-    owf::model::parse_yaml(definition)?;
+    ows::model::parse_yaml(definition)?;
     anyhow::ensure!(!traces.is_empty(), "at least one trace is required");
     Ok(Prompt {
         system: format!(
@@ -226,7 +226,7 @@ pub async fn propose(
 
 pub fn proposal_yaml(report: &str) -> anyhow::Result<String> {
     let yaml = fenced_yaml(report)?.ok_or_else(|| anyhow::anyhow!("optimizer returned no fenced YAML definition"))?;
-    owf::model::parse_yaml(&yaml)?;
+    ows::model::parse_yaml(&yaml)?;
     Ok(yaml)
 }
 
@@ -263,13 +263,33 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+pub use agent::agent::Effect;
 use agent::mcp::Mcp;
 use agent::providers::ToolDef;
 use async_trait::async_trait;
-use owf::durable::CallFailure;
-use owf::run::{CallInfo, Effect, Event, Functions, Host, Limits, Observer, Status, WorkflowError};
+use ows::durable::CallFailure;
+use ows::run::{CallInfo, Event, Functions, Host, Limits, Observer, Status, WorkflowError};
 use serde::{Deserialize, Serialize};
 use serde_json::Map;
+
+/// The functions a candidate may call, with what each does to the world: the
+/// engine's interpreter does not know whether a function reads or writes, so
+/// the workbench's seam says (design 07, decision 2). `effect_of` is one
+/// invocation's (a function that dispatches by an argument may differ per
+/// call); the function's by default.
+pub trait Adapter: Functions {
+    fn effect(&self, name: &str) -> Option<Effect>;
+    fn effect_of(&self, name: &str, _args: &Value) -> Option<Effect> {
+        self.effect(name)
+    }
+}
+
+/// The agent's own steps and MCP calls (`agent::flows::Standalone`).
+impl Adapter for agent::flows::Standalone {
+    fn effect(&self, name: &str) -> Option<Effect> {
+        agent::flows::Standalone::effect(self, name)
+    }
+}
 
 /// Canonical JSON preserves types, values and array order; only object key
 /// order is irrelevant. Never key fixtures by arrival order or a text preview.
@@ -488,7 +508,7 @@ struct ExecutionCache {
 /// One workbench owns immutable host permissions and settings. Model tools
 /// accept scenarios, never permissions. Changing settings requires a new host.
 pub struct Workbench {
-    adapter: Arc<dyn Functions>,
+    adapter: Arc<dyn Adapter>,
     catalog: OfflineCatalog,
     evidence: Evidence,
     allowed: BTreeSet<String>,
@@ -502,7 +522,7 @@ pub struct Workbench {
 
 impl Workbench {
     pub fn new(
-        adapter: Arc<dyn Functions>,
+        adapter: Arc<dyn Adapter>,
         catalog: OfflineCatalog,
         evidence: Evidence,
         allowed: BTreeSet<String>,
@@ -557,7 +577,7 @@ impl Workbench {
                 mock.function
             );
         }
-        for site in owf::model::call_sites(&wf) {
+        for site in ows::model::call_sites(&wf) {
             if wf.uses.functions.iter().any(|(n, _)| *n == site.function) {
                 continue;
             }
@@ -588,11 +608,11 @@ impl Workbench {
             cache: self.cache.clone(),
             calls: calls.clone(),
         });
-        owf::run::validate(&wf, &*functions)?;
+        ows::run::validate(&wf, &*functions)?;
         let host = Host {
             functions,
             observer: observer.clone(),
-            clock: Arc::new(owf::run::SystemClock),
+            clock: Arc::new(ows::run::SystemClock),
             limits: Limits {
                 max_tasks: self.max_tasks,
                 max_sleep: Some(Duration::ZERO),
@@ -603,7 +623,7 @@ impl Workbench {
         };
         let usage_before = self.meter.as_ref().map(|m| m.lock().unwrap().clone());
         let stop = cancel.child_token();
-        let execution = owf::run::run(&host, &wf, "workbench", scenario.input.clone(), &stop);
+        let execution = ows::run::run(&host, &wf, "workbench", scenario.input.clone(), &stop);
         tokio::pin!(execution);
         let outcome = tokio::select! {
             outcome = &mut execution => outcome,
@@ -640,7 +660,7 @@ impl Workbench {
                 .0
                 .iter()
                 .filter(|c| {
-                    c.parameters.is_none() && owf::model::call_sites(&wf).iter().any(|site| site.function == c.name)
+                    c.parameters.is_none() && ows::model::call_sites(&wf).iter().any(|site| site.function == c.name)
                 })
                 .map(|c| c.name.clone())
                 .collect(),
@@ -660,7 +680,7 @@ impl Workbench {
 
 type FixtureResult = (Result<Value, WorkflowError>, Provenance);
 struct ScenarioFunctions {
-    adapter: Arc<dyn Functions>,
+    adapter: Arc<dyn Adapter>,
     allowed: BTreeSet<String>,
     fixtures: HashMap<String, FixtureResult>,
     cache: Arc<Mutex<ExecutionCache>>,
@@ -743,11 +763,13 @@ impl ScenarioFunctions {
 
 #[async_trait]
 impl Functions for ScenarioFunctions {
-    fn effect(&self, name: &str) -> Option<Effect> {
-        self.adapter.effect(name)
+    fn has(&self, name: &str) -> bool {
+        self.adapter.effect(name).is_some()
     }
-    fn effect_of(&self, name: &str, args: &Value) -> Option<Effect> {
-        self.adapter.effect_of(name, args)
+    // A write invocation is bound at most once, as the agent's registry
+    // binds an MCP write.
+    fn at_most_once(&self, name: &str, args: &Value) -> bool {
+        self.adapter.effect_of(name, args) == Some(Effect::Write)
     }
     async fn execute(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
         self.dispatch(name, args, info).await
@@ -756,12 +778,7 @@ impl Functions for ScenarioFunctions {
         self.dispatch(name, args, info).await
     }
     async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError> {
-        self.dispatch(name, args, info).await.map_err(|failure| match failure {
-            CallFailure::Response(e)
-            | CallFailure::NotExecuted(e)
-            | CallFailure::Unknown(e)
-            | CallFailure::Interrupted(e) => e,
-        })
+        self.dispatch(name, args, info).await.map_err(|failure| failure.error().clone())
     }
 }
 
@@ -781,6 +798,9 @@ impl Observer for WorkbenchObserver {
             Event::TaskSuspended { reference, wake_at_ms } => {
                 json!({"event":"suspended","task":reference,"wake_at_ms":wake_at_ms})
             }
+            // Calls are in the report's `calls`; the engine's other events
+            // (jumps, timers, listens) add nothing a standalone path shows.
+            _ => return,
         };
         self.0.lock().unwrap().push(item);
     }

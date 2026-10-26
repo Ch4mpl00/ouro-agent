@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 agent = { path = "../agent" }
-owf = { path = "../owf" }
+ows = { git = "https://github.com/Ch4mpl00/ouro", tag = "v0.3.0" }
 anyhow = "1.0.104"
 async-trait = "0.1.92"
 base64 = "0.23.1"

@@ -708,7 +708,7 @@ fn choose_is_in_the_catalog_and_refuses_at_most_once() {
         "{catalog}"
     );
     let pinned = routed(CHOOSE)
-        .replace("      call: choose\n", "      call: choose\n      metadata: { delivery: at_most_once }\n");
+        .replace("      call: choose\n", "      call: choose\n      metadata: { ouro: { delivery: at_most_once } }\n");
     let error = check(&*w.engine.deps.mcp, &pinned).unwrap_err();
     assert!(error.contains("model adapters do not yet support at_most_once"), "{error}");
 }

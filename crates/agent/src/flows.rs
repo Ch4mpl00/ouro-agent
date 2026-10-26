@@ -23,7 +23,7 @@ use crate::{
     tracing::{GenerationEnd, Scope},
 };
 use ouro_runtime::ows::model::{Flow, Kind, Task, TaskList, Workflow};
-use owf::durable::Delivery;
+use ows::durable::Delivery;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -480,12 +480,12 @@ fn invalid(problems: &[String]) -> String {
     format!("invalid workflow:\n{}", problems.iter().map(|p| format!("  - {p}")).collect::<Vec<_>>().join("\n"))
 }
 
-/// The `owf` reading of a definition, checked against what this agent can
-/// call: the evals workbench's (crates/evals), until the step that removes
-/// `owf`. Saving and activating use `gate`, on the engine's dialect.
-pub fn check(mcp: &dyn Mcp, definition: &str) -> Result<owf::model::Workflow, String> {
+/// A definition in the engine's dialect, checked against what this agent can
+/// call, with no registry: the evals workbench's (crates/evals, design 07).
+/// Saving and activating use `gate`, against the engine's registry.
+pub fn check(mcp: &dyn Mcp, definition: &str) -> Result<Workflow, String> {
     struct Known<'a>(&'a dyn Mcp);
-    impl owf::model::Catalog for Known<'_> {
+    impl ows::model::Catalog for Known<'_> {
         fn events(&self) -> bool {
             true
         }
@@ -493,9 +493,9 @@ pub fn check(mcp: &dyn Mcp, definition: &str) -> Result<owf::model::Workflow, St
             !matches!(name, "confirm_request" | "review" | "resolve_review") && effect(self.0, name).is_some()
         }
     }
-    let wf = owf::model::parse_yaml(definition).map_err(|e| e.to_string())?;
-    owf::model::validate(&wf, &Known(mcp)).map_err(|e| e.to_string())?;
-    let sites: Vec<(String, String, Option<Value>, bool)> = owf::model::call_sites(&wf)
+    let wf = ows::model::parse_yaml(definition).map_err(|e| e.to_string())?;
+    ows::model::validate(&wf, &Known(mcp)).map_err(|e| e.to_string())?;
+    let sites: Vec<(String, String, Option<Value>, bool)> = ows::model::call_sites(&wf)
         .into_iter()
         .map(|s| (s.reference, s.function, s.with, s.delivery == Delivery::AtMostOnce))
         .collect();
@@ -1415,80 +1415,94 @@ fn cut(value: &Value, max: usize) -> Value {
 
 // ── 6. the evals workbench's adapter ────────────────────────────────────────
 // The optimizer (crates/evals) runs candidate workflows in memory on the
-// `owf` interpreter until the step that removes it: the workflow steps and
+// engine's interpreter (`ows::run::run`, design 07): the workflow steps and
 // MCP calls of this engine, with no admitted run behind them (no agent
 // turns, no children, no events). Not the agent's running path.
 
-struct Standalone {
+/// The workflow steps and MCP calls of an engine, for an isolated in-memory
+/// host such as the optimizer workbench. It grants no admitted context: the
+/// caller restricts what may run for real.
+pub struct Standalone {
     engine: std::sync::Arc<Engine>,
     root: Scope,
 }
 
-fn owf_error(error: ouro_runtime::FunctionError) -> owf::run::WorkflowError {
-    serde_json::to_value(&error)
-        .ok()
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_else(|| owf::run::WorkflowError::runtime(error.to_string()))
+/// `engine`'s steps for an in-memory host, traced under `root`.
+pub fn standalone(
+    engine: &std::sync::Arc<Engine>,
+    root: &std::sync::Arc<dyn crate::tracing::Span>,
+) -> std::sync::Arc<Standalone> {
+    std::sync::Arc::new(Standalone { engine: engine.clone(), root: root.clone() })
 }
 
-// How far a step's error says it got, as the interpreter records it.
-fn owf_failure(error: owf::run::WorkflowError) -> owf::durable::CallFailure {
-    use owf::durable::CallFailure;
-    match error.type_.as_str() {
-        ouro_runtime::CALL_NOT_EXECUTED => CallFailure::NotExecuted(error),
-        ouro_runtime::CALL_UNKNOWN => CallFailure::Unknown(error),
-        ouro_runtime::CALL_INTERRUPTED => CallFailure::Interrupted(error),
-        _ => CallFailure::Response(error),
-    }
-}
-
-#[async_trait::async_trait]
-impl owf::run::Functions for Standalone {
-    fn effect(&self, name: &str) -> Option<owf::run::Effect> {
+impl Standalone {
+    /// What `name` does, or None when a standalone run cannot call it: a host
+    /// function outside the `workflow` context needs an admitted run.
+    pub fn effect(&self, name: &str) -> Option<Effect> {
         let function = crate::functions::host_function(name);
         if function.is_some_and(|f| f.context != "workflow") {
             return None;
         }
-        match effect(&*self.engine.deps.mcp, name)? {
-            Effect::Read => Some(owf::run::Effect::Read),
-            Effect::Write => Some(owf::run::Effect::Write),
-        }
+        effect(&*self.engine.deps.mcp, name)
+    }
+}
+
+// How far a step's error says it got, as the interpreter records it.
+fn failure(error: ouro_runtime::FunctionError) -> ows::durable::CallFailure {
+    let error = serde_json::to_value(&error)
+        .ok()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_else(|| ows::run::WorkflowError::runtime(error.to_string()));
+    ows::durable::CallFailure::answer(error)
+}
+
+#[async_trait::async_trait]
+impl ows::run::Functions for Standalone {
+    fn has(&self, name: &str) -> bool {
+        self.effect(name).is_some()
+    }
+
+    // A write is bound at most once, as the agent's registry binds an MCP
+    // write (design 01, decision 8).
+    fn at_most_once(&self, name: &str, _: &Value) -> bool {
+        self.effect(name) == Some(Effect::Write)
     }
 
     async fn invoke(
         &self,
         name: &str,
         args: Value,
-        info: &owf::run::CallInfo<'_>,
-    ) -> Result<Value, owf::durable::CallFailure> {
-        use owf::durable::CallFailure;
+        info: &ows::run::CallInfo<'_>,
+    ) -> Result<Value, ows::durable::CallFailure> {
+        use ows::durable::CallFailure;
+        use ows::run::WorkflowError;
         if crate::functions::host_function(name).is_some() {
             if info.delivery == Delivery::AtMostOnce && name != "set_memory" {
-                return Err(CallFailure::NotExecuted(owf::run::WorkflowError::validation(
+                return Err(CallFailure::NotExecuted(WorkflowError::validation(
                     "model adapters do not yet support at_most_once",
                 )));
             }
             let label = info.reference.rsplit('/').next().unwrap_or(name);
             return crate::functions::run_step(&self.engine, name, &args, &self.root, label, info.cancel)
                 .await
-                .map_err(|e| owf_failure(owf_error(e)));
+                .map_err(failure);
         }
         let Value::Object(args) = args else {
-            return Err(CallFailure::NotExecuted(owf::run::WorkflowError::validation(format!(
+            return Err(CallFailure::NotExecuted(WorkflowError::validation(format!(
                 "{name}: arguments must be an object"
             ))));
         };
         let raw =
             self.engine.deps.mcp.call_tool_once(name, args, info.cancel).await.map_err(|failure| match failure {
                 crate::mcp::ToolCallFailure::NotExecuted(e) => {
-                    CallFailure::NotExecuted(owf::run::WorkflowError::communication(503, e.to_string()))
+                    CallFailure::NotExecuted(WorkflowError::communication(503, e.to_string()))
                 }
                 crate::mcp::ToolCallFailure::Unknown(e) => {
-                    CallFailure::Unknown(owf::run::WorkflowError::communication(503, e.to_string()))
+                    CallFailure::Unknown(WorkflowError::communication(503, e.to_string()))
                 }
             })?;
         if raw.starts_with("[tool error]") {
-            return Err(CallFailure::Response(owf::run::WorkflowError::communication(500, raw)));
+            return Err(CallFailure::Response(WorkflowError::communication(500, raw)));
         }
         Ok(parse_tool_json(&raw))
     }
@@ -1497,29 +1511,8 @@ impl owf::run::Functions for Standalone {
         &self,
         name: &str,
         args: Value,
-        info: &owf::run::CallInfo<'_>,
-    ) -> Result<Value, owf::run::WorkflowError> {
-        self.invoke(name, args, info).await.map_err(|failure| match failure {
-            owf::durable::CallFailure::NotExecuted(e)
-            | owf::durable::CallFailure::Response(e)
-            | owf::durable::CallFailure::Unknown(e)
-            | owf::durable::CallFailure::Interrupted(e) => e,
-        })
-    }
-}
-
-/// The workflow steps of `engine` for an isolated in-memory host such as the
-/// optimizer workbench, traced under `root`. It grants no admitted context:
-/// the caller restricts what may run for real.
-pub fn standalone_host(
-    engine: &std::sync::Arc<Engine>,
-    root: &std::sync::Arc<dyn crate::tracing::Span>,
-) -> owf::run::Host {
-    owf::run::Host {
-        functions: std::sync::Arc::new(Standalone { engine: engine.clone(), root: root.clone() }),
-        observer: std::sync::Arc::new(owf::run::Silent),
-        clock: std::sync::Arc::new(owf::run::SystemClock),
-        limits: owf::run::Limits::default(),
-        runtime: json!({"name":"agent-supervisor","version":env!("CARGO_PKG_VERSION")}),
+        info: &ows::run::CallInfo<'_>,
+    ) -> Result<Value, ows::run::WorkflowError> {
+        self.invoke(name, args, info).await.map_err(|failure| failure.error().clone())
     }
 }

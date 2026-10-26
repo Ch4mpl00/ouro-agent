@@ -1303,8 +1303,9 @@ const SYNTHETIC_WRITES: &[&str] = &[
     "invoke_sub_agent",
 ];
 
-/// What a call does to the world: a write is sent at most once.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a call does to the world: a write is sent at most once. Serialized
+/// as `Read`/`Write` (the evals workbench's catalogs and reports).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Effect {
     Read,
     Write,

@@ -9,10 +9,9 @@ use evals::optimizer::{compact_trace, prompt, proposal_yaml, propose};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-// A definition in the interpreter dialect the workbench runs (owf, until
-// the engine migration removes it): the reference loop as the owf era wrote
-// it; the reference loop itself and the built-ins are engine definitions.
-const DEFINITION: &str = include_str!("../../agent/tests/fixtures/telegram-loop.flat.yaml");
+// The reference loop, a definition in the engine's dialect the workbench
+// runs (design 07).
+const DEFINITION: &str = agent::agent::AGENT_LOOP;
 
 fn observation(id: &str, kind: ObservationType, parent: Option<&str>) -> Observation {
     Observation {

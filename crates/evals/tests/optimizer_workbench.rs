@@ -7,7 +7,7 @@ use agent::{
 };
 use async_trait::async_trait;
 use evals::optimizer::*;
-use owf::run::{CallInfo, Effect, Functions, WorkflowError};
+use ows::run::{CallInfo, Functions, WorkflowError};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
@@ -44,14 +44,19 @@ struct Adapter {
     active: AtomicUsize,
     peak: AtomicUsize,
 }
-#[async_trait]
-impl Functions for Adapter {
+impl evals::optimizer::Adapter for Adapter {
     fn effect(&self, name: &str) -> Option<Effect> {
         match name {
             "read" | "llm_compose" | "agent_turn" => Some(Effect::Read),
             "write" => Some(Effect::Write),
             _ => None,
         }
+    }
+}
+#[async_trait]
+impl Functions for Adapter {
+    fn has(&self, name: &str) -> bool {
+        evals::optimizer::Adapter::effect(self, name).is_some()
     }
     async fn call(&self, name: &str, args: Value, _: &CallInfo<'_>) -> Result<Value, WorkflowError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -176,7 +181,7 @@ async fn parallel_calls_are_independent_bounded_and_match_values_not_arrival_ord
     let adapter = Arc::new(Adapter::default());
     let bench = bench(adapter.clone(), &["read"], Evidence::default());
     let mut s = scenario(
-        "do:\n  - items:\n      for: {each: item, in: '${ [0,1,2,3,4,5] }'}\n      metadata: {concurrency: 3}\n      do:\n        - get:\n            call: read\n            with: {i: '${ $item }'}\n",
+        "do:\n  - items:\n      for: {each: item, in: '${ [0,1,2,3,4,5] }'}\n      metadata: {ouro: {concurrency: 3}}\n      do:\n        - get:\n            call: read\n            with: {i: '${ $item }'}\n",
     );
     s.mocks.push(mock("read", json!({"i":2}), json!({"i":"mock two"})));
     let r = bench.run(&s, &CancellationToken::new()).await.unwrap();
@@ -184,6 +189,22 @@ async fn parallel_calls_are_independent_bounded_and_match_values_not_arrival_ord
     assert_eq!(r.output, Some(json!([{"i":0},{"i":1},{"i":"mock two"},{"i":3},{"i":4},{"i":5}])));
     assert_eq!(adapter.calls.load(Ordering::SeqCst), 5);
     assert_eq!(adapter.peak.load(Ordering::SeqCst), 3);
+}
+// The bench reads a candidate in the engine's dialect (design 07, decision
+// 6): a flat `metadata.concurrency` is no extension there, so the `for` runs
+// one pass at a time and ends with the last pass's output, as in production.
+#[tokio::test]
+async fn a_flat_concurrency_key_is_not_the_engines() {
+    let adapter = Arc::new(Adapter::default());
+    let bench = bench(adapter.clone(), &["read"], Evidence::default());
+    let s = scenario(
+        "do:\n  - items:\n      for: {each: item, in: '${ [0,1,2,3,4,5] }'}\n      metadata: {concurrency: 3}\n      do:\n        - get:\n            call: read\n            with: {i: '${ $item }'}\n",
+    );
+    let r = bench.run(&s, &CancellationToken::new()).await.unwrap();
+    assert_eq!(r.status, "completed");
+    assert_eq!(r.output, Some(json!({"i":5})));
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 6);
+    assert_eq!(adapter.peak.load(Ordering::SeqCst), 1);
 }
 #[tokio::test]
 async fn rejected_context_unknown_function_and_duplicate_fixtures_do_not_execute() {
@@ -269,7 +290,7 @@ const PIPELINE: &str = r#"do:
   - bad_parse: {set: {status: parse_error}, then: end}
   - save:
       for: {each: item, in: '${ .items }'}
-      metadata: {concurrency: 16}
+      metadata: {ouro: {concurrency: 16}}
       do:
         - one:
             try:
@@ -470,8 +491,7 @@ async fn real_compose_reuses_existing_function_adapter_and_fake_provider() {
         Arc::new(OfflineCatalog::default()),
     )
     .unwrap();
-    let functions =
-        agent::flows::standalone_host(&engine, &null_scope().span(SpanStart::new("test", SpanKind::Chain))).functions;
+    let functions = agent::flows::standalone(&engine, &null_scope().span(SpanStart::new("test", SpanKind::Chain)));
     let bench = Workbench::new(
         functions,
         OfflineCatalog::default(),
@@ -490,13 +510,18 @@ async fn real_compose_reuses_existing_function_adapter_and_fake_provider() {
 #[tokio::test]
 async fn dynamic_write_effect_is_never_permitted_real_and_cancelled_calls_stay_reported() {
     struct Dynamic;
-    #[async_trait]
-    impl Functions for Dynamic {
+    impl evals::optimizer::Adapter for Dynamic {
         fn effect(&self, _: &str) -> Option<Effect> {
             Some(Effect::Read)
         }
         fn effect_of(&self, _: &str, args: &Value) -> Option<Effect> {
             Some(if args["write"] == true { Effect::Write } else { Effect::Read })
+        }
+    }
+    #[async_trait]
+    impl Functions for Dynamic {
+        fn has(&self, _: &str) -> bool {
+            true
         }
         async fn call(&self, _: &str, args: Value, _: &CallInfo<'_>) -> Result<Value, WorkflowError> {
             assert_ne!(args["write"], true, "dynamic write must not execute");
@@ -559,8 +584,7 @@ async fn provider_meter_tracks_large_cached_usage_without_stopping_execution() {
         Arc::new(OfflineCatalog::default()),
     )
     .unwrap();
-    let adapter =
-        agent::flows::standalone_host(&engine, &null_scope().span(SpanStart::new("meter", SpanKind::Chain))).functions;
+    let adapter = agent::flows::standalone(&engine, &null_scope().span(SpanStart::new("meter", SpanKind::Chain)));
     let mut bench = Workbench::new(
         adapter,
         OfflineCatalog::default(),
@@ -624,9 +648,7 @@ async fn candidate_compose_uses_actual_preset_family() {
         Arc::new(OfflineCatalog::default()),
     )
     .unwrap();
-    let adapter =
-        agent::flows::standalone_host(&engine, &null_scope().span(SpanStart::new("presets", SpanKind::Chain)))
-            .functions;
+    let adapter = agent::flows::standalone(&engine, &null_scope().span(SpanStart::new("presets", SpanKind::Chain)));
     let bench = Workbench::new(
         adapter,
         OfflineCatalog::default(),
