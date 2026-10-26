@@ -294,3 +294,80 @@ ambiguous, each reversible:
   is paused or the draft is the tripped content (decision 4, so a fix can
   become tried); `tried` needs every run of the draft to complete
   (decision 10); the no-signal mode's input follows step 5's fire input.
+
+## 2026-10-26 (step 4 (executor))
+
+Choices taken while implementing design 05 where the document is silent,
+each reversible (the two places the code made the document wrong are its
+Deviations 1 and 2):
+
+- **Engine pinned at the `v0.3.0` tag** (design 07); its breaking fields
+  needed no change in the agent (no struct literal of them).
+- **One seam for a handler's reads, `runs::RunReads`** (`run`, `records`,
+  `children`): implemented for `FunctionContext` (its run access) and for
+  `Engine` (the host's own store: the supervisor, a loop the host drives,
+  tests). `ChildStarts` is `RunReads` + the start, which is how it "gains
+  `run(id)`". `loop_tool` takes a `CallSite { runs, run, task, invocation }`;
+  tests call it through `support::loop_tool` on the host's store. `Records`
+  became `pub` (the seam names it).
+- **Handler call sites (R2-M2), classified:** moved to run access:
+  `loop_setup`, `context` (the signal run's records; a loop's read of the
+  signal run, an ancestor), `unanchor`, `start_guard`'s joined child,
+  `primary_loop`, `recovery_loop`, `signal_fallback_line`, `launch`,
+  `route_signal`'s joined route, `settle_child` (child and records),
+  `effects_started` (each run's `call_journal` of its records and its
+  children), `review`, `reviewed`, `signal_of`, `signal_transcript`,
+  `loop_of`/`loop_for`/`guard_context_of`, `guard_child_verdict`,
+  `loop_tool`'s worker read, `worker_runs`, `read_run`, and
+  `start_named_child`'s step 0. Stay on the engine by design: `deliver_event`
+  (mocked in a try), `confirmation::pending`, `builtin_version` and `decide`
+  (definitions, served by the guard store), `start_named_root` (live roots
+  only: a try records its recovery start instead), and host-side code (the
+  supervisor, `AgentLoop::drive`/`close` and `end_tree_loops`, the drain,
+  the reconciler, boot).
+- **The report:** runs also carry `key` (the last segment of their link
+  key: `route`, `primary`, `guard`, `worker:i.j`), since run ids are the
+  engine's hashes; `writes[]` are `{run, task, function, arguments, via}`;
+  the signal's writes are `writes` and the recovery's are
+  `recovery.writes` (split, not repeated); `drafts[].outcome` is
+  `completed`, `faulted: <detail>`, `cancelled`, `unfinished`, `did not
+  run` or `set aside: <line>`; `ended` is the first loop among the root's
+  children; a step path lists tasks entered (not `do`), skipped tasks,
+  switch cases, faults where they happened and retries, not suspensions
+  (with `max_hold = 0` every join suspends).
+- **Set-aside versions are recorded** by `runs::start_named_child` on
+  `Engine::sandbox` (`Sandbox::set_aside`, `fallback`): one more record of
+  decision 12's set; the root's comes from its `Choice`.
+- **`runs::choose`** (decide, then set aside) chooses the dry root and the
+  recorded recovery start; `start_named_root` keeps its own refusal retry.
+  **`supervisor::signal_admission`** (anchor, evidence, the builder) is
+  shared by `run_active` and the sandbox. **`functions::mcp_functions`** is
+  the registry's MCP set, whose non-read-only members the mock marks.
+- **A model's write is mocked in `AgentLoop::invoke`**, after the
+  availability checks (an unavailable tool still answers unavailable) and
+  after the verdict; its span gets `mock: true`.
+- **The press** delivers `dry_confirm:<token>` to the guard run with
+  `cx.deliver`; a card already stored (a re-dispatch) answers without a
+  second delivery; an expiry backdates the card 24 h + 1 ms
+  (`confirmation::Store::backdate`).
+- **One budget per try:** the signal's dry run and its recovery's share the
+  `TryOptions::timeout` deadline; `TryOptions::stray_read` is the test-only
+  hook of test 19 (a read of the run in `signal_session` through the
+  engine's handle). The guard store refuses and counts every method but
+  `definitions`, `query_definitions`, `definition_control` (overlaid) and
+  `policy`.
+- **Without a signal** a try also takes `drafts` (test 18), runs as
+  `try:<name>` under the builder's `dry-run` span, maps statuses as R-L2
+  (`main`'s `waiting` is `suspended`) and lists `drafts` when it named more
+  than the root.
+- **Restored tests, adapted:** paths are the engine's (`next[1] →
+  replied`), `child_outcome` answers a `Completed` status object, and the
+  skill-index text is read from migration 0007's file (a later migration
+  dropped the `workflows` table); only its dry-run test is restored, the
+  rest of `pending/skill_index.rs` needs scheduled fires (step 5). Test 16's
+  handler write is a tool whose read-only mark changes mid-run (no handler
+  writes to MCP on its own in a try otherwise).
+- **`workflow-author`**'s try section names the new report fields (`via`,
+  `run`, `task`, `key`, `fallback`, `recovery`, `outcome`,
+  `sandbox_refusals`) and that only drafts whose runs all completed become
+  tried.
