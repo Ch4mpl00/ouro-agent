@@ -10,8 +10,9 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 // A definition in the interpreter dialect the workbench runs (owf, until
-// the engine migration removes it); the built-ins are engine definitions.
-const DEFINITION: &str = include_str!("../../agent/tests/fixtures/telegram-loop.yaml");
+// the engine migration removes it): the reference loop as the owf era wrote
+// it; the reference loop itself and the built-ins are engine definitions.
+const DEFINITION: &str = include_str!("../../agent/tests/fixtures/telegram-loop.flat.yaml");
 
 fn observation(id: &str, kind: ObservationType, parent: Option<&str>) -> Observation {
     Observation {

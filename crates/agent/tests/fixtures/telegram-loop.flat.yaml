@@ -1,6 +1,7 @@
 # The reference Telegram loop as the `owf` era wrote it (flat metadata keys,
 # `tool` and `start_child` rounds): engine_dialect.rs shows the conversion to
-# the engine dialect preserves each task. Not run; telegram-loop.yaml is.
+# the engine dialect preserves each task, and the evals workbench (owf)
+# reads it. Not run by the agent; telegram-loop.yaml is.
 document: { dsl: '1.0.4', namespace: agent, name: telegram-loop, version: '1.0.0', metadata: { loop: { description: 'Telegram conversation loop: gathers its context, shows a status, ends on a reply to the conversation and nudges once before a silent end.' }, route: { when: { source: [telegram, telegram_button] } } } }
 # The reference for a channel's flow as ONE loop: it declares the route that
 # starts it, gathers its own first-turn context and sets up its instructions;
