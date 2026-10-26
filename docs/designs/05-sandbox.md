@@ -410,8 +410,8 @@ New:
     one test leaves a deliberate site on `engine.runtime` behind a test-only
     hook and sees the count.
 
-Mutants the suite must catch (run by the executor once, with
-`cargo mutants --in-diff` where it fits, by hand otherwise): the overlay
+Mutants the suite must catch (by hand, once, on a scratch copy; only these
+design rules, no blanket mutation run): the overlay
 ignored by `active_versions` or `decide`; `decide` ignores the digest rule;
 `mark_tried` without the completed check; `confirm_request` writes no card
 row; `resolve_review` edits the card in a sandbox; `DryMcp` dispatches a
