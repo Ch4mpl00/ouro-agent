@@ -1,3 +1,5 @@
+// PARKED (not compiled), for the sandbox step (design 01, step 4): dry
+// runs on a second in-memory runtime.
 // The dry-run sandbox (sandbox.rs): a Telegram-shaped signal through a draft
 // version of the example loop that declares its route (tests/fixtures), with real
 // (scripted) model turns, real reads, the real guard workflow and mocked

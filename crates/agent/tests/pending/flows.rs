@@ -1,3 +1,17 @@
+// PARKED (not compiled). tests/flows.rs keeps the catalog, validation and
+// composition tests; tests/workflow_steps.rs runs a workflow's own steps on
+// the engine (tools with typed outcomes, a retry across a restart, a send
+// cut in flight, choose, llm_compose), ported in step 2b. Still here, for the
+// versions step (design 03, decision 9: saving, activating and running
+// saved workflows through the agent): the store contract, the authoring
+// tools, handover by effect (a_fault_*), only_an_active_version_runs,
+// a_definition_that_no_longer_validates_changes_nothing,
+// a_waiting_saved_child_recovers_in_its_parents_session; for the sandbox
+// step: a_dry_run_records_the_writes_and_changes_nothing. Dropped (the old
+// run store; the engine's conformance covers them):
+// durable_wait_reopens_on_the_pinned_definition_*, fast_child_starts_*,
+// a_run_admitted_without_an_anchor_*. guard_is_reserved_* is covered on the
+// engine by engine_runs.rs an_activated_guard_version_never_reviews_a_round.
 // Saved workflows (`flows.rs`): the store contract on both implementations,
 // validation against what the agent can call, and runs on a real engine —
 // MCP tools go to a recording fake, `llm_compose` to a scripted provider —

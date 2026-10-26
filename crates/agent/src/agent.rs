@@ -1706,7 +1706,10 @@ async fn guard_child_verdict(
     let saved = engine.runtime.get(id).await?.ok_or_else(refused)?;
     let host: Option<crate::runs::GuardHost> =
         saved.admission.host().and_then(|h| serde_json::from_value(h.clone()).ok());
+    // The reserved round's own definition: a version an operator activated
+    // under the name authorizes nothing.
     let own = saved.admission.name == crate::flows::GUARD_NAME
+        && saved.admission.definition == crate::flows::GUARD
         && saved.child.as_ref().is_some_and(|link| link.parent == run)
         && host.is_some_and(|h| h.kind == crate::runs::GUARD && h.round == round && h.parent_loop == run);
     if !own {

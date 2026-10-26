@@ -1,3 +1,5 @@
+// PARKED (not compiled), for the sandbox step (design 01, step 4): the
+// skill-index workflow is installed and run through `try_draft`.
 //! The installed definition runs in a sandbox with a real skill filesystem,
 //! SQLite migrations/durable journal, scripted model and versioned memory.
 mod support;

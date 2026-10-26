@@ -389,13 +389,25 @@ async fn start_guard(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> 
                 engine.deps.db.write(move |db| db.put_evidence(&run, &body)).await?
             },
         };
+        // Always the built-in round, whatever version of `guard` is active:
+        // its stored outcome is what authorizes the round's calls.
+        let digest = ouro_runtime::durable::digest_of(crate::flows::GUARD);
+        let version = engine
+            .runtime
+            .definitions(crate::flows::GUARD_NAME)
+            .await?
+            .versions
+            .values()
+            .find(|d| d.digest == digest)
+            .map(|d| d.version)
+            .ok_or_else(|| anyhow::anyhow!("the built-in guard is not installed"))?;
         let span = live.scope().span(SpanStart::new("guard", SpanKind::Chain).input(input.clone()));
         anchor_child(&engine, &id, span, live.opts.session_id.clone()).await?;
         let child = ctx
             .start_child(ChildStart {
                 key: "guard".into(),
                 name: crate::flows::GUARD_NAME.into(),
-                version: None,
+                version: Some(version),
                 input,
                 host: serde_json::to_value(&host)?,
             })

@@ -95,9 +95,13 @@ docker compose exec postgres psql -U mcp -d mcp_state -c "SELECT * FROM signals 
 ## Workflow runs on the engine
 
 Every workflow run of the agent (a signal, its primary loop, workers, guard
-rounds, a recovery report) is a run of the ouro engine, stored in agent.db's
-`ouro_*` tables on a connection of its own (`crates/agent/src/runs.rs`;
-docs/designs/03-runs-on-the-engine.md). The built-ins `signal`,
+rounds, a recovery report) is a run of the ouro engine, stored in
+`engine.db` beside agent.db (the same directory, so the same volume:
+`/var/lib/ouro/agent/engine.db`), `ouro_*` tables the engine creates and
+migrates (`crates/agent/src/runs.rs`; docs/designs/03-runs-on-the-engine.md).
+Back up both files (`sqlite3 <file> ".backup <copy>"`). Not inside agent.db,
+as design 01 first had it: the engine's adapter takes SQLite's write lock for
+every operation, and agent.db's writes starved behind it (docs/designs/LOG.md). The built-ins `signal`,
 `agent-loop` and `guard` are saved and activated at boot, with
 `metadata.ouro.breaker: off`.
 
@@ -125,6 +129,14 @@ reconciler (every minute) sweeps the agent's own rows of those runs
 (`run_trace`, `confirmations`, `guard_verdict_uses`, `run_evidence`, and
 `evidence` no run links). Host data is at most a few KiB: large evidence
 (skill text, earlier messages) is content-addressed in `evidence`.
+
+**Latency:** a round's guard child, a worker and a signal's primary each
+start at the worker's next tick, and every commit goes through the store, so
+a signal costs a few hundred milliseconds before its first turn. A round of
+many workers is CPU-bound in the engine (its listens poll the store while
+they hold, and every task record carries the loop's context): in a debug
+build 16 one-turn workers take about 30 s; measure a release build before
+relying on wide fan-out.
 
 **Signal loss window:** `get_next_signal` takes a signal before the engine
 admits its run; a crash in between loses that signal, as before (design 03,
@@ -228,7 +240,7 @@ choice. To roll back, deploy an older commit.
 | Container units | `ouro-containers` starts Postgres and Codex on boot. `ouro-tunnel-client` waits for the restricted endpoint, then runs the tunnel container and owns its retries. |
 | Executables | `/opt/ouro/bin` (`mcp-tools`, `agent-supervisor`, `codex-service`) |
 | App files | `/opt/ouro/app`: `skills.default`, `crates/mcp/gateway.config.json`, `probe.py`, and the symlinks `skills` → `/var/lib/ouro/skills` and `storage` → `/var/lib/ouro/storage` |
-| State | `/var/lib/ouro/agent` (agent.db, `AGENT_DB_PATH`), `/var/lib/ouro/skills` (live skills), `/var/lib/ouro/storage` (attachments) |
+| State | `/var/lib/ouro/agent` (agent.db, `AGENT_DB_PATH`, and the engine's `engine.db` beside it), `/var/lib/ouro/skills` (live skills), `/var/lib/ouro/storage` (attachments) |
 | Native env (root-only) | `/etc/ouro/agent.env`, `/etc/ouro/mcp.env`, `/etc/ouro/mcp-tunnel.env` |
 | Container env | The server checkout's `.env.mcp` (tunnel keys: `OPENAI_TUNNEL_ID`, `OPENAI_TUNNEL_API_KEY`) and `.env`/Compose interpolation (Postgres credentials) |
 | Docker volumes | `agent-helper_pg-data`, `agent-helper_codex-home`. Keep the compose project directory stable. |

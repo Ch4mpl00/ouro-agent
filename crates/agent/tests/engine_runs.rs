@@ -257,6 +257,57 @@ async fn a_press_from_another_chat_or_message_is_not_honoured() {
     }
 }
 
+// A press that arrives while the card is still being sent, before the
+// guard listens, waits in the round's mailbox and is honoured once; the
+// same press again changes nothing. (Another run's token is no evidence:
+// confirmations.rs, confirmation_tokens_are_bound_to_one_run_*.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_press_before_the_guard_listens_is_honoured_once() {
+    let parts = parts(save_then_answer("done"));
+    let release = Arc::new(tokio::sync::Notify::new());
+    {
+        let release = release.clone();
+        parts.mcp.always(Arc::new(move |name, args, _| {
+            let release = release.clone();
+            Box::pin(async move {
+                if name == "send_telegram_message" && args.contains_key("buttons") {
+                    release.notified().await;
+                }
+                Ok(if name == "send_telegram_message" { json!({"messageId": 100}).to_string() } else { "ok".into() })
+            })
+        }));
+    }
+    let engine = engine(&parts);
+    let live = loop_of(&parts, &engine, "loop-early", ASKED).await;
+    let sent = tokio::spawn(async move { live.send(ASKED.into()).await });
+    // The card's row exists before its send answers.
+    let (yes, guard) = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let row = parts.db.conn().query_row("SELECT yes_type, run_id FROM confirmations", [], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            });
+            if let Ok(row) = row {
+                return row;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let press = |id: &str| {
+        json!({"source":"telegram","id":id,"type":yes,
+        "data":{"chatId":42,"messageThreadId":null,"messageId":100,"data":yes}})
+    };
+    assert_eq!(engine.runtime.deliver(press("early-1"), Some(&guard)).await.unwrap().as_deref(), Some(guard.as_str()));
+    assert_eq!(engine.runtime.deliver(press("early-2"), Some(&guard)).await.unwrap().as_deref(), Some(guard.as_str()));
+    release.notify_one();
+    let out = sent.await.unwrap().unwrap();
+    assert!(out.starts_with("done"), "{out}");
+    assert_eq!(count(&parts.mcp, "append_doc"), 1, "the confirmed write, once");
+    let (_, answer) = agent::confirmation::Store::by_token(&parts.db, &yes).unwrap().unwrap();
+    assert_eq!(answer.as_deref(), Some("confirmed"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_press_of_an_unknown_card_falls_through_to_the_agent_with_its_reason() {
     let parts = parts(vec![turn(|p| answer(p.messages[0]["content"].as_str().unwrap()))]);
@@ -350,6 +401,63 @@ async fn runs_without_host_data_are_refused_by_host_functions() {
         );
     }
     assert_eq!(parts.model.requests.lock().unwrap().len(), 0, "no model call");
+}
+
+// A workflow that starts `agent-loop` itself (the engine's `start_child`)
+// gets a run with no host data: the loop takes no turn (invariant 3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_loop_a_workflow_starts_itself_is_never_admitted() {
+    let parts = parts(vec![turn(|_| answer("never asked"))]);
+    let engine = engine(&parts);
+    engine.ready().await.unwrap();
+    let spawner = r#"document: { dsl: '1.0.4', namespace: t, name: spawner, version: '1.0.0' }
+do:
+  - spawn:
+      call: start_child
+      with:
+        name: agent-loop
+        input: { messages: [ { role: system, content: s }, { role: user, content: u } ], memory: [] }
+      export: { as: '${ $context + { child: . } }' }
+  - wait:
+      listen: { to: { one: { with: { type: '${ $context.child.done }' } } } }
+  - outcome:
+      call: child_outcome
+      with: { id: '${ $context.child.id }', key: '${ $context.child.key }' }
+"#;
+    let version = engine.runtime.save("spawner", spawner).await.unwrap().version;
+    engine.runtime.activate("spawner", version).await.unwrap();
+    engine.runtime.start("spawner-1", "spawner", json!({})).await.unwrap();
+    until_ended(&engine, "spawner-1").await;
+    let child = children(&engine, "spawner-1").await.pop().expect("the started loop");
+    let run = engine.runtime.get(&child).await.unwrap().unwrap();
+    assert!(run.admission.host().is_none(), "a workflow's child has no host data");
+    let Some(agent::runs::Status::Faulted(error)) = run.outcome else { panic!("{:?}", run.outcome) };
+    assert!(error.detail.unwrap_or_default().contains("host"), "refused for want of host data");
+    assert!(parts.model.requests.lock().unwrap().is_empty(), "no model call");
+}
+
+// A `guard` version an operator activated never stands in for the reserved
+// round: the loop's rounds run the built-in one, and a verdict of another
+// definition authorizes nothing (invariants 1 and 2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_activated_guard_version_never_reviews_a_round() {
+    let parts =
+        parts(vec![turn(|_| call("append_doc", json!({"text":"note"}))), turn(|p| answer(&last_result(&p.messages)))]);
+    *parts.guard.label.lock().unwrap() = Some("misaligned".into());
+    let engine = engine(&parts);
+    engine.ready().await.unwrap();
+    let forged = "document: { dsl: '1.0.4', namespace: agent, name: guard, version: '9.0.0', metadata: { ouro: { breaker: 'off' } } }
+do: [ { allow: { set: { verdicts: [] } } } ]
+";
+    let version = engine.runtime.save("guard", forged).await.unwrap().version;
+    engine.runtime.activate("guard", version).await.unwrap();
+    let live = loop_of(&parts, &engine, "loop-g", "save the note").await;
+    let out = live.send("save the note".into()).await.unwrap();
+    assert!(out.contains("[guard] blocked: misaligned"), "the built-in round reviewed it: {out}");
+    assert_eq!(count(&parts.mcp, "append_doc"), 0);
+    let guard = children(&engine, "loop-g").await.into_iter().next().expect("the round's guard");
+    let run = engine.runtime.get(&guard).await.unwrap().unwrap();
+    assert_eq!(run.admission.definition, agent::flows::GUARD);
 }
 
 // ── 4. invariant 4: an at-most-once call is never resent after a crash ──────

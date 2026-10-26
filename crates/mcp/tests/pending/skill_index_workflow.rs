@@ -1,3 +1,5 @@
+// PARKED (not compiled), for the sandbox step (design 01, step 4): the
+// skill-index workflow against the real MCP, through `try_draft`.
 //! Full sandbox: real MCP over HTTP, throwaway Postgres + SQLite, real OWF.
 //! The optional live test also uses a real model; no production data/pollers.
 #[path = "../../agent/tests/support/mod.rs"]

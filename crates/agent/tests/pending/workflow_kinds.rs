@@ -1,3 +1,7 @@
+// PARKED (not compiled), for the versions step (design 03, decision 9):
+// every test here saves and activates a workflow of the agent's or a copy
+// of agent-loop. a_child_a_workflow_starts_is_never_admitted is covered on
+// the engine by engine_runs.rs a_loop_a_workflow_starts_itself_is_never_admitted.
 // One kind of workflow (#60): any workflow the runtime starts on a signal is
 // admitted with the model's parameters, so it may mix deterministic steps
 // with agent turns, and a recurring task can start as a copy of agent-loop.

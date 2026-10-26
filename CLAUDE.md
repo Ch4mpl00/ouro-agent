@@ -88,7 +88,7 @@ deletion.
    lose one. `wait_for_signal` is supervisor-only — never offered to a model
    (`agent::mcp::SUPERVISOR_ONLY_TOOLS`). **Every workflow run is a run of
    the ouro engine** (`crates/agent/src/runs.rs`; docs/designs/03): its store
-   is `ouro_*` tables in agent.db on a connection of its own; the engine
+   is `ouro_*` tables in `engine.db` beside agent.db; the engine
    worker (started after MCP's first `tools/list`) drives every run. Each
    signal is the durable run `signal:<id>` of the built-in `signal`
    (`workflows/signal.yaml`), admitted with the signal as **host data** (what
@@ -240,8 +240,10 @@ data directory remains under `packages/`, gitignored.
   `memory` (freeform KV, e.g. `news_digest.last_read_at`), the local trace
   mirror (`traces` + per-node `judgements`), `improver_state`, the
   activity journal's progress, the schedule (`scheduled_tasks`,
-  `scheduled_fires`), saved workflows (`workflows`) and their durable runs
-  (`workflow_runs`, `workflow_records`). Migrations live in `crates/agent/migrations`
+  `scheduled_fires`), and what the agent keeps beside the engine's runs
+  (`run_trace`, `evidence`, `tool_snapshot`, `confirmations`). The engine's
+  own store (every workflow run) is `engine.db` beside it, `ouro_*` tables
+  migrated by the engine (`runs.rs` §1). Migrations live in `crates/agent/migrations`
   (drizzle's sqlite format and journal, applied on boot by `AgentDb::open`
   under the same race-tolerant boot the TS client had); a new one is a new
   `.sql` file plus a journal entry, and an applied one never changes (a test

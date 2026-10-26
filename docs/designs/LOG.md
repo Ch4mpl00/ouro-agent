@@ -112,3 +112,67 @@ cover, each reversible:
   reconnect, as MCP's tools are fixed at boot (mcp.rs).
 - **Engine pinned at 9aca1de** (design 04 merged): the built-ins carry
   `metadata.ouro.breaker: off`; the interim lifted threshold is gone.
+
+## 2026-10-26 (step 2b: the suite green on the engine)
+
+Decisions and findings while finishing step 2, each reversible:
+
+- **Engine pinned at the `v0.2.1` tag** (was rev 9aca1de): v0.2.0 hashes
+  child ids per attempt (`hostchild:<32hex>`; the agent only ever uses
+  `FunctionContext::child_id`), v0.2.1 wakes a parent joined on `done:`
+  only for an exact current listen.
+- **The engine's store is `engine.db` beside agent.db, not inside it**
+  (deviates from design 01 decision 3, which the maintainer took; flagged
+  for review). Evidence: the SQLite adapter opens `BEGIN IMMEDIATE` for
+  every operation, reads included, back to back on its one connection, and a
+  write of the agent's on another connection to the same file starved behind
+  it: 5–30 s waits and "database is locked" faults of `start_guard` and
+  `tool_once` under the suite's load; with two files the same test runs in
+  4 s with no slow write. One directory, one volume; two files to back up.
+  Reversible in one place (`runs::engine_store_path`). Kept besides, as
+  hygiene: AgentDb reads go to a reader connection of their own, handler
+  writes to the blocking pool, and the lifecycle drain and the reconciler
+  run in tasks of their own (their synchronous writes never sit in the
+  worker's task, which polls every run's calls).
+- **A handler's panic is its call's failure** (`internal error: …`), not the
+  end of the engine worker (it polls all runs in one task; a panic there
+  stopped the engine for good).
+- **Closing a loop the host drives (`AgentLoop::close`) cancels its run and
+  tree, joins its handlers, then ends its trace**; a shutdown cancels
+  nothing (runs resume at the next start). A cancelled run's span is an
+  aborted (error) observation. A child's span ends, and its loop closes,
+  when its parent reads its outcome (`Engine::ended_child`), not later in
+  the lifecycle drain.
+- **The reconciler writes a root's outcome into its trace only for a run
+  whose creator may be gone** (a signal that suspended): not for a recovery
+  report (its span is in the signal's trace) nor a loop the host runs itself.
+- **Quiescence from two agreeing reads of the run tree** (double collect,
+  the engine's clock): a parent that started a child and suspended between
+  the tree's listing and its own read looked quiescent with the child
+  unlisted, and the supervisor answered "resumes" for a running signal.
+- **Live trace scopes end at a shutdown** (and when the supervisor stops),
+  so a call cut in flight is written as stopped before the tracer closes.
+- **The guard round is pinned to the built-in definition**: `start_guard`
+  starts the version whose digest is the built-in's, and a round's verdicts
+  count only from a guard child running that text, whatever version of
+  `guard` an operator activated.
+- **`create_engine_on(deps, config, clock)`**: the runtime's clock as a seam
+  (tests move it past a 24-hour confirmation).
+- **Within a round, calls start in any order** (each is an engine call):
+  the round properties compare a round's dispatches as a multiset; reply
+  order stays the round's.
+- **Parked suites, triaged**: `confirmation_properties`, `loop_durability`,
+  most of `durable_loop`, the supervisor's confirmation scenarios and a
+  workflow's own steps (from `flows`) are ported to the engine
+  (`tests/confirmations.rs`, `loop_durability.rs`, `durable_loop.rs`,
+  `supervisor.rs`, `workflow_steps.rs`); what needs saved or activated
+  versions, routes or loop variants (step 3) or the sandbox (step 4) stays in
+  `tests/pending/` with a header naming the step. Dropped as tests of the old
+  store or of behaviour design 03 changed: in-process run history,
+  `a_restart_after_guard_rechecks_*` (a round's verdict is its guard
+  child's stored outcome, durable across a restart, not reviewed again),
+  pinned-definition reopen and fast-child timing (engine conformance).
+- **Performance finding for the engine**: a round of many workers is
+  CPU-bound in the engine (each holding listen polls the store; every task
+  record carries the loop's context); 16 one-turn workers take ~30 s in a
+  debug build. Recorded in docs/operations.md; not changed here.

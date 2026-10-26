@@ -1,3 +1,5 @@
+// PARKED (not compiled), for the versions step (design 03, decision 9):
+// loop variants, routes and their breaker need activated agent versions.
 mod support;
 use agent::{
     agent::{AGENT_LOOP, ConfirmTarget, LoopOptions},

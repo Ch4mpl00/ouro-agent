@@ -843,7 +843,8 @@ async fn forged_case(args: Value, mode: u8, w: &Witnesses) {
 fn workflows_cannot_forge_authority_or_borrow_another_parents_guard() {
     let w = Witnesses::new(&["forged confirmed outcome", "another parents guard", "forged allow verdict"]);
     TestRunner::new(Config { cases: cases(), ..Config::default() })
-        .run(&("[ -~]{0,40}", any::<i32>()), |(text, n)| {
+        // Text without `${`, which a definition reads as an expression.
+        .run(&("[ -#%-~]{0,40}", any::<i32>()), |(text, n)| {
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
             rt.block_on(async {
                 for mode in 0..3 {
