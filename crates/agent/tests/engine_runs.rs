@@ -371,7 +371,7 @@ async fn a_write_cut_by_a_restart_is_unknown_to_the_model_and_sent_once() {
     let first = engine(&parts);
     let live = loop_of(&parts, &first, "loop-4", "save the note").await;
     let running = tokio::spawn(async move { live.send("save the note".into()).await });
-    tokio::time::timeout(Duration::from_secs(10), sent.notified()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), sent.notified()).await.unwrap();
     first.halt().await;
     let _ = running.await;
     // The next process resumes the run: the write's outcome is unknown.
@@ -496,7 +496,9 @@ async fn sixteen_workers_complete_under_one_parent() {
     let parts = parts(turns);
     let engine = engine(&parts);
     let live = loop_of(&parts, &engine, "loop-7", "split it").await;
-    let out = tokio::time::timeout(Duration::from_secs(60), live.send("split it".into())).await.unwrap().unwrap();
+    // A liveness bound, not a latency one: in a debug build under the whole
+    // suite's load the round takes tens of seconds (docs/operations.md).
+    let out = tokio::time::timeout(Duration::from_secs(240), live.send("split it".into())).await.unwrap().unwrap();
     assert_eq!(out, "16 replies");
     assert_eq!(children(&engine, "loop-7").await.len(), 16);
 }
@@ -570,7 +572,7 @@ async fn a_worker_cut_by_a_restart_continues_as_the_same_child_after_its_skill_c
     let first = engine(&parts);
     let live = loop_of(&parts, &first, "loop-11", "delegate").await;
     let running = tokio::spawn(async move { live.send("delegate".into()).await });
-    tokio::time::timeout(Duration::from_secs(10), reached.notified()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), reached.notified()).await.unwrap();
     let before = children(&first, "loop-11").await;
     first.halt().await;
     let _ = running.await;
@@ -626,7 +628,7 @@ async fn the_primarys_guard_evidence_is_the_same_after_a_restart_before_it_start
                 let signal = signal.clone();
                 tokio::spawn(async move { supervisor.run_signal(&signal).await })
             };
-            tokio::time::timeout(Duration::from_secs(10), reached.notified()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(30), reached.notified()).await.unwrap();
             first.halt().await;
             running.abort();
             let second = engine(&parts);

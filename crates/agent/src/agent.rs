@@ -58,6 +58,8 @@ pub struct Engine {
     // hold this engine weakly, so neither keeps the other alive.
     pub runtime: Arc<ouro_runtime::Runtime>,
     pub control: ouro_runtime::control::Control,
+    // The runtime's time (its timers, leases, wake-ups).
+    pub clock: Arc<dyn ouro_runtime::durable::Clock>,
     pub scopes: crate::runs::Scopes,
     lifecycle: Arc<crate::runs::Lifecycle>,
     events: std::sync::Mutex<Option<ouro_runtime::BufferedEvents>>,
@@ -107,7 +109,8 @@ pub fn create_engine_on(
         Engine {
             deps,
             runtime: Arc::new(runtime),
-            control: ouro_runtime::control::Control::new(store, clock),
+            control: ouro_runtime::control::Control::new(store, clock.clone()),
+            clock,
             scopes: Default::default(),
             lifecycle,
             events: std::sync::Mutex::new(Some(events)),

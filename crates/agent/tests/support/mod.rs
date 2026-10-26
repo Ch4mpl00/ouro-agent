@@ -88,7 +88,15 @@ impl Mcp for FakeMcp {
         self.called.lock().unwrap().push((name.into(), args.clone()));
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(active, Ordering::SeqCst);
-        let result = agent::errors::or_cancel(cancel, async {
+        // A call the engine drops (a cancelled run) is no longer active.
+        struct Leaving<'a>(&'a AtomicUsize);
+        impl Drop for Leaving<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _leaving = Leaving(&self.active);
+        agent::errors::or_cancel(cancel, async {
             tokio::time::sleep(std::time::Duration::from_millis(
                 args.get("delay").and_then(Value::as_u64).unwrap_or(0),
             ))
@@ -100,9 +108,7 @@ impl Mcp for FakeMcp {
                 _ => Ok(args.get("output").and_then(Value::as_str).unwrap_or("ok").to_owned()),
             }
         })
-        .await;
-        self.active.fetch_sub(1, Ordering::SeqCst);
-        result
+        .await
     }
     async fn close(&self) {
         self.closed.fetch_add(1, Ordering::SeqCst);
@@ -134,13 +140,22 @@ pub fn fixture_on(
     skills: &[(&str, &str)],
     configure: impl FnOnce(&mut EngineDeps),
 ) -> Fixture {
+    fixture_clocked(provider, definitions, skills, Arc::new(ouro_runtime::durable::SystemClock), configure)
+}
+
+/// A fixture whose engine keeps time by `clock` (a confirmation's 24 hours).
+pub fn fixture_clocked(
+    provider: Arc<dyn ChatProvider>,
+    definitions: &[&str],
+    skills: &[(&str, &str)],
+    clock: Arc<dyn ouro_runtime::durable::Clock>,
+    configure: impl FnOnce(&mut EngineDeps),
+) -> Fixture {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("skills.default")).unwrap();
     for (name, body) in skills {
         std::fs::write(root.path().join("skills.default").join(format!("{name}.md")), body).unwrap();
     }
-    let db = Arc::new(AgentDb::open(root.path().join("agent.db")).unwrap());
-    let store = Arc::new(FsSkillStore::new(root.path()));
     // The reference Telegram loop calls its status tool directly, so every
     // fixture knows it (activation checks a definition's calls).
     let mcp = Arc::new(FakeMcp {
@@ -152,6 +167,30 @@ pub fn fixture_on(
             .collect(),
         ..Default::default()
     });
+    let (db, skills, engine) = open_engine(root.path(), provider, mcp.clone(), clock, configure);
+    Fixture { root, db, skills, mcp, engine }
+}
+
+/// Another engine on `f`'s files (agent.db and the engine's store): the
+/// next process after a restart.
+pub fn reopen(
+    f: &Fixture,
+    provider: Arc<dyn ChatProvider>,
+    clock: Arc<dyn ouro_runtime::durable::Clock>,
+    configure: impl FnOnce(&mut EngineDeps),
+) -> Arc<Engine> {
+    open_engine(f.root.path(), provider, f.mcp.clone(), clock, configure).2
+}
+
+fn open_engine(
+    root: &std::path::Path,
+    provider: Arc<dyn ChatProvider>,
+    mcp: Arc<FakeMcp>,
+    clock: Arc<dyn ouro_runtime::durable::Clock>,
+    configure: impl FnOnce(&mut EngineDeps),
+) -> (Arc<AgentDb>, Arc<FsSkillStore>, Arc<Engine>) {
+    let db = Arc::new(AgentDb::open(root.join("agent.db")).unwrap());
+    let store = Arc::new(FsSkillStore::new(root));
     let mut deps = EngineDeps {
         providers: Providers {
             openai: provider.clone(),
@@ -159,7 +198,7 @@ pub fn fixture_on(
             deepseek: provider.clone(),
             openrouter: Some(provider),
         },
-        mcp: mcp.clone(),
+        mcp,
         presets: default_presets(),
         skills: Vec::new(),
         skill_store: store.clone(),
@@ -170,11 +209,11 @@ pub fn fixture_on(
         schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
         env: Default::default(),
         db: (*db).clone(),
-        store: agent::runs::open_store(&root.path().join("agent.db")).unwrap(),
+        store: agent::runs::open_store(&root.join("agent.db")).unwrap(),
     };
     configure(&mut deps);
-    let engine = create_engine(deps);
-    Fixture { root, db, skills: store, mcp, engine }
+    let engine = agent::agent::create_engine_on(deps, agent::runs::config(), clock);
+    (db, store, engine)
 }
 
 // ── The TS agent-loop harness ───────────────────────────────────────────────

@@ -652,6 +652,26 @@ pub async fn wait_end(
     }
 }
 
+// `root`'s live tree, each run read on its own after the listing, by id.
+async fn tree_states(engine: &crate::agent::Engine, root: &SavedRun) -> anyhow::Result<Vec<SavedRun>> {
+    let mut runs = Vec::new();
+    for listed in tree(&engine.control, root).await? {
+        if let Some(saved) = engine.runtime.get(&listed.admission.id).await? {
+            runs.push(saved);
+        }
+    }
+    runs.sort_by(|a, b| a.admission.id.cmp(&b.admission.id));
+    Ok(runs)
+}
+
+fn same_state(a: &SavedRun, b: &SavedRun) -> bool {
+    a.admission.id == b.admission.id
+        && a.state == b.state
+        && a.wake_at_ms == b.wake_at_ms
+        && a.ended_ms == b.ended_ms
+        && a.held.is_some() == b.held.is_some()
+}
+
 /// Waits until each of `roots` ended or its tree is quiescent (decision 1),
 /// then until the lifecycle drain caught up with what the runs reported.
 pub async fn wait_quiescent(
@@ -667,8 +687,16 @@ pub async fn wait_quiescent(
             if run.ended_ms.is_some() {
                 continue;
             }
-            let now = now_ms();
-            if !tree(&engine.control, &run).await?.iter().all(|r| quiescent_run(r, now)) {
+            // Two reads of the tree that agree (a double collect): a run
+            // that started a child and suspended between the listing and
+            // its own read would otherwise look quiescent with its child
+            // unlisted. A child's end wakes its parent in the same commit,
+            // and a wake-up the engine set before `now` counts as due.
+            let first = tree_states(engine, &run).await?;
+            let fresh = tree_states(engine, &run).await?;
+            let now = engine.clock.now_ms();
+            let same = first.len() == fresh.len() && first.iter().zip(&fresh).all(|(a, b)| same_state(a, b));
+            if !same || !fresh.iter().all(|r| quiescent_run(r, now)) {
                 quiet = false;
                 break;
             }

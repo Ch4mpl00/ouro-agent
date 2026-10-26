@@ -477,13 +477,14 @@ async fn queue_polling_handles_signals_serially_and_survives_bad_polls() {
     let c = mcp.clone();
     let sup = supervisor.clone();
     let task = tokio::spawn(async move { run_poll_loop(c, sup, s, std::time::Duration::from_millis(1)).await });
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    // Each signal is a few engine runs on the worker's ticks.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             let n = mcp.calls.lock().unwrap().iter().filter(|(n, _)| n == "get_next_signal").count();
             if n >= 4 {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     })
     .await
@@ -541,9 +542,9 @@ async fn an_empty_queue_is_waited_on_and_a_new_signal_taken_at_once() {
     assert_eq!(asked["timeoutMs"], json!(25_000), "one wait round is 25 s");
     mcp.queue.lock().unwrap().push_back(json!({"signal":signal("dreaming",7),"pendingAfter":0}));
     mcp.arrived.notify_waiters();
-    // The signal's run takes the engine's starts; an hour's poll interval
-    // would still show.
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    // The signal's run takes the engine's starts (seconds under the whole
+    // suite's load); an hour's poll interval would still show.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
         while f.db.get_trace("dreaming:7").unwrap().is_none() {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
@@ -605,4 +606,438 @@ async fn recovery_failure_keeps_the_primary_error_and_transcript() {
         }
         supervisor.shutdown().await;
     }
+}
+
+// ── confirmations through the supervisor (design 03, decision 1) ────────────
+// The signal's tree waits for a press while the supervisor takes the next
+// signal; the press arrives as a signal of its own and the tree goes on in
+// the engine's worker. Telegram runs the default path in step 2 (no loop
+// variant is active, design 03 decision 9).
+
+// The engine's time: the system clock plus an offset a test moves forward.
+#[derive(Default)]
+struct Clock(std::sync::atomic::AtomicI64);
+
+impl ouro_runtime::durable::Clock for Clock {
+    fn now_ms(&self) -> i64 {
+        chrono::Utc::now().timestamp_millis() + self.0.load(Ordering::SeqCst)
+    }
+}
+
+fn confirming(mcp: &Arc<ContextMcp>, label: &str) -> impl FnOnce(&mut agent::agent::EngineDeps) {
+    let (mcp, api) = (mcp.clone(), Arc::new(GuardApi::default()));
+    *api.label.lock().unwrap() = Some(label.into());
+    move |deps| {
+        deps.mcp = mcp;
+        deps.skills = vec!["orchestrator".into(), "routing".into(), "telegram".into()];
+        deps.decisions = Some(agent::decisions::decision_client("guard-test".into(), api));
+        deps.env = agent::session::EnvConfig { user_email: None, telegram_chat_id: Some("999".into()) };
+    }
+}
+
+fn confirmation_fixture(model: Arc<Scripted>, mcp: &Arc<ContextMcp>, clock: Arc<Clock>) -> Fixture {
+    fixture_clocked(model, &[], SKILLS, clock, confirming(mcp, "needs_confirmation"))
+}
+
+async fn until<T>(what: &str, mut probe: impl AsyncFnMut() -> Option<T>) -> T {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Some(found) = probe().await {
+            return found;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+async fn ended(engine: &agent::agent::Engine, run: &str) -> agent::runs::Status {
+    until(run, async || engine.runtime.get(run).await.unwrap().and_then(|r| r.outcome)).await
+}
+
+// The signal's primary loop run (its host child), with its host data (the
+// control API's listing redacts it).
+async fn primary_of(engine: &agent::agent::Engine, signal: i64) -> ouro_runtime::durable::SavedRun {
+    children_of(engine, &format!("signal:{signal}")).await.into_iter().next().expect("the primary loop")
+}
+
+async fn children_of(engine: &agent::agent::Engine, run: &str) -> Vec<ouro_runtime::durable::SavedRun> {
+    let filter = agent::runs::Runs { parent: Some(run.into()), ..Default::default() };
+    let mut children = Vec::new();
+    for child in engine.control.list(&filter, None, 10).await.unwrap().items {
+        children.push(engine.runtime.get(&child.admission.id).await.unwrap().unwrap());
+    }
+    children
+}
+
+fn card_of(mcp: &ContextMcp) -> Map<String, Value> {
+    mcp.calls
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(n, a)| n == "send_telegram_message" && a.contains_key("buttons"))
+        .expect("a confirmation card")
+        .1
+        .clone()
+}
+
+fn cards_sent(mcp: &ContextMcp) -> usize {
+    mcp.calls.lock().unwrap().iter().filter(|(n, a)| n == "send_telegram_message" && a.contains_key("buttons")).count()
+}
+
+fn held(mcp: &ContextMcp) -> Vec<Map<String, Value>> {
+    mcp.calls.lock().unwrap().iter().filter(|(n, _)| n == "t1").map(|(_, a)| a.clone()).collect()
+}
+
+fn press_of(id: i64, card: &Map<String, Value>, index: usize) -> PendingSignal {
+    let mut press = signal("telegram_button", id);
+    press.content = json!({"chatId":-10042,"messageThreadId":7,"messageId":700,
+        "data":card["buttons"][0][index]["data"],"text":card["buttons"][0][index]["text"]})
+    .to_string();
+    press
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn confirmation_holds_exact_call_frees_supervisor_and_resumes_after_press_or_expiry() {
+    for mode in ["confirmed", "declined", "expired", "restart"] {
+        let args = json!({"recipient":"original@example.test","body":"exact original arguments"});
+        let model = Arc::new(Scripted::new(vec![
+            calls(&[("t1", args.clone())]),
+            assistant("other signal answered"),
+            calls(&[(
+                "send_telegram_message",
+                json!({"chatId":"-10042","messageThreadId":7,"text":"confirmation handled"}),
+            )]),
+            assistant("confirmation handled"),
+        ]));
+        let mcp = Arc::new(ContextMcp::default());
+        let clock = Arc::new(Clock::default());
+        let f = confirmation_fixture(model.clone(), &mcp, clock.clone());
+        let mut supervisor = create_supervisor(f.engine.clone());
+        f.db.activity_cutoff(chrono::Utc::now() - chrono::TimeDelta::minutes(1)).unwrap();
+        let result = supervisor.run_signal(&signal("telegram", 42)).await.unwrap();
+        assert!(result.contains("resumes"), "{mode}: {result}");
+        assert!(!f.db.due_activity(20, chrono::Utc::now()).unwrap().iter().any(|t| t.trace_id == "telegram:42"));
+        let primary = primary_of(&f.engine, 42).await;
+        assert_eq!(primary.state, ouro_runtime::durable::RunState::Waiting, "{mode}: {:?}", primary.outcome);
+        assert!(held(&mcp).is_empty());
+        let card = card_of(&mcp);
+        assert_eq!(card["chatId"], "-10042");
+        assert_eq!(card["messageThreadId"], 7);
+        assert!(card["text"].as_str().unwrap().contains("original@example.test"));
+        assert!(card["text"].as_str().unwrap().contains("go ahead"));
+        for b in card["buttons"][0].as_array().unwrap() {
+            assert!((19..=64).contains(&b["data"].as_str().unwrap().len()));
+        }
+        assert_eq!(supervisor.run_signal(&signal("peer", 43)).await.unwrap(), "other signal answered");
+
+        // A new engine on the same files: no live loop, verdict or working
+        // memory of the first process.
+        let engine = if mode == "restart" {
+            supervisor.shutdown().await;
+            let next = reopen(&f, model.clone(), clock.clone(), confirming(&mcp, "allow"));
+            supervisor = create_supervisor(next.clone());
+            next.ready().await.unwrap();
+            next
+        } else {
+            f.engine.clone()
+        };
+        if mode == "expired" {
+            f.db.conn().execute("UPDATE confirmations SET created_at_ms = created_at_ms - 86400001", []).unwrap();
+            clock.0.fetch_add(86_400_000 + 60_000, Ordering::SeqCst);
+        } else {
+            let index = usize::from(mode == "declined");
+            assert_eq!(supervisor.run_signal(&press_of(44, &card, index)).await.unwrap(), "Button delivered");
+            assert_eq!(model.seen.lock().unwrap().len(), 2, "a delivery takes no model turn");
+        }
+        assert_eq!(
+            ended(&engine, "signal:42").await,
+            agent::runs::Status::Completed(json!("confirmation handled")),
+            "{mode}"
+        );
+        let held = held(&mcp);
+        assert_eq!(held.len(), usize::from(mode == "confirmed" || mode == "restart"), "{mode}: {held:?}");
+        if let Some(call) = held.first() {
+            assert_eq!(json!(call), args);
+        }
+        let (trace, observations) = until("the trace's final output", async || {
+            let (trace, observations) = f.db.get_trace("telegram:42").unwrap()?;
+            (trace.output == json!("confirmation handled")).then_some((trace, observations))
+        })
+        .await;
+        assert_eq!(trace.name, "signal:telegram");
+        assert_eq!(trace.session_id.as_deref(), Some("telegram:42"));
+        assert!(trace.input.to_string().contains("Telegram message"), "{}", trace.input);
+        assert!(observations.iter().any(|o| o.name == "guard"));
+        assert!(
+            observations.iter().any(|o| o.name == "send_telegram_message" && o.input["text"] == "confirmation handled")
+        );
+        until("the run's end recorded", async || {
+            f.db.due_activity(20, chrono::Utc::now()).unwrap().iter().any(|t| t.trace_id == "telegram:42").then_some(())
+        })
+        .await;
+        assert_eq!(cards_sent(&mcp), 1, "{mode}: the card is not sent twice");
+        let edit = until("the card's edit", async || {
+            mcp.calls.lock().unwrap().iter().find(|(n, _)| n == "edit_telegram_message").map(|(_, a)| a.clone())
+        })
+        .await;
+        let defaults = agent::confirmation::Card::default();
+        let label = defaults.outcome(match mode {
+            "restart" | "confirmed" => "confirmed",
+            "declined" => "declined",
+            _ => "expired",
+        });
+        assert!(edit["text"].as_str().unwrap().ends_with(label), "{mode}: {edit:?}");
+        assert!(edit.get("buttons").is_none());
+        if mode == "declined" || mode == "expired" {
+            let transcript = serde_json::to_string(&model.seen.lock().unwrap().last().unwrap().messages).unwrap();
+            assert!(transcript.contains(if mode == "declined" {
+                "declined by the user"
+            } else {
+                "not confirmed within 24 h"
+            }));
+        }
+        supervisor.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_next_session_knows_pending_cards_in_its_conversation_only() {
+    let model = Arc::new(Scripted::new(vec![
+        calls(&[("t1", json!({"operation":"pending action"}))]),
+        assistant("same topic"),
+        assistant("other topic"),
+    ]));
+    let mcp = Arc::new(ContextMcp::default());
+    let f = confirmation_fixture(model.clone(), &mcp, Arc::new(Clock::default()));
+    let supervisor = create_supervisor(f.engine.clone());
+    supervisor.run_signal(&signal("telegram", 42)).await.unwrap();
+    assert_eq!(supervisor.run_signal(&signal("telegram", 43)).await.unwrap(), "same topic");
+    let mut other = signal("telegram", 44);
+    other.content = other.content.replace("thread_id=7", "thread_id=8");
+    assert_eq!(supervisor.run_signal(&other).await.unwrap(), "other topic");
+    let seen = model.seen.lock().unwrap().clone();
+    let same = seen[1].messages[0]["content"].as_str().unwrap();
+    assert!(
+        same.contains("Pending confirmations")
+            && same.contains("pending action")
+            && same.contains("-10042")
+            && same.contains("since"),
+        "{same}"
+    );
+    assert!(!seen[2].messages[0]["content"].as_str().unwrap().contains("Pending confirmations"));
+    assert_eq!(cards_sent(&mcp), 1);
+    assert!(held(&mcp).is_empty());
+    supervisor.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_confirmation_sleeps_its_parent_and_survives_restart() {
+    for restart in [false, true] {
+        let args = json!({"recipient":"worker@example.test","body":"held exactly once"});
+        let model = Arc::new(Scripted::new(vec![
+            calls(&[("invoke_sub_agent", json!({"prompt":"send the proposed message","skills":["telegram"]}))]),
+            calls(&[("t1", args.clone())]),
+            assistant("next signal answered"),
+            assistant("worker answer"),
+            assistant("parent answer"),
+        ]));
+        let mcp = Arc::new(ContextMcp::default());
+        let clock = Arc::new(Clock::default());
+        let f = confirmation_fixture(model.clone(), &mcp, clock.clone());
+        let mut supervisor = create_supervisor(f.engine.clone());
+        let result = supervisor.run_signal(&signal("telegram", 42)).await.unwrap();
+        assert!(result.contains("resumes"), "{result}");
+        let primary = primary_of(&f.engine, 42).await;
+        let worker = children_of(&f.engine, &primary.admission.id)
+            .await
+            .into_iter()
+            .find(|r| r.admission.name != "guard")
+            .expect("the worker");
+        let guard = children_of(&f.engine, &worker.admission.id)
+            .await
+            .into_iter()
+            .find(|r| r.admission.name == "guard")
+            .expect("the worker's guard");
+        for run in [&primary, &worker, &guard] {
+            let state = f.engine.runtime.get(&run.admission.id).await.unwrap().unwrap().state;
+            assert_eq!(state, ouro_runtime::durable::RunState::Waiting, "{}", run.admission.id);
+        }
+        // The worker confirms where its parent does (invariant 5).
+        assert_eq!(worker.admission.host().unwrap()["confirm"], json!({"chatId":"-10042","messageThreadId":7}));
+        assert_eq!(supervisor.run_signal(&signal("peer", 43)).await.unwrap(), "next signal answered");
+        assert!(held(&mcp).is_empty());
+        let card = card_of(&mcp);
+        let engine = if restart {
+            supervisor.shutdown().await;
+            let next = reopen(&f, model.clone(), clock.clone(), confirming(&mcp, "needs_confirmation"));
+            supervisor = create_supervisor(next.clone());
+            next.ready().await.unwrap();
+            next
+        } else {
+            f.engine.clone()
+        };
+        assert_eq!(supervisor.run_signal(&press_of(44, &card, 0)).await.unwrap(), "Button delivered");
+        assert_eq!(ended(&engine, "signal:42").await, agent::runs::Status::Completed(json!("parent answer")));
+        assert_eq!(ended(&engine, &worker.admission.id).await, agent::runs::Status::Completed(json!("worker answer")));
+        let held = held(&mcp);
+        assert_eq!(held.len(), 1);
+        assert_eq!(json!(held[0]), args);
+        assert_eq!(cards_sent(&mcp), 1);
+        let (trace, observations) = until("the trace's final output", async || {
+            let (trace, observations) = f.db.get_trace("telegram:42").unwrap()?;
+            (trace.output == json!("parent answer")).then_some((trace, observations))
+        })
+        .await;
+        assert_eq!(trace.output, "parent answer");
+        assert!(observations.iter().any(|o| o.name == "invoke_sub_agent"));
+        supervisor.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn confirmation_during_the_hold_finishes_without_suspending() {
+    let model = Arc::new(Scripted::new(vec![calls(&[("t1", json!({"body":"held"}))]), assistant("done")]));
+    let mcp = Arc::new(ContextMcp::default());
+    let f = confirmation_fixture(model, &mcp, Arc::new(Clock::default()));
+    let supervisor = create_supervisor(f.engine.clone());
+    let incoming = signal("telegram", 42);
+    let running = {
+        let supervisor = supervisor.clone();
+        tokio::spawn(async move { supervisor.run_signal(&incoming).await })
+    };
+    // The card's press arrives during the guard's hold, straight to it.
+    let (token, guard): (String, String) = until("the card", async || {
+        f.db.conn()
+            .query_row("SELECT yes_type, run_id FROM confirmations WHERE message_id IS NOT NULL", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .ok()
+    })
+    .await;
+    let event = json!({"source":"telegram","id":"telegram_button:during-hold","type":token,
+        "data":{"chatId":-10042,"messageThreadId":7,"messageId":700,"data":token}});
+    assert_eq!(f.engine.runtime.deliver(event, Some(&guard)).await.unwrap().as_deref(), Some(guard.as_str()));
+    assert_eq!(running.await.unwrap().unwrap(), "done", "the signal ended without suspending");
+    assert_eq!(held(&mcp).len(), 1);
+    let (trace, observations) = f.db.get_trace("telegram:42").unwrap().unwrap();
+    assert_eq!(trace.output, "done");
+    assert!(!observations.iter().any(|o| o.name.starts_with("resume:")), "no execution was resumed");
+    supervisor.shutdown().await;
+}
+
+// A press is delivered to the guard round whose card holds its token, with
+// no model turn; a press of a card already answered goes to the agent with
+// the Telegram context and the reason; a peer's confirmations go to the
+// default chat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn button_routing_delivers_without_a_model_and_falls_back_with_telegram_context() {
+    let model = Arc::new(Scripted::new(vec![
+        calls(&[("t1", json!({"body":"held"}))]),
+        assistant("done"),
+        assistant("stale button understood"),
+        assistant("peer done"),
+    ]));
+    let mcp = Arc::new(ContextMcp::default());
+    let f = confirmation_fixture(model.clone(), &mcp, Arc::new(Clock::default()));
+    let supervisor = create_supervisor(f.engine.clone());
+    assert!(supervisor.run_signal(&signal("telegram", 9)).await.unwrap().contains("resumes"));
+    let card = card_of(&mcp);
+    assert_eq!(supervisor.run_signal(&press_of(10, &card, 0)).await.unwrap(), "Button delivered");
+    assert_eq!(model.seen.lock().unwrap().len(), 1, "a delivery takes no model turn");
+    assert_eq!(ended(&f.engine, "signal:9").await, agent::runs::Status::Completed(json!("done")));
+    assert_eq!(supervisor.run_signal(&press_of(11, &card, 0)).await.unwrap(), "stale button understood");
+    let seen = model.seen.lock().unwrap().clone();
+    let stale = seen.last().unwrap();
+    let content = stale.messages.last().unwrap()["content"].as_str().unwrap();
+    assert!(content.contains("pressed the button") && content.contains("700"), "{content}");
+    let system = stale.messages[0]["content"].as_str().unwrap();
+    assert!(system.contains("Delivery:") && system.contains("already answered"), "{system}");
+    let primary = primary_of(&f.engine, 11).await;
+    assert_eq!(primary.admission.host().unwrap()["confirm"], json!({"chatId":"-10042","messageThreadId":7}));
+    assert!(mcp.calls.lock().unwrap().iter().any(|(n, a)| n == "get_telegram_chat_history" && a["threadId"] == 7));
+    assert_eq!(supervisor.run_signal(&signal("peer", 12)).await.unwrap(), "peer done");
+    let primary = primary_of(&f.engine, 12).await;
+    assert_eq!(primary.admission.host().unwrap()["confirm"], json!({"chatId":"999","messageThreadId":null}));
+    supervisor.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn telegram_without_an_active_route_keeps_the_default_first_turn_and_loop() {
+    for source in ["telegram", "telegram_button"] {
+        let model = Arc::new(Scripted::new(vec![assistant("default answer")]));
+        let mcp = Arc::new(ContextMcp::default());
+        let f = fixture_on(model.clone(), &[], SKILLS, |deps| {
+            deps.mcp = mcp.clone();
+            deps.skills = vec!["orchestrator".into(), "routing".into()];
+            deps.env = agent::session::EnvConfig { user_email: None, telegram_chat_id: Some("999".into()) };
+        });
+        mcp.notes.lock().unwrap().push("Earlier activity from the journal".into());
+        mcp.history.lock().unwrap().push(history(
+            100,
+            "Earlier message",
+            "user",
+            -10042,
+            Some(7),
+            "2026-09-06 11:59:00",
+        ));
+        let supervisor = create_supervisor(f.engine.clone());
+        let mut incoming = signal(source, 50);
+        if source == "telegram_button" {
+            incoming.content =
+                json!({"chatId":-10042,"messageThreadId":7,"messageId":123,"text":"Stale button","data":"unclaimed"})
+                    .to_string();
+        }
+        assert_eq!(supervisor.run_signal(&incoming).await.unwrap(), "default answer");
+        let primary = primary_of(&f.engine, 50).await;
+        assert_eq!(primary.admission.name, "agent-loop");
+        let target = json!({"chatId":"-10042","messageThreadId":7});
+        assert_eq!(primary.admission.host().unwrap()["confirm"], target);
+        assert_eq!(primary.admission.host().unwrap()["conversation"], target);
+        let seen = model.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "the default loop adds no silent-end reminder");
+        let system = seen[0].messages[0]["content"].as_str().unwrap();
+        assert!(system.contains("Earlier activity from the journal"), "{system}");
+        assert!(system.contains("Delivery: use send_telegram_message for the current signal's chatId and optional messageThreadId. A final assistant message alone is not delivered to Telegram."));
+        assert!(!system.contains("A message delivered to this conversation ends the session"));
+        assert!(!system.contains("TELEGRAM"), "the default path does not autoload transport rules");
+        let user = seen[0].messages.last().unwrap()["content"].as_str().unwrap();
+        assert!(user.contains("telegram.history"), "{user}");
+        assert!(
+            mcp.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(n, a)| n == "get_telegram_chat_history" && a["chatId"] == "-10042" && a["threadId"] == 7)
+        );
+        supervisor.shutdown().await;
+    }
+}
+
+// A primary loop cancelled while its turn is in flight (an operator's
+// cancel) ends its signal without a failure report (design 03, decision 6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_primary_ends_its_signal_without_a_report() {
+    let in_flight = Arc::new(tokio::sync::Notify::new());
+    let notify = in_flight.clone();
+    let model = Turns::new(vec![turn_async(move |p| async move {
+        notify.notify_one();
+        p.cancel.cancelled().await;
+        Err(agent::errors::aborted())
+    })]);
+    let (f, _, supervisor) = setup(model.clone());
+    let running = {
+        let supervisor = supervisor.clone();
+        tokio::spawn(async move { supervisor.run_signal(&signal("scheduler", 42)).await })
+    };
+    in_flight.notified().await;
+    let primary = primary_of(&f.engine, 42).await;
+    assert!(f.engine.runtime.cancel(&primary.admission.id).await.unwrap());
+    running.await.unwrap().unwrap();
+    assert_eq!(model.requests.lock().unwrap().len(), 1, "no report was asked of the model");
+    assert!(f.engine.runtime.get("recovery:42").await.unwrap().is_none(), "no report run");
+    let (_, obs) = f.db.get_trace("scheduler:42").unwrap().unwrap();
+    assert!(!obs.iter().any(|o| o.name == "recovery"));
+    let loops = f.engine.loop_ids().await;
+    assert!(loops.is_empty(), "{loops:?} {:?}", primary.admission.id);
+    supervisor.shutdown().await;
 }

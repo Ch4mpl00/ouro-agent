@@ -1,3 +1,19 @@
+// PARKED (not compiled). tests/supervisor.rs holds this suite on the
+// engine (step 2b ported the confirmation scenarios: a held call freeing the
+// supervisor and resuming after a press, a decline, an expiry or a restart;
+// a worker's confirmation; a press during the hold; pending cards in the next
+// session; button routing; Telegram on the default path; a cancelled primary
+// without a report). Still here, for the versions step (design 03, decision
+// 9; they need saved workflows, routes, loop variants or a `signal`
+// override): a_saved_workflow_runs_and_faults_hand_over_by_effect,
+// an_interrupted_saved_workflow_is_left_to_durable_recovery,
+// an_activated_signal_*, a_signal_override_without_a_catch_*,
+// a_catch_before_signal_session_cannot_start_recovery,
+// an_override_cannot_forge_confirmation_* (covered on the engine by
+// confirmations.rs, workflows_cannot_forge_authority_*),
+// activated_signal_routes_*, a_signal_route_has_its_own_breaker_*,
+// a_telegram_signal_runs_the_loop_that_declares_its_route,
+// a_rebuilt_routed_loop_keeps_what_its_setup_added.
 // Rust-only: routing, source isolation, recovery, shutdown and the poll loop
 // as scenarios, beyond the one-to-one ports in agent_loop.rs,
 // telegram_context.rs and supervisor_e2e.rs.

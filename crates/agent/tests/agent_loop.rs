@@ -1336,7 +1336,7 @@ async fn close_cancels_active_round_joins_tools_and_closes_trace_once() {
     // ticks, every commit in the SQLite store.
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while f.mcp.active.load(Ordering::SeqCst) < 2 {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     })
     .await
