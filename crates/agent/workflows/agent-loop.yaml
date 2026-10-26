@@ -14,7 +14,14 @@ do:
   - route:
       switch:
         - answered: { when: '${ .calls == [] }', then: answer }
-        - act: { then: guard }
+        - act: { then: observe }
+  - observe:
+      # A loop started with an observer (`on_step`, host data) tells it what
+      # this turn decided, before the calls run; never joined, and a broken
+      # observer is ignored (`observe_step`). Rounds of only bookkeeping skip it.
+      if: '${ $context.on_step != null and ([ $context.calls[] | select(.name != "finish" and (.name | startswith("working_memory_") | not)) ] | length) > 0 }'
+      call: observe_step
+      with: { i: '${ $context.i }', calls: '${ $context.calls }', content: '${ .content }', reasoning: '${ .message.reasoning_content // null }' }
   - guard:
       call: start_guard
       with: { calls: '${ $context.calls }', i: '${ $context.i }' }

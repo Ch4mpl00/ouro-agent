@@ -37,7 +37,8 @@ pub const FUNCTION_SLOTS: usize = 2 * DRIVES;
 /// The run tree's jump budget, a backstop: `max_iterations` is the binding
 /// limit of every loop. One round of agent-loop takes two jumps (`route` and
 /// `next`) plus one per guarded call in its guard round; the dispatcher takes
-/// at most three. With the primary's 100 iterations and 16 workers of 50,
+/// at most three, and the Telegram route around its loop a handful (its
+/// switch and the reply's guard round; design 08). With the primary's 100 iterations and 16 workers of 50,
 /// each with up to 16 guarded calls a round, that is
 /// 100 × 18 + 16 × 50 × 18 + 3 = 16 203; this leaves a margin over it
 /// (docs/operations.md, Jump budget). The recovery report runs outside the
@@ -322,6 +323,13 @@ pub struct LoopHost {
     pub max_iterations: usize,
     pub max_concurrent_tools: usize,
     pub tool_whitelist: Option<Vec<String>>,
+    /// Tools the loop is never offered (sorted; design 08). Absent in runs
+    /// admitted before it existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_tools: Vec<String>,
+    /// The observer of its acting turns, `{workflow, input}` (design 08).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_step: Option<Value>,
     pub include_engine_skills: bool,
     pub parent_id: Option<String>,
     pub root_request_digest: Option<String>,
@@ -624,7 +632,8 @@ pub fn quiescent_run(run: &SavedRun, now: i64) -> bool {
 // version is a built-in text (an older one: the boot upgrades it). An active
 // version that is not a built-in (the agent's override, an operator's) is
 // never replaced, and a name an operator paused is left alone: an
-// activation would lift the pause (design 04, decision 5).
+// activation would lift the pause (design 04, decision 5). A built-in the
+// engine refuses against the current registry is skipped (design 08).
 
 pub async fn install_builtins(
     runtime: &ouro_runtime::Runtime,
@@ -632,6 +641,13 @@ pub async fn install_builtins(
     builtins: &[(&str, &str)],
 ) -> anyhow::Result<()> {
     for (name, yaml) in builtins {
+        // A built-in that calls tools this MCP does not offer (the Telegram
+        // route without Telegram) is not installed; the rest are, and its
+        // signals take the default path.
+        if let Err(error) = runtime.validate(yaml) {
+            eprintln!("[engine] the built-in `{name}` does not fit this MCP and is not installed: {error:#}");
+            continue;
+        }
         let digest = ouro_runtime::durable::digest_of(yaml);
         let (record_name, record_digest) = (name.to_string(), digest.clone());
         db.write(move |db| crate::flows::WorkflowMeta::record(db, &record_name, &record_digest, None, true)).await?;
@@ -1060,13 +1076,14 @@ pub async fn boot(engine: &std::sync::Arc<crate::agent::Engine>) -> anyhow::Resu
 /// Where a named start happens: the signal's own run; a loop (the primary,
 /// a worker, a recovery report, a loop the host runs itself), which only a
 /// loop may serve; a route the dispatcher starts; a scheduled task's saved
-/// workflow.
+/// workflow; a loop's step observer (design 08), which nothing replaces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Site {
     Signal,
     Loop,
     Route,
     Saved,
+    Observer,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1133,6 +1150,7 @@ impl Fallback {
         let instead = match (&ran, site) {
             (Some((ran, _)), _) => format!("the built-in `{ran}` runs this time"),
             (None, Site::Route) => "the default path handles this signal".into(),
+            (None, Site::Observer) => "nothing observes this step".into(),
             (None, _) => "the agent loop takes this task".into(),
         };
         let line = format!(
@@ -1286,7 +1304,7 @@ async fn fallback_target(engine: &crate::agent::Engine, site: Site) -> anyhow::R
     let name = match site {
         Site::Signal => crate::supervisor::SIGNAL_NAME,
         Site::Loop => crate::agent::AGENT_LOOP_NAME,
-        Site::Route | Site::Saved => return Ok(None),
+        Site::Route | Site::Saved | Site::Observer => return Ok(None),
     };
     let version = crate::flows::builtin_version(&engine.runtime, name)
         .await?

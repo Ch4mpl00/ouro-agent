@@ -1,0 +1,246 @@
+document: { dsl: '1.0.4', namespace: agent, name: telegram, version: '1.0.0', metadata: { route: { when: { source: [telegram, telegram_button] }, priority: -1 }, ouro: { breaker: 'off' } } }
+# A Telegram signal's flow (docs/designs/08-telegram-loop.md): the route the
+# dispatcher starts as the signal's primary run, wrapped around a loop that
+# does not know it runs here. It opens a 👀 bubble at once, gathers the
+# first turn's context, starts the loop as its own child with the delivery
+# tools taken away and a status observer on every step, joins it, composes
+# the one reply from what the loop did, sends it through the guard as the
+# loop would, and clears the bubble. Every bubble call is cosmetic: none of
+# them can fail the signal. Priority -1: an agent's route of the same
+# specificity wins without a tie.
+# Built-ins never trip (design 01, decision 10): a provider outage must not stop the agent.
+input:
+  from: '${ . + { bubble: ("status:" + (.signal.id | tostring)) } }'
+do:
+  - open:
+      if: '${ $context.conversation != null }'
+      try:
+        - quiet:
+            try:
+              - bubble:
+                  call: telegram_send_status
+                  with:
+                    id: '${ $context.bubble }'
+                    text: 👀
+                    chatId: '${ $context.conversation.chatId }'
+                    messageThreadId: '${ $context.conversation.messageThreadId }'
+                    seq: 0
+            catch:
+              # An unknown outcome is caught only by name; nothing resends it.
+              errors: { with: { type: urn:ouro:errors:call.unknown } }
+              do:
+                - unanswered: { set: '${ . }' }
+      catch:
+        do:
+          - shown: { set: '${ . }' }
+  - input:
+      call: signal_input
+      export: { as: '${ $context + { input: .input } }' }
+  - activity:
+      call: recent_activity
+      export: { as: '${ $context + { activity: . } }' }
+  - pending_confirmations:
+      if: '${ $context.confirm != null }'
+      call: pending_confirmations
+      with: { target: '${ $context.confirm }' }
+      export: { as: '${ $context + { pending_confirmations: . } }' }
+  - preselect:
+      call: preselect_skills
+      with:
+        request: '${ $context.signal.content }'
+        context: '${ "Signal source: " + $context.signal.source + "\n\n" + $context.input }'
+        loaded: [telegram]
+      export: { as: '${ $context + { preselected: . } }' }
+  - work:
+      try:
+        - start:
+            call: start_loop
+            with:
+              input: '${ $context.input }'
+              skills: [telegram]
+              loaded: '${ [ "telegram" ] + ($context.preselected.names // []) }'
+              preset: smart
+              exclude_tools: [send_telegram_message, telegram_send_status, start_typing, send_telegram_chat_action]
+              on_step: >-
+                ${ if $context.conversation != null
+                   then { workflow: "telegram-status", input: { id: $context.bubble, chatId: $context.conversation.chatId, messageThreadId: $context.conversation.messageThreadId } }
+                   else null end }
+              system: >-
+                ${ [
+                  $context.activity,
+                  $context.pending_confirmations,
+                  "Call find_skills only when the task needs something specific that the skills already in your instructions don't cover; the source is only a hint.",
+                  $context.preselected.block,
+                  "This conversation's reply is written and sent for you after you finish: do not send it yourself and do not assign its delivery to a worker. Do the work now, then finish with what you did, what failed, and what the user should hear."
+                ] | map(select(. != null and . != "")) }
+            export: { as: '${ $context + { loop: . } }' }
+        - wait:
+            # No hold: the wrapper suspends until its loop ends; a loop that
+            # sleeps on a confirmation lets it sleep too.
+            listen:
+              read: envelope
+              to:
+                any:
+                  - with: { type: '${ $context.loop.done }' }
+                  - with: { type: '${ $context.loop.waiting }' }
+        - sleeping:
+            if: '${ .[0].type == $context.loop.waiting }'
+            do:
+              - hide:
+                  # A bubble would freeze above the card for hours; the
+                  # tombstone keeps later status lines away.
+                  if: '${ $context.conversation != null }'
+                  try:
+                    - quiet:
+                        try:
+                          - clear:
+                              call: telegram_send_status
+                              with:
+                                id: '${ $context.bubble }'
+                                text: ''
+                                chatId: '${ $context.conversation.chatId }'
+                                messageThreadId: '${ $context.conversation.messageThreadId }'
+                                seq: 1000000
+                        catch:
+                          # An unknown outcome is caught only by name; nothing resends it.
+                          errors: { with: { type: urn:ouro:errors:call.unknown } }
+                          do:
+                            - unanswered: { set: '${ . }' }
+                  catch:
+                    do:
+                      - hidden: { set: '${ . }' }
+              - done:
+                  listen: { to: { one: { with: { type: '${ $context.loop.done }' } } } }
+        - outcome:
+            call: loop_outcome
+            with: { ref: '${ $context.loop }' }
+            export: { as: '${ $context + { outcome: . } }' }
+        - after_loop:
+            switch:
+              - faulted: { when: '${ $context.outcome.status == "faulted" }', then: loop_failed }
+              - completed: { when: '${ $context.outcome.status == "completed" }', then: transcript }
+              - cancelled: { then: clear }
+        - loop_failed:
+            raise:
+              error:
+                type: https://open-workflow-specification.org/spec/1.0.0/errors/runtime
+                status: 500
+                title: '${ $context.outcome.error.title // "Loop failed" }'
+                detail: '${ $context.outcome.error.detail // $context.outcome.error.title // "loop failed" }'
+        - transcript:
+            call: loop_transcript
+            with: { ref: '${ $context.loop }' }
+            export: { as: '${ $context + { work: . } }' }
+        - compose:
+            call: llm_compose
+            with:
+              preset: compose
+              skill: telegram
+              json: true
+              prompt: >-
+                Write the one Telegram message that answers the user's latest message in the history, from the work below
+                (what the agent did: its calls and their results) and its result (the agent's closing note to you).
+                Never claim an action the work does not show; say plainly what failed or was not done. Follow the style
+                rules. If the work shows this reply was already delivered to this conversation, or nothing should be
+                sent, answer {"reply": null}; otherwise answer {"reply": "<the message>"}.
+              input: '${ { history: $context.input, work: $context.work, result: ($context.outcome.output // "") } }'
+            export: { as: '${ $context + { reply: (if (.reply | type) == "string" and .reply != "" then .reply else null end) } }' }
+        - send:
+            if: '${ $context.reply != null and $context.conversation != null }'
+            do:
+              - call:
+                  set: >-
+                    ${ { id: "reply", name: "send_telegram_message",
+                         arguments: ({ chatId: $context.conversation.chatId, messageThreadId: $context.conversation.messageThreadId, text: $context.reply } | tojson) } }
+                  export: { as: '${ $context + { send: . } }' }
+              - guard:
+                  # The reply is model text from tool results: the guard's
+                  # rules and review apply to it as to the model's own send.
+                  call: start_guard
+                  with: { calls: '${ [ $context.send ] }', i: 1 }
+                  export: { as: '${ $context + { guard_run: .run } }' }
+              - wait_guard:
+                  if: '${ $context.guard_run != null }'
+                  listen:
+                    read: envelope
+                    to:
+                      any:
+                        - with: { type: '${ "done:" + $context.guard_run }' }
+                        - with: { type: '${ "waiting:" + $context.guard_run }' }
+                  metadata: { ouro: { hold: PT60S } }
+              - sleep_guard:
+                  if: '${ $context.guard_run != null and .[0].type == ("waiting:" + $context.guard_run) }'
+                  listen: { to: { one: { with: { type: '${ "done:" + $context.guard_run }' } } } }
+              - once:
+                  try:
+                    - deliver:
+                        call: tool_once
+                        with: { call: '${ $context.send }', guard_run: '${ $context.guard_run // null }', i: 1, index: 0 }
+                  catch:
+                    # Sent before a restart without an answer: it may have
+                    # arrived, so it counts as sent and is never repeated.
+                    errors: { with: { type: urn:ouro:errors:call.unknown } }
+                    do:
+                      - unknown: { set: '${ { failed: false, presented: "outcome unknown" } }' }
+                  export: { as: '${ $context + { sent: (.failed | not), presented: .presented } }' }
+        - clear:
+            if: '${ $context.conversation != null }'
+            try:
+              - quiet:
+                  try:
+                    - bubble:
+                        call: telegram_send_status
+                        with:
+                          id: '${ $context.bubble }'
+                          text: ''
+                          chatId: '${ $context.conversation.chatId }'
+                          messageThreadId: '${ $context.conversation.messageThreadId }'
+                          seq: 1000000
+                  catch:
+                    # An unknown outcome is caught only by name; nothing resends it.
+                    errors: { with: { type: urn:ouro:errors:call.unknown } }
+                    do:
+                      - unanswered: { set: '${ . }' }
+            catch:
+              do:
+                - cleared: { set: '${ . }' }
+        - answer:
+            # What the user got: the reply sent, the guard's answer to one it
+            # stopped, or the loop's own output when nothing was sent.
+            set: >-
+              ${ { output: (if $context.sent == true then $context.reply
+                            elif $context.presented != null then $context.presented
+                            else $context.outcome.output end) } }
+      catch:
+        as: failure
+        do:
+          - clear:
+              if: '${ $context.conversation != null }'
+              try:
+                - quiet:
+                    try:
+                      - bubble:
+                          call: telegram_send_status
+                          with:
+                            id: '${ $context.bubble }'
+                            text: ''
+                            chatId: '${ $context.conversation.chatId }'
+                            messageThreadId: '${ $context.conversation.messageThreadId }'
+                            seq: 1000000
+                    catch:
+                      # An unknown outcome is caught only by name; nothing resends it.
+                      errors: { with: { type: urn:ouro:errors:call.unknown } }
+                      do:
+                        - unanswered: { set: '${ . }' }
+              catch:
+                do:
+                  - cleared: { set: '${ . }' }
+          - fail:
+              raise:
+                error:
+                  type: https://open-workflow-specification.org/spec/1.0.0/errors/runtime
+                  status: 500
+                  title: '${ $failure.title // "Telegram signal failed" }'
+                  detail: '${ $failure.detail // $failure.title // "telegram signal failed" }'
+output:
+  as: '${ .output }'

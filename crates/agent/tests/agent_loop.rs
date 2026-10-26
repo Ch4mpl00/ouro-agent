@@ -745,7 +745,7 @@ async fn the_routed_telegram_loop_loads_history_before_its_first_generation_and_
     ]});
     let mcp_calls: Arc<Mutex<Option<Arc<ToolMcp>>>> = Arc::default();
     let seen = mcp_calls.clone();
-    let h = Harness::new(
+    let h = Harness::with_status(
         task_context("task"),
         vec![
             turn(move |p| {

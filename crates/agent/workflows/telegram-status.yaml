@@ -1,0 +1,50 @@
+document: { dsl: '1.0.4', namespace: agent, name: telegram-status, version: '1.0.0', metadata: { ouro: { breaker: 'off' } } }
+# One line for the Telegram wrapper's progress bubble (design 08): the
+# observer a loop starts after each acting turn, never joined. A cheap model
+# with no context but the step writes it; the line goes to the bubble with
+# the turn's number as its `seq`, so MCP drops one that arrives after a
+# newer line or after the reply cleared the bubble. Bounded (PT20S) so a slow
+# model never holds the supervisor; nothing here can fail the loop.
+# Input: { id, chatId, messageThreadId, seq, step: { calls: [{name, arguments}], content, reasoning } }.
+# Built-ins never trip (design 01, decision 10): a provider outage must not stop the agent.
+do:
+  - line:
+      try:
+        - compose:
+            call: llm_compose
+            timeout: { after: PT20S }
+            with:
+              preset: base
+              json: true
+              prompt: >-
+                Write one line for a Telegram progress bubble: an emoji and at most 60 characters in Russian saying what
+                the agent is doing now, from the step below (the calls it just decided to make). Never a result, never a
+                promise. Answer {"status": "<the line>"}.
+              input: '${ { step: $context.step } }'
+            export: { as: '${ $context + { status: (if (.status | type) == "string" then .status else null end) } }' }
+      catch:
+        do:
+          - none: { set: '${ . }' }
+  - show:
+      if: '${ $context.status != null and $context.status != "" }'
+      try:
+        - quiet:
+            try:
+              - bubble:
+                  call: telegram_send_status
+                  with:
+                    id: '${ $context.id }'
+                    text: '${ $context.status }'
+                    chatId: '${ $context.chatId }'
+                    messageThreadId: '${ $context.messageThreadId }'
+                    seq: '${ $context.seq }'
+            catch:
+              # An unknown outcome is caught only by name; nothing resends it.
+              errors: { with: { type: urn:ouro:errors:call.unknown } }
+              do:
+                - unanswered: { set: '${ . }' }
+      catch:
+        do:
+          - skipped: { set: '${ . }' }
+  - done:
+      set: '${ { status: $context.status } }'

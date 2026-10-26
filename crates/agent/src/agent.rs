@@ -368,6 +368,15 @@ pub struct LoopOptions {
     pub skills: Vec<String>,
     pub allow_skill_writes: bool,
     pub tool_whitelist: Option<HashSet<String>>,
+    // Tools this loop is never offered, whatever its skills allow (design
+    // 08, review G-H3): checked where a tool is offered or called, never
+    // folded into `allowed`, so a skill loaded later cannot bring one back.
+    // A worker inherits it: a narrowing is inherited, as the confirmation
+    // target is.
+    pub exclude_tools: std::collections::BTreeSet<String>,
+    // The workflow told about every acting turn (`observe_step`, design 08):
+    // `{workflow, input}`.
+    pub on_step: Option<Value>,
     pub include_engine_skills: bool,
     pub preset: PresetName,
     pub max_iterations: usize,
@@ -401,6 +410,8 @@ impl LoopOptions {
             skills: Vec::new(),
             allow_skill_writes: false,
             tool_whitelist: None,
+            exclude_tools: Default::default(),
+            on_step: None,
             include_engine_skills: true,
             preset: PresetName::Base,
             max_iterations: 100,
@@ -838,7 +849,8 @@ impl AgentLoop {
     }
 
     fn allows(&self, tool: &str) -> bool {
-        self.skills.read().unwrap_or_else(|e| e.into_inner()).allowed.as_ref().is_none_or(|s| s.contains(tool))
+        !self.opts.exclude_tools.contains(tool)
+            && self.skills.read().unwrap_or_else(|e| e.into_inner()).allowed.as_ref().is_none_or(|s| s.contains(tool))
     }
     fn runs_skill(&self, name: &str) -> bool {
         self.skills.read().unwrap_or_else(|e| e.into_inner()).names.iter().any(|n| n == name)
@@ -861,6 +873,9 @@ impl AgentLoop {
         self.observation_meta.clone()
     }
     fn visible(&self, name: &str) -> bool {
+        if self.opts.exclude_tools.contains(name) {
+            return false;
+        }
         match name {
             "invoke_sub_agent" => self.opts.parent_id.is_none(),
             "write_skill" => {
@@ -1173,6 +1188,7 @@ impl AgentLoop {
         };
         opts.allow_skill_writes = self.opts.allow_skill_writes && opts.skills.iter().any(|s| s == "dreaming");
         opts.include_engine_skills = false;
+        opts.exclude_tools = self.opts.exclude_tools.clone();
         // A workflow is written in a language the cheap preset gets wrong:
         // the author always gets `smartest` with maximum reasoning effort.
         opts.preset = if opts.skills.iter().any(|s| s == "workflow-author") { PresetName::Smartest } else { preset };
@@ -1410,6 +1426,8 @@ impl Engine {
         opts.include_engine_skills = host.include_engine_skills;
         opts.allow_skill_writes = host.allow_skill_writes;
         opts.tool_whitelist = host.tool_whitelist.as_ref().map(|w| w.iter().cloned().collect());
+        opts.exclude_tools = host.exclude_tools.iter().cloned().collect();
+        opts.on_step = host.on_step.clone();
         opts.preset = match host.preset.as_str() {
             "compiler" => PresetName::Compiler,
             name => PresetName::selectable(name).ok_or_else(|| anyhow::anyhow!("unknown preset {name}"))?,
@@ -1502,6 +1520,10 @@ pub fn loop_input(messages: Value, memory: Value, opts: &LoopOptions) -> Value {
     if let Some(confirm) = &opts.confirm {
         input["confirm"] = json!(confirm);
     }
+    // For the loop's `observe` step to skip itself when nobody observes.
+    if let Some(on_step) = &opts.on_step {
+        input["on_step"] = on_step.clone();
+    }
     input
 }
 
@@ -1556,6 +1578,8 @@ pub async fn loop_host(
         max_iterations: opts.max_iterations,
         max_concurrent_tools: opts.max_concurrent_tools,
         tool_whitelist: whitelist,
+        exclude_tools: opts.exclude_tools.iter().cloned().collect(),
+        on_step: opts.on_step.clone(),
         include_engine_skills: opts.include_engine_skills,
         parent_id: opts.parent_id.clone(),
         root_request_digest: root_request,
@@ -2348,6 +2372,52 @@ pub(crate) fn history_messages(records: &Records) -> &[Value] {
         .max_by_key(|messages| messages.len())
         .map(Vec::as_slice)
         .unwrap_or_default()
+}
+
+/// A loop's work as a reader outside it sees it (`loop_transcript`, design
+/// 08): its messages without the instructions, each turn compact (the
+/// assistant's text, its calls with clipped arguments, each result clipped),
+/// the request kept and as much of the end as fits in `budget` characters.
+pub fn compact_transcript(messages: &[Value], budget: usize) -> String {
+    use crate::activity::clip;
+    let mut entries = Vec::new();
+    for message in messages.iter().filter(|m| m["role"] != "system") {
+        match message["role"].as_str() {
+            Some("user") => entries.push(format!("user: {}", clip(&history_text(&message["content"]), 2000))),
+            Some("assistant") => {
+                let text = history_text(&message["content"]);
+                if !text.trim().is_empty() {
+                    entries.push(format!("assistant: {}", clip(text.trim(), 1500)));
+                }
+                for call in message["tool_calls"].as_array().into_iter().flatten() {
+                    let name = call["function"]["name"].as_str().unwrap_or_default();
+                    let arguments = call["function"]["arguments"].as_str().unwrap_or_default();
+                    entries.push(format!("call {name}({})", clip(arguments, 300)));
+                }
+            }
+            Some("tool") => entries.push(format!("result: {}", clip(&history_text(&message["content"]), 800))),
+            _ => {}
+        }
+    }
+    let Some((first, rest)) = entries.split_first() else { return String::new() };
+    let mut used = first.chars().count();
+    let mut tail = Vec::new();
+    for entry in rest.iter().rev() {
+        let size = entry.chars().count() + 1;
+        if used + size > budget {
+            break;
+        }
+        used += size;
+        tail.push(entry.as_str());
+    }
+    tail.reverse();
+    let omitted = rest.len() - tail.len();
+    let mut out = vec![first.clone()];
+    if omitted > 0 {
+        out.push(format!("… {omitted} earlier entries omitted …"));
+    }
+    out.extend(tail.into_iter().map(str::to_owned));
+    out.join("\n")
 }
 
 fn history_text(value: &Value) -> String {
