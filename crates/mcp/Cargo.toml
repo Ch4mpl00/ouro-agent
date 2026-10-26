@@ -40,6 +40,9 @@ url = "2.5.8"
 # The agent's skill loader and MCP client, for the cross-crate contract tests
 # (tests/skills_contract.rs, tests/shipped_skills.rs).
 agent = { path = "../agent" }
+# The engine the agent's test support names (tests/skill_index_workflow.rs
+# includes crates/agent/tests/support), at the agent's tag.
+ouro-runtime = { git = "https://github.com/Ch4mpl00/ouro", tag = "v0.3.0" }
 cucumber = "0.23"
 proptest = "1"
 tempfile = "3"
