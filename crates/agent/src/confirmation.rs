@@ -132,7 +132,7 @@ const PENDING_COLUMNS: &str = "run_id,call_key,yes_type,no_type,chat_id,thread_i
 impl Store for AgentDb {
     fn outcome(&self, run: &str, key: &str) -> anyhow::Result<Option<String>> {
         Ok(self
-            .conn()
+            .read()
             .query_row("SELECT outcome FROM confirmations WHERE run_id=?1 AND call_key=?2", params![run, key], |r| {
                 r.get(0)
             })
@@ -141,7 +141,7 @@ impl Store for AgentDb {
     }
 
     fn waiting(&self, target: &ConfirmTarget) -> anyhow::Result<Vec<(String, Value)>> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT run_id,card,chat_id,thread_id,message_id,created_at_ms FROM confirmations
             WHERE outcome IS NULL AND message_id IS NOT NULL AND chat_id = ?1 AND thread_id IS ?2
@@ -156,7 +156,7 @@ impl Store for AgentDb {
 
     fn get(&self, run: &str, key: &str) -> anyhow::Result<Option<Pending>> {
         Ok(self
-            .conn()
+            .read()
             .query_row(
                 &format!("SELECT {PENDING_COLUMNS} FROM confirmations WHERE run_id = ?1 AND call_key = ?2"),
                 params![run, key],
@@ -166,7 +166,7 @@ impl Store for AgentDb {
     }
     fn by_token(&self, token: &str) -> anyhow::Result<Option<(Pending, Option<String>)>> {
         Ok(self
-            .conn()
+            .read()
             .query_row(
                 &format!("SELECT {PENDING_COLUMNS},outcome FROM confirmations WHERE yes_type = ?1 OR no_type = ?1"),
                 [token],
@@ -239,7 +239,7 @@ impl Store for AgentDb {
         Ok(outcome)
     }
     fn pending_loop_confirmation(&self, loop_run: &str, key: &str) -> anyhow::Result<bool> {
-        Ok(self.conn().query_row(
+        Ok(self.read().query_row(
             "SELECT EXISTS(SELECT 1 FROM confirmations WHERE loop_run = ?1 AND call_key = ?2 AND outcome IS NULL)",
             params![loop_run, key],
             |r| r.get(0),
@@ -261,7 +261,7 @@ impl Store for AgentDb {
         Ok(same)
     }
     fn unanswered_before(&self, before_ms: i64) -> anyhow::Result<Vec<Pending>> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare(&format!(
             "SELECT {PENDING_COLUMNS} FROM confirmations WHERE outcome IS NULL AND created_at_ms < ?1 ORDER BY created_at_ms"
         ))?;

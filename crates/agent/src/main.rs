@@ -191,7 +191,7 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
         } else {
             local
         };
-        // The engine's store shares agent.db on a connection of its own.
+        // The engine's store: engine.db beside agent.db (runs.rs §1).
         let store = agent::runs::open_store(&config.db)?;
         let engine = create_engine(EngineDeps {
             providers,

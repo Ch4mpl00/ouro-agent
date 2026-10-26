@@ -58,9 +58,20 @@ pub fn config() -> ouro_runtime::Config {
     }
 }
 
-/// The engine's store in agent.db: its own connection, `ouro_*` tables.
-pub fn open_store(path: &std::path::Path) -> anyhow::Result<Arc<dyn ouro_runtime::durable::RunStore>> {
-    Ok(Arc::new(ouro_runtime::durable::sqlite::open(path)?))
+/// The engine's store beside agent.db (`engine.db` in its directory),
+/// `ouro_*` tables. Not inside agent.db, as design 01 decision 3 had it: the
+/// engine's adapter takes SQLite's write lock for every operation, reads
+/// included, back to back, and a write of the agent's on another connection
+/// to the same file starved behind it for seconds, past its busy timeout
+/// (docs/designs/LOG.md, 2026-10-26, step 2b). One directory, one volume, two
+/// files to back up.
+pub fn engine_store_path(agent_db: &std::path::Path) -> std::path::PathBuf {
+    agent_db.with_file_name("engine.db")
+}
+
+/// Opens (and migrates) the engine's store for agent.db at `agent_db`.
+pub fn open_store(agent_db: &std::path::Path) -> anyhow::Result<Arc<dyn ouro_runtime::durable::RunStore>> {
+    Ok(Arc::new(ouro_runtime::durable::sqlite::open(engine_store_path(agent_db))?))
 }
 
 /// A store in memory, for tests and tools that keep nothing.
@@ -103,10 +114,10 @@ impl RunTrace {
 }
 
 impl AgentDb {
-    /// Runs `f` (a write) on the blocking pool. The engine's store shares
-    /// this file and holds its write lock across the awaits of a commit, so
-    /// a write that waits for that lock must never block the task or thread
-    /// that polls the engine's runs (the worker drives them all in one task).
+    /// Runs `f` (a write) on the blocking pool. A write may wait for
+    /// SQLite's lock (another process, a long transaction): it must never
+    /// block the task that polls the engine's runs (the worker drives them all
+    /// in one task, handlers included).
     pub async fn write<T: Send + 'static>(
         &self,
         f: impl FnOnce(&AgentDb) -> anyhow::Result<T> + Send + 'static,
@@ -144,7 +155,7 @@ impl AgentDb {
     }
 
     pub fn evidence(&self, digest: &str) -> anyhow::Result<Option<String>> {
-        Ok(self.conn().query_row("SELECT body FROM evidence WHERE digest = ?1", [digest], |r| r.get(0)).optional()?)
+        Ok(self.read().query_row("SELECT body FROM evidence WHERE digest = ?1", [digest], |r| r.get(0)).optional()?)
     }
 
     /// Insert-or-ignore: a re-dispatched starter keeps the first anchor.
@@ -159,7 +170,7 @@ impl AgentDb {
 
     pub fn run_trace(&self, run: &str) -> anyhow::Result<Option<RunTrace>> {
         Ok(self
-            .conn()
+            .read()
             .query_row(
                 "SELECT run_id, trace_id, session_id, parent_span_id, recorded, created_ms FROM run_trace WHERE run_id = ?1",
                 [run],
@@ -169,7 +180,7 @@ impl AgentDb {
     }
 
     pub fn open_run_traces(&self, limit: usize) -> anyhow::Result<Vec<RunTrace>> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut statement = conn.prepare(
             "SELECT run_id, trace_id, session_id, parent_span_id, recorded, created_ms FROM run_trace
              WHERE recorded = 0 ORDER BY created_ms LIMIT ?1",
@@ -178,7 +189,7 @@ impl AgentDb {
     }
 
     pub fn trace_runs(&self, trace: &str) -> anyhow::Result<Vec<RunTrace>> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut statement = conn.prepare(
             "SELECT run_id, trace_id, session_id, parent_span_id, recorded, created_ms FROM run_trace WHERE trace_id = ?1",
         )?;
@@ -208,7 +219,7 @@ impl AgentDb {
     }
 
     pub fn tool_snapshot(&self) -> anyhow::Result<Vec<(String, bool)>> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut statement = conn.prepare("SELECT name, read_only FROM tool_snapshot ORDER BY name")?;
         Ok(statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
     }
@@ -436,7 +447,11 @@ pub fn span_end(status: &Status) -> SpanEnd {
     match status {
         Status::Completed(output) => SpanEnd::output(output.clone()),
         Status::Faulted(error) => SpanEnd::error(error.to_string()).with_output(json!({"error": error.to_string()})),
-        Status::Cancelled => SpanEnd::output(json!({"cancelled": true})),
+        // The agent cancels a run only when its work is cut off (a closed
+        // loop, a parent's end): an aborted observation, as before.
+        Status::Cancelled => {
+            SpanEnd::error(crate::errors::aborted().to_string()).with_output(json!({"cancelled": true}))
+        }
         Status::Waiting { wake_at_ms } => SpanEnd::output(json!({"waiting_until_ms": wake_at_ms})),
         Status::Interrupted(error) => SpanEnd::error(error.to_string()),
     }
@@ -748,7 +763,13 @@ pub async fn background(
             }
         }
     };
-    tokio::join!(worker, drain, reconciler);
+    // Each its own task: the drain and the reconciler write agent.db
+    // synchronously, and such a write may wait for the engine's lock, which
+    // only the worker's progress releases (§2): in the worker's task it
+    // would stall the very commit it waits for.
+    let (drain, reconciler) = (tokio::spawn(drain), tokio::spawn(reconciler));
+    worker.await;
+    let _ = tokio::join!(drain, reconciler);
 }
 
 // One lifecycle event: a stop ends the execution's scope; an end ends the
@@ -760,14 +781,23 @@ async fn handle(engine: &std::sync::Arc<crate::agent::Engine>, event: ouro_runti
     match event.kind {
         EventKind::RunSuspended { .. } | EventKind::RunInterrupted { .. } => engine.scopes.stop(&run, None),
         EventKind::RunEnded { .. } => {
-            let status = engine.runtime.get(&run).await.ok().flatten().and_then(|r| r.outcome);
-            if let Some(status) = &status {
-                finish(engine, &run, event.parent_id.is_none(), status).await;
+            let saved = engine.runtime.get(&run).await.ok().flatten();
+            if let Some(saved) = &saved
+                && let Some(status) = &saved.outcome
+            {
+                finish(engine, &run, trace_root(saved), status).await;
             }
             engine.end_run_loop(&run).await;
         }
         _ => {}
     }
+}
+
+/// Whether a run's outcome is its trace's: a root run, except a recovery
+/// report, which is a root of its own (outside the signal's tree, R2-H2)
+/// but traces as a span of the signal's trace, whose outcome is the signal's.
+pub fn trace_root(run: &SavedRun) -> bool {
+    run.child.is_none() && host_kind(run.admission.host()) != Some(RECOVERY)
 }
 
 // A run that ended: its live scope ends with the outcome; a child is
@@ -832,7 +862,7 @@ pub async fn reconcile_once(engine: &std::sync::Arc<crate::agent::Engine>, now: 
             let Some(status) = &run.outcome else { continue };
             let id = &run.admission.id;
             if engine.deps.db.run_trace(id)?.is_some_and(|row| !row.recorded) {
-                finish(engine, id, run.child.is_none(), status).await;
+                finish(engine, id, trace_root(&run), status).await;
                 recorded += 1;
             }
             engine.end_run_loop(id).await;

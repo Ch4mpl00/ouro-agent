@@ -25,10 +25,15 @@ use crate::trace_model::{Observation, Trace};
 
 pub const DEFAULT_DB_PATH: &str = "packages/agent/data/agent.db";
 
-// One connection, shared. Built once in the composition root and passed down.
+// One connection for writes, shared, and one for reads (a file's: WAL
+// readers never wait for a writer). Built once in the composition root and
+// passed down. The engine's handlers read synchronously inside the task that
+// drives every run (runs.rs §2): a read queued behind a write that waits for
+// SQLite's lock (another process's transaction) would stall them all.
 #[derive(Clone)]
 pub struct AgentDb {
     conn: Arc<Mutex<Connection>>,
+    reader: Option<Arc<Mutex<Connection>>>,
 }
 
 impl AgentDb {
@@ -49,11 +54,26 @@ impl AgentDb {
         retry_boot_race(|| conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(())).map_err(anyhow::Error::from))?;
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL")?;
         retry_boot_race(|| migrate(&conn))?;
-        Ok(AgentDb { conn: Arc::new(Mutex::new(conn)) })
+        // An in-memory database is private to its connection: it reads on it.
+        let memory = path.as_os_str().is_empty() || path.as_os_str() == ":memory:";
+        let reader = if memory {
+            None
+        } else {
+            let reader = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+            reader.busy_timeout(Duration::from_millis(5000))?;
+            reader.execute_batch("PRAGMA query_only = ON")?;
+            Some(Arc::new(Mutex::new(reader)))
+        };
+        Ok(AgentDb { conn: Arc::new(Mutex::new(conn)), reader })
     }
 
     pub fn conn(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The connection reads use: never behind a write.
+    pub fn read(&self) -> MutexGuard<'_, Connection> {
+        self.reader.as_ref().unwrap_or(&self.conn).lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -198,7 +218,7 @@ pub trait MemoryStore: Send + Sync {
 
 impl MemoryStore for AgentDb {
     fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
-        Ok(self.conn().query_row("SELECT value FROM memory WHERE key = ?1", [key], |r| r.get(0)).optional()?)
+        Ok(self.read().query_row("SELECT value FROM memory WHERE key = ?1", [key], |r| r.get(0)).optional()?)
     }
 
     fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {

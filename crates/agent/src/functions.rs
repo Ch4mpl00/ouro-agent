@@ -11,7 +11,7 @@
 // itself has none (invariant 3), so a refusal is the answer to any other
 // caller, recorded as not executed.
 use crate::{
-    agent::{AgentLoop, Effect, Engine, EngineDeps, LoopOptions, Refusal, refuse, tool_call},
+    agent::{Effect, Engine, EngineDeps, LoopOptions, Refusal, refuse, tool_call},
     errors::is_aborted,
     providers,
     runs::{GUARD, GuardHost, PRIMARY, RECOVERY, SIGNAL, SignalHost},
@@ -93,9 +93,19 @@ where
     let function = Function::new(name, json!({}), json!({}), move |args: Value, ctx: FunctionContext| {
         let call = engine.upgrade().map(|engine| handler(engine, args, ctx));
         async move {
-            match call {
-                Some(call) => call.await,
-                None => Err(FunctionError::interrupted("the agent engine is closed")),
+            let Some(call) = call else { return Err(FunctionError::interrupted("the agent engine is closed")) };
+            // A handler's panic is its call's failure: the engine worker
+            // polls every run's calls, and must outlive a bug in one.
+            match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(call)).await {
+                Ok(result) => result,
+                Err(panic) => {
+                    let detail = panic
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| panic.downcast_ref::<&str>().copied())
+                        .unwrap_or("a handler panicked");
+                    Err(FunctionError::runtime(format!("internal error: {detail}")))
+                }
             }
         }
     })
@@ -216,7 +226,7 @@ impl Drop for PendingToolSpan {
 
 // ── 3. loop functions ───────────────────────────────────────────────────────
 
-async fn live_loop(engine: &Arc<Engine>, ctx: &FunctionContext) -> anyhow::Result<Arc<AgentLoop>> {
+async fn live_loop(engine: &Arc<Engine>, ctx: &FunctionContext) -> anyhow::Result<crate::agent::Entered> {
     Ok(engine.loop_of(&ctx.run_id, ctx.host(), &ctx.function).await?.0)
 }
 
@@ -661,6 +671,9 @@ async fn settle_child(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
             return Err(refuse(format!("settle_child: {id} is not a child of this run")));
         };
         use ouro_runtime::ows::run::Status;
+        if let Some(outcome) = &child.outcome {
+            engine.ended_child(id, outcome).await;
+        }
         let settled = match (&child.outcome, kind) {
             (Some(Status::Completed(output)), _) => {
                 let text = output.as_str().map(str::to_owned).unwrap_or_else(|| output.to_string());

@@ -237,6 +237,29 @@ impl Engine {
             self.end_loop(id).await;
         }
     }
+    /// A child its parent found ended: its span ends with its outcome and
+    /// its loop closes now, before the parent goes on (the lifecycle drain
+    /// would, later; both are idempotent).
+    pub async fn ended_child(&self, id: &str, outcome: &crate::runs::Status) {
+        self.end_run_loop(id).await;
+        self.scopes.stop(id, Some(crate::runs::span_end(outcome)));
+    }
+    /// Ends the engine-built loops of `run`'s descendants: a host-driven
+    /// loop closed mid-run cancelled its tree with it.
+    pub async fn end_tree_loops(&self, run: &str) {
+        let mut pending = vec![run.to_owned()];
+        while let Some(parent) = pending.pop() {
+            let filter = crate::runs::Runs { parent: Some(parent), ..Default::default() };
+            let Ok(page) = self.control.list(&filter, None, 1_000).await else { continue };
+            for child in page.items {
+                let id = child.admission.id;
+                Box::pin(self.end_run_loop(&id)).await;
+                // Cut off with its parent: an aborted observation.
+                self.scopes.stop(&id, Some(SpanEnd::error(aborted().to_string())));
+                pending.push(id);
+            }
+        }
+    }
     // The loops alive now: a started loop stays registered until end_loop.
     pub async fn loop_ids(&self) -> Vec<String> {
         let mut ids: Vec<_> = self.loops.lock().await.keys().cloned().collect();
@@ -253,6 +276,10 @@ impl Engine {
         if let Some(background) = background {
             let _ = background.await;
         }
+    }
+    /// Whether the engine is shutting down (its runs resume at the next start).
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
     }
     pub fn stopping(&self) -> &CancellationToken {
         &self.stop
@@ -376,6 +403,27 @@ pub struct AgentLoop {
     guard: tokio::sync::Mutex<crate::guard::State>,
     // The round's calls running at once: at most max_concurrent_tools.
     slots: tokio::sync::Semaphore,
+    // Held (read) by every handler of the loop's run while it works (`enter`):
+    // `close` takes it (write), so a closed loop's calls have stopped and
+    // ended their spans before its trace ends.
+    busy: Arc<tokio::sync::RwLock<()>>,
+    // The run a send drives now (`drive`): closing the loop cancels it, so
+    // the engine never resumes a run nobody waits for.
+    driving: std::sync::Mutex<Option<String>>,
+}
+
+/// A loop entered by a handler of its run (`AgentLoop::enter`): while it
+/// lives, `AgentLoop::close` waits.
+pub struct Entered {
+    loop_: Arc<AgentLoop>,
+    _busy: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+impl std::ops::Deref for Entered {
+    type Target = Arc<AgentLoop>;
+    fn deref(&self) -> &Arc<AgentLoop> {
+        &self.loop_
+    }
 }
 
 // The skills a loop runs and the tools they allow (None: every tool).
@@ -524,6 +572,8 @@ fn create_loop(engine: &Arc<Engine>, mut opts: LoopOptions, prepared: Prepared) 
         memory_restored: AtomicBool::new(true),
         slots: tokio::sync::Semaphore::new(opts_slots),
         guard: Default::default(),
+        busy: Default::default(),
+        driving: Default::default(),
     }))
 }
 
@@ -535,11 +585,32 @@ impl AgentLoop {
             trace.end();
         }
     }
+    /// Closes the loop: its generation and calls are cancelled, the run a
+    /// send drives is cancelled with its tree (and the loops of that tree
+    /// closed), and the trace ends once every call has stopped.
     pub async fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
         self.cancel.cancel();
+        let driving = self.driving.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let (Some(run), Some(engine)) = (driving, self.engine.upgrade())
+            && !engine.is_stopping()
+        {
+            if let Err(error) = engine.runtime.cancel(&run).await {
+                eprintln!("[{}] cancelling run {run}: {error:#}", self.opts.id);
+            }
+            engine.end_tree_loops(&run).await;
+        }
         let _joined = self.gate.lock().await;
+        let _idle = self.busy.write().await;
         self.end_trace();
+    }
+    /// Enters the loop for one handler of its run; a closed loop refuses.
+    pub(crate) async fn enter(self: &Arc<Self>) -> anyhow::Result<Entered> {
+        let busy = self.busy.clone().read_owned().await;
+        if self.is_closed() {
+            return Err(aborted());
+        }
+        Ok(Entered { loop_: self.clone(), _busy: busy })
     }
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
@@ -620,6 +691,7 @@ impl AgentLoop {
             engine.deps.db.write(move |db| db.insert_run_trace(&row)).await?;
         }
         engine.scopes.borrow(&run, scope);
+        *self.driving.lock().unwrap_or_else(|e| e.into_inner()) = Some(run.clone());
         let started = engine
             .runtime
             .start_with(
@@ -633,7 +705,19 @@ impl AgentLoop {
             Ok(_) => crate::runs::wait_end(&engine, &run, &self.cancel).await,
             Err(error) => Err(error),
         };
+        // A send given up (the loop closed, its caller cancelled) gives up
+        // its run: nobody waits for it, so the engine must not resume it.
+        // A shutdown is no end: the run resumes at the next start.
+        if (self.cancel.is_cancelled() || self.opts.cancel.is_cancelled()) && !engine.is_stopping() {
+            if let Err(error) = engine.runtime.cancel(&run).await {
+                eprintln!("[{}] cancelling run {run}: {error:#}", self.opts.id);
+            }
+            engine.end_tree_loops(&run).await;
+        }
+        // Its calls in flight stop (and end their spans) before its trace.
+        drop(self.busy.write().await);
         engine.scopes.release(&run);
+        self.driving.lock().unwrap_or_else(|e| e.into_inner()).take();
         if run != self.opts.id {
             engine.loops.lock().await.remove(&run);
         }
@@ -1282,9 +1366,9 @@ impl Engine {
         run: &str,
         host: Option<&Value>,
         function: &str,
-    ) -> anyhow::Result<(Arc<AgentLoop>, crate::runs::LoopHost)> {
+    ) -> anyhow::Result<(Entered, crate::runs::LoopHost)> {
         let host = loop_host_of(host, function)?;
-        let live = self.loop_for(run, &host).await?;
+        let live = self.loop_for(run, &host).await?.enter().await?;
         if !live.guard.lock().await.history_restored {
             let records = self.runtime.records(run).await?;
             live.restore_guard_history(&records).await?;
@@ -1613,12 +1697,25 @@ async fn guard_child_verdict(
     if !own {
         return Err(refused());
     }
+    if let Some(outcome) = &saved.outcome {
+        engine.ended_child(id, outcome).await;
+    }
     let Some(ouro_runtime::ows::run::Status::Completed(output)) = saved.outcome else { return Ok(None) };
     let verdicts: Vec<(String, crate::guard::Verdict)> = serde_json::from_value(output["verdicts"].clone())?;
     let verdict = verdicts.into_iter().find(|(key, _)| key == &crate::guard::key(call)).map(|(_, v)| v);
-    if verdict.is_some()
-        && !crate::confirmation::Store::use_guard_verdict(&engine.deps.db, id, &crate::guard::key(call), invocation)?
-    {
+    let spent = match verdict {
+        // A write may wait for the engine's lock on agent.db (runs.rs §2).
+        Some(_) => {
+            let (child, key, invocation) = (id.to_owned(), crate::guard::key(call), invocation.to_owned());
+            !engine
+                .deps
+                .db
+                .write(move |db| crate::confirmation::Store::use_guard_verdict(db, &child, &key, &invocation))
+                .await?
+        }
+        None => false,
+    };
+    if spent {
         return Ok(Some(crate::guard::Verdict {
             label: "unverified_confirmation".into(),
             guidance: "This verdict was already used by another call. Do not retry it.".into(),
@@ -1693,6 +1790,9 @@ pub async fn loop_tool(
             saved.child.as_ref().is_some_and(|link| link.parent == run && link.key.ends_with(&format!("/{key}"))),
             "worker run does not belong to this call"
         );
+        if let Some(outcome) = &saved.outcome {
+            engine.ended_child(id, outcome).await;
+        }
         let raw = match saved.outcome {
             Some(ouro_runtime::ows::run::Status::Completed(Value::String(s))) => s,
             Some(ouro_runtime::ows::run::Status::Completed(v)) => v.to_string(),
@@ -1849,13 +1949,19 @@ pub async fn loop_context(
                 )
             })?;
             let (input, earlier) = crate::supervisor::signal_input(signal, &at.session, mcp, scope, cancel).await?;
-            let db = &engine.deps.db;
-            let earlier =
-                (!earlier.is_empty()).then(|| db.put_evidence(&at.run, &json!(earlier).to_string())).transpose()?;
             let snapshot = at.session.memory.snapshot();
-            let memory = (snapshot.as_array().is_some_and(|m| !m.is_empty()))
-                .then(|| db.put_evidence(&at.run, &snapshot.to_string()))
-                .transpose()?;
+            let earlier = (!earlier.is_empty()).then(|| json!(earlier).to_string());
+            let memory = (snapshot.as_array().is_some_and(|m| !m.is_empty())).then(|| snapshot.to_string());
+            // A write may wait for the engine's lock on agent.db (runs.rs §2).
+            let run = at.run.clone();
+            let (earlier, memory) = engine
+                .deps
+                .db
+                .write(move |db| {
+                    let earlier = earlier.map(|body| db.put_evidence(&run, &body)).transpose()?;
+                    Ok((earlier, memory.map(|body| db.put_evidence(&run, &body)).transpose()?))
+                })
+                .await?;
             Ok(json!({"input": input, "earlier": earlier, "memory": memory}))
         }
         "recent_activity" => Ok(json!(crate::supervisor::load_recent_activity(mcp, scope, cancel).await?)),
