@@ -371,3 +371,8 @@ Deviations 1 and 2):
   `run`, `task`, `key`, `fallback`, `recovery`, `outcome`,
   `sandbox_refusals`) and that only drafts whose runs all completed become
   tried.
+- **Hand mutants** (once, on a scratch copy): every one the design names is
+  caught; "`mark_tried` without the completed check" was first taken two
+  ways, and the one that drops the dry run's own status survived until test
+  6 gained a try whose routed draft completes while a `signal` draft faults
+  after it (nothing is tried).

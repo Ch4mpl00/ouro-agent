@@ -669,6 +669,25 @@ async fn only_a_completed_try_marks_tried_and_only_drafts_whose_runs_all_complet
     assert_eq!(report["drafts"][0]["ran"], true);
     assert!(!tried(&s.f.engine, "telegram-loop", &faulting_loop));
 
+    // Faulted after the draft completed: the routed loop's runs all
+    // completed, but a draft of `signal` faults once it settled; the try
+    // faulted, so nothing is tried, not even the loop.
+    let (s, _) = sandbox(vec![send("Rust 2.0 is out"), assistant("reported")], "allow").await;
+    let late = without_breaker(agent::supervisor::SIGNAL).replace(
+        "        - answer:\n            set: '${ { output: .output } }'",
+        "        - answer:\n            raise: { error: { type: 'https://example.com/late', status: 500, detail: late } }",
+    );
+    assert_ne!(late, without_breaker(agent::supervisor::SIGNAL));
+    save(&s.f.engine, "signal", &late).await;
+    let mut args = telegram(None);
+    args["drafts"] = json!(["signal"]);
+    let report = s.try_signal(args).await.unwrap();
+    assert_eq!(report["status"], "faulted", "{report:#}");
+    let draft = |name: &str| report["drafts"].as_array().unwrap().iter().find(|d| d["name"] == name).unwrap().clone();
+    assert_eq!(draft("telegram-loop")["outcome"], "completed", "{report:#}");
+    assert!(!tried(&s.f.engine, "telegram-loop", LOOP), "a faulted try marks nothing");
+    assert!(!tried(&s.f.engine, "signal", &late));
+
     // Timed out: stopped by the try's own budget.
     let s = sandbox_on(Turns::new(vec![stuck()]), "allow", true).await;
     let options = TryOptions { timeout: Duration::from_millis(500), ..TryOptions::default() };
