@@ -193,3 +193,9 @@ Decisions and findings while finishing step 2, each reversible:
   the built-in fallback (for the maintainer to confirm); the fallback record
   and a line in the run's system parts; same-text saves reuse the version,
   20 agent versions per name at most.
+- **Goldfish round 2** (2 high, 5 medium, 8 low): resolved in the document
+  (R2-n). The three maintainer calls taken reversibly: an operator pause is
+  never lifted by the agent and falls back only to another name; the
+  20-version cap counts only never-activated versions; `call: start_child`
+  stays allowed, `run: workflow` and any `schedule` are refused in agent
+  versions until step 5.
