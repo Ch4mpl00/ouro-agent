@@ -431,3 +431,44 @@ write; a handler site left on `engine.runtime`.
 - None blocking. Reversible: decision 11's input for the no-signal mode may
   change with step 5's fire input; decision 13 (recovery as a host child only
   in a try).
+
+## Deviations
+
+Found by the executor of step 4 while implementing; each written here
+before the code changed course.
+
+1. **No-signal `steps` from the observer, not from `DryRunRun::calls`
+   (decision 11).** `ouro_runtime::durable::CallEntry` (what
+   `DryRunRun::calls` holds) carries a call's key, function, delivery, state
+   and annotations, but no result, so "each call's clipped output from the
+   root's `DryRunRun::calls`" cannot be built from it. Proposal, implemented:
+   the sandbox's observer (decision 8) records the root's `CallFinished`
+   events, each with its task path, function and result, and `steps` are
+   those, clipped as `main`'s were; `DryRunRun::calls` still gives the call
+   journal (its states) for `tried` and the run tree.
+2. **The no-signal mode answers a write with `main`'s `{"ok":true,"dryRun":true}`,
+   not `MOCK_REPLY` (decisions 6 and 11).** Test 4 restores
+   `dry_run_generates_without_writing_memory`: the skill-index workflow
+   checks its writes' `ok` (`check_project`, `check_write`) and raises
+   without it, so with `MOCK_REPLY` (no `ok`) that dry run faults where
+   `main`'s completed. `main` answered the no-signal form with this stub for
+   exactly that reason (its comment: "saved workflows (skill-index) check a
+   write's `ok`. A signal's dry run answers with the sandbox's explicit mock
+   instead"). Proposal, implemented: the mock answers `MOCK_REPLY` in a try
+   with a signal and `main`'s stub in a try without one (the `Mock` is built
+   per try); the report's `note` names the answer it gave. Reversible with
+   step 5's fire input (decision 11's open question).
+3. **The wall-clock bounds of tests 1 ("under 4 s") and 10 ("under 5 s")
+   measure the holds against the run's own cost, not absolutely.** On the
+   engine a debug-build dry run spends 100–200 ms of the engine's own work
+   at every start and resume of a run (admission, replay), with nothing
+   waiting: a confirmed try takes about 2.5 s alone and a two-round try with
+   a worker about 3.4 s, but 6.5 s and 8 s under the suite's load
+   (`scripts/test.py`, six binaries at once), where both bounds failed with
+   no hold involved. What the bounds exist to catch is a hold the dry run
+   should cut (the guard's `PT5S` answer, a round's `PT60S` join, a
+   worker's `PT15M`). Proposal, implemented: the confirmation test also
+   runs the same chain without a card and requires each confirmed try to
+   take less than that plus 4 s (under the guard's 5 s hold, whatever the
+   load); test 10 requires under 30 s (one held `PT60S` join or `PT15M`
+   worker exceeds it).
