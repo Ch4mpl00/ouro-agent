@@ -145,7 +145,17 @@ deletion.
    run (`route_signal`, most specific first), a scheduled task's saved
    workflow likewise (`run_saved_workflow`); a worker or the primary may run
    a loop variant (the YAML's `start_worker { loop }`, the call's `loop`,
-   a skill's `loop:`, else `agent-loop`). **The breaker is the engine's**:
+   a skill's `loop:`, else `agent-loop`). **Telegram signals route to the
+   built-in `telegram`** (`workflows/telegram.yaml`, priority -1, so an
+   agent's route of the same specificity wins; docs/designs/08): it opens the
+   👀 bubble, gathers the first turn's context, starts the loop as its own
+   child with `start_loop` (host data inherited from the route's, only
+   narrowed: `exclude_tools` takes the delivery tools away from it and its
+   workers, `on_step` starts the `telegram-status` observer after each acting
+   turn through `observe_step`), joins it, composes the reply with
+   `llm_compose` from `loop_transcript`, sends it through the guard
+   (`start_guard` + `tool_once`, as the loop would) and clears the bubble.
+   The loop does not know it runs inside a Telegram flow. **The breaker is the engine's**:
    three faults of a version's runs in a row trip it; built-ins declare
    `breaker: off`, agent versions declare none. Every start of a name the
    agent may have overridden goes through `runs::start_named_root/child`
@@ -159,8 +169,9 @@ deletion.
    - `skills/orchestrator.md` + `skills/routing.md` — always; how to use
      working memory and when to delegate to a domain skill.
    - `skills/<signal.source>.md` (with `skills.default/` fallback) — for `peer`
-     and `scheduler` on the default path. Domain work is delegated to a
-     sub-agent with that source's skill.
+     and `scheduler` on the default path; the `telegram` route loads
+     `telegram` (the slim style and topic rules) into its loop and its
+     compose. Domain work is delegated to a sub-agent with that source's skill.
 
    The built-in `signal` workflow's `try`/`catch` starts a recovery report
    through `recovery_loop`, then raises the signal failure again. Reporting
@@ -226,7 +237,9 @@ mcp-tools/
     │   ├── src/guard.rs                    loop write/open-world policy, deterministic rules, batched verdicts
     │   ├── guard/                          compiled guard instructions and reason data (git-owned)
     │   ├── workflows/                      built-in OWF: agent-loop.yaml, signal.yaml (dispatcher),
-    │   │                                   guard.yaml (reserved round review and confirmation);
+    │   │                                   guard.yaml (reserved round review and confirmation),
+    │   │                                   telegram.yaml (the Telegram route around its loop),
+    │   │                                   telegram-status.yaml (its progress-bubble observer);
     │   │                                   the agent may override agent-loop and signal and
     │   │                                   activate its own loops (with routes)
     │   ├── src/activity.rs                 traces → ouro/activity journal notes (background

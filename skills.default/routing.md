@@ -63,10 +63,12 @@ language and required output in the brief. Date, timezone and the news
 watermark are provided from the shared session environment automatically.
 
 The default is compose-and-return. The parent inspects the short result or
-explicitly reads its memory key, then calls `send_telegram_message` with
-the actual text. Delivery can instead be assigned explicitly to a worker
-that has the tool; provide chat/thread and require a completion report.
-Never send a duplicate after a worker already delivered.
+explicitly reads its memory key, then delivers the actual text (or, when
+its instructions say the reply is delivered for it, finishes with that
+text). Delivery can instead be assigned explicitly to a worker that has the
+tool, unless your instructions say the reply is delivered for you; provide
+chat/thread and require a completion report. Never send a duplicate after a
+worker already delivered.
 
 A conversational answer never advances `news_digest.last_read_at`: the
 saved news workflow owns it. A watermark the conversation does own (an

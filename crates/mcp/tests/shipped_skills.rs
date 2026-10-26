@@ -144,3 +144,26 @@ fn all_shipped_skills_pass_the_agents_startup_validation_against_prods_mcp_surfa
         verdict.unwrap();
     });
 }
+
+// Design 08, decision 11: the shipped Telegram skill is the slim one, every
+// turn of every Telegram signal pays for it. Its tools are named (the
+// startup validation above checks them against MCP), never `*`.
+#[test]
+fn the_shipped_telegram_skill_is_slim_and_names_its_tools() {
+    support::runtime().block_on(async {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let raw = std::fs::read_to_string(repo.join("skills.default/telegram.md")).expect("skills.default/telegram.md");
+        assert!(raw.len() < 3 * 1024, "{} bytes", raw.len());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("skills.default")).unwrap();
+        std::fs::write(dir.path().join("skills.default/telegram.md"), &raw).unwrap();
+        let skill = FsSkillStore::new(dir.path()).read_skill("telegram").await.unwrap().expect("the skill");
+        let SkillTools::Named(tools) = skill.tools else { panic!("tools: * in the Telegram skill") };
+        let mut tools: Vec<String> = tools.into_iter().collect();
+        tools.sort();
+        assert_eq!(
+            tools,
+            ["edit_telegram_message", "get_fact", "get_telegram_chat_history", "read_doc", "recall", "remember"]
+        );
+    });
+}

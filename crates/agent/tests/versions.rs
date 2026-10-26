@@ -59,6 +59,13 @@ fn telegram(id: i64, text: &str) -> PendingSignal {
     signal(id, "telegram", &format!("Telegram message in chat 42.\nText: {}", json!(text)))
 }
 
+// A signal of a source with no built-in route: since design 08 a Telegram
+// signal's next match after an agent's route is the built-in `telegram`, so
+// the tests of the default path behind a route use this one.
+fn chat(id: i64, text: &str) -> PendingSignal {
+    signal(id, "chat", text)
+}
+
 fn scheduled(id: i64, workflow: &str) -> PendingSignal {
     PendingSignal { payload: Some(json!({"workflow": workflow})), ..signal(id, "scheduler", "do the task") }
 }
@@ -339,26 +346,26 @@ async fn a_set_aside_route_gives_way_to_the_next_match_then_to_the_default_path(
     let model = Arc::new(Scripted::new(script));
     let f = ready(model.clone(), &[]).await;
     let supervisor = create_supervisor(f.engine.clone());
-    let research = |id: i64| PendingSignal { payload: Some(json!({"topic":"research"})), ..telegram(id, "hi") };
+    let research = |id: i64| PendingSignal { payload: Some(json!({"topic":"research"})), ..chat(id, "hi") };
     let specific = activate_definition(
         &f.engine,
         "tg-specific",
-        &faulting(&route("tg-specific", "source: telegram, topic: research")),
+        &faulting(&route("tg-specific", "source: chat, topic: research")),
     )
     .await;
-    activate_definition(&f.engine, "tg-general", &route("tg-general", "source: telegram")).await;
+    activate_definition(&f.engine, "tg-general", &route("tg-general", "source: chat")).await;
     for id in 51..=53 {
         assert!(supervisor.run_signal(&research(id)).await.is_err(), "the specific route faults");
     }
     assert_eq!(supervisor.run_signal(&research(54)).await.unwrap(), "general answer");
     assert_eq!(child(&f.engine, "signal:54", "route").await.admission.name, "tg-general");
-    let (_, observations) = agent::db::TraceStore::get_trace(&*f.db, "telegram:54").unwrap().unwrap();
+    let (_, observations) = agent::db::TraceStore::get_trace(&*f.db, "chat:54").unwrap().unwrap();
     assert!(observations.iter().any(|o| o.name == "route:tg-general"));
     assert!(observations.iter().any(|o| o.name == "fallback"), "the set-aside route is recorded");
 
-    activate_definition(&f.engine, "tg-general", &faulting(&route("tg-general", "source: telegram"))).await;
+    activate_definition(&f.engine, "tg-general", &faulting(&route("tg-general", "source: chat"))).await;
     for id in 55..=57 {
-        assert!(supervisor.run_signal(&telegram(id, "hi")).await.is_err());
+        assert!(supervisor.run_signal(&chat(id, "hi")).await.is_err());
     }
     assert_eq!(supervisor.run_signal(&research(58)).await.unwrap(), "default answer");
     let primary = child(&f.engine, "signal:58", "primary").await;
@@ -366,7 +373,7 @@ async fn a_set_aside_route_gives_way_to_the_next_match_then_to_the_default_path(
     let system = system_of(model.seen.lock().unwrap().last().unwrap());
     let line = format!("Workflow `tg-specific` v{specific} was set aside (its breaker tripped after 3 faults in a row");
     assert!(system.contains(&line) && system.contains("the default path handles this signal"), "{system}");
-    assert!(system.contains("Signal source: telegram"), "the default path gathered its context");
+    assert!(system.contains("Signal source: chat"), "the default path gathered its context");
     supervisor.shutdown().await;
 }
 
@@ -642,7 +649,7 @@ async fn a_paused_name_falls_back_to_another_name_and_never_to_itself() {
     let f = ready(model.clone(), &[]).await;
     let supervisor = create_supervisor(f.engine.clone());
     let last_system = || system_of(model.seen.lock().unwrap().last().unwrap());
-    activate_definition(&f.engine, "tg-route", &route("tg-route", "source: telegram")).await;
+    activate_definition(&f.engine, "tg-route", &route("tg-route", "source: chat")).await;
     activate_definition(&f.engine, "paused-loop", &variant("paused-loop")).await;
     activate_definition(&f.engine, "paused-task", &document("paused-task", "do: [ { a: { set: { ok: true } } } ]\n"))
         .await;
@@ -650,7 +657,7 @@ async fn a_paused_name_falls_back_to_another_name_and_never_to_itself() {
         pause(&f.engine, name, "maintenance window").await;
     }
     // A route: the default path.
-    assert_eq!(supervisor.run_signal(&telegram(81, "hi")).await.unwrap(), "default answer");
+    assert_eq!(supervisor.run_signal(&chat(81, "hi")).await.unwrap(), "default answer");
     assert!(last_system().contains("Workflow `tg-route` v1 was set aside (an operator paused it"), "{}", last_system());
     // A loop variant: the built-in agent-loop.
     assert_eq!(send(&f.engine, "parent").await.unwrap(), "parent done");
@@ -959,7 +966,11 @@ async fn routes_at_equal_specificity_need_distinct_priorities_and_the_most_speci
     activate_definition(&f.engine, "route-b", &prioritized).await;
     activate_definition(&f.engine, "route-c", &route("route-c", "source: telegram, topic: research")).await;
     let names = |routes: Vec<(String, u64)>| routes.into_iter().map(|(n, _)| n).collect::<Vec<_>>();
-    assert_eq!(names(flows::signal_routes(&f.engine, "telegram", &Value::Null).await.unwrap()), ["route-b", "route-a"]);
+    // The built-in Telegram route (design 08) comes last: priority -1.
+    assert_eq!(
+        names(flows::signal_routes(&f.engine, "telegram", &Value::Null).await.unwrap()),
+        ["route-b", "route-a", "telegram"]
+    );
     let research = json!({"topic":"research"});
     assert_eq!(names(flows::signal_routes(&f.engine, "telegram", &research).await.unwrap())[0], "route-c");
     let supervisor = create_supervisor(f.engine.clone());

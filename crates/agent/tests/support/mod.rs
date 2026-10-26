@@ -525,6 +525,12 @@ impl Harness {
         Self::configured(session, turns, tool_result, tracer, |_| {})
     }
 
+    /// A harness whose MCP also offers the status tool the reference
+    /// Telegram loop calls directly (activation checks a definition's calls).
+    pub fn with_status(session: Session, turns: Vec<Turn>, tool_result: &str, tracer: Arc<dyn Tracer>) -> Harness {
+        Self::build(session, turns, tool_result, tracer, true, |_| {})
+    }
+
     /// A harness whose engine dependencies `configure` changes before the
     /// engine is built (handlers hold it weakly: it cannot change after).
     pub fn configured(
@@ -534,9 +540,25 @@ impl Harness {
         tracer: Arc<dyn Tracer>,
         configure: impl FnOnce(&mut EngineDeps),
     ) -> Harness {
+        Self::build(session, turns, tool_result, tracer, false, configure)
+    }
+
+    // Without the status tool, the built-in Telegram route (design 08) is not
+    // installed: these harnesses drive the default path, Telegram signals too.
+    fn build(
+        session: Session,
+        turns: Vec<Turn>,
+        tool_result: &str,
+        tracer: Arc<dyn Tracer>,
+        status: bool,
+        configure: impl FnOnce(&mut EngineDeps),
+    ) -> Harness {
         let model = Turns::new(turns);
-        let status = ToolDef::new(STATUS_TOOL, STATUS_TOOL, json!({"type":"object"}));
-        let mcp = ToolMcp::returning(vec![search_tool(), status], tool_result);
+        let mut defs = vec![search_tool()];
+        if status {
+            defs.push(ToolDef::new(STATUS_TOOL, STATUS_TOOL, json!({"type":"object"})));
+        }
+        let mcp = ToolMcp::returning(defs, tool_result);
         let persist = Arc::new(PersistLog::default());
         let provider: Arc<dyn ChatProvider> = model.clone();
         let (store, dry_store) = agent::runs::memory_store_with_view();

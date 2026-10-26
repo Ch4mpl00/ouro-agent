@@ -33,6 +33,8 @@ const NOISE: &[&str] = &[
     "working_memory_list",
     "working_memory_delete",
     "send_telegram_chat_action",
+    // The progress bubble (design 08): ephemeral, never what the user got.
+    "telegram_send_status",
 ];
 const READ: &[&str] = &[
     "search_news",
@@ -215,13 +217,14 @@ fn build_packet(
     let mut refs = HashMap::new();
     let mut kept = Vec::new();
     // What a dry run did inside (sandbox.rs) did not happen: only the try
-    // itself is an action of the run.
+    // itself is an action of the run. Nor is an observer's work an action.
     let dry = |o: &Observation| {
         let mut parent = o.parent_observation_id.as_deref();
         let mut visited = HashSet::new();
         while let Some(id) = parent.filter(|id| visited.insert(*id)) {
             let Some(p) = by_id.get(id) else { break };
-            if p.meta("dry_run") == Some(&json!(true)) {
+            // A loop's step observer (design 08) only paints its progress.
+            if p.meta("dry_run") == Some(&json!(true)) || p.meta("activity") == Some(&json!("observer")) {
                 return true;
             }
             parent = p.parent_observation_id.as_deref();

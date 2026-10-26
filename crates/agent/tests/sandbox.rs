@@ -57,8 +57,17 @@ const READS: &[&str] = &[
     "get_timezone",
     "search_news",
 ];
-const WRITES: &[&str] =
-    &["send_telegram_message", "edit_telegram_message", "remember", "journal_append", "telegram_send_status"];
+// The Telegram tools the built-in route takes away from its loop (design 08)
+// are all offered, so that route runs here as on the full MCP.
+const WRITES: &[&str] = &[
+    "send_telegram_message",
+    "edit_telegram_message",
+    "remember",
+    "journal_append",
+    "telegram_send_status",
+    "start_typing",
+    "send_telegram_chat_action",
+];
 const FLIPPING: &str = "mark_seen";
 
 impl World {
@@ -895,8 +904,9 @@ async fn a_route_draft_of_a_name_never_activated_runs_and_a_narrowed_route_does_
     assert_eq!(active_version(&s.f.engine, "tg-new").await, None, "nothing activated");
 
     // Narrowed: only presses route to the draft now, so a message takes the
-    // default path, although the active version's `when` matched it.
-    let (s, _) = sandbox(vec![assistant("default path")], "allow").await;
+    // next route, the built-in `telegram` (design 08), although the active
+    // version's `when` matched it.
+    let (s, _) = sandbox(vec![assistant("default path"), assistant(r#"{"reply":"default path"}"#)], "allow").await;
     let narrowed = LOOP.replace("when: { source: [telegram, telegram_button] }", "when: { source: telegram_button }");
     assert_ne!(narrowed, LOOP);
     save(&s.f.engine, "telegram-loop", &narrowed).await;
@@ -904,7 +914,8 @@ async fn a_route_draft_of_a_name_never_activated_runs_and_a_narrowed_route_does_
     assert_eq!(report["status"], "completed", "{report:#}");
     assert_eq!(report["drafts"][0]["ran"], false, "{report:#}");
     assert!(runs_of(&report, "telegram-loop", None).is_empty(), "neither the draft nor the active one: {report:#}");
-    assert_eq!(run(&report, "agent-loop", Some("primary"))["version"], "built-in");
+    assert_eq!(run(&report, "telegram", Some("route"))["version"], "built-in");
+    assert_eq!(run(&report, "agent-loop", Some("loop"))["version"], "built-in");
     assert!(!tried(&s.f.engine, "telegram-loop", &narrowed));
 }
 
@@ -945,8 +956,10 @@ async fn a_draft_of_a_tripped_name_is_tried_and_one_of_a_paused_name_is_set_asid
     tool(&s.f.engine, "activate_workflow", json!({"name":"tg-loop","version":version})).await.unwrap();
     assert!(s.f.engine.runtime.definitions("tg-loop").await.unwrap().tripped.is_none());
 
-    // Paused: the operator's pause stands for the draft too.
-    let s = sandbox_on(Arc::new(Scripted::new(vec![assistant("default path")])), "allow", false).await;
+    // Paused: the operator's pause stands for the draft too (the built-in
+    // Telegram route takes the signal, design 08).
+    let model = Scripted::new(vec![assistant("default path"), assistant(r#"{"reply":"default path"}"#)]);
+    let s = sandbox_on(Arc::new(model), "allow", false).await;
     activate_definition(&s.f.engine, "tg-loop", &renamed(&active_loop(), "tg-loop")).await;
     let version = save(&s.f.engine, "tg-loop", &fixed).await;
     pause(&s.f.engine, "tg-loop", "maintenance window").await;

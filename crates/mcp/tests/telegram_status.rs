@@ -180,3 +180,56 @@ fn start_typing_keeps_the_indicator_alive_until_a_message_goes_to_that_chat_then
         assert_eq!(env.fake.lock().actions.len(), after, "no refresh after the message");
     });
 }
+
+// Design 08, decision 7 (narrowed by review G-L2): an update that carries a
+// `seq` is dropped when an update with an equal or greater `seq` was applied
+// to that id, or once the id was cleared (a tombstone), so a status line
+// that arrives late can't overwrite a newer one or bring the bubble back
+// after the reply. Updates without a `seq` behave as before.
+#[test]
+fn a_seq_drops_stale_updates_and_a_cleared_id_drops_later_ones() {
+    let _serial = serial();
+    let env = env();
+    runtime().block_on(async {
+        env.fake.lock().chat.clear();
+        let status = |id: &'static str, text: &'static str, seq: Option<u64>| {
+            let mut args = json!({ "id": id, "text": text });
+            if let Some(seq) = seq {
+                args["seq"] = json!(seq);
+            }
+            call(&env.client, "telegram_send_status", args)
+        };
+        let ok = |out: Outcome| match out {
+            Outcome::Ok(v) => v,
+            other => panic!("{other:?}"),
+        };
+        let shown = |fake: &FakeTelegram| bubbles(fake).iter().map(|b| undotted(&b.text)).collect::<Vec<_>>();
+
+        assert_eq!(ok(status("status:seq", "👀", Some(0)).await)["action"], "created");
+        assert_eq!(ok(status("status:seq", "step 2", Some(2)).await)["action"], "updated");
+        let stale = ok(status("status:seq", "step 1", Some(1)).await);
+        assert_eq!((stale["action"].clone(), stale["reason"].clone()), (json!("dropped"), json!("stale")));
+        let equal = ok(status("status:seq", "step 2 again", Some(2)).await);
+        assert_eq!(equal["reason"], "stale");
+        assert_eq!(shown(&env.fake), ["step 2"]);
+
+        assert_eq!(ok(status("status:seq", "", Some(1_000_000)).await)["action"], "deleted");
+        let late = ok(status("status:seq", "step 3", Some(3)).await);
+        assert_eq!((late["action"].clone(), late["reason"].clone()), (json!("dropped"), json!("cleared")));
+        assert!(shown(&env.fake).is_empty(), "the bubble does not come back after the reply");
+
+        // Without a seq: as before, even after a clear.
+        assert_eq!(ok(status("status:seq", "again", None).await)["action"], "created");
+        assert_eq!(shown(&env.fake), ["again"]);
+        assert_eq!(ok(status("status:seq", "", None).await)["action"], "deleted");
+        let cleared_twice = ok(status("status:seq", "", None).await);
+        assert_eq!(cleared_twice["action"], "noop");
+        // A cleared id still drops a sequenced update, a clear included.
+        assert_eq!(ok(status("status:seq", "step 4", Some(4)).await)["reason"], "cleared");
+        assert!(shown(&env.fake).is_empty());
+
+        // Another id is not affected by this one's tombstone.
+        assert_eq!(ok(status("status:other", "👀", Some(0)).await)["action"], "created");
+        assert_eq!(ok(status("status:other", "", Some(1_000_000)).await)["action"], "deleted");
+    });
+}

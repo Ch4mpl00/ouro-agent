@@ -30,6 +30,10 @@ struct ContextMcp {
     waits: std::sync::atomic::AtomicBool,
     wait_broken: std::sync::atomic::AtomicBool,
     arrived: tokio::sync::Notify,
+    // Offers the status tool the reference Telegram loop calls directly. Off,
+    // the built-in Telegram route (design 08) is not installed, and Telegram
+    // signals take the default path these tests are about.
+    status: std::sync::atomic::AtomicBool,
 }
 #[async_trait]
 impl Mcp for ContextMcp {
@@ -45,6 +49,7 @@ impl Mcp for ContextMcp {
             "telegram_send_status",
         ]
         .iter()
+        .filter(|n| **n != "telegram_send_status" || self.status.load(Ordering::SeqCst))
         .map(|n| ToolDef::new(n, n, json!({"type":"object"})))
         .collect()
     }
@@ -1359,6 +1364,7 @@ async fn a_telegram_signal_runs_the_loop_that_declares_its_route() {
     ]));
     let api = Arc::new(GuardApi::default());
     let mcp = Arc::new(ContextMcp::default());
+    mcp.status.store(true, Ordering::SeqCst);
     let f = fixture_on(model.clone(), &[], SKILLS, |deps| {
         deps.mcp = mcp.clone();
         deps.skills = vec!["orchestrator".into(), "routing".into()];
@@ -1433,6 +1439,7 @@ async fn a_rebuilt_routed_loop_keeps_what_its_setup_added() {
         calls(&[("send_telegram_message", json!({"chatId":"-10042","messageThreadId":7,"text":"finished"}))]),
     ]));
     let mcp = Arc::new(ContextMcp::default());
+    mcp.status.store(true, Ordering::SeqCst);
     mcp.history.lock().unwrap().push(history(100, "Earlier message", "user", -10042, Some(7), "2026-09-06 11:59:00"));
     let routed = |label: &str| {
         let api = Arc::new(GuardApi::default());

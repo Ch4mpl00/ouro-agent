@@ -35,6 +35,13 @@ use tokio_util::sync::CancellationToken;
 
 pub const GUARD_NAME: &str = "guard";
 pub const GUARD: &str = include_str!("../workflows/guard.yaml");
+/// A Telegram signal's route: the wrapper around its loop, and the observer
+/// that writes its progress bubble (docs/designs/08-telegram-loop.md). The
+/// agent may override either.
+pub const TELEGRAM_NAME: &str = "telegram";
+pub const TELEGRAM: &str = include_str!("../workflows/telegram.yaml");
+pub const TELEGRAM_STATUS_NAME: &str = "telegram-status";
+pub const TELEGRAM_STATUS: &str = include_str!("../workflows/telegram-status.yaml");
 
 /// The definitions the runtime itself runs, saved and activated at boot.
 pub fn builtins() -> Vec<(&'static str, &'static str)> {
@@ -42,6 +49,8 @@ pub fn builtins() -> Vec<(&'static str, &'static str)> {
         (crate::supervisor::SIGNAL_NAME, crate::supervisor::SIGNAL),
         (crate::agent::AGENT_LOOP_NAME, crate::agent::AGENT_LOOP),
         (GUARD_NAME, GUARD),
+        (TELEGRAM_STATUS_NAME, TELEGRAM_STATUS),
+        (TELEGRAM_NAME, TELEGRAM),
     ]
 }
 

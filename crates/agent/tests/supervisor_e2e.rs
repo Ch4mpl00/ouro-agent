@@ -205,12 +205,9 @@ impl ServerHandler for FakeMcp {
                 json!({"type":"object","properties":{"chatId":{"type":["string","number"]},"limit":{"type":"number"},"threadId":{"type":"number"}},"required":["chatId"]}),
             ),
             tool("get_timezone", "Timezone.", json!({"type":"object","properties":{}})),
-            // The reference Telegram loop's status bubble.
-            tool(
-                "telegram_send_status",
-                "Live status.",
-                json!({"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"},"chatId":{"type":["string","number"]},"messageThreadId":{"type":["number","null"]}},"required":["id","text"]}),
-            ),
+            // No status tool: the built-in Telegram route (design 08) is not
+            // installed, and Telegram signals take the default path whose
+            // ordering and delivery this property is about.
         ]))
     }
     async fn call_tool(
@@ -254,7 +251,6 @@ impl ServerHandler for FakeMcp {
                 json_reply(json!({"messages":[]}))
             }
             "get_timezone" => json_reply(json!({"timezone":"UTC","local_now":"2026-10-12 10:00"})),
-            "telegram_send_status" => json_reply(json!({"ok":true})),
             other => return Err(ErrorData::invalid_params(format!("Tool {other} not found"), None)),
         })
     }
