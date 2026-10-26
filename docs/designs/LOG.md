@@ -475,3 +475,27 @@ each reversible:
   read against the design; 106/107 binaries in the executor's full run, the
   one failure the sandbox confirmation test's wall-clock bound under load
   (24/24 alone), covered by the item above.
+
+## 2026-10-26 (step 6: executor)
+
+Design 07 (remove `crates/owf`), written and implemented by the step's
+executor; choices where the document is silent, each reversible:
+
+- **No goldfish round** for 07: a removal with no new contract (the
+  workbench keeps its rules, the agent's running path is untouched).
+- **`flows::check` reads the engine's dialect**, so
+  `tests/flows.rs`'s at-most-once refusal of `choose` writes
+  `metadata: { ouro: { delivery: at_most_once } }` (the flat key is no
+  longer read, by `check` or the engine).
+- **`Standalone` keeps `ows`'s default `execute`** (`call` with
+  `CallFailure::answer`): the workbench's real calls keep `owf`'s catchable
+  error contract, and only typed call-outcome errors stop a run.
+- **`engine_dialect.rs`** gains `converted_flat_keys_reach_the_engine` (the
+  converter's reading of each extension on the synthetic definition) in place
+  of the `owf`-vs-`ows` comparison it loses.
+- **`docs/optimizer.md`** (the workbench's own doc) names the engine's
+  dialect; the two `.claude/tasks` records that describe `crates/owf` as live
+  code carry a superseded note; their open issues (#43, #44) are left to the
+  maintainer to re-triage.
+- **Hand mutants** (once each, in place on the committed tree, restored by
+  `git checkout`): both caught (deviation 1 of design 07 on which test).

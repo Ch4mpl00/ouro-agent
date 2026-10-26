@@ -225,10 +225,11 @@ server checks out exactly that commit.
 | `deploy/probe.py` | — | the native services + tunnel client |
 | tests, specs, docs, anything else | — | nothing: no build, upload or restart |
 
-Two cases need a manual step:
+Two cases worth knowing:
 
-- **`crates/owf` and `crates/evals` are not selected automatically.** After
-  a change that only touches `crates/owf`, run `scripts/deploy.sh agent`.
+- **`crates/evals` is not selected automatically**: its binaries are run
+  as CLIs and never deployed. A change of the engine's pinned tag changes
+  `Cargo.lock` and so rebuilds every service binary.
 - **Unchanged binaries are omitted by hash**, so a rebuild that produces the
   same binary uploads nothing.
 

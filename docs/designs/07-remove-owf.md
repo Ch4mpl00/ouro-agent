@@ -166,3 +166,12 @@ deploys by the overview's rollout.
 ## Open questions
 
 None.
+
+## Deviations
+
+1. **Hand mutant 1 is caught by one test, not two.** A missing fixture
+   answered as a catchable error is caught by
+   `missing_mock_escapes_catch…` only; `competing_branch…` still sees
+   `needs_mock` (the losing branch's call is recorded `missing` whatever the
+   error kind). One killing test is what the mutant needs; the design's
+   "and `competing_branch…`" was wrong.

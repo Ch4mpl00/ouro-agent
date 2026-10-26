@@ -26,7 +26,7 @@ flowchart LR
     subgraph agent ["crates/agent — supervisor"]
         C[Schedule<br/>engine triggers, fire drain] -->|fire| S
         Q -->|get_next_signal<br/>wait_for_signal| S[Supervisor<br/>one signal at a time]
-        S -->|scheduler task<br/>naming a workflow| W[Saved workflow<br/>crates/owf]
+        S -->|scheduler task<br/>naming a workflow| W[Saved workflow<br/>ouro engine]
         S -->|all other signals| L[Agent loop<br/>skills · sub-agents]
         W -.->|faulted before any write| L
     end
@@ -60,9 +60,17 @@ Postgres, the Codex sandbox and the tunnel daemon run in Docker.
 | --- | --- | --- |
 | **`crates/mcp`** | `mcp-tools` | A stateless MCP server. It wraps Gmail, Telegram (bot and read-only userbot), Monobank, news, PDF, files and unified memory as primitive tools. It also runs the pollers that turn external events into signals. It knows nothing about the agent. |
 | **`crates/agent`** | `agent-supervisor` | The supervisor and the agent. It takes signals, preselects skills, and runs the agent loop or a saved workflow. It owns the schedule, the activity journal and the trace mirror. It knows MCP only through the protocol. |
-| **`crates/owf`** | (library) | An interpreter for the [Open Workflow Specification](https://serverlessworkflow.io) DSL 1.0, limited to the subset saved workflows use. It covers parsing against the official JSON Schema, validation, jq expressions (via jaq) and durable replay. It knows nothing about MCP or the agent. |
 | **`crates/codex`** | `codex-service` | The sandbox where the agent's `code_agent` tool and the codex judge run `codex exec`. It exposes `POST /run` and `GET /health`. |
-| **`crates/evals`** | `judge`, `judge-worker`, `improve`, … | The tooling that evaluates the agent: a per-node judge, judge-noise calibration, the improver gate and the closed-loop improver, trace replay, and the news-filter golden set. It reads the trace mirror and Langfuse, and is never in the signal path. |
+| **`crates/evals`** | `judge`, `judge-worker`, `improve`, … | The tooling that evaluates the agent: a per-node judge, judge-noise calibration, the improver gate and the closed-loop improver, trace replay, the news-filter and guard golden sets, and the workflow optimizer, whose workbench runs candidates in memory on the engine's interpreter. It reads the trace mirror and Langfuse, and is never in the signal path. |
+
+Workflows run on the **ouro engine** (`Ch4mpl00/ouro`, crates `ows`,
+`ouro-durable` and `ouro-runtime`, a git dependency pinned to a tag): an
+interpreter for the [Open Workflow Specification](https://serverlessworkflow.io)
+DSL 1.0 with durable runs, versions, a breaker, triggers and dry runs. It
+knows nothing about MCP or the agent; `crates/agent` adapts it
+(`runs.rs`, `functions.rs`, `flows.rs`). The agent's own interpreter,
+`crates/owf`, was removed when the migration finished
+(`docs/designs/07-remove-owf.md`).
 
 The server and the agent do not import each other's code. The protocol is
 the boundary. Only tests cross it: `crates/mcp/tests` drive the agent's
@@ -107,10 +115,9 @@ mcp-tools/
 └── crates/
     ├── mcp/                 src/<domain>.rs, src/bin (CLIs), migrations/pg,
     │                        specs/*.feature, tests/ (+ tests/model)
-    ├── agent/               supervisor, agent loop, schedule, flows, durable,
+    ├── agent/               supervisor, agent loop, schedule, flows, runs, sandbox,
     │                        skills, activity, tracing;
     │                        migrations/ (agent.db)
-    ├── owf/                 the workflow interpreter + schema/
     ├── codex/               codex-service
     └── evals/               judge, improver, replay, golden-set evals
 ```
@@ -146,7 +153,7 @@ Telegram.
    `list_scheduled_tasks` are supervisor-only and never shown to a model.
 2. **Route by source.**
    - A `scheduler` fire whose payload names a saved workflow runs that
-     workflow's active version (`flows.rs` over `crates/owf`). No model
+     workflow's active version (an engine run, `flows.rs`). No model
      chooses the steps.
    - All other signals run the primary **agent loop** (`agent.rs`). A
      scheduler fire uses the `scheduler` skill and `base` preset. Recurring
@@ -436,13 +443,16 @@ The workflow's input is `{ env: { timezone, now, localNow, newsLastReadAt,
 techLastReadAt, userEmail, telegramChatId }, signal: { source, content, id } }`.
 Expressions are jq, with the wall clock and environment withheld.
 
-**Durable runs.** A run's definition and input are pinned when it is
-admitted. The run executes under fenced leases on agent.db (`durable.rs`),
-and a recovery worker resumes runs that were interrupted or are waiting. On
-replay, completed steps restore their saved output, and a write that already
-completed is never sent again. Calls marked
-`metadata: { delivery: at_most_once }` commit their intent before dispatch.
-`crates/owf/README.md` documents the contract.
+**Durable runs.** A run's definition, version and input are pinned when it
+is admitted to the ouro engine's store (the `ouro_*` tables, `runs.rs`). The
+engine's worker runs it under leases and resumes runs that were interrupted
+or are waiting. On replay, completed steps restore their saved output, and a
+write that already completed is never sent again: every MCP tool without
+`readOnlyHint` is bound at most once, and a call marked
+`metadata: { ouro: { delivery: at_most_once } }` is too; their intent is
+committed before dispatch, and an outcome the engine cannot know is never
+resent. The engine's `docs/durable-invariants.md` and `docs/call-outcomes.md`
+document the contract.
 
 ## Memory
 

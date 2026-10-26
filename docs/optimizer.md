@@ -8,7 +8,11 @@ activates a workflow, schedules work, or deploys anything.
 
 **Current execution scope: standalone pipelines.** Existing `llm_compose` and
 other standalone function contracts are reused. JQ, control flow, reusable
-functions and bounded concurrent `for`/`fork` run in the OWF interpreter.
+functions and bounded concurrent `for`/`fork` run in memory on the ouro
+engine's interpreter (`ows::run::run`, no journal), in the engine's dialect:
+extensions sit under `metadata.ouro` (`concurrency`, `delivery`), and a flat
+`metadata.concurrency` is ignored, as in production. A write invocation is
+bound at most once, as the agent binds an MCP write.
 Signal/agent/guard/child/event host functions need admitted runtime context and
 are rejected before execution, including when a fixture could answer them.
 The existing signal sandbox remains separate and retains its original behavior.

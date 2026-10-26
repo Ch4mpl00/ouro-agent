@@ -15,12 +15,17 @@ workspace:
 - **`crates/evals`** — the evaluation tooling around the agent: the per-node
   judge (CLI + `judge-worker`), judge-noise calibration, the improver gate and
   the closed-loop improver (`improve-worker`), trace replay, the news-filter
-  golden-set eval. Reads the agent's trace mirror and Langfuse; never in the
-  signal path.
-- **`crates/owf`** — an interpreter for the Open Workflow Specification DSL
-  (the subset saved workflows use): parse + the official JSON Schema,
-  validation, and the run behind `Functions`/`Observer`/`Clock` seams. No
-  knowledge of MCP or the agent; `crates/agent/src/flows.rs` adapts it.
+  golden-set eval, the workflow optimizer (`optimize`: its workbench runs
+  candidates in memory on the engine's interpreter, `ows::run`). Reads the
+  agent's trace mirror and Langfuse; never in the signal path.
+
+The workflow engine is not in this workspace: the **ouro engine**
+(`Ch4mpl00/ouro`, crates `ows`, `ouro-durable`, `ouro-runtime`, a git
+dependency pinned to a tag) interprets the Open Workflow Specification DSL
+and runs it durably: runs, versions, the breaker, triggers, dry runs.
+`crates/agent/src/{runs,functions,flows}.rs` adapt it
+(`docs/designs/01-engine-migration.md`); the agent's own interpreter
+(`crates/owf`) was removed in step 6 (`docs/designs/07-remove-owf.md`).
 
 The server and the agent communicate strictly through the MCP protocol;
 neither depends on the other's crate (only tests do: `crates/mcp/tests` drive
@@ -235,12 +240,11 @@ mcp-tools/
     │   ├── src/db.rs                       agent.db: memory KV, trace mirror, judgements
     │   └── migrations/                     agent.db migrations (drizzle journal, unchanged)
     ├── codex/                              codex-service (POST /run, GET /health)
-    ├── owf/                                Open Workflow Specification interpreter (+ schema/)
     └── evals/
-        ├── src/                            judge, noise, gate, improver, scores, Langfuse API
+        ├── src/                            judge, noise, gate, improver, optimizer, scores, Langfuse API
         ├── src/bin/                        judge, judge-worker, judge-noise, judge-gate, improve,
         │                                   improve-worker, judge-replay, langfuse-trace,
-        │                                   news-filter-eval
+        │                                   news-filter-eval, guard-eval, optimize
         └── noise-baseline.json             committed judge σ per (model | prompt version)
 ```
 
