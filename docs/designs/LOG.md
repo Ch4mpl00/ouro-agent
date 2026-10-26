@@ -523,3 +523,43 @@ executor; choices where the document is silent, each reversible:
   the user asks. Such a task fires as a `scheduler` signal, so only its
   primary loop may write skills, not a delegated `dreaming` worker. No
   migration: a `schedule.engine_seeded` key already written stays, unread.
+
+## 2026-10-26 (maintainer: one database — tried, reverted)
+
+The maintainer asked to move the engine's store into agent.db
+(`runs::engine_store_path` returning agent.db itself) now that ouro v0.2.2
+made reads `BEGIN DEFERRED`. Tried on the branch with the no-seed change
+above, measured with one full `scripts/test.py` run, and **reverted**:
+`engine.db` stays beside agent.db, and the step 2b entry stands.
+
+- Checked first: both sides open the file in WAL with a busy timeout
+  (AgentDb 5 s, the engine 30 s); the drizzle migrator and its hash pin read
+  only `__drizzle_migrations`, the engine only `ouro_migrations`/`ouro_*`;
+  nothing in scripts/deploy backs up or copies `engine.db` by name.
+- **The run**: 99/101 binaries, 394 s (37 s build) against 101/101 and
+  459 s (134 s build) for the last two-file run: tests 357 s against 325 s.
+  Slower: `engine_runs` 59 → 95 s, `loop_properties` 325 → 358 s,
+  `confirmations` 120 → 136 s.
+- **Failure 1, a lock fault, deterministic**: `mcp-tools`'s
+  `skill_index_workflow` fails every time, alone and unloaded, with
+  "database is locked" from `WorkflowMeta::mark_tried` (`flows.rs`, the
+  agent's synchronous `UPDATE workflow_meta` after a dry run,
+  `sandbox::mark_tried`), after the 5 s busy timeout. The test runs on a
+  current-thread runtime: the engine opened an IMMEDIATE transaction on its
+  connection, and the agent's write then blocked the only runtime thread in
+  SQLite's busy wait, so the engine task that would commit never ran. The
+  same test on a 4-thread runtime passes (5 s). On one file every
+  synchronous agent write on a runtime thread can wait on an engine
+  transaction that needs a runtime thread to finish; with two files the two
+  never share a lock.
+- **Failure 2**: `confirmations`'
+  `confirmation_resolution_crashes_preserve_authority_and_at_most_once_execution`
+  (the crash-around-resolution property, 4-thread runtimes): the next
+  process completed the run without the confirmed write (`writes == []`).
+  Not seen in the two-file runs; no lock line in its log, cause not
+  isolated.
+- **After the revert** (no-seed change only): `skill_index_workflow`
+  passes (4.9 s) and the crash property passes alone (28 s).
+- **What one file would need**: every agent.db write off the runtime
+  threads (the blocking pool), or the agent's tables written through the
+  engine's connection. Left to the maintainer.

@@ -63,11 +63,14 @@ pub fn config() -> ouro_runtime::Config {
 
 /// The engine's store beside agent.db (`engine.db` in its directory),
 /// `ouro_*` tables. Not inside agent.db, as design 01 decision 3 had it: the
-/// engine's adapter takes SQLite's write lock for every operation, reads
-/// included, back to back, and a write of the agent's on another connection
-/// to the same file starved behind it for seconds, past its busy timeout
-/// (docs/designs/LOG.md, 2026-10-26, step 2b). One directory, one volume, two
-/// files to back up.
+/// engine's write transactions (`BEGIN IMMEDIATE`; reads are deferred since
+/// ouro v0.2.2) and the agent's synchronous writes on another connection to
+/// the same file then wait on one SQLite lock. An agent write that blocks a
+/// runtime thread can starve the engine task that would commit and release
+/// it, until the 5 s busy timeout: "database is locked" (step 2b; retried
+/// on v0.3.0 and still failing, docs/designs/LOG.md, 2026-10-26,
+/// "maintainer: one database"). One directory, one volume, two files to
+/// back up.
 pub fn engine_store_path(agent_db: &std::path::Path) -> std::path::PathBuf {
     agent_db.with_file_name("engine.db")
 }
