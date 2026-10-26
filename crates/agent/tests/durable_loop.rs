@@ -219,7 +219,7 @@ async fn a_round_cut_by_a_restart_resumes_without_regenerating_or_resending() {
     let heard = seen(&second, 0);
     assert!(heard.contains("outcome unknown: send"), "the model hears the write may have run: {heard}");
     assert!(heard.contains("search ok"), "the read has its reply: {heard}");
-    let requests = api.requests.lock().unwrap();
+    let requests = api.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 1);
     let state = &requests[0]["state"];
     assert!(state["skills"].as_str().unwrap().contains("Original scheduled skill text"));
@@ -320,7 +320,7 @@ async fn a_worker_turn_aborted_by_shutdown_is_asked_again_not_reported_as_a_cras
     assert_eq!(ended(&engine2, &child.admission.id).await, Status::Completed(json!("worker result")));
     assert_eq!(ended(&engine2, "peer:9").await, Status::Completed(json!("all done")));
     assert_eq!(first.requests.lock().unwrap().len(), 3);
-    let requests = second.requests.lock().unwrap();
+    let requests = second.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 2, "only the cut turn was asked again");
     let worker = serde_json::to_string(&requests[0]).unwrap();
     assert!(worker.contains("search ok"), "the worker's earlier round stands: {worker}");
@@ -329,7 +329,6 @@ async fn a_worker_turn_aborted_by_shutdown_is_asked_again_not_reported_as_a_cras
     assert!(!parent.contains("crashed"), "{parent}");
     assert_eq!(world.names(), ["search"]);
     assert!(world2.names().is_empty(), "the worker's read is not made again");
-    drop(requests);
     engine2.shutdown().await;
 }
 
@@ -404,7 +403,7 @@ async fn call_chain_and_the_root_request_reach_a_durable_worker_after_restart() 
     engine2.ready().await.unwrap();
     assert_eq!(ended(&engine2, "root").await, Status::Completed(json!("done")));
     assert_eq!(world.names(), ["send", "send"]);
-    let requests = api.requests.lock().unwrap();
+    let requests = api.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0]["state"]["root_request"], "Original root request: publish the report");
     assert_eq!(requests[0]["state"]["task"], "worker task");
@@ -413,7 +412,6 @@ async fn call_chain_and_the_root_request_reach_a_durable_worker_after_restart() 
     assert_eq!(requests[1]["state"]["chain"][0]["name"], "send");
     assert_eq!(requests[1]["state"]["chain"][0]["arguments"], "{\"q\":\"first\"}");
     assert!(!requests[1].to_string().contains("send ok"));
-    drop(requests);
     engine2.shutdown().await;
 }
 
@@ -760,9 +758,8 @@ async fn unavailable_guard_permits_current_conversation_replies_only() {
         assert_eq!(live.send("Reply in chat 42 and thread peer-7".into()).await.unwrap(), "done");
         assert_eq!(fixture.mcp.called.lock().unwrap().len(), 2);
         assert!(fixture.engine.deps.memory.get("x").unwrap().is_none());
-        let seen_ = model.seen.lock().unwrap();
+        let seen_ = model.seen.lock().unwrap().clone();
         assert!(serde_json::to_string(&seen_[1].messages).unwrap().contains("[guard] blocked: guard_unavailable —"));
-        drop(seen_);
         fixture.engine.shutdown().await;
     }
 }
