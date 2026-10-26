@@ -1031,7 +1031,10 @@ async fn the_list_shows_each_live_task_with_its_next_and_last_fire_and_its_fault
     assert_eq!(listed["prompt"], prompt, "quotes and newlines round-trip");
     assert_eq!((listed["recurring"].as_bool(), listed["timezone"].as_str()), (Some(true), Some("Europe/Kyiv")));
     assert!(listed["source"].is_null() && listed["workflow"].is_null());
-    assert!(listed["created_at"].as_str().unwrap().starts_with("2026-11-10T06:00:00"));
+    // The test clock runs on from its offset, so under load the task is made
+    // a few seconds after 06:00, never a minute.
+    let created = ms(listed["created_at"].as_str().unwrap());
+    assert!((ms("2026-11-10T06:00:00Z")..ms("2026-11-10T06:01:00Z")).contains(&created), "{list:#}");
     // Wednesday 2026-11-11 09:00 Kyiv.
     assert_eq!(listed["next_fire"], "2026-11-11T07:00:00.000Z");
     assert!(listed["last_fire"].is_null());
