@@ -224,11 +224,6 @@ impl Fixture {
         }
         cmd
     }
-    // The system task's id, once a start seeded it.
-    fn seeded(&self) -> Option<String> {
-        use agent::db::MemoryStore;
-        AgentDb::open(self.root.join("agent.db")).unwrap().get(agent::schedule::SEEDED).unwrap()
-    }
     fn trace(&self) -> (agent::trace_model::Trace, Vec<agent::trace_model::Observation>) {
         let db = AgentDb::open(self.root.join("agent.db")).unwrap();
         let recent = db.list_recent(10, None).unwrap();
@@ -243,7 +238,6 @@ async fn binary_runs_scheduler_and_agent_sources_and_flushes_matching_otel_ids()
         let output = tokio::time::timeout(Duration::from_secs(20), f.child(true).output()).await.unwrap().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         assert_eq!(f.state.sends.load(Ordering::SeqCst), 1);
-        assert_eq!(f.seeded(), None, "`--once` seeds no scheduled task (design 06, test 12)");
         // A plain reply to the conversation the request came from skips Jev;
         // a send to the default chat on a scheduler's behalf is judged.
         assert_eq!(
@@ -290,7 +284,6 @@ async fn sigterm_cancels_an_active_signal_and_flushes_trace_before_process_exit(
     let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output()).await.unwrap().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let (trace, obs) = f.trace();
-    assert!(f.seeded().is_some(), "a normal start seeds the system task");
     assert_eq!(trace.metadata.as_ref().unwrap()["error"], true);
     assert!(obs.iter().any(|o| o.name == "iter-0" && o.level == "ERROR"));
     assert!(!obs.iter().any(|o| o.name == "recovery"));

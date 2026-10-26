@@ -514,3 +514,12 @@ executor; choices where the document is silent, each reversible:
   maintainer to re-triage.
 - **Hand mutants** (once each, in place on the committed tree, restored by
   `git checkout`): both caught (deviation 1 of design 07 on which test).
+
+## 2026-10-26 (maintainer: no seeded dreaming)
+
+- **Maintainer: "dreaming isn't needed for now."** The first start seeds no
+  task (design 06 decision 14 and test 12 removed; the design's Deviations
+  say what went). The `dreaming` skill stays; the agent schedules it when
+  the user asks. Such a task fires as a `scheduler` signal, so only its
+  primary loop may write skills, not a delegated `dreaming` worker. No
+  migration: a `schedule.engine_seeded` key already written stays, unread.

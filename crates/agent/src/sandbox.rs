@@ -444,9 +444,6 @@ impl FireStore for DryFires {
     async fn next_task_id(&self) -> anyhow::Result<i64> {
         anyhow::bail!(NO_WRITES)
     }
-    async fn seed_id(&self) -> anyhow::Result<i64> {
-        anyhow::bail!(NO_WRITES)
-    }
 }
 
 // Every trace a dry run would start is a span under the builder's call: the

@@ -1,7 +1,7 @@
 // Scheduled tasks on the engine's triggers (docs/designs/06-schedules.md,
-// tests 1–18; test 14 is a unit test in src/schedule.rs, test 12's `--once`
-// half is in runtime_process.rs). Every scenario runs on a moved clock: the
-// engine's worker fires a task's trigger at its slot, `fire_scheduled`
+// tests 1–18; test 14 is a unit test in src/schedule.rs; test 12, the seeded
+// `dreaming` task, went with the seed, LOG.md 2026-10-26). Every scenario
+// runs on a moved clock: the engine's worker fires a task's trigger at its slot, `fire_scheduled`
 // records the fire, and the supervisor's drain runs it as a signal.
 mod support;
 use agent::{
@@ -144,9 +144,6 @@ impl FireStore for Flaky {
     }
     async fn next_task_id(&self) -> anyhow::Result<i64> {
         self.inner.next_task_id().await
-    }
-    async fn seed_id(&self) -> anyhow::Result<i64> {
-        self.inner.seed_id().await
     }
 }
 
@@ -773,53 +770,12 @@ async fn the_agent_cannot_write_or_fire_a_tasks_definition() {
     w.supervisor.shutdown().await;
 }
 
-// ── 12. boot ────────────────────────────────────────────────────────────────
+// ── 13. validation and the cap ──────────────────────────────────────────────
 
 async fn tasks_named(w: &World) -> Vec<String> {
     let page = w.engine().control.definitions(None, 1_000).await.unwrap();
     page.items.into_iter().map(|d| d.name).filter(|n| n.starts_with("task-")).collect()
 }
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_first_start_seeds_dreaming_once_and_a_cancelled_one_stays_cancelled() {
-    use agent::db::MemoryStore;
-    let w = world_at("2026-11-10T06:00:00Z").await;
-    // Prod: the tick's own marker is set.
-    w.f.db.set("schedule.initialized", "1").unwrap();
-    let id = agent::schedule::seed(w.engine(), chrono_tz::UTC).await.unwrap().expect("seeded");
-    let task = w.active_task(id).await;
-    assert_eq!((task.cron.as_str(), task.source.as_deref(), task.recurring), ("0 4 * * *", Some("dreaming"), true));
-    assert!(task.prompt.contains("Previous fire"));
-    assert_eq!(agent::schedule::seed(w.engine(), chrono_tz::UTC).await.unwrap(), None, "never again");
-    assert_eq!(w.cancel(id).await["ok"], true);
-    assert_eq!(agent::schedule::seed(w.engine(), chrono_tz::UTC).await.unwrap(), None);
-    assert!(w.active_task(id).await.cancelled, "a cancelled dreaming stays cancelled");
-    assert_eq!(tasks_named(&w).await, [format!("task-{id}")]);
-    // It fires as a `dreaming` signal.
-    let fresh = world_at("2026-11-10T03:00:00Z").await;
-    let id = agent::schedule::seed(fresh.engine(), chrono_tz::UTC).await.unwrap().unwrap();
-    let (fire, _, _, _) = fresh.fire_at("2026-11-10T04:00:00.300Z", 1).await;
-    assert_eq!(fresh.drain().await.ran, 1);
-    assert!(fresh.f.db.get_trace(&format!("dreaming:{fire}")).unwrap().is_some());
-    assert!(fresh.model.fires()[0].contains(&format!("Scheduled task #{id} fired.")));
-    w.supervisor.shutdown().await;
-    fresh.supervisor.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_crash_between_the_seed_key_and_the_activation_completes_the_same_task() {
-    use agent::db::MemoryStore;
-    let w = world_at("2026-11-10T06:00:00Z").await;
-    // The key was written, the process died before the definition.
-    let id = w.engine().deps.schedule.fires.seed_id().await.unwrap();
-    assert_eq!(w.f.db.get(agent::schedule::SEEDED).unwrap(), Some(id.to_string()));
-    assert_eq!(agent::schedule::seed(w.engine(), chrono_tz::UTC).await.unwrap(), Some(id));
-    assert_eq!(agent::schedule::seed(w.engine(), chrono_tz::UTC).await.unwrap(), None);
-    assert_eq!(tasks_named(&w).await, [format!("task-{id}")], "no second one");
-    w.supervisor.shutdown().await;
-}
-
-// ── 13. validation and the cap ──────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn invalid_crons_and_the_task_past_the_cap_are_refused_and_save_nothing() {

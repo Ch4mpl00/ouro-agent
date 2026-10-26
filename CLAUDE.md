@@ -87,10 +87,11 @@ deletion.
    `TELEGRAM_TOPICS_JSON` in its own env). Fire ids start above 10⁹, so
    `scheduler:<id>` never lands on an older MCP signal's trace. A zone watch
    (60 s) moves recurring tasks when the user's zone changes; after downtime
-   a task fires once, for its oldest missed slot. The first start seeds the
-   system task (the nightly `dreaming` tick) once; MCP's old tasks are not
-   imported. Digests are user-specific: they are tasks once the user asks
-   for them, never in the seed. The engine's store is the only copy of the
+   a task fires once, for its oldest missed slot. Nothing is seeded (the
+   system `dreaming` task was removed by the maintainer; the skill stays and
+   can be scheduled when the user asks); MCP's old tasks are not imported.
+   Digests are user-specific: they are tasks once the user asks for them.
+   The engine's store is the only copy of the
    tasks: export them before re-creating it (design 06, Rollout).
 3. The supervisor (`crates/agent/src/supervisor.rs`, composed in `main.rs`)
    loops on `get_next_signal`. With an empty queue it blocks on
@@ -220,7 +221,7 @@ mcp-tools/
     │   │                                   chain, real turns, reads and guard, writes mocked, nothing kept
     │   ├── src/schedule.rs                 scheduled tasks: `task-<id>` definitions on engine triggers,
     │   │                                   the fire table and its drain, the zone watch, the schedule
-    │   │                                   tools, the system task's seed
+    │   │                                   tools
     │   ├── src/agent.rs                    the engine, the loop's turn/tool/settle, synthetic tools
     │   ├── src/guard.rs                    loop write/open-world policy, deterministic rules, batched verdicts
     │   ├── guard/                          compiled guard instructions and reason data (git-owned)

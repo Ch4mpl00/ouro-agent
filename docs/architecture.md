@@ -133,7 +133,7 @@ mcp-tools/
 | `telegram` | Bot `getUpdates` poller in `crates/mcp` (accepts only `TELEGRAM_DEFAULT_CHAT_ID`) | long-poll |
 | `nashdom-bill` | Gmail poller in `crates/mcp`; one entry in `gmail.rs` `SUBSCRIPTIONS` per mail-driven source | 1 min |
 | `peer` | Another agent calling `ask_ouro` (see [Peer messaging](#peer-messaging)) | on demand |
-| `scheduler` (or a task's own source, e.g. `dreaming`) | The agent's own schedule (`crates/agent/src/schedule.rs`): engine triggers record fires, the supervisor's drain runs them without the queue | at the slot |
+| `scheduler` (or a task's own source) | The agent's own schedule (`crates/agent/src/schedule.rs`): engine triggers record fires, the supervisor's drain runs them without the queue | at the slot |
 
 The MCP server also runs a **news harvester**. It polls Hacker News every
 15 min, Habr every 30 min, and the user's subscribed Telegram channels (through
@@ -349,8 +349,8 @@ the loop.
 writes a live skill with `write_skill`. Telegram communication rules exist
 only that way. They live in the live overlay (`skills/telegram.md`) and
 preselection brings them in. A fresh install has none until the agent is
-asked to save some. The nightly `dreaming` task reviews recent signals and
-may revise skills.
+asked to save some. The `dreaming` skill reviews recent signals and may
+revise skills; nothing schedules it unless the user asks for it.
 
 **Improver overlay.** The closed-loop improver in `crates/evals` writes
 append-only lessons to `skills/<name>.patch.md`. At runtime the patch is
@@ -387,9 +387,9 @@ supervisor's drain runs it as a signal. A fire whose signal run started is
 never repeated, even if it failed. After downtime a task fires once, for its
 oldest missed slot. `schedule_task` takes a 5-field cron expression,
 `recurring: false` for a one-shot, `cron_expr: "now"` to run right away, and
-`workflow: <name>` to run a saved workflow instead of planning the task. The
-first start seeds the system task, the nightly `dreaming` review; the tasks
-MCP used to hold are not imported. There are no digests until the user asks
+`workflow: <name>` to run a saved workflow instead of planning the task.
+Nothing is seeded (the system `dreaming` task was removed); the tasks MCP
+used to hold are not imported. There are no digests until the user asks
 the agent to schedule them: user-specific prompts live in the engine's store,
 not in git.
 

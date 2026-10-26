@@ -248,19 +248,13 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
             );
             // Scheduled tasks are engine definitions (`task-<id>`): their
             // triggers record fires, and the drain runs each one through the
-            // supervisor, one signal at a time with the queue's. The first
-            // start seeds the system task; the zone watch keeps recurring
+            // supervisor, one signal at a time with the queue's. Nothing is
+            // seeded (schedule.rs header); the zone watch keeps recurring
             // tasks on the user's zone (schedule.rs, design 06). Not in
             // `--once`: fires recorded then wait for the next normal start.
             let schedule_cancel = stopping.child_token();
             let mut scheduled = Vec::new();
             if !once {
-                let zone = agent::schedule::user_zone(&engine, &stopping).await.unwrap_or(chrono_tz::Tz::UTC);
-                match agent::schedule::seed(&engine, zone).await {
-                    Ok(Some(id)) => eprintln!("[schedule] system task #{id} seeded"),
-                    Ok(None) => {}
-                    Err(error) => eprintln!("[schedule] seeding failed, retried on the next start: {error:#}"),
-                }
                 scheduled.push(tokio::spawn(run_drain(
                     supervisor.clone(),
                     config.env_context.clone(),

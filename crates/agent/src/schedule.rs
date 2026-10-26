@@ -12,7 +12,11 @@
 //   3. the drain and the zone watch
 //   4. tools — schedule_task / list_scheduled_tasks / cancel_scheduled_task
 //   5. fire_scheduled — what a trigger's run records
-//   6. boot — the system task, seeded once
+//
+// Nothing is seeded. Design 06 decision 14 seeded a system `dreaming` task
+// on the first start; the maintainer removed it (LOG.md, 2026-10-26). The
+// `dreaming` skill stays, and the agent schedules it when the user asks. The
+// key the seed wrote (`schedule.engine_seeded`) is no longer read.
 use crate::{
     agent::Engine,
     db::AgentDb,
@@ -87,13 +91,7 @@ pub trait FireStore: Send + Sync {
     async fn latest(&self, task_id: i64) -> anyhow::Result<Option<Fire>>;
     /// A new task id, never one used before.
     async fn next_task_id(&self) -> anyhow::Result<i64>;
-    /// The system task's id: allocated and stored under `SEEDED` the first
-    /// time, the same id ever after (decision 14).
-    async fn seed_id(&self) -> anyhow::Result<i64>;
 }
-
-/// The memory key holding the system task's id.
-pub const SEEDED: &str = "schedule.engine_seeded";
 
 /// Fire ids continue above any signal id MCP handed out (migration 0005), so
 /// a fire's trace and run (`scheduler:<id>`, `signal:<id>`) never land on an
@@ -203,26 +201,6 @@ impl FireStore for AgentDb {
         })
         .await
     }
-
-    async fn seed_id(&self) -> anyhow::Result<i64> {
-        self.write(|db| {
-            let mut conn = db.conn();
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let stored: Option<String> =
-                tx.query_row("SELECT value FROM memory WHERE key = ?1", [SEEDED], |r| r.get(0)).optional()?;
-            if let Some(id) = stored.and_then(|v| v.parse().ok()) {
-                return Ok(id);
-            }
-            let id: i64 = tx.query_row("INSERT INTO task_ids DEFAULT VALUES RETURNING id", [], |r| r.get(0))?;
-            tx.execute(
-                "INSERT INTO memory (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-                params![SEEDED, id.to_string()],
-            )?;
-            tx.commit()?;
-            Ok(id)
-        })
-        .await
-    }
 }
 
 /// The same contract without a database.
@@ -233,7 +211,6 @@ pub struct MemoryFires(Mutex<MemoryState>);
 struct MemoryState {
     fires: Vec<Fire>,
     tasks: i64,
-    seeded: Option<i64>,
 }
 
 #[async_trait]
@@ -278,15 +255,6 @@ impl FireStore for MemoryFires {
     async fn next_task_id(&self) -> anyhow::Result<i64> {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         state.tasks += 1;
-        Ok(state.tasks)
-    }
-    async fn seed_id(&self) -> anyhow::Result<i64> {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(id) = state.seeded {
-            return Ok(id);
-        }
-        state.tasks += 1;
-        state.seeded = Some(state.tasks);
         Ok(state.tasks)
     }
 }
@@ -851,51 +819,6 @@ pub async fn fire(engine: &Engine, run: &SavedRun, slot: &Value) -> Result<Value
         .map_err(FireFailure::Storage)?;
     schedules.wake();
     Ok(json!({"fire": id}))
-}
-
-// ── 6. boot ────────────────────────────────────────────────────────────────
-
-const DREAMING_CRON: &str = "0 4 * * *";
-const DREAMING_SOURCE: &str = "dreaming";
-const DREAMING_PROMPT: &str = "Daily dreaming tick. Review the signals processed since the \
-             previous dreaming fire (see 'Previous fire' header above) and \
-             consider whether any skill files deserve an edit based on \
-             patterns, recurring user feedback, or failure modes you \
-             observed. Use list_signals(since=<previous fire>) to scope \
-             the review. Edit skills via write_skill when warranted.";
-
-/// The first start under `SEEDED` (decision 14) creates the system task,
-/// the generic dreaming tick, on `zone`; never again, so a cancelled one
-/// stays cancelled. Crash-safe: the id is allocated and stored first, and a
-/// stored id whose definition has no active version is completed. User
-/// tasks (the digests) are never shipped. Returns the task's id when this
-/// start created or completed it.
-pub async fn seed(engine: &Engine, zone: Tz) -> anyhow::Result<Option<i64>> {
-    let schedules = &engine.deps.schedule;
-    let _writing = schedules.writes.lock().await;
-    let id = schedules.fires.seed_id().await?;
-    let name = task_name(id);
-    let definitions = engine.runtime.definitions(&name).await?;
-    if definitions.active.is_some() {
-        return Ok(None);
-    }
-    if let Some(&version) = definitions.versions.keys().next_back() {
-        engine.runtime.activate_as(&name, version, "agent", Some("seeded")).await?;
-        return Ok(Some(id));
-    }
-    let task = Task {
-        id,
-        cron: DREAMING_CRON.into(),
-        recurring: true,
-        prompt: DREAMING_PROMPT.into(),
-        source: Some(DREAMING_SOURCE.into()),
-        workflow: None,
-        timezone: zone.name().into(),
-        created: iso(now(engine)),
-        cancelled: false,
-    };
-    put(engine, &name, &definition(&task, &Trigger::Cron(zone)), "seeded").await?;
-    Ok(Some(id))
 }
 
 #[cfg(test)]

@@ -20,8 +20,9 @@ Typical routes:
 - `news-query`: a specific news subject, region, person or event.
 - `tech-digest`: IT news across HN, Habr and Telegram.
 - `nashdom-bill`: utility mail and PDF extraction.
-- `dreaming`: the scheduled skill-maintenance task. It may update skills
-  as assigned; it should report what changed.
+- `dreaming`: skill maintenance, run only when the user asks for it (or
+  schedules it). It may update skills as assigned; it should report what
+  changed.
 - `workflow-author`: author or change a saved task, the agent's own loop,
   signal handling or routing. Examples: "присылай каждое утро …",
   "поправь цикл для Telegram", "сначала покажи статус", "заканчивай после

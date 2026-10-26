@@ -162,6 +162,8 @@ decides trip notices".
     save and activate `task-<id>` idempotently (a key with an id whose
     definition has no version is completed; identical YAML is the same
     digest). Not in `--once`.
+    **Removed by the maintainer (2026-10-26)**: nothing is seeded; see
+    Deviations.
     MCP's import goes (overview decision 2); `list_scheduled_tasks` stays in
     `SUPERVISOR_ONLY_TOOLS`.
 15. **A cap (R-H3).** `schedule_task` refuses past 100 live tasks (not
@@ -327,7 +329,8 @@ manual clock (`tests/support` `fixture_clocked`, `Engine.clock`; R-L3).
     by expression runs a child whose `fire_scheduled` completes with
     `refused` and records nothing, and the supervisor stays live;
     `workflow_functions` does not list `fire_scheduled`.
-12. Boot: a fresh database seeds dreaming once; a database with
+12. *(Removed with decision 14's seed, see Deviations.)* Boot: a fresh
+    database seeds dreaming once; a database with
     `schedule.initialized` already set (prod) seeds it once too; a second
     start seeds nothing; a cancelled dreaming stays cancelled; a crash
     after the key was written and before activation completes the same
@@ -360,7 +363,7 @@ whose run exists (test 5b); old fires left `pending` by the migration (test
 Before deploying the engine migration: export prod's tasks
 (`sqlite3 -json … "SELECT * FROM scheduled_tasks"`) into the maintainer's
 private notes, not the repo, and recreate them by hand after the deploy
-(overview decision 2); dreaming is seeded. The same export is the procedure
+(overview decision 2); nothing is seeded (decision 14 removed). The same export is the procedure
 before any future engine store re-creation. No deploy without the
 maintainer.
 
@@ -370,6 +373,16 @@ None blocking. Reversible: the cap of 100 (decision 15).
 
 ## Deviations
 
-None found against the code: the step 5 executor implemented the decisions
-as written. Choices the document leaves open are in [LOG.md](LOG.md),
-"step 5 (executor)".
+The step 5 executor implemented the decisions as written. Choices the
+document leaves open are in [LOG.md](LOG.md), "step 5 (executor)".
+
+- **Decision 14 removed (maintainer, 2026-10-26: "dreaming isn't needed for
+  now").** The first start seeds no task: `schedule::seed`, the `DREAMING_*`
+  constants, `FireStore::seed_id` and the `schedule.engine_seeded` key are
+  gone, and so are test 12's two tests and the `--once`/normal-start
+  assertions in `runtime_process.rs`. A database where the key was written
+  keeps it unread (no migration deletes it). The `dreaming` skill stays; the
+  agent schedules it when the user asks. Such a task fires as a `scheduler`
+  signal (`schedule_task` sets no source), so its primary loop may write
+  skills, while a worker delegated with the `dreaming` skill may not (a
+  worker's skill writes need a `dreaming` signal, `signal.yaml`).
