@@ -81,7 +81,16 @@ pub fn create_engine(deps: EngineDeps) -> Arc<Engine> {
 
 /// An engine with the runtime configured as `config` (capacity, budget).
 pub fn create_engine_with(deps: EngineDeps, config: ouro_runtime::Config) -> Arc<Engine> {
-    let clock: Arc<dyn ouro_runtime::durable::Clock> = Arc::new(ouro_runtime::durable::SystemClock);
+    create_engine_on(deps, config, Arc::new(ouro_runtime::durable::SystemClock))
+}
+
+/// An engine whose runtime keeps time by `clock` (its timers, leases and
+/// timeouts): tests move it past a 24-hour confirmation.
+pub fn create_engine_on(
+    deps: EngineDeps,
+    config: ouro_runtime::Config,
+    clock: Arc<dyn ouro_runtime::durable::Clock>,
+) -> Arc<Engine> {
     let (lifecycle, events) = crate::runs::Lifecycle::new(10_000);
     let store = deps.store.clone();
     Arc::new_cyclic(|engine: &Weak<Engine>| {
