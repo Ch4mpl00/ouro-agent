@@ -1,8 +1,8 @@
 // Workflows (`flows.rs`): the gate a definition passes, the authoring
 // tools over the engine's catalog, the author's catalog and probes, the
 // model steps, and a scheduled task's saved workflow as the signal's primary
-// run (design 04). The dry run is parked for the sandbox step
-// (tests/pending/flows.rs).
+// run (design 04), and a dry run of a draft without a signal (the sandbox
+// step, design 05, test 2).
 mod support;
 use agent::{
     agent::{Engine, EngineDeps, Providers, create_engine},
@@ -88,7 +88,8 @@ struct World {
     engine: Arc<Engine>,
     mcp: Arc<ToolMcp>,
     written: Arc<support::TraceLog>,
-    store: Arc<dyn ouro_runtime::durable::RunStore>,
+    persist: Arc<PersistLog>,
+    store: (Arc<dyn ouro_runtime::durable::RunStore>, Arc<dyn ouro_runtime::durable::RunStore>),
 }
 
 fn world(replies: Vec<&str>) -> World {
@@ -96,7 +97,7 @@ fn world(replies: Vec<&str>) -> World {
 }
 
 fn world_with(replies: Vec<&str>, decisions: Option<Arc<agent::decisions::DecisionClient>>) -> World {
-    world_on(replies, decisions, agent::runs::memory_store(), &[])
+    world_on(replies, decisions, agent::runs::memory_store_with_view(), &[])
 }
 
 // A world on the engine store `store` (another process's, after a restart),
@@ -104,7 +105,7 @@ fn world_with(replies: Vec<&str>, decisions: Option<Arc<agent::decisions::Decisi
 fn world_on(
     replies: Vec<&str>,
     decisions: Option<Arc<agent::decisions::DecisionClient>>,
-    store: Arc<dyn ouro_runtime::durable::RunStore>,
+    store: (Arc<dyn ouro_runtime::durable::RunStore>, Arc<dyn ouro_runtime::durable::RunStore>),
     extra: &[&str],
 ) -> World {
     let llm: Arc<Scripted> = Arc::new(Scripted::new(replies.into_iter().map(assistant).collect()));
@@ -150,10 +151,11 @@ fn world_on(
         decisions,
         env: Default::default(),
         db: agent::db::AgentDb::open(":memory:").unwrap(),
-        store: store.clone(),
+        store: store.0.clone(),
+        dry_store: store.1.clone(),
         schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
     });
-    World { engine, mcp, written, store }
+    World { engine, mcp, written, persist, store }
 }
 
 impl World {
@@ -590,7 +592,7 @@ async fn only_an_active_version_runs() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_definition_that_no_longer_validates_changes_nothing() {
-    let before = world_on(vec![], None, agent::runs::memory_store(), &["search_web"]);
+    let before = world_on(vec![], None, agent::runs::memory_store_with_view(), &["search_web"]);
     activate_definition(&before.engine, "digest", &DIGEST.replace("call: search_news", "call: search_web")).await;
     before.engine.halt().await;
     // The next process's MCP has no `search_web` (and no snapshot of it).
@@ -810,4 +812,72 @@ async fn a_compose_with_a_missing_skill_fails_before_generation() {
     assert_eq!(error.to_string(), "skill not found: missing");
     assert!(model.seen.lock().unwrap().is_empty());
     f.engine.shutdown().await;
+}
+
+// ── dry runs without a signal (design 05, test 2) ───────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dry_run_records_the_writes_and_changes_nothing() {
+    let w = world(vec!["Today: Rust 2.0"]);
+    let draft = DIGEST.replace("do:\n", "do:\n  - pause: { wait: PT1H }\n");
+    let saved = w.tool("save_workflow", json!({"name": "digest", "definition": draft})).await.unwrap();
+    assert_eq!(saved["version"], 1, "{saved}");
+    let session = support::task_context("author");
+    let cancel = CancellationToken::new();
+    let trace = w.engine.deps.tracer.trace(agent::tracing::TraceStart {
+        id: "author".into(),
+        name: "t".into(),
+        ..Default::default()
+    });
+    let scope: agent::tracing::Scope = trace.clone();
+    let args = |v: Value| v.as_object().unwrap().clone();
+    let try_draft = agent::sandbox::try_draft;
+    let reply = try_draft(&w.engine, &args(json!({"name": "digest"})), &session, &scope, &cancel).await.unwrap();
+    trace.end();
+    let reply: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!((reply["status"].as_str(), reply["version"].as_u64()), (Some("completed"), Some(1)), "{reply}");
+
+    assert_eq!(w.calls().iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["search_news"], "only the read ran");
+    assert!(w.persist.0.lock().unwrap().is_empty(), "no watermark moved");
+    let writes: Vec<(&str, &str, &str)> = reply["writes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| (w["function"].as_str().unwrap(), w["task"].as_str().unwrap(), w["via"].as_str().unwrap()))
+        .collect();
+    assert_eq!(writes, [("send_telegram_message", "/do/3/send", "yaml"), ("set_memory", "/do/4/mark", "yaml")]);
+    assert_eq!(reply["writes"][0]["arguments"]["text"], "Today: Rust 2.0");
+    let compose = reply["steps"].as_array().unwrap().iter().find(|s| s["task"] == "/do/2/compose").unwrap();
+    assert_eq!(compose["output"], "Today: Rust 2.0");
+    assert_eq!(reply["path"], json!(["pause", "search", "compose", "send", "mark"]));
+    let digest = ouro_runtime::durable::digest_of(&draft);
+    let meta = agent::flows::WorkflowMeta::get(&w.engine.deps.db, "digest", &digest).unwrap().unwrap();
+    assert!(meta.tried_ms.is_some(), "a completed dry run marks it");
+    assert!(reply["next"].as_str().unwrap().contains("fix"), "{reply}");
+    let observations = w.written.all().into_iter().find(|t| t.id == "author").unwrap().observations;
+    let run = observations.iter().find(|o| o.name == "dry-run").unwrap();
+    assert_eq!(run.metadata.as_ref().unwrap()["workflow"], "digest");
+    let search = observations.iter().find(|o| o.name == "search_news").unwrap();
+    assert_eq!(search.parent_observation_id.as_deref(), Some(run.id.as_str()));
+    assert!(try_draft(&w.engine, &args(json!({"name": "nope"})), &session, &scope, &cancel).await.is_err());
+}
+
+// A version that no longer passes the gate (a tool went away) is not tried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dry_run_of_a_version_that_no_longer_fits_the_tools_is_refused() {
+    let before = world_on(vec![], None, agent::runs::memory_store_with_view(), &["search_web"]);
+    let calling = DIGEST.replace("call: search_news", "call: search_web").replace("query:", "q:");
+    before.tool("save_workflow", json!({"name": "digest", "definition": calling})).await.unwrap();
+    let w = world_on(vec![], None, before.store.clone(), &[]);
+    let session = support::task_context("author");
+    let args = json!({"name": "digest", "version": 1});
+    let invalid = agent::sandbox::try_draft(
+        &w.engine,
+        args.as_object().unwrap(),
+        &session,
+        &agent::tracing::null_scope(),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(invalid.unwrap_err().to_string().contains("search_web"));
 }

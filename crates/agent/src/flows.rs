@@ -142,6 +142,30 @@ impl WorkflowMeta for AgentDb {
     }
 }
 
+impl AgentDb {
+    /// Copies every `workflow_meta` row into `to`: what a dry run's
+    /// database knows of the versions (sandbox.rs, design 05 decision 1).
+    pub fn copy_workflow_meta(&self, to: &AgentDb) -> anyhow::Result<()> {
+        let rows: Vec<Meta> = {
+            let conn = self.read();
+            let mut statement =
+                conn.prepare("SELECT name, digest, note, builtin, created_ms, tried_ms FROM workflow_meta")?;
+            statement.query_map([], meta_row)?.collect::<rusqlite::Result<_>>()?
+        };
+        let mut conn = to.conn();
+        let tx = conn.transaction()?;
+        for m in rows {
+            tx.execute(
+                "INSERT OR REPLACE INTO workflow_meta (name, digest, note, builtin, created_ms, tried_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![m.name, m.digest, m.note, m.builtin, m.created_ms, m.tried_ms],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
 /// The same contract without a database, for tests and tools that need none.
 #[derive(Default)]
 pub struct MemoryMeta(Mutex<BTreeMap<(String, String), Meta>>);
@@ -730,6 +754,15 @@ pub fn takes_turns(wf: &Workflow) -> bool {
     ouro_runtime::ows::model::call_sites(wf).iter().any(|s| s.function == "agent_turn")
 }
 
+/// A workflow the runtime runs on a signal of its own choosing: the
+/// dispatcher, the loop, a loop variant or a route (a scheduled task's
+/// workflow runs on its own fires). Ported from `main`.
+pub fn is_runtime_workflow(name: &str, wf: &Workflow) -> bool {
+    built_in(name).is_some()
+        || workflow_metadata(wf).get("loop").is_some()
+        || workflow_metadata(wf).get("route").is_some()
+}
+
 #[derive(Clone, Debug)]
 pub struct Route {
     pub when: BTreeMap<String, Vec<String>>,
@@ -964,6 +997,10 @@ pub const MAX_DRAFTS: usize = 20;
 /// The engine issue for pruning never-activated versions.
 pub const PRUNING_ISSUE: &str = "Ch4mpl00/ouro#36";
 
+/// How long a dry run may take before it is stopped (`try_workflow`, ported
+/// from `main`).
+pub const DRY_RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 // What a probe returns at most: enough to see a reply's shape, never a
 // whole store.
 const PROBE_MAX_CHARS: usize = 6000;
@@ -1039,10 +1076,7 @@ pub async fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> any
                 })
                 .collect();
             let then = "before the user sees it, then describe in words what it will do, the at-most-once calls above all; activate this version only after they confirm it in the chat.";
-            let runtime_workflow = built_in(&name).is_some()
-                || workflow_metadata(wf).get("loop").is_some()
-                || workflow_metadata(wf).get("route").is_some();
-            let next = if runtime_workflow {
+            let next = if is_runtime_workflow(&name, wf) {
                 format!(
                     "Dry-run it on a signal of the type it handles (try_workflow with `signal`, and `drafts` for the other drafts of the chain) {then}"
                 )

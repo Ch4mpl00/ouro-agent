@@ -5,8 +5,9 @@
 // a workflow starts itself is never admitted (engine_runs.rs,
 // a_loop_a_workflow_starts_itself_is_never_admitted). Restored from
 // tests/pending on the engine (design 04): a scheduled task's saved workflow
-// is the signal's primary run (`run_saved_workflow`); the dry run of the
-// first test stays parked for the sandbox step (tests/pending/workflow_kinds.rs).
+// is the signal's primary run (`run_saved_workflow`); the first test's dry
+// run (try_workflow on a fire of its task) came back with the sandbox step
+// (design 05, test 3).
 mod support;
 use agent::{
     agent::{AGENT_LOOP, Engine},
@@ -16,6 +17,7 @@ use agent::{
     schedule::{FIRST_FIRE_ID, Fire, FireSink, SupervisorSink},
     supervisor::{Supervisor, create_supervisor},
     trace_model::Observation,
+    tracing::{Scope, TraceStart},
 };
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
@@ -195,23 +197,49 @@ fn send() -> agent::providers::Message {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_semi_deterministic_workflow_saves_tries_and_runs_on_a_scheduled_signal() {
-    let a = agent(vec![send(), assistant("Sent the summary.")]);
+    let a = agent(vec![send(), assistant("Sent the summary."), send(), assistant("Sent the summary.")]);
     let definition = pages();
     assert!(!definition.contains("metadata: { loop"), "not a loop: a scheduled task's workflow");
     let saved = a.tool("save_workflow", json!({"name":"pages","definition":definition})).await.unwrap();
     assert!(saved["next"].as_str().unwrap().contains("payload: {workflow: \"pages\"}"), "{saved}");
-    // The dry run (try_workflow on a fire of its task) returns with the
-    // sandbox step; its record of a completed dry run is what activation needs.
-    mark_tried(&a.f.engine, "pages", &definition);
+    // The scheduled form of a dry run has no admitted input for its turns.
+    let trace =
+        a.f.engine.deps.tracer.trace(TraceStart { id: "author".into(), name: "author".into(), ..Default::default() });
+    let scope: Scope = trace.clone();
+    let cancel = CancellationToken::new();
+    // The dry signal's env is the builder session's: its chat (R-L4).
+    let author = agent::session::session(
+        "author",
+        agent::session::EnvData { telegram_chat_id: Some("999".into()), ..context().env.clone() },
+    );
+    let plain = json!({"name":"pages"});
+    let plain = agent::sandbox::try_draft(&a.f.engine, plain.as_object().unwrap(), &author, &scope, &cancel).await;
+    assert!(plain.unwrap_err().to_string().contains("takes agent turns"));
+
+    // Dry run on a fire of its task: the same admission, writes mocked.
+    let args = json!({"name":"pages","signal":{"source":"scheduler","content":"Summarize the pages for me.","payload":{"workflow":"pages"}}});
+    let report: Value = serde_json::from_str(
+        &agent::sandbox::try_signal(&a.f.engine, args.as_object().unwrap(), &author, &scope, &cancel).await.unwrap(),
+    )
+    .unwrap();
+    trace.end();
+    assert_eq!(report["status"], "completed", "{report:#}");
+    assert_eq!(report["drafts"], json!([{"name":"pages","version":1,"ran":true,"outcome":"completed"}]));
+    let writes = report["writes"].as_array().unwrap();
+    assert_eq!(writes.len(), 1, "{report:#}");
+    assert_eq!((writes[0]["function"].as_str(), writes[0]["via"].as_str()), (Some(SEND.0), Some("tool")));
+    assert_eq!(writes[0]["arguments"], json!({"chatId":"999","text":SEND.1}));
+    assert_eq!((report["ended"]["by"].as_str(), report["ended"]["turns"].as_u64()), (Some("answer"), Some(2)));
+    assert!(a.world.called(SEND.0).is_empty(), "the dry run sent nothing");
     a.tool("activate_workflow", json!({"name":"pages","version":1})).await.unwrap();
 
     let id = a.fire("pages", "Summarize the pages for me.").await;
-    let urls: Vec<Value> = a.world.called("fetch_page").iter().map(|args| args["url"].clone()).collect();
+    let urls: Vec<Value> = a.world.called("fetch_page").iter().skip(2).map(|args| args["url"].clone()).collect();
     assert_eq!(urls.len(), 2, "each page read once by the steps, not by the model");
     assert!(urls.contains(&json!("https://a.example/1")) && urls.contains(&json!("https://b.example/2")));
     assert_eq!(a.world.called(SEND.0).len(), 1);
     let seen = a.model.seen.lock().unwrap().clone();
-    let first = &seen[0];
+    let first = &seen[2];
     for part in ["Body of https://a.example/1", "Body of https://b.example/2", "SCHEDULER"] {
         assert!(system(first).contains(part), "{part}: {}", system(first));
     }

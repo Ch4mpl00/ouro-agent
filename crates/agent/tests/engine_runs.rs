@@ -90,6 +90,7 @@ const CHAT: &str = "42";
 #[derive(Clone)]
 struct Parts {
     store: Arc<dyn ouro_runtime::durable::RunStore>,
+    dry_store: Arc<dyn ouro_runtime::durable::RunStore>,
     db: AgentDb,
     mcp: Arc<ToolMcp>,
     model: Arc<Turns>,
@@ -106,6 +107,7 @@ fn tools() -> Vec<agent::providers::ToolDef> {
 
 // Telegram answers a send with its message id; the rest answer "ok".
 fn parts(turns: Vec<Turn>) -> Parts {
+    let (store, dry_store) = agent::runs::memory_store_with_view();
     let mcp = ToolMcp::returning(tools(), "ok");
     mcp.always(Arc::new(|name, args, _| {
         Box::pin(async move {
@@ -117,7 +119,8 @@ fn parts(turns: Vec<Turn>) -> Parts {
         })
     }));
     Parts {
-        store: agent::runs::memory_store(),
+        store,
+        dry_store,
         db: AgentDb::open(":memory:").unwrap(),
         mcp,
         model: Turns::new(turns),
@@ -152,6 +155,7 @@ fn engine_with(parts: &Parts, config: ouro_runtime::Config) -> Arc<Engine> {
             env: agent::session::EnvConfig { user_email: None, telegram_chat_id: Some(CHAT.into()) },
             db: parts.db.clone(),
             store: parts.store.clone(),
+            dry_store: parts.dry_store.clone(),
         },
         config,
     )
@@ -338,14 +342,12 @@ async fn a_write_without_a_guard_child_is_reviewed_inline_and_a_foreign_guard_ru
     let live = loop_of(&parts, &engine, "loop-2", "save the note").await;
     let write = json!({"id":"c1","name":"append_doc","arguments":"{\"text\":\"x\"}"});
     // No guard child: the host reviews the call itself before dispatch.
-    agent::agent::loop_tool(&engine, &live, &json!({"call":write,"i":1,"index":0}), "loop-2", "k1", true)
-        .await
-        .unwrap();
+    support::loop_tool(&engine, &live, &json!({"call":write,"i":1,"index":0}), "loop-2", "k1", true).await.unwrap();
     assert_eq!(parts.guard.requests.lock().unwrap().len(), 1, "one review");
     assert_eq!(count(&parts.mcp, "append_doc"), 1);
     // A guard run that is not this run's own guard child is refused.
     let foreign = json!({"call":write,"guard_run":"signal:9","i":1,"index":0});
-    let error = agent::agent::loop_tool(&engine, &live, &foreign, "loop-2", "k2", true).await.unwrap_err();
+    let error = support::loop_tool(&engine, &live, &foreign, "loop-2", "k2", true).await.unwrap_err();
     assert!(error.downcast_ref::<agent::agent::Refusal>().is_some(), "{error}");
     assert_eq!(count(&parts.mcp, "append_doc"), 1, "never dispatched");
 }
@@ -371,7 +373,7 @@ async fn a_pending_card_cannot_be_bypassed_by_omitting_the_guard_child() {
         })
         .unwrap();
     let args = json!({"call":{"id":"c1","name":"append_doc","arguments":"{}"},"i":1,"index":0});
-    let out = agent::agent::loop_tool(&engine, &live, &args, "loop-3", "k", true).await.unwrap();
+    let out = support::loop_tool(&engine, &live, &args, "loop-3", "k", true).await.unwrap();
     assert!(out["presented"].as_str().unwrap().contains("unverified_confirmation"), "{out}");
     assert_eq!(count(&parts.mcp, "append_doc"), 0);
 }

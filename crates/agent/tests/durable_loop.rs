@@ -72,11 +72,13 @@ impl World {
 #[derive(Clone)]
 struct Stores {
     store: Arc<dyn ouro_runtime::durable::RunStore>,
+    dry_store: Arc<dyn ouro_runtime::durable::RunStore>,
     db: AgentDb,
 }
 
 fn stores() -> Stores {
-    Stores { store: agent::runs::memory_store(), db: AgentDb::open(":memory:").unwrap() }
+    let (store, dry_store) = agent::runs::memory_store_with_view();
+    Stores { store, dry_store, db: AgentDb::open(":memory:").unwrap() }
 }
 
 fn engine_on(
@@ -105,6 +107,7 @@ fn engine_on(
         env: Default::default(),
         db: stores.db.clone(),
         store: stores.store.clone(),
+        dry_store: stores.dry_store.clone(),
         schedule: Arc::new(agent::schedule::MemorySchedule::default()),
     })
 }
@@ -459,7 +462,7 @@ async fn a_parent_reads_what_its_durable_worker_did() {
 async fn read(engine: &Arc<Engine>, live: &Arc<AgentLoop>, run: &str, args: Value) -> Value {
     let call = json!({"id": "history", "name": "read_run", "arguments": args.to_string()});
     let key = format!("read:{args}");
-    agent::agent::loop_tool(engine, live, &json!({"call": call}), run, &key, false).await.unwrap()
+    support::loop_tool(engine, live, &json!({"call": call}), run, &key, false).await.unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -861,7 +864,7 @@ async fn a_guard_child_result_cannot_authorize_another_invocation() {
     let guard = guard.expect("the round's guard child");
     let call = json!({"id":"call-0","name":"send","arguments":json!({"q":"once"}).to_string()});
     let args = json!({"call": call, "guard_run": guard.admission.id, "i": 1, "index": 0});
-    let again = agent::agent::loop_tool(&engine, &live, &args, "once", "another invocation", true).await.unwrap();
+    let again = support::loop_tool(&engine, &live, &args, "once", "another invocation", true).await.unwrap();
     assert!(again["presented"].as_str().unwrap().contains("already used"), "{again}");
     assert_eq!(world.names(), ["send"], "the verdict authorized one invocation");
 }

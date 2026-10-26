@@ -1,5 +1,6 @@
 // User confirmation: 1. pending cards and the SQLite store; 2. host-rendered
-// requests and resolution. Tokens authorize one exact call in one durable run.
+// requests and resolution; 3. a dry run's press. Tokens authorize one exact
+// call in one durable run.
 use crate::db::MemoryStore;
 use crate::{agent::ConfirmTarget, db::AgentDb, mcp::Mcp, providers::ToolCall};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -115,6 +116,9 @@ pub trait Store: Send + Sync {
     /// Cards created before `before_ms` and not answered: the cut-over's.
     fn unanswered_before(&self, before_ms: i64) -> anyhow::Result<Vec<Pending>>;
     fn expire(&self, run: &str, key: &str) -> anyhow::Result<()>;
+    /// Moves a card's creation `by_ms` into the past: how a dry run, which
+    /// never waits a day, lets its card expire (`press`).
+    fn backdate(&self, run: &str, key: &str, by_ms: i64) -> anyhow::Result<()>;
 }
 fn pending_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Pending> {
     Ok(Pending {
@@ -271,6 +275,13 @@ impl Store for AgentDb {
         self.conn().execute(
             "UPDATE confirmations SET outcome = 'expired' WHERE run_id = ?1 AND call_key = ?2 AND outcome IS NULL",
             params![run, key],
+        )?;
+        Ok(())
+    }
+    fn backdate(&self, run: &str, key: &str, by_ms: i64) -> anyhow::Result<()> {
+        self.conn().execute(
+            "UPDATE confirmations SET created_at_ms = created_at_ms - ?3 WHERE run_id = ?1 AND call_key = ?2",
+            params![run, key, by_ms],
         )?;
         Ok(())
     }
@@ -433,6 +444,83 @@ pub async fn expire_cut_over(
         edit_card(mcp, p, "expired", card, cancel).await;
     }
     Ok(cards.len())
+}
+
+// ── 3. a dry run's press ───────────────────────────────────────────────────
+
+/// How a dry run answers a card it does not send (`try_workflow`'s
+/// `confirm`, accept by default).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answer {
+    Confirm,
+    Decline,
+    Expire,
+}
+
+impl Answer {
+    pub fn parse(word: Option<&str>) -> anyhow::Result<Answer> {
+        Ok(match word {
+            None | Some("accept") => Answer::Confirm,
+            Some("decline") => Answer::Decline,
+            Some("expire") => Answer::Expire,
+            Some(other) => anyhow::bail!("confirm: `{other}` is not one of accept, decline, expire"),
+        })
+    }
+    pub fn word(self) -> &'static str {
+        match self {
+            Answer::Confirm => "accept",
+            Answer::Decline => "decline",
+            Answer::Expire => "expire",
+        }
+    }
+}
+
+// The message id a dry card stands in for: no message exists.
+pub const DRY_CARD_MESSAGE: i64 = 0;
+// Older than the 24 hours `resolve` asks of a real expiry.
+const DRY_EXPIRY_MS: i64 = 86_400_001;
+
+/// A dry run's request (design 05, decision 7): the card is stored and
+/// marked sent as a real one, but nothing is sent. The answer is in place
+/// at once: a press of its button delivered to the guard run asking (`ctx`'s
+/// own run), shaped as Telegram's, or for an expiry a card already a day old
+/// (the listen's timeout fires at once in a dry run). The guard's listen and
+/// `resolve` then take and verify it exactly as live.
+pub async fn press(
+    db: &AgentDb,
+    ctx: &ouro_runtime::FunctionContext,
+    req: Request<'_>,
+    answer: Answer,
+) -> anyhow::Result<Value> {
+    let key = crate::guard::key(req.call);
+    let (run, lookup) = (req.run.to_owned(), key.clone());
+    if let Some(p) = db.write(move |db| Store::get(db, &run, &lookup)).await? {
+        return Ok(json!({"required":true,"types":[p.yes,p.no]}));
+    }
+    let p = card(&req, key.clone());
+    let (row, run, sent) = (p.clone(), req.run.to_owned(), key.clone());
+    db.write(move |db| {
+        Store::insert(db, &row)?;
+        Store::sent(db, &run, &sent, DRY_CARD_MESSAGE)
+    })
+    .await?;
+    let types = json!({"required":true,"types":[p.yes,p.no]});
+    let (pressed, label) = match answer {
+        Answer::Confirm => (&p.yes, &req.card.confirm),
+        Answer::Decline => (&p.no, &req.card.decline),
+        Answer::Expire => {
+            let (run, card) = (req.run.to_owned(), key.clone());
+            db.write(move |db| Store::backdate(db, &run, &card, DRY_EXPIRY_MS)).await?;
+            return Ok(types);
+        }
+    };
+    // The shape of a Telegram button press (the supervisor's TelegramButton).
+    let chat = p.target.chat_id.parse::<i64>().map_or_else(|_| json!(p.target.chat_id), |id| json!(id));
+    let event = json!({"source": "telegram", "id": format!("dry_confirm:{pressed}"), "type": pressed,
+        "data": {"chatId": chat, "messageThreadId": p.target.message_thread_id,
+            "messageId": DRY_CARD_MESSAGE, "data": pressed, "text": label}});
+    ctx.deliver(event, &ctx.run_id).await.map_err(crate::runs::access_error)?;
+    Ok(types)
 }
 
 /// Why a press found no card to answer (design 03, decision 8): the agent

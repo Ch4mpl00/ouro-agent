@@ -457,9 +457,8 @@ async fn settle_exposes_ordered_generic_outcomes_before_model_truncation() {
     // t_read uses the same injected MCP as any other tool, with no channel contract.
     let mut results = Vec::new();
     for call in &calls[..4] {
-        let result = agent::agent::loop_tool(&f.engine, &live, &json!({"call":call}), "outcomes", "invocation", true)
-            .await
-            .unwrap();
+        let result =
+            support::loop_tool(&f.engine, &live, &json!({"call":call}), "outcomes", "invocation", true).await.unwrap();
         results.push(result);
     }
     assert!(results[0]["presented"].as_str().unwrap().contains("\"truncated\":true"));

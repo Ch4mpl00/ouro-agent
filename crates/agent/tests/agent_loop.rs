@@ -1069,6 +1069,7 @@ impl ChatProvider for Stub {
 }
 
 fn engine_with(openrouter: Option<Arc<dyn ChatProvider>>) -> Arc<agent::agent::Engine> {
+    let (store, dry_store) = agent::runs::memory_store_with_view();
     create_engine(EngineDeps {
         providers: Providers {
             openai: Arc::new(Stub(ProviderKind::Openai)),
@@ -1086,7 +1087,8 @@ fn engine_with(openrouter: Option<Arc<dyn ChatProvider>>) -> Arc<agent::agent::E
         decisions: None,
         env: Default::default(),
         db: agent::db::AgentDb::open(":memory:").unwrap(),
-        store: agent::runs::memory_store(),
+        store,
+        dry_store,
         schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
     })
 }

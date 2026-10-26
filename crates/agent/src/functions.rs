@@ -4,6 +4,12 @@
 // settlement; 6. guard functions; 7. dispatcher functions; 8. workflow steps;
 // 9. the catalog authors see.
 //
+// A handler reads its run tree (its own run, its ancestors, its descendants
+// and their records) through the call's run access (`FunctionContext::run`,
+// `records`, `children`; runs.rs §11), never through the engine's own
+// handle: in a dry run the call is driven by a private store (design 05,
+// decision 3).
+//
 // Every handler holds the engine weakly. A host function serves only the runs
 // its host data says it serves (`FunctionContext::host`): loop functions a
 // loop run, guard functions a guard run, dispatcher functions the signal's
@@ -14,7 +20,7 @@ use crate::{
     agent::{AGENT_LOOP_NAME, Effect, Engine, EngineDeps, LoopOptions, Refusal, refuse, tool_call},
     errors::is_aborted,
     providers,
-    runs::{Choice, Fallback, GUARD, GuardHost, Named, PRIMARY, RECOVERY, SIGNAL, SignalHost, Site},
+    runs::{Choice, Fallback, GUARD, GuardHost, Named, PRIMARY, RECOVERY, RunReads, SIGNAL, SignalHost, Site},
     supervisor::PendingSignal,
     tracing::{ContextUpdate, EventStart, Level, Scope, Span, SpanEnd, SpanKind, SpanStart},
 };
@@ -37,20 +43,7 @@ pub const AT_MOST_ONCE: &[&str] = &["tool_once", "confirm_request", "set_memory"
 /// one answers `not_executed`), the host functions and the workflow steps.
 pub fn registry(engine: Weak<Engine>, deps: &EngineDeps) -> Registry {
     let mut registry = Registry::new();
-    let mut tools: std::collections::BTreeMap<String, bool> =
-        deps.db.tool_snapshot().unwrap_or_default().into_iter().collect();
-    for tool in deps.mcp.tools() {
-        let read_only = deps.mcp.read_only(&tool.name);
-        tools.insert(tool.name, read_only);
-    }
-    for (name, read_only) in tools {
-        if WITHHELD.contains(&name.as_str())
-            || crate::mcp::SUPERVISOR_ONLY_TOOLS.contains(&name.as_str())
-            || HOST_FUNCTIONS.iter().any(|f| f.name == name)
-            || matches!(name.as_str(), "start_child" | "child_outcome")
-        {
-            continue;
-        }
+    for (name, read_only) in mcp_functions(deps) {
         let delivery = if read_only { Delivery::AtLeastOnce } else { Delivery::AtMostOnce };
         let tool = name.clone();
         add(&mut registry, &engine, &name, delivery, move |engine, args, ctx| {
@@ -86,6 +79,26 @@ pub fn registry(engine: Weak<Engine>, deps: &EngineDeps) -> Registry {
         add(&mut registry, &engine, name, repeat, move |e, a, c| step(e, a, c, name));
     }
     registry
+}
+
+/// The MCP tools the registry registers, each with whether MCP marks it
+/// read-only: every tool the snapshot ever held and MCP's current ones, but
+/// those no workflow may call. A dry run mocks the ones not read-only
+/// (sandbox.rs, design 05 decision 6).
+pub fn mcp_functions(deps: &EngineDeps) -> std::collections::BTreeMap<String, bool> {
+    let mut tools: std::collections::BTreeMap<String, bool> =
+        deps.db.tool_snapshot().unwrap_or_default().into_iter().collect();
+    for tool in deps.mcp.tools() {
+        let read_only = deps.mcp.read_only(&tool.name);
+        tools.insert(tool.name, read_only);
+    }
+    tools.retain(|name, _| {
+        !(WITHHELD.contains(&name.as_str())
+            || crate::mcp::SUPERVISOR_ONLY_TOOLS.contains(&name.as_str())
+            || HOST_FUNCTIONS.iter().any(|f| f.name == name)
+            || matches!(name.as_str(), "start_child" | "child_outcome"))
+    });
+    tools
 }
 
 fn add<F, Fut>(registry: &mut Registry, engine: &Weak<Engine>, name: &str, delivery: Delivery, handler: F)
@@ -231,7 +244,7 @@ impl Drop for PendingToolSpan {
 // ── 3. loop functions ───────────────────────────────────────────────────────
 
 async fn live_loop(engine: &Arc<Engine>, ctx: &FunctionContext) -> anyhow::Result<crate::agent::Entered> {
-    Ok(engine.loop_of(&ctx.run_id, ctx.host(), &ctx.function).await?.0)
+    Ok(engine.loop_of(ctx, &ctx.run_id, ctx.host(), &ctx.function).await?.0)
 }
 
 async fn agent_turn(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
@@ -247,8 +260,8 @@ async fn agent_settle(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
 async fn loop_setup(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
     let setup = async {
         let live = live_loop(&engine, &ctx).await?;
-        let saved = engine.runtime.get(&ctx.run_id).await?.ok_or_else(|| anyhow::anyhow!("unknown run"))?;
-        let records = engine.runtime.records(&ctx.run_id).await?;
+        let saved = RunReads::run(&ctx, &ctx.run_id).await?.ok_or_else(|| anyhow::anyhow!("unknown run"))?;
+        let records = RunReads::records(&ctx, &ctx.run_id).await?;
         crate::agent::loop_setup(&engine, &live, &saved.admission.input, &args, &records).await
     };
     setup.await.map_err(failed)
@@ -268,7 +281,13 @@ async fn classify(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Res
 async fn tool(engine: Arc<Engine>, args: Value, ctx: FunctionContext, once: bool) -> Result<Value, FunctionError> {
     let call = async {
         let live = live_loop(&engine, &ctx).await?;
-        crate::agent::loop_tool(&engine, &live, &args, &ctx.run_id, &ctx.idempotency_key, once).await
+        let at = crate::agent::CallSite {
+            runs: &ctx,
+            run: &ctx.run_id,
+            task: &ctx.task_path,
+            invocation: &ctx.idempotency_key,
+        };
+        crate::agent::loop_tool(&engine, &live, &args, &at, once).await
     };
     call.await.map_err(if once { failed_once } else { failed })
 }
@@ -289,8 +308,8 @@ async fn context(
     let call = async {
         let at = match crate::runs::host_kind(ctx.host()) {
             Some(SIGNAL) => {
-                let (host, signal) = signal_of(&engine, &ctx, name).await?;
-                let records = engine.runtime.records(&ctx.run_id).await?;
+                let (host, signal) = signal_of(&ctx, name).await?;
+                let records = RunReads::records(&ctx, &ctx.run_id).await?;
                 crate::agent::ContextHost {
                     run: ctx.run_id.clone(),
                     session: signal_session_of(&engine, &host, &records)?,
@@ -300,11 +319,10 @@ async fn context(
                 }
             }
             _ => {
-                let (live, host) = engine.loop_of(&ctx.run_id, ctx.host(), name).await?;
+                let (live, host) = engine.loop_of(&ctx, &ctx.run_id, ctx.host(), name).await?;
+                // The signal run that started this loop: an ancestor.
                 let signal = match host.signal_id {
-                    Some(id) => engine
-                        .runtime
-                        .get(&signal_run(id))
+                    Some(id) => RunReads::run(&ctx, &signal_run(id))
                         .await?
                         .and_then(|run| crate::supervisor::admitted_signal(&run.admission.input["signal"])),
                     None => None,
@@ -375,8 +393,8 @@ async fn anchor_child(
 // A start that failed after its anchor was written, with nothing stored
 // under the child's id: its span ends with the error and its anchor goes,
 // so a later start of the id anchors afresh.
-async fn unanchor(engine: &Engine, child: &str, error: &str) {
-    if engine.runtime.get(child).await.ok().flatten().is_some() {
+async fn unanchor(engine: &Engine, ctx: &FunctionContext, child: &str, error: &str) {
+    if RunReads::run(ctx, child).await.ok().flatten().is_some() {
         return;
     }
     engine.scopes.stop(child, Some(SpanEnd::error(error)));
@@ -436,7 +454,7 @@ async fn start_guard(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> 
             .await
             .map_err(anyhow::Error::from)?;
         // The calls the joined child reviews: its own stored input.
-        let joined = engine.runtime.get(&child.id).await?.map(|r| r.admission.input["calls"].clone());
+        let joined = RunReads::run(&ctx, &child.id).await?.map(|r| r.admission.input["calls"].clone());
         let guarded: Vec<usize> = joined
             .as_ref()
             .and_then(Value::as_array)
@@ -558,7 +576,7 @@ async fn start_worker(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
         let build = loop_builder(&engine, &opts, crate::runs::WORKER, &id, &prompt, memory);
         let started = crate::runs::start_named_child(&engine, &ctx, &key, &opts.workflow, Site::Loop, build).await;
         if let Err(error) = &started {
-            unanchor(&engine, &id, &error.to_string()).await;
+            unanchor(&engine, &ctx, &id, &error.to_string()).await;
         }
         match started? {
             Named::Started(child, ran) => {
@@ -582,9 +600,9 @@ async fn start_worker(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
 /// (agent-loop by default); one set aside gives way to the built-in.
 async fn primary_loop(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
     let start = async {
-        let (host, signal) = signal_of(&engine, &ctx, "primary_loop").await?;
+        let (host, signal) = signal_of(&ctx, "primary_loop").await?;
         let input = args["input"].as_str().ok_or_else(|| anyhow::anyhow!("input: Required"))?;
-        let records = engine.runtime.records(&ctx.run_id).await?;
+        let records = RunReads::records(&ctx, &ctx.run_id).await?;
         let session = signal_session_of(&engine, &host, &records)?;
         let recorded_input = crate::agent::recorded_output(&records, "signal_input");
         if let Some(memory) = recorded_input.and_then(|o| o["memory"].as_str()) {
@@ -627,7 +645,7 @@ async fn primary_loop(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
         let build = loop_builder(&engine, &opts, PRIMARY, &id, input, session.memory.snapshot());
         let started = crate::runs::start_named_child(&engine, &ctx, key, &opts.workflow, Site::Loop, build).await;
         if let Err(error) = &started {
-            unanchor(&engine, &id, &error.to_string()).await;
+            unanchor(&engine, &ctx, &id, &error.to_string()).await;
         }
         match started? {
             Named::Started(child, ran) => {
@@ -650,8 +668,8 @@ async fn primary_loop(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
 /// agent's, or the built-in while that is set aside (design 04).
 async fn recovery_loop(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
     let start = async {
-        let (host, _) = signal_of(&engine, &ctx, "recovery_loop").await?;
-        let records = engine.runtime.records(&ctx.run_id).await?;
+        let (host, _) = signal_of(&ctx, "recovery_loop").await?;
+        let records = RunReads::records(&ctx, &ctx.run_id).await?;
         if crate::agent::recorded_output(&records, "signal_session").is_none() {
             return Ok(Value::Null);
         }
@@ -693,9 +711,20 @@ async fn recovery_loop(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -
         };
         anchor_child(&engine, &id, span.clone(), None, Some(session.id.clone())).await?;
         let build = loop_builder(&engine, &opts, RECOVERY, &id, prompt, json!([]));
+        // A dry run records the start it would make; the sandbox runs it as
+        // a second dry run once the signal's has ended (design 05, decision 13).
+        if let Some(sandbox) = &engine.sandbox {
+            let choice = crate::runs::choose(&engine, AGENT_LOOP_NAME, Site::Loop).await?;
+            let (input, host) = build(choice.clone()).await?;
+            if let Some(fallback) = &choice.fallback {
+                crate::runs::trace_fallback(span.clone(), fallback, true);
+            }
+            sandbox.recovery(crate::sandbox::Start { id: id.clone(), choice, input, host });
+            return Ok(json!({"started": id}));
+        }
         let started = crate::runs::start_named_root(&engine, &id, AGENT_LOOP_NAME, Site::Loop, build).await;
         if let Err(error) = &started {
-            unanchor(&engine, &id, &error.to_string()).await;
+            unanchor(&engine, &ctx, &id, &error.to_string()).await;
         }
         let (_, ran) = started?;
         if let Some(fallback) = &ran.fallback {
@@ -740,8 +769,8 @@ impl Launch {
 
 // The signal run's own fallback line, when it runs the built-in signal in
 // place of a set-aside override (runs.rs §10): every primary run hears it.
-async fn signal_fallback_line(engine: &Engine, ctx: &FunctionContext) -> anyhow::Result<Option<String>> {
-    let saved = engine.runtime.get(&ctx.run_id).await?.ok_or_else(|| anyhow::anyhow!("unknown run"))?;
+async fn signal_fallback_line(ctx: &FunctionContext) -> anyhow::Result<Option<String>> {
+    let saved = RunReads::run(ctx, &ctx.run_id).await?.ok_or_else(|| anyhow::anyhow!("unknown run"))?;
     Ok(saved.admission.input["signal"]["fallback"].as_str().map(str::to_owned))
 }
 
@@ -756,13 +785,13 @@ async fn launch(
     context: &Value,
 ) -> anyhow::Result<Named<ouro_runtime::ChildRef>> {
     let function = if launch == Launch::Route { "route_signal" } else { "run_saved_workflow" };
-    let (host, signal) = signal_of(engine, ctx, function).await?;
-    let records = engine.runtime.records(&ctx.run_id).await?;
+    let (host, signal) = signal_of(ctx, function).await?;
+    let records = RunReads::records(ctx, &ctx.run_id).await?;
     let session = signal_session_of(engine, &host, &records)?;
     let key = launch.key();
     let id = ctx.child_id(key);
     let scope = engine.scope_for(&ctx.run_id, &ctx.definition);
-    let fallback_line = signal_fallback_line(engine, ctx).await?;
+    let fallback_line = signal_fallback_line(ctx).await?;
     let content = engine.evidence_of(Some(&host.evidence.content))?;
     let source_skill = match launch {
         Launch::Saved => engine.deps.skill_store.read_skill(&signal.source).await?.is_some(),
@@ -846,7 +875,7 @@ async fn launch(
         crate::runs::trace_fallback(scope.clone(), fallback, false);
         // A start refused after its anchor was written: nothing ran.
         if anchored.load(std::sync::atomic::Ordering::SeqCst) {
-            unanchor(engine, &id, &fallback.line).await;
+            unanchor(engine, ctx, &id, &fallback.line).await;
         }
     }
     Ok(named)
@@ -866,7 +895,7 @@ impl From<Launch> for Site {
 /// for the default path when it has no active version or is set aside.
 async fn run_saved_workflow(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
     let call = async {
-        signal_of(&engine, &ctx, "run_saved_workflow").await?;
+        signal_of(&ctx, "run_saved_workflow").await?;
         let name = args["name"].as_str().ok_or_else(|| anyhow::anyhow!("name: Required"))?;
         match launch(&engine, &ctx, Launch::Saved, name, &args["context"]).await? {
             Named::Started(child, _) => Ok(json!({"started": child})),
@@ -890,9 +919,9 @@ async fn run_saved_workflow(engine: Arc<Engine>, args: Value, ctx: FunctionConte
 /// false, fallback?}` and the default path runs, the line in its instructions.
 async fn route_signal(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
     let call = async {
-        let (_, signal) = signal_of(&engine, &ctx, "route_signal").await?;
+        let (_, signal) = signal_of(&ctx, "route_signal").await?;
         // A route started before (a re-dispatch) is joined, whatever matches now.
-        let names = match engine.runtime.get(&ctx.child_id(ROUTE)).await? {
+        let names = match RunReads::run(&ctx, &ctx.child_id(ROUTE)).await? {
             Some(saved) => vec![saved.admission.name],
             None => {
                 let payload = signal.payload.clone().unwrap_or(Value::Null);
@@ -921,10 +950,10 @@ async fn route_signal(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
 /// faulted after a write raises.
 async fn settle_child(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
     let settle = async {
-        signal_of(&engine, &ctx, "settle_child").await?;
+        signal_of(&ctx, "settle_child").await?;
         let id = args["ref"]["id"].as_str().ok_or_else(|| refuse("settle_child: ref.id required"))?;
         let kind = args["kind"].as_str().unwrap_or(PRIMARY);
-        let child = engine.runtime.get(id).await?.filter(|c| c.child.as_ref().is_some_and(|l| l.parent == ctx.run_id));
+        let child = RunReads::run(&ctx, id).await?.filter(|c| c.child.as_ref().is_some_and(|l| l.parent == ctx.run_id));
         let Some(child) = child else {
             return Err(refuse(format!("settle_child: {id} is not a child of this run")));
         };
@@ -947,7 +976,7 @@ async fn settle_child(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
                 // A route's run is the signal's primary run: its answer is
                 // the signal's; its skills are its own (no primary_loop record).
                 if kind == PRIMARY || kind == ROUTE {
-                    let records = engine.runtime.records(&ctx.run_id).await?;
+                    let records = RunReads::records(&ctx, &ctx.run_id).await?;
                     let loaded = if kind == PRIMARY { primary_loaded(&records) } else { Vec::new() };
                     scope.update(ContextUpdate {
                         output: Some(json!(text)),
@@ -958,7 +987,7 @@ async fn settle_child(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
                 json!({"action": "done", "output": text})
             }
             (Some(Status::Cancelled), _) => json!({"action": "done", "output": null}),
-            (Some(Status::Faulted(error)), SAVED) if !effects_started(&engine, id).await? => {
+            (Some(Status::Faulted(error)), SAVED) if !effects_started(&ctx, id).await? => {
                 let detail = error.detail.clone().unwrap_or_else(|| error.to_string());
                 scope.event(EventStart {
                     name: "fallback".into(),
@@ -1006,21 +1035,21 @@ fn primary_loaded(records: &crate::agent::Records) -> Vec<String> {
 }
 
 /// Whether a run or one of its descendants started a write: an at-most-once
-/// call that completed, failed or has an unknown outcome.
-async fn effects_started(engine: &Engine, id: &str) -> anyhow::Result<bool> {
+/// call that completed, failed or has an unknown outcome. The call journal
+/// comes from each run's records (run access has no journal of its own).
+async fn effects_started(runs: &dyn RunReads, id: &str) -> anyhow::Result<bool> {
     use ouro_runtime::CallStatus;
     let mut pending = vec![id.to_owned()];
     while let Some(run) = pending.pop() {
-        for call in engine.runtime.calls(&run).await.unwrap_or_default() {
+        let records = runs.records(&run).await.unwrap_or_default();
+        for call in ouro_runtime::ows::durable::call_journal(&records) {
             if call.delivery == Delivery::AtMostOnce
                 && matches!(call.state, CallStatus::Completed | CallStatus::Failed | CallStatus::Unknown)
             {
                 return Ok(true);
             }
         }
-        let filter = ouro_runtime::durable::control::Runs { parent: Some(run), ..Default::default() };
-        let page = engine.control.list(&filter, None, 1_000).await.map_err(anyhow::Error::from)?;
-        pending.extend(page.items.into_iter().map(|r| r.admission.id));
+        pending.extend(runs.children(&run).await?.into_iter().map(|r| r.admission.id));
     }
     Ok(false)
 }
@@ -1037,7 +1066,7 @@ fn guard_host(ctx: &FunctionContext, function: &str) -> anyhow::Result<GuardHost
 async fn review(engine: Arc<Engine>, _args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
     let call = async {
         let host = guard_host(&ctx, "review")?;
-        let saved = engine.runtime.get(&ctx.run_id).await?.ok_or_else(|| anyhow::anyhow!("unknown run"))?;
+        let saved = RunReads::run(&ctx, &ctx.run_id).await?.ok_or_else(|| anyhow::anyhow!("unknown run"))?;
         let scope = engine.scope_for(&ctx.run_id, &ctx.definition);
         crate::agent::guard_review(&engine, &host, &saved.admission.input, &scope, &ctx.cancel).await
     };
@@ -1047,13 +1076,12 @@ async fn review(engine: Arc<Engine>, _args: Value, ctx: FunctionContext) -> Resu
 // The reviewed item of `call` from this guard run's own `review` record,
 // never from YAML.
 async fn reviewed(
-    engine: &Engine,
     ctx: &FunctionContext,
     args: &Value,
 ) -> anyhow::Result<(providers::ToolCall, String, crate::guard::Verdict, crate::agent::Records)> {
     let call = tool_call(&args["call"])?;
     let key = crate::guard::key(&call);
-    let records = engine.runtime.records(&ctx.run_id).await?;
+    let records = RunReads::records(ctx, &ctx.run_id).await?;
     let review = crate::agent::recorded_output(&records, "review").ok_or_else(|| refuse("missing review evidence"))?;
     let item = review["items"]
         .as_array()
@@ -1067,7 +1095,7 @@ async fn reviewed(
 /// user's confirmation, sent at most once (invariant 6).
 async fn confirm_request(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
     let host = guard_host(&ctx, "confirm_request").map_err(failed)?;
-    let (call, _, verdict, _) = reviewed(&engine, &ctx, &args).await.map_err(failed)?;
+    let (call, _, verdict, _) = reviewed(&ctx, &args).await.map_err(failed)?;
     if verdict.label != "needs_confirmation" {
         return Err(FunctionError::not_executed("call needs no confirmation"));
     }
@@ -1080,22 +1108,23 @@ async fn confirm_request(engine: Arc<Engine>, args: Value, ctx: FunctionContext)
         .and_then(|e| serde_json::from_str(&e).ok())
         .ok_or_else(|| FunctionError::not_executed("guard evidence is missing"))?;
     let goal = if context.root_request.is_empty() { &context.task } else { &context.root_request };
-    crate::confirmation::request(
-        &engine.deps.db,
-        &*engine.deps.mcp,
-        crate::confirmation::Request {
-            run: &ctx.run_id,
-            loop_run: &host.parent_loop,
-            call: &call,
-            target: &target,
-            guidance: &verdict.guidance,
-            goal,
-            card: &crate::confirmation::Card::load(&*engine.deps.memory),
-        },
-        &ctx.cancel,
-    )
-    .await
-    .map_err(failed_once)
+    let card = crate::confirmation::Card::load(&*engine.deps.memory);
+    let request = crate::confirmation::Request {
+        run: &ctx.run_id,
+        loop_run: &host.parent_loop,
+        call: &call,
+        target: &target,
+        guidance: &verdict.guidance,
+        goal,
+        card: &card,
+    };
+    // A dry run sends no card: it stores one and answers it at once, as the
+    // try asked, with a press delivered to this run (design 05, decision 7).
+    if let Some(sandbox) = &engine.sandbox {
+        let scope = engine.scope_for(&ctx.run_id, &ctx.definition);
+        return sandbox.press(&engine.deps.db, &ctx, request, &host.parent_loop, &scope).await.map_err(failed_once);
+    }
+    crate::confirmation::request(&engine.deps.db, &*engine.deps.mcp, request, &ctx.cancel).await.map_err(failed_once)
 }
 
 /// `resolve_review { call, outcome }`: the call's verdict. For one that
@@ -1105,7 +1134,7 @@ async fn confirm_request(engine: Arc<Engine>, args: Value, ctx: FunctionContext)
 async fn resolve_review(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
     let call = async {
         let host = guard_host(&ctx, "resolve_review")?;
-        let (call, key, verdict, records) = reviewed(&engine, &ctx, &args).await?;
+        let (call, key, verdict, records) = reviewed(&ctx, &args).await?;
         let verdict = if verdict.label == "needs_confirmation" && host.confirm.is_some() {
             let store: &dyn crate::confirmation::Store = &engine.deps.db;
             let (run, card_key, claimed, events) = (
@@ -1125,16 +1154,19 @@ async fn resolve_review(engine: Arc<Engine>, args: Value, ctx: FunctionContext) 
                     }
                 })
                 .await?;
-            crate::confirmation::close_card(
-                store,
-                &*engine.deps.mcp,
-                &ctx.run_id,
-                &call,
-                &outcome,
-                &crate::confirmation::Card::load(&*engine.deps.memory),
-                &ctx.cancel,
-            )
-            .await;
+            // A dry run's card was never sent: there is none to edit.
+            if engine.sandbox.is_none() {
+                crate::confirmation::close_card(
+                    store,
+                    &*engine.deps.mcp,
+                    &ctx.run_id,
+                    &call,
+                    &outcome,
+                    &crate::confirmation::Card::load(&*engine.deps.memory),
+                    &ctx.cancel,
+                )
+                .await;
+            }
             crate::agent::confirmation_verdict(&call, &outcome)
         } else {
             verdict
@@ -1165,16 +1197,12 @@ const DISPATCHER_ONLY: &str = "only the signal dispatcher calls it";
 
 /// The signal run's host data and its signal (the run's input, written by
 /// the supervisor), or a refusal for any other run.
-async fn signal_of(
-    engine: &Engine,
-    ctx: &FunctionContext,
-    function: &str,
-) -> anyhow::Result<(SignalHost, PendingSignal)> {
+async fn signal_of(ctx: &FunctionContext, function: &str) -> anyhow::Result<(SignalHost, PendingSignal)> {
     let host: SignalHost = match crate::runs::host_kind(ctx.host()) {
         Some(SIGNAL) => serde_json::from_value(ctx.host().cloned().unwrap_or_default())?,
         _ => return Err(refuse(format!("{function}: {DISPATCHER_ONLY}"))),
     };
-    let saved = engine.runtime.get(&ctx.run_id).await?.ok_or_else(|| anyhow::anyhow!("unknown run"))?;
+    let saved = RunReads::run(ctx, &ctx.run_id).await?.ok_or_else(|| anyhow::anyhow!("unknown run"))?;
     let signal = crate::supervisor::admitted_signal(&saved.admission.input["signal"])
         .ok_or_else(|| anyhow::anyhow!("the signal run has no signal"))?;
     Ok((host, signal))
@@ -1196,7 +1224,12 @@ fn signal_session_of(
 /// recorded in the output for the run's later functions (decision 4).
 async fn signal_session(engine: Arc<Engine>, _args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
     let call = async {
-        let (host, signal) = signal_of(&engine, &ctx, "signal_session").await?;
+        let (host, signal) = signal_of(&ctx, "signal_session").await?;
+        // Design 05, test 19: a deliberate read through the engine's own
+        // handle in a dry run, which the sandbox refuses and counts.
+        if engine.sandbox.as_ref().is_some_and(|s| s.stray_read()) {
+            let _ = engine.runtime.get(&ctx.run_id).await;
+        }
         let deps = crate::session::EnvDeps {
             mcp: engine.deps.mcp.clone(),
             memory: engine.deps.memory.clone(),
@@ -1221,7 +1254,7 @@ async fn signal_session(engine: Arc<Engine>, _args: Value, ctx: FunctionContext)
 /// the reason, and the agent decides what to say.
 async fn deliver_event(engine: Arc<Engine>, _args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
     let call = async {
-        let (host, signal) = signal_of(&engine, &ctx, "deliver_event").await?;
+        let (host, signal) = signal_of(&ctx, "deliver_event").await?;
         let button = crate::supervisor::signal_value(&signal)["button"].clone();
         let token = button["data"].as_str().ok_or_else(|| refuse("deliver_event: the signal is not a button press"))?;
         let store: &dyn crate::confirmation::Store = &engine.deps.db;
@@ -1287,16 +1320,16 @@ fn trace_delivery(engine: &Engine, ctx: &FunctionContext, target: &str, token: &
 
 /// `signal_transcript { ref }`: the bounded JSON transcript of this run's
 /// own primary child, from its last loop record; `[]` without one.
-async fn signal_transcript(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
+async fn signal_transcript(_engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
     let call = async {
-        signal_of(&engine, &ctx, "signal_transcript").await?;
+        signal_of(&ctx, "signal_transcript").await?;
         let Some(id) = args["ref"]["id"].as_str() else { return Ok(json!("[]")) };
         let own =
-            engine.runtime.get(id).await?.is_some_and(|c| c.child.as_ref().is_some_and(|l| l.parent == ctx.run_id));
+            RunReads::run(&ctx, id).await?.is_some_and(|c| c.child.as_ref().is_some_and(|l| l.parent == ctx.run_id));
         if !own {
             return Err(refuse(format!("signal_transcript: {id} is not a child of this run")));
         }
-        let records = engine.runtime.records(id).await.unwrap_or_default();
+        let records = RunReads::records(&ctx, id).await.unwrap_or_default();
         let messages = crate::agent::history_messages(&records);
         // A run that took no turn (a saved workflow's steps) has only its
         // admitted instructions: no transcript.

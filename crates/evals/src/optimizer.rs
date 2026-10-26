@@ -809,6 +809,7 @@ pub fn isolated_engine(
     skills: Arc<dyn SkillStore>,
     mcp: Arc<dyn Mcp>,
 ) -> anyhow::Result<Arc<Engine>> {
+    let (store, dry_store) = agent::runs::memory_store_with_view();
     Ok(create_engine(EngineDeps {
         providers,
         presets,
@@ -821,7 +822,8 @@ pub fn isolated_engine(
         decisions: None,
         env: Default::default(),
         db: agent::db::AgentDb::open(":memory:")?,
-        store: agent::runs::memory_store(),
+        store,
+        dry_store,
         schedule: Arc::new(agent::schedule::MemorySchedule::default()),
     }))
 }

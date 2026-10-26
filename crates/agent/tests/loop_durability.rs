@@ -224,6 +224,7 @@ impl Mcp for World {
 // What outlives an engine: the stores, the world and the model.
 struct Parts {
     store: Arc<dyn ouro_runtime::durable::RunStore>,
+    dry_store: Arc<dyn ouro_runtime::durable::RunStore>,
     db: AgentDb,
     model: Arc<Model>,
     world: Arc<World>,
@@ -232,8 +233,10 @@ struct Parts {
 
 fn parts(rounds: &[Vec<Call>]) -> Parts {
     let deaths = Arc::new(Deaths::default());
+    let (store, dry_store) = agent::runs::memory_store_with_view();
     Parts {
-        store: agent::runs::memory_store(),
+        store,
+        dry_store,
         db: AgentDb::open(":memory:").unwrap(),
         model: Model::new(rounds.to_vec(), deaths.clone()),
         world: Arc::new(World { deaths: deaths.clone(), ..World::default() }),
@@ -267,6 +270,7 @@ fn engine(p: &Parts) -> Arc<Engine> {
         env: Default::default(),
         db: p.db.clone(),
         store: p.store.clone(),
+        dry_store: p.dry_store.clone(),
         schedule: Arc::new(agent::schedule::MemorySchedule::default()),
     })
 }

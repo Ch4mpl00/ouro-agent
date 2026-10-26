@@ -132,6 +132,7 @@ async fn activate_reference_loop(root: &std::path::Path) {
         env: Default::default(),
         db,
         store: agent::runs::open_store(&root.join("agent.db")).unwrap(),
+        dry_store: agent::runs::open_store_view(&root.join("agent.db")).unwrap(),
     });
     support::activate_telegram_loop(&author).await;
     author.shutdown().await;

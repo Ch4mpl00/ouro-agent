@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 struct World {
     store: Arc<dyn ouro_runtime::durable::RunStore>,
+    dry_store: Arc<dyn ouro_runtime::durable::RunStore>,
     db: AgentDb,
     mcp: Arc<ToolMcp>,
     llm: Arc<Scripted>,
@@ -60,8 +61,10 @@ fn world_with(replies: Vec<&str>, decisions: Option<Arc<agent::decisions::Decisi
         Box::pin(async move { Ok(out) })
     }));
     let (tracer, written) = recording();
+    let (store, dry_store) = agent::runs::memory_store_with_view();
     World {
-        store: agent::runs::memory_store(),
+        store,
+        dry_store,
         db: AgentDb::open(":memory:").unwrap(),
         mcp,
         llm: Arc::new(Scripted::new(replies.into_iter().map(assistant).collect())),
@@ -123,6 +126,7 @@ impl World {
             env: Default::default(),
             db: self.db.clone(),
             store: self.store.clone(),
+            dry_store: self.dry_store.clone(),
             schedule: Arc::new(agent::schedule::MemorySchedule::default()),
         })
     }

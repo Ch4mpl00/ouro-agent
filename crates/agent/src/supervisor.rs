@@ -508,59 +508,12 @@ impl Supervisor {
         let trace=engine.deps.tracer.trace(TraceStart{id:id.clone(),name:format!("signal:{}",signal.source),kind:SpanKind::Agent,session_id:Some(id.clone()),tags:Some(vec![signal.source.clone(),if saved.is_some(){"saved-workflow"}else{"agent-loop"}.into()]),metadata:Some(json!({"signal_id":signal.id,"signal_source":signal.source,"signal_created_at":signal.created_at,"activity":"run"}).as_object().unwrap().clone()),..Default::default()});
         trace.update(ContextUpdate::input(signal.content.clone()));
         let started = async {
-            // The anchor and the evidence go in before the engine admits it;
-            // a write may wait for the engine's lock on agent.db (runs.rs §2).
-            let row = trace.anchor().map(|anchor| crate::runs::RunTrace {
-                run_id: run.clone(),
-                trace_id: anchor.trace_id,
-                session_id: anchor.session_id,
-                parent_span_id: Some(anchor.parent_span_id),
-                recorded: false,
-                created_ms: crate::runs::now_ms(),
-            });
-            let (evidence_run, content) = (run.clone(), signal.content.clone());
-            let content = engine
-                .deps
-                .db
-                .write(move |db| {
-                    if let Some(row) = &row {
-                        db.insert_run_trace(row)?;
-                    }
-                    db.put_evidence(&evidence_run, &content)
-                })
-                .await
-                .map_err(|e| e.context("anchoring the signal run"))?;
-            let host = crate::runs::SignalHost {
-                kind: crate::runs::SIGNAL.into(),
-                signal_id: signal.id,
-                source: signal.source.clone(),
-                created_ms: timestamp(&signal.created_at).unwrap_or_else(crate::runs::now_ms),
-                evidence: crate::runs::SignalEvidence { content },
-            };
+            let build = signal_admission(engine, signal, trace.anchor()).await?;
             let scope: Scope = trace.clone();
             engine.scopes.borrow(&run, scope.clone());
-            // The agent's own `signal`, or the built-in in place of one set
-            // aside (design 04): its line reaches whichever primary runs
-            // (`signal.fallback`); the host data stays the signal's, so a
-            // start again joins.
-            let host = serde_json::to_value(&host)?;
-            let pending = signal_value(signal);
-            let build = move |choice: crate::runs::Choice| -> futures::future::BoxFuture<'static, anyhow::Result<(Value, Value)>> {
-                let (mut value, host) = (pending.clone(), host.clone());
-                Box::pin(async move {
-                    let mut input = json!({});
-                    if let Some(fallback) = choice.fallback {
-                        value["fallback"] = json!(fallback.line);
-                        input["fallback"] = serde_json::to_value(&fallback)?;
-                    }
-                    input["signal"] = value;
-                    Ok((input, host))
-                })
-            };
-            let (_, ran) =
-                crate::runs::start_named_root(engine, &run, SIGNAL_NAME, crate::runs::Site::Signal, build)
-                    .await
-                    .map_err(|e| e.context("admitting the signal run"))?;
+            let (_, ran) = crate::runs::start_named_root(engine, &run, SIGNAL_NAME, crate::runs::Site::Signal, build)
+                .await
+                .map_err(|e| e.context("admitting the signal run"))?;
             if let Some(fallback) = &ran.fallback {
                 crate::runs::trace_fallback(scope, fallback, true);
             }
@@ -615,6 +568,70 @@ impl Supervisor {
 
 pub const SIGNAL: &str = include_str!("../workflows/signal.yaml");
 pub const SIGNAL_NAME: &str = "signal";
+
+/// What builds a signal run's input and host data for the definition chosen.
+pub type SignalBuild = Box<
+    dyn Fn(crate::runs::Choice) -> futures::future::BoxFuture<'static, anyhow::Result<(Value, Value)>> + Send + Sync,
+>;
+
+/// The signal run's admission, the same for the supervisor and a dry run
+/// (design 05, decision 5): its anchor under `anchor` and its content as
+/// evidence go in first (a write may wait for the engine's lock on agent.db,
+/// runs.rs §2), then the builder of its input (the signal, and the line of an
+/// override of `signal` set aside for it) and its host data. The agent's own
+/// `signal`, or the built-in in place of one set aside (design 04): its line
+/// reaches whichever primary runs (`signal.fallback`); the host data stays
+/// the signal's, so a start again joins.
+pub async fn signal_admission(
+    engine: &Engine,
+    signal: &PendingSignal,
+    anchor: Option<crate::tracing::TraceAnchor>,
+) -> anyhow::Result<SignalBuild> {
+    let run = crate::functions::signal_run(signal.id);
+    let row = anchor.map(|anchor| crate::runs::RunTrace {
+        run_id: run.clone(),
+        trace_id: anchor.trace_id,
+        session_id: anchor.session_id,
+        parent_span_id: Some(anchor.parent_span_id),
+        recorded: false,
+        created_ms: crate::runs::now_ms(),
+    });
+    let (evidence_run, content) = (run.clone(), signal.content.clone());
+    let content = engine
+        .deps
+        .db
+        .write(move |db| {
+            if let Some(row) = &row {
+                db.insert_run_trace(row)?;
+            }
+            db.put_evidence(&evidence_run, &content)
+        })
+        .await
+        .map_err(|e| e.context("anchoring the signal run"))?;
+    let host = crate::runs::SignalHost {
+        kind: crate::runs::SIGNAL.into(),
+        signal_id: signal.id,
+        source: signal.source.clone(),
+        created_ms: timestamp(&signal.created_at).unwrap_or_else(crate::runs::now_ms),
+        evidence: crate::runs::SignalEvidence { content },
+    };
+    let host = serde_json::to_value(&host)?;
+    let pending = signal_value(signal);
+    Ok(Box::new(
+        move |choice: crate::runs::Choice| -> futures::future::BoxFuture<'static, anyhow::Result<(Value, Value)>> {
+            let (mut value, host) = (pending.clone(), host.clone());
+            Box::pin(async move {
+                let mut input = json!({});
+                if let Some(fallback) = choice.fallback {
+                    value["fallback"] = json!(fallback.line);
+                    input["fallback"] = serde_json::to_value(&fallback)?;
+                }
+                input["signal"] = value;
+                Ok((input, host))
+            })
+        },
+    ))
+}
 
 // ── 3. polling ───────────────────────────────────────────────────────────
 

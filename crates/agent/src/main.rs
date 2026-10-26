@@ -191,8 +191,10 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
         } else {
             local
         };
-        // The engine's store: engine.db beside agent.db (runs.rs §1).
+        // The engine's store: engine.db beside agent.db (runs.rs §1), and a
+        // read-only view of it for dry runs, opened once it migrated.
         let store = agent::runs::open_store(&config.db)?;
+        let dry_store = agent::runs::open_store_view(&config.db)?;
         let engine = create_engine(EngineDeps {
             providers,
             mcp: mcp.clone(),
@@ -207,6 +209,7 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
             },
             db: (*db).clone(),
             store,
+            dry_store,
             tracer,
             codex: codex_client(&std::env::var("CODEX_URL").unwrap_or_else(|_| "http://localhost:3010".into())),
             decisions: Some(Arc::new(

@@ -432,20 +432,30 @@ route to check that it still takes the default path.
   each branch your loop must handle.
 - **The trace.** `status` and `output`, `ended` (how the primary loop ended:
   `finish`, `answer`, a `workflow rule` and the step it ended at, `limit` or
-  `fault`; `nudged` when it got a reminder), `writes`, and `runs`: each
-  workflow that ran, with its `version` (`draft vN` for yours), its `path`
-  (every step in order, `task → case` for each switch, a fault with its
-  error; a jq error names the expression and the value it met), a loop's
-  `turns` (reasoning, text, calls with their `verdict`, `confirmation`,
-  `ok` and `result`), and `children` (guard rounds, workers). A large reply
-  is in your working memory (`memory_key`) with a preview.
+  `fault`; `nudged` when it got a reminder), `writes` (in the order they
+  happened, each with its `function`, `arguments`, the `run` and `task` it
+  came from, and `via`: `yaml` for a workflow's own call, `tool` for a
+  model's, `handler` for one the runtime made itself), and `runs`: each
+  workflow that ran, with its `version` (`draft vN` for yours), its `key`
+  (how its parent started it: `route`, `primary`, `guard`, `worker:i.j`),
+  its `path` (every step in order, `task → case` for each switch, a fault
+  with its error; a jq error names the expression and the value it met), a
+  loop's `turns` (reasoning, text, calls with their `verdict`,
+  `confirmation`, `ok` and `result`), a `fallback` line when a version was
+  set aside for it, and `children` (guard rounds, workers). A signal that
+  faulted shows its failure report's own dry run under `recovery` (its
+  runs and writes). A large reply is in your working memory (`memory_key`)
+  with a preview. A `sandbox_refusals` count is the runtime's fault, not
+  your workflow's: report it.
 - **Judging it.** Compare the trace with what the user asked for, as for a
   scheduled workflow: the loop taken, each turn, each call's arguments,
   how the loop ended and what it answered. Fix and try again, three tries
-  at most. `drafts` with `ran: false` did not run and stay untried: check
-  the signal against the loop's route `when`.
+  at most. `drafts` with `ran: false` did not run and stay untried
+  (`outcome` says why: `did not run`, or `set aside: …` with the reason):
+  check the signal against the loop's route `when`.
 
-A completed try marks every draft that ran as tried; activation needs it.
+A completed try marks every draft whose runs all completed as tried;
+activation needs it.
 
 ## The language
 

@@ -210,6 +210,7 @@ fn open_engine(
         env: Default::default(),
         db: (*db).clone(),
         store: agent::runs::open_store(&root.join("agent.db")).unwrap(),
+        dry_store: agent::runs::open_store_view(&root.join("agent.db")).unwrap(),
     };
     configure(&mut deps);
     let engine = agent::agent::create_engine_on(deps, agent::runs::config(), clock);
@@ -524,6 +525,7 @@ impl Harness {
         let mcp = ToolMcp::returning(vec![search_tool(), status], tool_result);
         let persist = Arc::new(PersistLog::default());
         let provider: Arc<dyn ChatProvider> = model.clone();
+        let (store, dry_store) = agent::runs::memory_store_with_view();
         let mut deps = EngineDeps {
             providers: Providers {
                 openai: provider.clone(),
@@ -542,7 +544,8 @@ impl Harness {
             schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
             env: Default::default(),
             db: agent::db::AgentDb::open(":memory:").unwrap(),
-            store: agent::runs::memory_store(),
+            store,
+            dry_store,
         };
         configure(&mut deps);
         let engine = create_engine(deps);
@@ -677,4 +680,18 @@ pub fn faulting(definition: &str) -> String {
     };
     assert_ne!(faulting, definition, "a top-level do list");
     faulting
+}
+
+/// `agent::loop_tool` as a test calls it from outside a run's function: the
+/// host's own store is the run tree it reads (a handler reads its call's).
+pub async fn loop_tool(
+    engine: &Arc<Engine>,
+    live: &Arc<agent::agent::AgentLoop>,
+    args: &Value,
+    run: &str,
+    invocation: &str,
+    once: bool,
+) -> anyhow::Result<Value> {
+    let at = agent::agent::CallSite { runs: &**engine, run, task: "test", invocation };
+    agent::agent::loop_tool(engine, live, args, &at, once).await
 }

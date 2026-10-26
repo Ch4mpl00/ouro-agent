@@ -70,6 +70,7 @@ fn tool_call(id: &str, name: &str, args: Value) -> Message {
 
 fn engine(model: Model, tools: &[&str], store: Arc<FsSkillStore>) -> Arc<agent::agent::Engine> {
     let provider: Arc<dyn ChatProvider> = Arc::new(model);
+    let (runs, dry_store) = agent::runs::memory_store_with_view();
     create_engine(EngineDeps {
         providers: Providers {
             openai: provider.clone(),
@@ -89,7 +90,8 @@ fn engine(model: Model, tools: &[&str], store: Arc<FsSkillStore>) -> Arc<agent::
         decisions: Some(support::allow_guard()),
         env: Default::default(),
         db: agent::db::AgentDb::open(":memory:").unwrap(),
-        store: agent::runs::memory_store(),
+        store: runs,
+        dry_store,
         schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
     })
 }

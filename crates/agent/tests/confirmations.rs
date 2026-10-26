@@ -109,6 +109,7 @@ impl ouro_runtime::durable::Clock for Clock {
 #[derive(Clone)]
 struct Parts {
     store: Arc<dyn ouro_runtime::durable::RunStore>,
+    dry_store: Arc<dyn ouro_runtime::durable::RunStore>,
     db: AgentDb,
     world: Arc<World>,
     model: Arc<Scripted>,
@@ -117,10 +118,12 @@ struct Parts {
 }
 
 fn parts(script: Vec<Message>, label: &str) -> Parts {
+    let (store, dry_store) = agent::runs::memory_store_with_view();
     let api = Arc::new(GuardApi::default());
     *api.label.lock().unwrap() = Some(label.into());
     Parts {
-        store: agent::runs::memory_store(),
+        store,
+        dry_store,
         db: AgentDb::open(":memory:").unwrap(),
         world: Arc::new(World::default()),
         model: Arc::new(Scripted::new(script)),
@@ -151,6 +154,7 @@ fn engine(p: &Parts) -> Arc<Engine> {
             env: agent::session::EnvConfig { user_email: None, telegram_chat_id: Some("42".into()) },
             db: p.db.clone(),
             store: p.store.clone(),
+            dry_store: p.dry_store.clone(),
         },
         agent::runs::config(),
         p.clock.clone(),

@@ -368,6 +368,7 @@ async fn run(plans: &[(i64, Plan)]) -> Run {
     std::fs::create_dir(&live_dir).unwrap();
     std::fs::write(live_dir.join("telegram.md"), "---\ntools: *\n---\nFixture Telegram transport rules.\n").unwrap();
     let skill_store = Arc::new(FsSkillStore { live_dir, defaults_dir: repo.join("skills.default") });
+    let (store, dry_store) = agent::runs::memory_store_with_view();
     let engine = create_engine(EngineDeps {
         providers: Providers {
             openai: provider.clone(),
@@ -385,7 +386,8 @@ async fn run(plans: &[(i64, Plan)]) -> Run {
         decisions: Some(support::allow_guard()),
         env: agent::session::EnvConfig { user_email: None, telegram_chat_id: Some(CHAT.to_string()) },
         db: (*db).clone(),
-        store: agent::runs::memory_store(),
+        store,
+        dry_store,
         schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
     });
     let supervisor = create_supervisor(engine.clone());

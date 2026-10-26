@@ -7,7 +7,8 @@
 // boundary; 4. live trace scopes; 5. the lifecycle observer; 6. the run tree
 // and its quiescence; 7. built-ins at boot; 8. reconciliation and sweep;
 // 9. waiting, the background and the reconciler; 10. starting a name the
-// agent may have overridden (design 04).
+// agent may have overridden (design 04); 11. what a handler reads of its run
+// tree (design 05, decision 3).
 use crate::{
     db::AgentDb,
     tracing::{Scope, Span, SpanEnd, Trace, TraceAnchor, TraceStart},
@@ -76,9 +77,26 @@ pub fn open_store(agent_db: &std::path::Path) -> anyhow::Result<Arc<dyn ouro_run
     Ok(Arc::new(ouro_runtime::durable::sqlite::open(engine_store_path(agent_db))?))
 }
 
+/// A read-only view of the engine's store for agent.db at `agent_db`
+/// (`EngineDeps::dry_store`), opened after `open_store` migrated it: the
+/// definitions a dry run reads (design 05, decision 1).
+pub fn open_store_view(agent_db: &std::path::Path) -> anyhow::Result<Arc<dyn ouro_runtime::durable::RunStore>> {
+    Ok(Arc::new(ouro_runtime::durable::sqlite::open_read_only(engine_store_path(agent_db))?))
+}
+
 /// A store in memory, for tests and tools that keep nothing.
 pub fn memory_store() -> Arc<dyn ouro_runtime::durable::RunStore> {
     Arc::new(ouro_runtime::durable::memory::memory())
+}
+
+/// A store in memory and a read-only view of it (`EngineDeps::store`,
+/// `dry_store`), for tests and tools that keep nothing.
+pub fn memory_store_with_view() -> (Arc<dyn ouro_runtime::durable::RunStore>, Arc<dyn ouro_runtime::durable::RunStore>)
+{
+    use ouro_runtime::durable::{TransactionalStore, memory::MemoryBackend};
+    let backend = Arc::new(MemoryBackend::default());
+    let view = Arc::new(backend.read_only_view());
+    (Arc::new(TransactionalStore::new(backend)), Arc::new(TransactionalStore::new(view)))
 }
 
 pub fn now_ms() -> i64 {
@@ -1153,6 +1171,7 @@ pub struct Ran {
 /// it, if any. The starter's builder makes the run's input and host data
 /// from it, so a fallback rebuilds both (the line in its instructions, the
 /// definition it names in its host data).
+#[derive(Clone, Debug)]
 pub struct Choice {
     pub name: String,
     pub version: u64,
@@ -1297,6 +1316,22 @@ fn refused(version: u64, (reason, text, faults): (FallbackReason, String, Option
     Aside { version: Some(version), digest: None, reason, error: Some(text), faults }
 }
 
+/// What a start of `name` at `site` runs, by the rule every start follows:
+/// its active version, or what runs in place of one set aside (step 1). A
+/// dry run's root and its recorded recovery start choose this way (design
+/// 05, decision 5), without the refusal a start may still meet.
+pub async fn choose(engine: &crate::agent::Engine, name: &str, site: Site) -> anyhow::Result<Choice> {
+    let aside = match decide(engine, name, site).await? {
+        Decision::Start { version, yaml } => return Ok(Choice { name: name.into(), version, yaml, fallback: None }),
+        Decision::Aside(aside) => aside,
+    };
+    let (fallback, target) = set_aside(engine, name, site, aside).await?;
+    let Some((target, version, yaml)) = target else {
+        anyhow::bail!("`{name}` was set aside and has nothing to run in its place: {}", fallback.line)
+    };
+    Ok(Choice { name: target, version, yaml, fallback: Some(fallback) })
+}
+
 /// Starts root run `id` of `name` at `site` (the signal; a recovery report or
 /// a loop the host runs itself), its input and host data from `build`. An
 /// existing run is returned as it was admitted (step 0). A refusal in the
@@ -1351,9 +1386,10 @@ pub async fn start_named_root(
 
 /// What starts a host child of the calling run: its function's context
 /// (`FunctionContext`); a seam, so a test can stand in for a re-dispatched
-/// call.
+/// call. It reads the child it may have started already through the call's
+/// run access (`RunReads::run`, design 05, R2-L).
 #[async_trait::async_trait]
-pub trait ChildStarts: Send + Sync {
+pub trait ChildStarts: RunReads {
     fn child_id(&self, key: &str) -> String;
     async fn start_child(
         &self,
@@ -1390,7 +1426,7 @@ pub async fn start_named_child(
     let start = async |name: &str, version: Option<u64>, input: Value, host: Value| {
         ctx.start_child(ouro_runtime::ChildStart { key: key.into(), name: name.into(), version, input, host }).await
     };
-    if let Some(saved) = engine.runtime.get(&ctx.child_id(key)).await? {
+    if let Some(saved) = ctx.run(&ctx.child_id(key)).await? {
         let child = start(&saved.admission.name, None, Value::Null, Value::Null).await?;
         return Ok(Named::Started(child, ran_of(&saved)));
     }
@@ -1411,17 +1447,106 @@ pub async fn start_named_child(
         Decision::Aside(aside) => aside,
     };
     let (fallback, target) = set_aside(engine, name, site, aside).await?;
+    // A dry run reports the version it set aside (design 05, decision 8).
+    if let Some(sandbox) = &engine.sandbox {
+        sandbox.set_aside(&fallback);
+    }
     let Some((target, target_version, yaml)) = target else { return Ok(Named::SetAside(fallback)) };
     let choice = Choice { name: target.clone(), version: target_version, yaml, fallback: Some(fallback.clone()) };
     let (input, host) = build(choice).await?;
     match start(&target, Some(target_version), input, host).await {
         Ok(child) => {
+            if let Some(sandbox) = &engine.sandbox {
+                sandbox.fallback(&child.id, &fallback);
+            }
             let ran = Ran { name: target, version: target_version, pinned: true, fallback: Some(fallback) };
             Ok(Named::Started(child, ran))
         }
         Err(e) => {
             eprintln!("[engine] the built-in `{target}` in place of `{name}` was refused too: {e:#}");
             anyhow::bail!("{}", fallback.error.clone().unwrap_or(fallback.line))
+        }
+    }
+}
+
+// ── 11. what a handler reads of its run tree ────────────────────────────────
+// Design 05, decision 3 (ouro design 07): a handler reads its own run, its
+// ancestors, its descendants and their records through the call's run
+// access, which is the store driving the call: the host's in a live run, a
+// dry run's private one in a dry run. The engine's own handle
+// (`Engine::runtime`, `control`) reads the host's store, so a handler that
+// used it would read the wrong runs in a dry run (the sandbox's guard store
+// refuses it, counting). Host-side code (the supervisor, a loop the host
+// drives, tests) reads through the engine (`impl RunReads for Engine`).
+
+/// The runs a caller may read, by id: a handler's lineage, or for the host
+/// its whole store.
+#[async_trait::async_trait]
+pub trait RunReads: Send + Sync {
+    /// A run (`None`: no such run, or one outside the caller's lineage).
+    async fn run(&self, id: &str) -> anyhow::Result<Option<SavedRun>>;
+    /// A run's records (empty for one the caller cannot read).
+    async fn records(&self, id: &str) -> anyhow::Result<crate::agent::Records>;
+    /// The children of `parent` by their parent link, every page.
+    async fn children(&self, parent: &str) -> anyhow::Result<Vec<SavedRun>>;
+}
+
+// A run-access failure as the agent's handlers report it: a call that lost
+// its run is stopped (`interrupted`, it resumes), anything else an error.
+pub fn access_error(error: ouro_runtime::RunAccessError) -> anyhow::Error {
+    match error {
+        ouro_runtime::RunAccessError::Interrupted(cause) => {
+            crate::errors::aborted().context(format!("the call lost its run: {cause:#}"))
+        }
+        other => anyhow::Error::new(other),
+    }
+}
+
+const CHILDREN_PAGE: usize = 200;
+
+#[async_trait::async_trait]
+impl RunReads for ouro_runtime::FunctionContext {
+    async fn run(&self, id: &str) -> anyhow::Result<Option<SavedRun>> {
+        ouro_runtime::FunctionContext::run(self, id).await.map_err(access_error)
+    }
+    async fn records(&self, id: &str) -> anyhow::Result<crate::agent::Records> {
+        Ok(ouro_runtime::FunctionContext::records(self, id).await.map_err(access_error)?.unwrap_or_default())
+    }
+    async fn children(&self, parent: &str) -> anyhow::Result<Vec<SavedRun>> {
+        let mut children = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = ouro_runtime::FunctionContext::children(self, parent, cursor, CHILDREN_PAGE)
+                .await
+                .map_err(access_error)?;
+            children.extend(page.items);
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(children),
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RunReads for crate::agent::Engine {
+    async fn run(&self, id: &str) -> anyhow::Result<Option<SavedRun>> {
+        self.runtime.get(id).await
+    }
+    async fn records(&self, id: &str) -> anyhow::Result<crate::agent::Records> {
+        self.runtime.records(id).await
+    }
+    async fn children(&self, parent: &str) -> anyhow::Result<Vec<SavedRun>> {
+        let mut children = Vec::new();
+        let mut cursor = None;
+        loop {
+            let filter = Runs { parent: Some(parent.into()), ..Default::default() };
+            let page = self.control.list(&filter, cursor.as_ref(), CHILDREN_PAGE).await.map_err(anyhow::Error::from)?;
+            children.extend(page.items);
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(children),
+            }
         }
     }
 }

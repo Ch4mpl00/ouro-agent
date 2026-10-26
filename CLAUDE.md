@@ -124,8 +124,11 @@ deletion.
    and `metadata.ouro.breaker`, argument names, the guarded round, launch
    metadata); only `guard` is reserved, so `agent-loop` and `signal` are the
    agent's to override, and activating the built-in's current text undoes
-   an override. Activation needs a tried version (dry runs return with the
-   sandbox step). Routes (`metadata.route`) start as the signal's primary
+   an override. Activation needs a tried version: a completed dry run
+   (`try_workflow`, docs/designs/05) on the engine's own dry run
+   (`Runtime::dry_run_opts`) of a second, never started engine whose run
+   store overlays the drafts as active and refuses run reads (handlers read
+   their run tree through the call's run access, `runs::RunReads`). Routes (`metadata.route`) start as the signal's primary
    run (`route_signal`, most specific first), a scheduled task's saved
    workflow likewise (`run_saved_workflow`); a worker or the primary may run
    a loop variant (the YAML's `start_worker { loop }`, the call's `loop`,
@@ -201,7 +204,8 @@ mcp-tools/
     │   │                                   trace scopes, quiescence, built-ins, reconciler, named
     │   │                                   starts and their fallbacks
     │   ├── src/functions.rs                the engine's registry: MCP tools, host functions, steps
-    │   ├── src/sandbox.rs                  dry runs (unavailable until the migration's sandbox step)
+    │   ├── src/sandbox.rs                  dry runs on the engine's dry run: a signal through the draft
+    │   │                                   chain, real turns, reads and guard, writes mocked, nothing kept
     │   ├── src/schedule.rs                 scheduled tasks: cron rows, the 30 s tick, the schedule
     │   │                                   tools, the first start's import
     │   ├── src/agent.rs                    the engine, the loop's turn/tool/settle, synthetic tools

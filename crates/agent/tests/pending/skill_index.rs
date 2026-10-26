@@ -1,5 +1,6 @@
-// PARKED (not compiled), for the sandbox step (design 01, step 4): the
-// skill-index workflow is installed and run through `try_draft`.
+// PARKED (not compiled), for the schedules step (design 01, step 5): the
+// skill-index workflow installed and run on its scheduled fires. Its dry run
+// came back with the sandbox step (tests/skill_index.rs, design 05 test 4).
 //! The installed definition runs in a sandbox with a real skill filesystem,
 //! SQLite migrations/durable journal, scripted model and versioned memory.
 mod support;
@@ -8,7 +9,7 @@ use agent::{
     agent::{Engine, EngineDeps, Providers, create_engine},
     db::AgentDb,
     flows::WorkflowSignal,
-    flows::{FlowResult, WorkflowStore, create_durable_flows, try_draft},
+    flows::{FlowResult, WorkflowStore, create_durable_flows},
     models::{ModelPreset, Presets, ReasoningEffort},
     providers::{ToolDef, assistant},
     skills::{FsSkillStore, SkillStore, catalog_snapshot, hash_value},
@@ -242,31 +243,6 @@ async fn concurrent_document_edit_is_not_overwritten() {
     s.memory.lock().unwrap().conflict = true;
     assert!(matches!(s.run(1).await, FlowResult::Faulted { .. }));
     assert_eq!(s.memory.lock().unwrap().doc.as_ref().unwrap()["body"], "other writer");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn dry_run_generates_without_writing_memory() {
-    let s = Sandbox::new(&["Alpha", "Beta"]);
-    let trace =
-        s.engine.deps.tracer.trace(TraceStart { id: "dry-index".into(), name: "dry".into(), ..Default::default() });
-    let scope: Scope = trace.clone();
-    let report: Value = serde_json::from_str(
-        &try_draft(
-            &s.engine,
-            json!({"name":"skill-index"}).as_object().unwrap(),
-            &task_context("dry-index").env,
-            &scope,
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(report["status"], "completed", "{report}");
-    assert_eq!(s.memory.lock().unwrap().writes, 0);
-    assert!(s.memory.lock().unwrap().doc.is_none());
-    assert!(report["writes"].as_array().unwrap().iter().any(|w| w["function"] == "write_doc"));
-    trace.end();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

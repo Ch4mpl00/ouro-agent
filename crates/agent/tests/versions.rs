@@ -440,6 +440,7 @@ fn changed_host(f: &Fixture, provider: Arc<dyn agent::providers::ChatProvider>, 
         env: Default::default(),
         db: (*db).clone(),
         store: agent::runs::open_store(&f.root.path().join("agent.db")).unwrap(),
+        dry_store: agent::runs::open_store_view(&f.root.path().join("agent.db")).unwrap(),
     })
 }
 
@@ -691,6 +692,21 @@ struct Redispatched {
     engine: Arc<Engine>,
     id: String,
     asked: Mutex<Vec<ouro_runtime::ChildStart>>,
+}
+
+// A re-dispatched call reads what its first dispatch started, as a call's
+// run access does.
+#[async_trait::async_trait]
+impl agent::runs::RunReads for Redispatched {
+    async fn run(&self, id: &str) -> anyhow::Result<Option<SavedRun>> {
+        self.engine.runtime.get(id).await
+    }
+    async fn records(&self, id: &str) -> anyhow::Result<agent::agent::Records> {
+        self.engine.runtime.records(id).await
+    }
+    async fn children(&self, parent: &str) -> anyhow::Result<Vec<SavedRun>> {
+        agent::runs::RunReads::children(&*self.engine, parent).await
+    }
 }
 
 #[async_trait::async_trait]
