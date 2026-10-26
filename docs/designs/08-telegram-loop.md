@@ -1,6 +1,7 @@
 # 08. A Telegram wrapper around agent-loop: status bubble, composed reply, slim skill
 
-Status: draft 2 (elephant; the wrapper shape is the maintainer's) · Issues:
+Status: implemented with the review's corrections (see Deviations); draft 2 by
+the elephant, the wrapper shape is the maintainer's · Issues:
 #52 (per-source loops), #53 (slim prompts; the Telegram part) · Engine:
 ouro 0.3.0, no engine change · Decisions log: [LOG.md](LOG.md)
 
@@ -130,6 +131,12 @@ The maintainer wants (2026-10-26):
   wrapper (#52's other half); typing indicators.
 - A status line while the model is still thinking (before a turn nothing is
   known; the bubble keeps the previous line, 👀 at first).
+- Known limitations (review G-M8, G-H4): the composed reply is plain text
+  (no buttons), the loop never learns its reply's message id (so it cannot
+  edit that reply later), and a Telegram signal's loop cannot post into
+  another chat or topic (its workers inherit the deny set).
+- The bubble across a long sleep (review G-M6): it is cleared when the loop
+  sleeps on a confirmation card and not reopened after the press.
 
 ## Design
 
@@ -193,3 +200,110 @@ the composed reply, the latency added by compose.
 
 - Compose model: `compose` (gpt-6.1-sol) by default; `smart` if its latency
   shows.
+
+## Deviations
+
+Written by the executor before changing course: the zero-context review
+(goldfish, 5 high / 11 medium / 7 low) is applied as corrections, with the
+maintainer's decisions on the high ones. Each entry names the review item.
+
+- **review G-H1: `start_loop`, not `primary_loop`.** A route runs with loop
+  host data, so the dispatcher's `primary_loop`, `settle_child` and
+  `signal_transcript` refuse it, and the gate refuses a route that calls
+  them. Three generic host functions (context `agent-loop`, so an agent's
+  copy of `telegram` passes the gate) replace them in the wrapper:
+  `start_loop { input, loop?, skills, loaded, preset, system, exclude_tools,
+  on_step }` starts one owned loop child (kind `primary`) whose
+  conversation, confirmation target, session, env, signal id and guard
+  evidence come from the caller's host data, never from YAML, and whose
+  instructions start with the caller's own (the session context, the
+  signal source, its env addendum, a handover, a fallback line, a button
+  note); `loop_outcome { ref }` answers `{status: completed | faulted |
+  cancelled, output, error}`; `loop_transcript { ref }` (G-M3). The
+  dispatcher's functions stay dispatcher-only; `primary_loop` also takes
+  `exclude_tools` and `on_step`.
+- **maintainer, on G-H1: `start_loop` starts any named loop.** Its `loop`
+  argument (default `agent-loop`) names the loop it runs, a future
+  `research-loop` the agent writes included; the start goes through
+  `runs::start_named_child` at the loop site, so overrides and fallbacks
+  (design 04) apply. Any run in a signal's tree with loop host data may
+  call it, an agent-saved workflow included (the gate allows it). The
+  child's host data is the caller's, only narrowed: preset, skills,
+  `exclude_tools` (added to the caller's own), `on_step` and the system
+  lines may be chosen; the conversation, the confirmation target and the
+  session cannot be redirected.
+  TODO(ouro#43): once `run: workflow`/`start_child` can inherit host data,
+  `start_loop` (and `signal`'s `primary_loop`) give way to `run: workflow`
+  and are removed.
+- **review G-H2: `observe_step`, a host function, not YAML `start_child`.**
+  ouro 0.3.0's reserved `start_child` turns an unknown, tripped or paused
+  name into an interruption, which would stall the loop (an engine bug the
+  maintainer files in ouro). The loop's `observe` step calls `observe_step {
+  i, content, calls }`; `on_step` lives in the loop's host data; the start
+  goes through `runs::start_named_child` (a new site, `Observer`, with
+  nothing in place of a set-aside observer), and any refusal answers `{id:
+  null}`. `step.reasoning` does not exist (G-L1): the observer gets the
+  turn's `content` (often empty) and its calls. The step sits after
+  `route`'s `act` branch, and is skipped for rounds of only `finish` /
+  `working_memory_*`.
+- **review G-H3: `exclude_tools` is a deny set in host data.** `LoopOptions`
+  and `LoopHost` carry it (serde default: stored runs still read); `allows()`
+  and `visible()` check it, never `allowed`, so a restart and a `tools: *`
+  skill loaded mid-loop keep it. A name that is no tool (the MCP snapshot,
+  MCP's current list, the synthetic tools; G-L3) fails the start.
+- **review G-H4: nobody but the wrapper sends the reply.** Workers inherit
+  their loop's deny set (a narrowing is inherited, as the confirmation
+  target is), so decision 3's "posting into another chat goes to a worker"
+  is dropped: the Telegram loop cannot post elsewhere (Non-goals).
+  `orchestrator.md`/`routing.md` lose "you own delivery" for a conditional
+  line; the wrapper's system lines say the reply is written and sent after
+  the loop finishes and must not be sent or delegated; compose answers
+  `{reply: null}` when the work shows the reply already delivered.
+- **review G-H5: the composed reply is guarded.** The wrapper sends it as
+  the loop does: `start_guard` on the one `send_telegram_message` call, the
+  join, then `classify`/`tool_once` under the guard run (the route's run has
+  loop host data, so those functions serve it). The deterministic rules and
+  Jev apply; a block or a declined card clears the bubble and the wrapper's
+  output is the guard's reply.
+- **review G-M1:** 👀 is the wrapper's first step, before any model call.
+- **review G-M2:** every status call (open, clear, the catch's clear) sits
+  in a `try` with an empty catch; the send's `call.unknown` counts as sent
+  (no resend, no report); any other send error raises into the catch.
+- **review G-M3:** `loop_transcript` drops the system message and renders
+  the turns compactly (calls with clipped arguments, results clipped per
+  call), keeping the request and as much of the tail as fits.
+- **review G-M4:** `start_loop`'s span is tagged `activity: loop`, so the
+  journal's `final` is the route's (the reply sent); `settle_child { kind:
+  route }` takes the skills of a route that took no turn from its
+  `start_loop` record (`loaded`).
+- **review G-M5:** `signal_transcript` follows a route that took no turn to
+  its loop child, so the recovery report sees the loop's work.
+- **review G-M6:** the bubble id is `status:<signal id>`. When the loop
+  sleeps on a confirmation the wrapper clears the bubble (it would freeze
+  above the card for hours); the tombstone then keeps later status lines
+  away, and nothing reopens it.
+- **review G-M7:** `launch` adds the undelivered button press's note to
+  every route's instructions (which `start_loop` inherits). A press that
+  resolves a card never reaches the wrapper; the null-reply example is "a
+  press the agent decides needs no answer".
+- **review G-M8:** replies with buttons and the reply's message id inside
+  the loop: Non-goals.
+- **review G-M9:** each observer is anchored under the loop's span as
+  `observe:<i>` (`activity: observer`); the journal skips what is under it.
+- **review G-M10:** the built-in route has `priority: -1`, so an agent's
+  route of equal specificity wins without a tie; the default-path tests that
+  send `telegram` signals are ported (see the LOG entry).
+- **review G-M11:** the observer's compose has `timeout: PT20S`, so it never
+  holds the supervisor's quiescence for long.
+- **review G-L2, decision 7 narrowed:** `seq` and the tombstone gate only
+  updates that carry a `seq`; an update without one behaves exactly as
+  before, after a clear too (an agent or a saved workflow reusing an id
+  after clearing it keeps working, and the existing bubble property holds).
+  Marks are kept in the per-id queue's turn and dropped after an hour; the
+  answer is `{action: "dropped", reason: "stale" | "cleared"}`.
+- **review G-L4:** compose gets `history: $context.input` (the rendered
+  history and the request), no separate `request`.
+- **review G-L5:** accepted: `llm_compose` always prepends `composer`.
+- **review G-L6/G-L7:** rollout also moves a `telegram.patch.md` aside and
+  checks for an agent route on `source: telegram`; unjoined observers are
+  stored runs the sweep removes like any other.
