@@ -5,7 +5,9 @@
 // Sections: 1. the runtime (store, capacity, budget); 2. agent tables
 // (evidence, run anchors, the MCP tool snapshot); 3. host data, the trust
 // boundary; 4. live trace scopes; 5. the lifecycle observer; 6. the run tree
-// and its quiescence; 7. built-ins at boot; 8. reconciliation and sweep.
+// and its quiescence; 7. built-ins at boot; 8. reconciliation and sweep;
+// 9. waiting, the background and the reconciler; 10. starting a name the
+// agent may have overridden (design 04).
 use crate::{
     db::AgentDb,
     tracing::{Scope, Span, SpanEnd, Trace, TraceAnchor, TraceStart},
@@ -201,6 +203,13 @@ impl AgentDb {
         Ok(())
     }
 
+    /// Forgets the anchor of a run the engine refused to admit (nothing was
+    /// stored under its id), so the next start of that id anchors afresh.
+    pub fn forget_run_trace(&self, run: &str) -> anyhow::Result<()> {
+        self.conn().execute("DELETE FROM run_trace WHERE run_id = ?1", [run])?;
+        Ok(())
+    }
+
     /// Adds MCP's tools to the snapshot (never shrunk): a tool that goes away
     /// stays registered and answers `not_executed`, so a run that calls it
     /// never faults on a missing function at resume (design 01, decision 16).
@@ -298,6 +307,10 @@ pub struct LoopHost {
     pub guard_request: Option<String>,
     pub signal_id: Option<i64>,
     pub evidence: LoopEvidence,
+    /// The version set aside for this run, when it runs a built-in in its
+    /// place (§10): its record, and the line its instructions carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Fallback>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -332,6 +345,9 @@ enum Live {
     Borrowed(Scope),
     // The span a starter opened for the child; ended when the run stops.
     Span(Arc<dyn Span>),
+    // The same, inside a span of its own starter's (a route's, a saved
+    // workflow's), which ends with it.
+    Wrapped(Arc<dyn Span>, Arc<dyn Span>),
     // A continuation segment opened here; ended when the run stops.
     Segment(Arc<dyn Trace>),
 }
@@ -354,6 +370,11 @@ impl Scopes {
     /// A span opened for `run` by its starter, ended when the run stops.
     pub fn own(&self, run: &str, span: Arc<dyn Span>) {
         self.lock().entry(run.into()).or_insert(Live::Span(span));
+    }
+
+    /// `own`, with `outer` (the span `span` nests in) ended right after it.
+    pub fn own_wrapped(&self, run: &str, span: Arc<dyn Span>, outer: Arc<dyn Span>) {
+        self.lock().entry(run.into()).or_insert(Live::Wrapped(span, outer));
     }
 
     pub fn release(&self, run: &str) {
@@ -392,7 +413,7 @@ impl Scopes {
 
     /// Whether the scope of `run` is one this registry ends (not borrowed).
     pub fn owns(&self, run: &str) -> bool {
-        matches!(self.lock().get(run), Some(Live::Span(_) | Live::Segment(_)))
+        matches!(self.lock().get(run), Some(Live::Span(_) | Live::Wrapped(..) | Live::Segment(_)))
     }
 
     /// Ends the scope the run's execution traced into: on a stop (suspended,
@@ -408,6 +429,11 @@ impl Scopes {
         };
         match removed {
             Some(Live::Span(span)) => span.end(end.unwrap_or_default()),
+            Some(Live::Wrapped(span, outer)) => {
+                let end = end.unwrap_or_default();
+                span.end(end.clone());
+                outer.end(end);
+            }
             Some(Live::Segment(trace)) => {
                 if let Some(end) = end
                     && let Some(output) = end.output
@@ -442,6 +468,11 @@ impl Scopes {
                 Live::Span(span) => {
                     span.end(SpanEnd::error("stopped by a shutdown; the run resumes at the next start"))
                 }
+                Live::Wrapped(span, outer) => {
+                    let stopped = SpanEnd::error("stopped by a shutdown; the run resumes at the next start");
+                    span.end(stopped.clone());
+                    outer.end(stopped);
+                }
                 Live::Segment(trace) => trace.end(),
                 Live::Borrowed(_) => {}
             }
@@ -458,7 +489,7 @@ impl Scopes {
 fn current(live: &HashMap<String, Live>, run: &str) -> Option<Scope> {
     Some(match live.get(run)? {
         Live::Borrowed(scope) => scope.clone(),
-        Live::Span(span) => span.clone(),
+        Live::Span(span) | Live::Wrapped(span, _) => span.clone(),
         Live::Segment(trace) => trace.clone(),
     })
 }
@@ -566,39 +597,39 @@ pub fn quiescent_run(run: &SavedRun, now: i64) -> bool {
 }
 
 // ── 7. built-ins at boot ────────────────────────────────────────────────────
-// Design 03, R-M7: reuse the stored version whose digest equals the
-// built-in's, else save it; activate only when nothing is active or the
-// active version is one of the built-in digests seen before (kept in the
-// memory KV until the versions step's `workflow_meta`). An active version
-// that is not a built-in (an operator's) is never replaced.
-
-pub fn builtin_digests_key(name: &str) -> String {
-    format!("engine.builtin_digests.{name}")
-}
+// Design 03, R-M7, on design 04's `workflow_meta`: reuse the stored version
+// whose digest equals the built-in's, else save it, and record its digest as
+// a built-in text; activate it only when nothing is active or the active
+// version is a built-in text (an older one: the boot upgrades it). An active
+// version that is not a built-in (the agent's override, an operator's) is
+// never replaced, and a name an operator paused is left alone: an
+// activation would lift the pause (design 04, decision 5).
 
 pub async fn install_builtins(
     runtime: &ouro_runtime::Runtime,
-    memory: &dyn crate::db::MemoryStore,
+    db: &AgentDb,
     builtins: &[(&str, &str)],
 ) -> anyhow::Result<()> {
     for (name, yaml) in builtins {
         let digest = ouro_runtime::durable::digest_of(yaml);
-        let known_key = builtin_digests_key(name);
-        let mut known: Vec<String> =
-            memory.get(&known_key)?.and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default();
+        let (record_name, record_digest) = (name.to_string(), digest.clone());
+        db.write(move |db| crate::flows::WorkflowMeta::record(db, &record_name, &record_digest, None, true)).await?;
         let definitions = runtime.definitions(name).await?;
+        if let Some(manual) = definitions.tripped.as_ref().and_then(|t| t.manual.as_ref()) {
+            eprintln!("[engine] `{name}` is paused by an operator ({}): its built-in is not installed", manual.note);
+            continue;
+        }
         let version = match definitions.versions.values().find(|d| d.digest == digest) {
             Some(d) => d.version,
             None => runtime.save(name, yaml).await?.version,
         };
-        if !known.contains(&digest) {
-            known.push(digest.clone());
-            memory.set(&known_key, &serde_json::to_string(&known)?)?;
-        }
-        let active_digest = definitions.active.and_then(|v| definitions.versions.get(&v)).map(|d| d.digest.clone());
-        let replace = match &active_digest {
+        let active = definitions.active.and_then(|v| definitions.versions.get(&v));
+        let replace = match active {
             None => true,
-            Some(active) => active != &digest && known.contains(active),
+            Some(active) => {
+                active.digest != digest
+                    && crate::flows::WorkflowMeta::get(db, name, &active.digest)?.is_some_and(|m| m.builtin)
+            }
         };
         if replace {
             runtime.activate_as(name, version, "agent-supervisor", Some("built-in")).await?;
@@ -975,7 +1006,7 @@ async fn history(engine: &crate::agent::Engine, since: i64, before: i64) -> anyh
 /// installed, and cards created before the migration marker are edited to
 /// "expired" once (their runs are gone).
 pub async fn boot(engine: &std::sync::Arc<crate::agent::Engine>) -> anyhow::Result<()> {
-    install_builtins(&engine.runtime, &*engine.deps.memory, &crate::flows::builtins()).await?;
+    install_builtins(&engine.runtime, &engine.deps.db, &crate::flows::builtins()).await?;
     if engine.deps.memory.get(MIGRATED_KEY)?.is_none() {
         let now = now_ms();
         let card = crate::confirmation::Card::load(&*engine.deps.memory);
@@ -993,4 +1024,404 @@ pub async fn boot(engine: &std::sync::Arc<crate::agent::Engine>) -> anyhow::Resu
         engine.deps.memory.set(MIGRATED_KEY, &now.to_string())?;
     }
     Ok(())
+}
+
+// ── 10. starting a name the agent may have overridden ───────────────────────
+// Design 04 (R-M1, R2-H1): every start of `signal`, a loop, a route or a
+// saved workflow goes through one decision. A start that the engine refuses
+// before admitting anything (the breaker tripped, an operator paused it, a
+// function it calls is gone, it no longer validates) never fails the run
+// it serves: the same id starts pinned at the built-in in its place, or the
+// route or saved path steps aside for the default path. A fault during a
+// run is not a refusal. A starter dispatched again joins what its first
+// dispatch committed, under the name that ran.
+
+/// Where a named start happens: the signal's own run; a loop (the primary,
+/// a worker, a recovery report, a loop the host runs itself), which only a
+/// loop may serve; a route the dispatcher starts; a scheduled task's saved
+/// workflow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Site {
+    Signal,
+    Loop,
+    Route,
+    Saved,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FallbackReason {
+    Tripped,
+    Invalid,
+    Missing,
+    NotALoop,
+    Paused,
+}
+
+impl FallbackReason {
+    fn text(self, faults: Option<u32>) -> String {
+        match self {
+            FallbackReason::Tripped => {
+                format!("its breaker tripped after {} faults in a row", faults.unwrap_or(0))
+            }
+            FallbackReason::Invalid => "it no longer fits the tools".into(),
+            FallbackReason::Missing => "it has no active version".into(),
+            FallbackReason::NotALoop => "it is not a loop".into(),
+            FallbackReason::Paused => "an operator paused it".into(),
+        }
+    }
+}
+
+/// A version set aside for one start (design 04, R-M4): which, why, what
+/// ran instead (`None`: a route or a saved workflow, whose path steps aside),
+/// and the line the run that runs tells its model. Informs; the agent decides.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Fallback {
+    pub name: String,
+    pub version: Option<u64>,
+    pub digest: Option<String>,
+    pub reason: FallbackReason,
+    pub error: Option<String>,
+    pub ran: Option<(String, u64)>,
+    pub line: String,
+}
+
+// An error carried into host data stays short.
+const FALLBACK_ERROR_CHARS: usize = 400;
+
+/// Why a version is set aside for one start, before what runs instead is
+/// known: its version and content, the reason, the engine's words, and the
+/// breaker's count.
+struct Aside {
+    version: Option<u64>,
+    digest: Option<String>,
+    reason: FallbackReason,
+    error: Option<String>,
+    faults: Option<u32>,
+}
+
+impl Fallback {
+    fn new(name: &str, aside: Aside, site: Site, ran: Option<(String, u64)>) -> Fallback {
+        let Aside { version, digest, reason, error, faults } = aside;
+        let error = error.map(|e| crate::activity::clip(&e, FALLBACK_ERROR_CHARS));
+        let version_text = version.map(|v| format!(" v{v}")).unwrap_or_default();
+        let why = match &error {
+            Some(error) => format!("{}: {error}", reason.text(faults)),
+            None => reason.text(faults),
+        };
+        let instead = match (&ran, site) {
+            (Some((ran, _)), _) => format!("the built-in `{ran}` runs this time"),
+            (None, Site::Route) => "the default path handles this signal".into(),
+            (None, _) => "the agent loop takes this task".into(),
+        };
+        let line = format!(
+            "Workflow `{name}`{version_text} was set aside ({why}); {instead}. Tell the user if it matters; fix or re-activate it if you own it."
+        );
+        Fallback { name: name.into(), version, digest, reason, error, ran, line }
+    }
+}
+
+/// The fallback record where it shows (design 04, R-M4): a `fallback`
+/// event on `scope` and, for the span of the run that ran in its place
+/// (`metadata`), the record in its metadata.
+pub fn trace_fallback(scope: crate::tracing::Scope, fallback: &Fallback, metadata: bool) {
+    let record = serde_json::to_value(fallback).unwrap_or_default();
+    scope.event(crate::tracing::EventStart {
+        name: "fallback".into(),
+        level: Some(crate::tracing::Level::Warning),
+        metadata: json!({"fallback": record}).as_object().cloned(),
+        ..Default::default()
+    });
+    if metadata {
+        scope.update(crate::tracing::ContextUpdate::metadata(
+            json!({"fallback": record}).as_object().cloned().unwrap_or_default(),
+        ));
+    }
+}
+
+/// What a named start ran: its definition and version, whether it was
+/// pinned, and the version set aside for it, if any.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Ran {
+    pub name: String,
+    pub version: u64,
+    pub pinned: bool,
+    pub fallback: Option<Fallback>,
+}
+
+/// What a start runs: the definition chosen and the version set aside for
+/// it, if any. The starter's builder makes the run's input and host data
+/// from it, so a fallback rebuilds both (the line in its instructions, the
+/// definition it names in its host data).
+pub struct Choice {
+    pub name: String,
+    pub version: u64,
+    pub yaml: String,
+    pub fallback: Option<Fallback>,
+}
+
+/// The outcome of a named start at a route or a saved site, which may step
+/// aside instead of starting.
+pub enum Named<T> {
+    Started(T, Ran),
+    SetAside(Fallback),
+}
+
+/// What a stored run ran, from its admission: a joined start reports it.
+pub fn ran_of(run: &SavedRun) -> Ran {
+    let fallback = run
+        .admission
+        .host()
+        .and_then(|h| h.get("fallback"))
+        .or_else(|| run.admission.input.get("fallback"))
+        .and_then(|f| serde_json::from_value(f.clone()).ok());
+    Ran {
+        name: run.admission.name.clone(),
+        version: run.admission.version,
+        pinned: run.admission.runtime[ouro_runtime::durable::PINNED] == true,
+        fallback,
+    }
+}
+
+enum Decision {
+    Start { version: u64, yaml: String },
+    Aside(Aside),
+}
+
+// Step 1: the active version just read, unless there is none, it is set
+// aside (its breaker, an operator), or it is no loop at a loop site (R-H2).
+async fn decide(engine: &crate::agent::Engine, name: &str, site: Site) -> anyhow::Result<Decision> {
+    let definitions = engine.runtime.definitions(name).await?;
+    let Some(d) = definitions.active.and_then(|v| definitions.versions.get(&v)) else {
+        return Ok(Decision::Aside(Aside {
+            version: None,
+            digest: None,
+            reason: FallbackReason::Missing,
+            error: None,
+            faults: None,
+        }));
+    };
+    if let Some(trip) = &definitions.tripped {
+        let refusal = trip.refusal(name);
+        let reason = if refusal.paused { FallbackReason::Paused } else { FallbackReason::Tripped };
+        let error = match &trip.manual {
+            Some(manual) => format!("{refusal}: {}", manual.note),
+            None => refusal.to_string(),
+        };
+        return Ok(Decision::Aside(Aside {
+            version: Some(d.version),
+            digest: Some(d.digest.clone()),
+            reason,
+            error: Some(error),
+            faults: Some(trip.faults),
+        }));
+    }
+    if site == Site::Loop && !crate::flows::is_loop_definition(name, &d.yaml) {
+        return Ok(Decision::Aside(Aside {
+            version: Some(d.version),
+            digest: Some(d.digest.clone()),
+            reason: FallbackReason::NotALoop,
+            error: None,
+            faults: None,
+        }));
+    }
+    Ok(Decision::Start { version: d.version, yaml: d.yaml.clone() })
+}
+
+// The refusal table's rows a fallback answers: a breaker's trip or an
+// operator's pause, and a definition this host no longer admits. Anything
+// else (nesting depth, host data, a mismatch, storage, an interruption) is
+// no property of the version and stays the start's error.
+fn refusal(error: &anyhow::Error) -> Option<(FallbackReason, String, Option<u32>)> {
+    if let Some(tripped) = error.downcast_ref::<ouro_runtime::durable::DefinitionTripped>() {
+        let reason = if tripped.paused { FallbackReason::Paused } else { FallbackReason::Tripped };
+        return Some((reason, tripped.to_string(), Some(tripped.faults)));
+    }
+    if error.is::<ouro_runtime::MissingFunction>() || error.is::<ouro_runtime::InvalidDefinition>() {
+        return Some((FallbackReason::Invalid, format!("{error:#}"), None));
+    }
+    None
+}
+
+fn child_refusal(error: &ouro_runtime::ChildError) -> Option<(FallbackReason, String, Option<u32>)> {
+    use ouro_runtime::{ChildError, ChildRefusal};
+    match error {
+        ChildError::Refused(ChildRefusal::Tripped(tripped)) => {
+            let reason = if tripped.paused { FallbackReason::Paused } else { FallbackReason::Tripped };
+            Some((reason, tripped.to_string(), Some(tripped.faults)))
+        }
+        ChildError::Refused(ChildRefusal::Inadmissible(error)) => {
+            Some((FallbackReason::Invalid, format!("{error:#}"), None))
+        }
+        _ => None,
+    }
+}
+
+// What runs in place of a set-aside version of `name`: the signal's
+// built-in for the dispatcher, the built-in `agent-loop` at a loop site
+// (the only built-in loop); none for a route or a saved workflow.
+async fn fallback_target(engine: &crate::agent::Engine, site: Site) -> anyhow::Result<Option<(String, u64, String)>> {
+    let name = match site {
+        Site::Signal => crate::supervisor::SIGNAL_NAME,
+        Site::Loop => crate::agent::AGENT_LOOP_NAME,
+        Site::Route | Site::Saved => return Ok(None),
+    };
+    let version = crate::flows::builtin_version(&engine.runtime, name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("the built-in `{name}` is not installed"))?;
+    let yaml = crate::flows::built_in(name).unwrap_or_default().to_owned();
+    Ok(Some((name.to_owned(), version, yaml)))
+}
+
+// The fallback for `name` set aside at `site`, or the start's own error: a
+// pause of the very name the fallback would run stops the start with the
+// pause's note (decision 5).
+async fn set_aside(
+    engine: &crate::agent::Engine,
+    name: &str,
+    site: Site,
+    aside: Aside,
+) -> anyhow::Result<(Fallback, Option<(String, u64, String)>)> {
+    let target = fallback_target(engine, site).await?;
+    if aside.reason == FallbackReason::Paused && target.as_ref().is_some_and(|(t, _, _)| t == name) {
+        let note = aside.error.unwrap_or_else(|| format!("{name} is paused by an operator"));
+        eprintln!("[engine] `{name}` is paused by an operator and has no other version to run: {note}");
+        anyhow::bail!("{note}");
+    }
+    let ran = target.as_ref().map(|(t, v, _)| (t.clone(), *v));
+    Ok((Fallback::new(name, aside, site, ran), target))
+}
+
+// A start's refusal in the table, as the version it set aside.
+fn refused(version: u64, (reason, text, faults): (FallbackReason, String, Option<u32>)) -> Aside {
+    Aside { version: Some(version), digest: None, reason, error: Some(text), faults }
+}
+
+/// Starts root run `id` of `name` at `site` (the signal; a recovery report or
+/// a loop the host runs itself), its input and host data from `build`. An
+/// existing run is returned as it was admitted (step 0). A refusal in the
+/// table starts the same id pinned at the built-in in its place; the
+/// fallback's own refusal is the original error, logged (R-L9).
+pub async fn start_named_root(
+    engine: &crate::agent::Engine,
+    id: &str,
+    name: &str,
+    site: Site,
+    build: impl Fn(Choice) -> futures::future::BoxFuture<'static, anyhow::Result<(Value, Value)>>,
+) -> anyhow::Result<(SavedRun, Ran)> {
+    if let Some(saved) = engine.runtime.get(id).await? {
+        let ran = ran_of(&saved);
+        return Ok((saved, ran));
+    }
+    let aside = match decide(engine, name, site).await? {
+        Decision::Start { version, yaml } => {
+            let (input, host) = build(Choice { name: name.into(), version, yaml, fallback: None }).await?;
+            let start = ouro_runtime::Start { version: Some(version), host };
+            match engine.runtime.start_with(id, name, input, start).await {
+                Ok(saved) => {
+                    let ran = Ran { name: name.into(), version, pinned: true, fallback: None };
+                    return Ok((saved, ran));
+                }
+                Err(e) => match refusal(&e) {
+                    Some(why) => refused(version, why),
+                    None => return Err(e),
+                },
+            }
+        }
+        Decision::Aside(aside) => aside,
+    };
+    let (fallback, target) = set_aside(engine, name, site, aside).await?;
+    let Some((target, target_version, yaml)) = target else {
+        anyhow::bail!("`{name}` was set aside and has nothing to run in its place: {}", fallback.line)
+    };
+    let choice = Choice { name: target.clone(), version: target_version, yaml, fallback: Some(fallback.clone()) };
+    let (input, host) = build(choice).await?;
+    let start = ouro_runtime::Start { version: Some(target_version), host };
+    match engine.runtime.start_with(id, &target, input, start).await {
+        Ok(saved) => {
+            let ran = Ran { name: target, version: target_version, pinned: true, fallback: Some(fallback) };
+            Ok((saved, ran))
+        }
+        Err(e) => {
+            eprintln!("[engine] the built-in `{target}` in place of `{name}` was refused too: {e:#}");
+            anyhow::bail!("{}", fallback.error.clone().unwrap_or(fallback.line))
+        }
+    }
+}
+
+/// What starts a host child of the calling run: its function's context
+/// (`FunctionContext`); a seam, so a test can stand in for a re-dispatched
+/// call.
+#[async_trait::async_trait]
+pub trait ChildStarts: Send + Sync {
+    fn child_id(&self, key: &str) -> String;
+    async fn start_child(
+        &self,
+        child: ouro_runtime::ChildStart,
+    ) -> Result<ouro_runtime::ChildRef, ouro_runtime::ChildError>;
+}
+
+#[async_trait::async_trait]
+impl ChildStarts for ouro_runtime::FunctionContext {
+    fn child_id(&self, key: &str) -> String {
+        ouro_runtime::FunctionContext::child_id(self, key)
+    }
+    async fn start_child(
+        &self,
+        child: ouro_runtime::ChildStart,
+    ) -> Result<ouro_runtime::ChildRef, ouro_runtime::ChildError> {
+        ouro_runtime::FunctionContext::start_child(self, child).await
+    }
+}
+
+/// Starts the host child `key` of the calling run as a run of `name` at
+/// `site` (the primary, a worker, a route, a saved workflow). A child the
+/// call started before is joined under the name it runs (step 0), whatever
+/// `name` says now. At a route or saved site a set-aside version starts
+/// nothing (`Named::SetAside`): the caller steps aside.
+pub async fn start_named_child(
+    engine: &crate::agent::Engine,
+    ctx: &dyn ChildStarts,
+    key: &str,
+    name: &str,
+    site: Site,
+    build: impl Fn(Choice) -> futures::future::BoxFuture<'static, anyhow::Result<(Value, Value)>>,
+) -> anyhow::Result<Named<ouro_runtime::ChildRef>> {
+    let start = async |name: &str, version: Option<u64>, input: Value, host: Value| {
+        ctx.start_child(ouro_runtime::ChildStart { key: key.into(), name: name.into(), version, input, host }).await
+    };
+    if let Some(saved) = engine.runtime.get(&ctx.child_id(key)).await? {
+        let child = start(&saved.admission.name, None, Value::Null, Value::Null).await?;
+        return Ok(Named::Started(child, ran_of(&saved)));
+    }
+    let aside = match decide(engine, name, site).await? {
+        Decision::Start { version, yaml } => {
+            let (input, host) = build(Choice { name: name.into(), version, yaml, fallback: None }).await?;
+            match start(name, Some(version), input, host).await {
+                Ok(child) => {
+                    let ran = Ran { name: name.into(), version, pinned: true, fallback: None };
+                    return Ok(Named::Started(child, ran));
+                }
+                Err(e) => match child_refusal(&e) {
+                    Some(why) => refused(version, why),
+                    None => return Err(e.into()),
+                },
+            }
+        }
+        Decision::Aside(aside) => aside,
+    };
+    let (fallback, target) = set_aside(engine, name, site, aside).await?;
+    let Some((target, target_version, yaml)) = target else { return Ok(Named::SetAside(fallback)) };
+    let choice = Choice { name: target.clone(), version: target_version, yaml, fallback: Some(fallback.clone()) };
+    let (input, host) = build(choice).await?;
+    match start(&target, Some(target_version), input, host).await {
+        Ok(child) => {
+            let ran = Ran { name: target, version: target_version, pinned: true, fallback: Some(fallback) };
+            Ok(Named::Started(child, ran))
+        }
+        Err(e) => {
+            eprintln!("[engine] the built-in `{target}` in place of `{name}` was refused too: {e:#}");
+            anyhow::bail!("{}", fallback.error.clone().unwrap_or(fallback.line))
+        }
+    }
 }

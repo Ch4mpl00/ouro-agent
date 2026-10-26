@@ -3,9 +3,9 @@
 // middle of a round is resumed by the next one from the run's records,
 // without a second generation of that round and without sending a write
 // again. Its guard, its workers and their history (`read_run`), on the
-// engine. The suite of the old run store, rewritten: what needs a saved
-// agent-loop version returns with the versions step (design 03, decision 9;
-// tests/pending/durable_loop.rs).
+// engine. The suite of the old run store, rewritten; what needed a saved
+// agent-loop version came back with the versions step (design 04): the
+// agent's own agent-loop, its breaker, and what its YAML may do itself.
 mod support;
 use agent::{
     agent::{AgentLoop, Engine, EngineDeps, LoopOptions, Providers, create_engine},
@@ -864,4 +864,211 @@ async fn a_guard_child_result_cannot_authorize_another_invocation() {
     let again = agent::agent::loop_tool(&engine, &live, &args, "once", "another invocation", true).await.unwrap();
     assert!(again["presented"].as_str().unwrap().contains("already used"), "{again}");
     assert_eq!(world.names(), ["send"], "the verdict authorized one invocation");
+}
+
+// ── the agent's own agent-loop (design 04) ──────────────────────────────────
+
+// Every run of a name's version, live or ended, with its host data.
+async fn runs_under(engine: &Engine, parent: &str) -> Vec<ouro_runtime::durable::SavedRun> {
+    let live = agent::runs::Runs { parent: Some(parent.into()), ..Default::default() };
+    let ended = agent::runs::Runs { since_ms: Some(0), before_ms: Some(i64::MAX / 4), ..live.clone() };
+    let mut ids: Vec<String> = Vec::new();
+    for page in
+        [engine.control.list(&live, None, 100).await.unwrap(), engine.control.history(&ended, None, 100).await.unwrap()]
+    {
+        for run in page.items {
+            if !ids.contains(&run.admission.id) {
+                ids.push(run.admission.id);
+            }
+        }
+    }
+    let mut runs = Vec::new();
+    for id in ids {
+        runs.push(engine.runtime.get(&id).await.unwrap().unwrap());
+    }
+    runs
+}
+
+// The agent's agent-loop (after a dry run) drives every loop started after;
+// three faults of that version in a row set it aside, and activating a
+// version again starts a fresh count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_activated_agent_loop_runs_and_three_faults_in_a_row_put_the_built_in_one_back() {
+    let llm = Arc::new(Scripted::new((0..6).map(|_| assistant("hello")).collect()));
+    let engine = engine(llm, Arc::new(World::default()));
+    let run = |n: usize| {
+        let engine = engine.clone();
+        async move { start(&engine, &format!("peer:{n}")).await.send("go".into()).await }
+    };
+    let louder =
+        support::without_breaker(agent::agent::AGENT_LOOP).replace("output: .content", r#"output: ("v2 " + .content)"#);
+    assert_ne!(louder, support::without_breaker(agent::agent::AGENT_LOOP));
+    support::activate_definition(&engine, "agent-loop", &louder).await;
+    assert_eq!(run(1).await.unwrap(), "v2 hello");
+
+    let broken = "document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '9.0.0' }\n\
+        do: [ { boom: { raise: { error: { type: 'https://example.com/boom', status: 500 } } } }, { guard: { call: start_guard, with: { calls: [], i: 1 } } } ]\n";
+    support::activate_definition(&engine, "agent-loop", broken).await;
+    for n in 2..5 {
+        assert!(run(n).await.is_err(), "fault {}", n - 1);
+    }
+    assert_eq!(run(5).await.unwrap(), "hello", "the built-in loop is back");
+    // Activating a version again closes the breaker for it.
+    support::activate_definition(&engine, "agent-loop", &louder).await;
+    assert_eq!(run(6).await.unwrap(), "v2 hello");
+}
+
+// agent-loop without its guarded round.
+fn without_guard() -> String {
+    let definition = support::without_breaker(agent::agent::AGENT_LOOP);
+    let a = definition.find("  - guard:\n").unwrap();
+    let b = definition.find("  - round:\n").unwrap();
+    format!("{}{}", &definition[..a], &definition[b..]).replace("- act: { then: guard }", "- act: { then: round }")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn guardless_overrides_are_refused_early_but_old_stored_ones_are_enforced_by_the_host() {
+    let (engine, world, api, _) = guarded(vec![calls(&[("send", json!({"q":"x"}))]), assistant("done")], "misaligned");
+    let definition = without_guard();
+    assert!(!definition.contains("call: start_guard"));
+    let save = json!({"name":"agent-loop","definition":definition});
+    let error = agent::flows::tool(&engine, "save_workflow", save.as_object().unwrap()).await.unwrap_err().to_string();
+    assert!(error.contains("requires a `call: start_guard`"), "{error}");
+    let version = engine.runtime.save("agent-loop", &definition).await.unwrap().version;
+    let digest = ouro_runtime::durable::digest_of(&definition);
+    agent::flows::WorkflowMeta::record(&engine.deps.db, "agent-loop", &digest, None, false).unwrap();
+    support::mark_tried(&engine, "agent-loop", &definition);
+    let activate = json!({"name":"agent-loop","version":version});
+    assert!(
+        agent::flows::tool(&engine, "activate_workflow", activate.as_object().unwrap())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("requires a `call: start_guard`")
+    );
+    // Stored past the gate, it still runs every call the host must review
+    // through a review: the tool supplies the missing guard.
+    support::store_definition(&engine, "agent-loop", &definition).await;
+    guarded_run(&engine, "legacy").await;
+    assert!(world.names().is_empty());
+    assert_eq!(api.requests.lock().unwrap().len(), 1, "tool supplied the missing guard");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn arguments_swapped_after_guard_require_a_new_verdict_and_yaml_cannot_change_the_task() {
+    for name in ["send", "remote_read"] {
+        let (engine, world, api, _) = guarded(vec![], "allow");
+        // The YAML reviews one call and runs another: the host's own task and
+        // root request stay the evidence (the YAML has no say in them).
+        let definition = r#"
+document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '2.0.0' }
+do:
+  - review:
+      call: start_guard
+      with: { calls: [{ id: c, name: send, arguments: '{"q":"original"}' }], i: 1 }
+      export: { as: '${ $context + { guard: . } }' }
+  - wait:
+      listen: { to: { one: { with: { type: '${ "done:" + $context.guard.run }' } } } }
+  - changed:
+      call: tool_once
+      with: { call: { id: c, name: send, arguments: '{"q":"changed"}' }, guard_run: '${ $context.guard.run }', i: 1 }
+"#;
+        let definition = definition.replace("name: send", &format!("name: {name}"));
+        support::store_definition(&engine, "agent-loop", &definition).await;
+        guarded_run(&engine, "swapped").await;
+        assert_eq!(world.names(), [name]);
+        let requests = api.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["state"]["task"], "go");
+        assert_eq!(requests[1]["state"]["task"], "go");
+        assert_eq!(requests[1]["state"]["root_request"], "");
+        assert_eq!(requests[1]["state"]["calls"][0]["arguments"], r#"{"q":"changed"}"#);
+    }
+}
+
+// A call written into the loop's definition is the author's, trusted as a
+// saved workflow's (the user approved the definition): it runs as a step,
+// unreviewed. Only the model's calls go through the guarded round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_loops_own_calls_run_as_workflow_steps_without_a_review() {
+    for name in ["send", "remote_read"] {
+        let (engine, world, api, _) = guarded(vec![], "misaligned");
+        let definition = "document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '2.0.0' }\ndo: [{ bypass: { call: send, with: { q: bypass } } }]";
+        let definition = definition.replace("call: send", &format!("call: {name}"));
+        support::store_definition(&engine, "agent-loop", &definition).await;
+        guarded_run(&engine, "direct").await;
+        assert_eq!(world.names(), [name]);
+        assert!(api.requests.lock().unwrap().is_empty(), "no review of the definition's own call");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn override_calls_are_in_the_host_chain_even_without_assistant_messages() {
+    let (engine, world, api, _) = guarded(vec![], "allow");
+    let definition = r#"
+document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '2.0.0' }
+do:
+  - first:
+      call: tool_repeat
+      with: { call: { id: first, name: search, arguments: '{"q":"facts"}' }, i: 1, index: 0 }
+  - second:
+      call: tool_once
+      with: { call: { id: second, name: send, arguments: '{"q":"notes"}' }, i: 1, index: 1 }
+"#;
+    support::store_definition(&engine, "agent-loop", definition).await;
+    guarded_run(&engine, "override-chain").await;
+    assert_eq!(world.names(), ["search", "send"]);
+    let requests = api.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["state"]["chain"][0]["name"], "search");
+    assert_eq!(requests[0]["state"]["chain"][0]["arguments"], "{\"q\":\"facts\"}");
+    assert!(!requests[0].to_string().contains("search ok"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_legacy_loop_without_a_guard_step_cannot_dispatch_a_blocked_remote_read() {
+    let (engine, world, api, _) =
+        guarded(vec![calls(&[("remote_read", json!({"q":"private data"}))]), assistant("done")], "misaligned");
+    support::store_definition(&engine, "agent-loop", &without_guard()).await;
+    assert_eq!(guarded_run(&engine, "legacy-remote").await, "done");
+    assert!(world.names().is_empty());
+    assert_eq!(api.requests.lock().unwrap().len(), 1);
+}
+
+// Workers run the active agent-loop, and its faults count toward its
+// breaker: after three, the next worker runs the built-in in its place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_children_keep_the_active_loop_version_and_its_breaker() {
+    let model = Arc::new(Scripted::new(vec![
+        calls(&[("invoke_sub_agent", json!({"prompt":"first"}))]),
+        calls(&[("invoke_sub_agent", json!({"prompt":"second"}))]),
+        calls(&[("invoke_sub_agent", json!({"prompt":"third"}))]),
+        calls(&[("invoke_sub_agent", json!({"prompt":"fourth"}))]),
+        assistant("worker recovered"),
+        assistant("done"),
+    ]));
+    let engine = engine(model.clone(), Arc::new(World::default()));
+    // The parent runs a loop of its own; its workers run agent-loop.
+    support::activate_definition(&engine, "parent-loop", &support::variant("parent-loop")).await;
+    let broken = "document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '2.0.0' }\ndo: [{ boom: { raise: { error: { type: 'https://example.com/boom', status: 500 } } } }, { guard: { call: start_guard, with: { calls: [], i: 1 } } }]";
+    let version = support::activate_definition(&engine, "agent-loop", broken).await;
+    let mut opts = options("breaker-parent");
+    opts.workflow = "parent-loop".into();
+    assert_eq!(engine.start_loop(opts).await.unwrap().send("go".into()).await.unwrap(), "done");
+    let builtin = agent::flows::builtin_version(&engine.runtime, "agent-loop").await.unwrap().unwrap();
+    let workers = runs_under(&engine, "breaker-parent").await;
+    let worker = |round: u64| {
+        let key = format!("/{}", agent::agent::worker_key(round, 0));
+        workers.iter().find(|r| r.child.as_ref().is_some_and(|l| l.key.ends_with(&key))).unwrap().clone()
+    };
+    for round in 1..=3 {
+        let child = worker(round);
+        assert_eq!(child.admission.version, version);
+        assert!(matches!(child.outcome, Some(Status::Faulted(_))));
+    }
+    let recovered = worker(4);
+    assert_eq!(recovered.admission.version, builtin);
+    assert!(agent::runs::ran_of(&recovered).fallback.is_some());
+    assert_eq!(recovered.outcome, Some(Status::Completed(json!("worker recovered"))));
+    assert_eq!(model.seen.lock().unwrap().len(), 6);
 }

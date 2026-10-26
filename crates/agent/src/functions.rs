@@ -11,10 +11,10 @@
 // itself has none (invariant 3), so a refusal is the answer to any other
 // caller, recorded as not executed.
 use crate::{
-    agent::{Effect, Engine, EngineDeps, LoopOptions, Refusal, refuse, tool_call},
+    agent::{AGENT_LOOP_NAME, Effect, Engine, EngineDeps, LoopOptions, Refusal, refuse, tool_call},
     errors::is_aborted,
     providers,
-    runs::{GUARD, GuardHost, PRIMARY, RECOVERY, SIGNAL, SignalHost},
+    runs::{Choice, Fallback, GUARD, GuardHost, Named, PRIMARY, RECOVERY, SIGNAL, SignalHost, Site},
     supervisor::PendingSignal,
     tracing::{ContextUpdate, EventStart, Level, Scope, Span, SpanEnd, SpanKind, SpanStart},
 };
@@ -27,6 +27,10 @@ use std::sync::{Arc, Weak};
 
 /// Taking signals is the supervisor's: a workflow that did would steal them.
 pub const WITHHELD: &[&str] = &["get_next_signal"];
+
+/// The host functions sent at most once: a write the engine must never
+/// repeat (the model's write, a confirmation card, the memory KV).
+pub const AT_MOST_ONCE: &[&str] = &["tool_once", "confirm_request", "set_memory"];
 
 /// The registry of the engine's runs: every MCP tool the snapshot ever held
 /// (permissive schemas, at most once unless MCP marks it read-only; an absent
@@ -53,8 +57,8 @@ pub fn registry(engine: Weak<Engine>, deps: &EngineDeps) -> Registry {
             mcp_tool(engine, tool.clone(), args, ctx)
         });
     }
-    let once = Delivery::AtMostOnce;
-    let repeat = Delivery::AtLeastOnce;
+    let (once, repeat) = (Delivery::AtMostOnce, Delivery::AtLeastOnce);
+    debug_assert!(AT_MOST_ONCE.iter().all(|f| ["tool_once", "confirm_request", "set_memory"].contains(f)));
     add(&mut registry, &engine, "agent_turn", repeat, agent_turn);
     add(&mut registry, &engine, "agent_settle", repeat, agent_settle);
     add(&mut registry, &engine, "loop_setup", repeat, loop_setup);
@@ -328,14 +332,19 @@ pub fn signal_run(id: i64) -> String {
 // at least once, its child's id derived from the call (`child_id`), so a
 // re-dispatch joins the child its first dispatch committed. Starters build no
 // loop (R2-M1); anchors and evidence are written before the start,
-// insert-or-ignore.
+// insert-or-ignore. A name the agent may have overridden starts through
+// `runs::start_named_child` (design 04): a set-aside version gives way to
+// the built-in `agent-loop` at a loop site, and steps the route or the
+// saved workflow aside for the default path.
 
 // The child's trace: a span under the starter's scope, which the child's
-// functions trace into while it lives in this process.
+// functions trace into while it lives in this process. `outer`: a span the
+// starter opened around it, which ends with it.
 async fn anchor_child(
     engine: &Engine,
     child: &str,
     span: Arc<dyn Span>,
+    outer: Option<Arc<dyn Span>>,
     session: Option<String>,
 ) -> anyhow::Result<()> {
     if let Some(anchor) = span.anchor() {
@@ -350,11 +359,31 @@ async fn anchor_child(
         engine.deps.db.write(move |db| db.insert_run_trace(&row)).await?;
     }
     if engine.scopes.current(child).is_none() {
-        engine.scopes.own(child, span);
+        match outer {
+            Some(outer) => engine.scopes.own_wrapped(child, span, outer),
+            None => engine.scopes.own(child, span),
+        }
     } else {
         span.end(SpanEnd::default());
+        if let Some(outer) = outer {
+            outer.end(SpanEnd::default());
+        }
     }
     Ok(())
+}
+
+// A start that failed after its anchor was written, with nothing stored
+// under the child's id: its span ends with the error and its anchor goes,
+// so a later start of the id anchors afresh.
+async fn unanchor(engine: &Engine, child: &str, error: &str) {
+    if engine.runtime.get(child).await.ok().flatten().is_some() {
+        return;
+    }
+    engine.scopes.stop(child, Some(SpanEnd::error(error)));
+    let run = child.to_owned();
+    if let Err(e) = engine.deps.db.write(move |db| db.forget_run_trace(&run)).await {
+        eprintln!("[engine] forgetting the anchor of {child}: {e:#}");
+    }
 }
 
 /// `start_guard { calls, i }`: the round's guard, a host child named guard
@@ -391,18 +420,11 @@ async fn start_guard(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> 
         };
         // Always the built-in round, whatever version of `guard` is active:
         // its stored outcome is what authorizes the round's calls.
-        let digest = ouro_runtime::durable::digest_of(crate::flows::GUARD);
-        let version = engine
-            .runtime
-            .definitions(crate::flows::GUARD_NAME)
+        let version = crate::flows::builtin_version(&engine.runtime, crate::flows::GUARD_NAME)
             .await?
-            .versions
-            .values()
-            .find(|d| d.digest == digest)
-            .map(|d| d.version)
             .ok_or_else(|| anyhow::anyhow!("the built-in guard is not installed"))?;
         let span = live.scope().span(SpanStart::new("guard", SpanKind::Chain).input(input.clone()));
-        anchor_child(&engine, &id, span, live.opts.session_id.clone()).await?;
+        anchor_child(&engine, &id, span, None, live.opts.session_id.clone()).await?;
         let child = ctx
             .start_child(ChildStart {
                 key: "guard".into(),
@@ -429,10 +451,69 @@ async fn start_guard(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> 
     start.await.map_err(failed)
 }
 
-/// `start_worker { call, i, index, memory }`: the model's `invoke_sub_agent`
-/// call as a host child, a loop with the worker's host data: it inherits the
-/// confirmation target (invariant 5) and the guard's evidence. `{id: null}`
-/// when it cannot start; `tool_repeat` then presents the error to the model.
+// A loop's options with the line of the version set aside for it, if any,
+// as the last part of its instructions, running the definition chosen.
+fn chosen(opts: &LoopOptions, choice: &Choice) -> LoopOptions {
+    let mut opts = opts.clone();
+    opts.workflow = choice.name.clone();
+    if let Some(fallback) = &choice.fallback {
+        let parts = [opts.system_prompt.take().unwrap_or_default(), fallback.line.clone()];
+        opts.system_prompt = Some(parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("\n\n"));
+    }
+    opts
+}
+
+/// What a named start builds a loop's admission with (`runs::start_named_*`).
+type Build = futures::future::BoxFuture<'static, anyhow::Result<(Value, Value)>>;
+
+// The builder of a loop's admission: `opts` running the definition chosen,
+// the first user message `prompt`, its working memory.
+fn loop_builder(
+    engine: &Arc<Engine>,
+    opts: &LoopOptions,
+    kind: &'static str,
+    id: &str,
+    prompt: &str,
+    memory: Value,
+) -> impl Fn(Choice) -> Build + use<> {
+    let (engine, opts, id, prompt) = (engine.clone(), opts.clone(), id.to_owned(), prompt.to_owned());
+    move |choice: Choice| {
+        let (engine, opts, id, prompt, memory) =
+            (engine.clone(), chosen(&opts, &choice), id.clone(), prompt.clone(), memory.clone());
+        Box::pin(async move {
+            let (input, host) =
+                loop_admission(&engine, &opts, kind, &id, &prompt, memory, choice.fallback.as_ref()).await?;
+            Ok((input, serde_json::to_value(&host)?))
+        })
+    }
+}
+
+// A loop's input and host data for the definition chosen (`chosen`): its
+// instructions, the first user message `prompt`, its working memory.
+async fn loop_admission(
+    engine: &Engine,
+    opts: &LoopOptions,
+    kind: &str,
+    id: &str,
+    prompt: &str,
+    memory: Value,
+    fallback: Option<&Fallback>,
+) -> anyhow::Result<(Value, crate::runs::LoopHost)> {
+    let prepared = crate::agent::prepare(engine, opts).await?;
+    let messages = json!([providers::system(&prepared.system), providers::user(prompt)]);
+    let input = crate::agent::loop_input(messages, memory, opts);
+    let mut host =
+        crate::agent::loop_host(engine, opts, kind, id, &prepared.skill_text(&opts.loaded_skill_text)).await?;
+    host.fallback = fallback.cloned();
+    Ok((input, host))
+}
+
+/// `start_worker { call, i, index, memory, loop? }`: the model's
+/// `invoke_sub_agent` call as a host child, a loop with the worker's host
+/// data: it inherits the confirmation target (invariant 5) and the guard's
+/// evidence. The loop it runs (design 04, R-M9): the YAML's `loop`, else the
+/// call's, else its skill's preference, else agent-loop. `{id: null}` when
+/// it cannot start; `tool_repeat` then presents the error to the model.
 async fn start_worker(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
     let start = async {
         let live = live_loop(&engine, &ctx).await?;
@@ -464,37 +545,30 @@ async fn start_worker(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
             }
         };
         opts.trace_scope = None;
-        let prepared = match crate::agent::prepare(&engine, &opts).await {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                span.end(SpanEnd::error(error.to_string()));
-                return Ok(json!({"id": null}));
+        if let Some(name) = args["loop"].as_str().filter(|name| !name.is_empty()) {
+            opts.workflow = name.to_owned();
+        }
+        // Its skills must exist whichever loop runs it.
+        if let Err(error) = crate::agent::prepare(&engine, &opts).await {
+            span.end(SpanEnd::error(error.to_string()));
+            return Ok(json!({"id": null}));
+        }
+        anchor_child(&engine, &id, span.clone(), None, live.opts.session_id.clone()).await?;
+        let memory = live.opts.session.memory.snapshot();
+        let build = loop_builder(&engine, &opts, crate::runs::WORKER, &id, &prompt, memory);
+        let started = crate::runs::start_named_child(&engine, &ctx, &key, &opts.workflow, Site::Loop, build).await;
+        if let Err(error) = &started {
+            unanchor(&engine, &id, &error.to_string()).await;
+        }
+        match started? {
+            Named::Started(child, ran) => {
+                if let Some(fallback) = &ran.fallback {
+                    crate::runs::trace_fallback(span.clone(), fallback, true);
+                }
+                Ok(serde_json::to_value(child)?)
             }
-        };
-        let input = json!({
-            "messages": [providers::system(&prepared.system), providers::user(&prompt)],
-            "memory": live.opts.session.memory.snapshot(),
-        });
-        let host = crate::agent::loop_host(
-            &engine,
-            &opts,
-            crate::runs::WORKER,
-            &id,
-            &prepared.skill_text(&opts.loaded_skill_text),
-        )
-        .await?;
-        anchor_child(&engine, &id, span, live.opts.session_id.clone()).await?;
-        let child = ctx
-            .start_child(ChildStart {
-                key,
-                name: opts.workflow.clone(),
-                version: None,
-                input,
-                host: serde_json::to_value(&host)?,
-            })
-            .await
-            .map_err(anyhow::Error::from)?;
-        Ok(serde_json::to_value(child)?)
+            Named::SetAside(_) => Ok(json!({"id": null})),
+        }
     };
     start.await.map_err(failed)
 }
@@ -504,10 +578,12 @@ async fn start_worker(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
 /// definition is the trusted source of these arguments (invariant 3
 /// restated); what the signal's context functions captured (earlier user
 /// messages, the working memory, the preselected block) comes from their
-/// records in this run's journal (decision 4).
+/// records in this run's journal (decision 4). `loop` names the loop it runs
+/// (agent-loop by default); one set aside gives way to the built-in.
 async fn primary_loop(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
     let start = async {
         let (host, signal) = signal_of(&engine, &ctx, "primary_loop").await?;
+        let input = args["input"].as_str().ok_or_else(|| anyhow::anyhow!("input: Required"))?;
         let records = engine.runtime.records(&ctx.run_id).await?;
         let session = signal_session_of(&engine, &host, &records)?;
         let recorded_input = crate::agent::recorded_output(&records, "signal_input");
@@ -519,7 +595,6 @@ async fn primary_loop(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
             Some(digest) => serde_json::from_str(&engine.evidence_of(Some(&digest.to_owned()))?.unwrap_or_default())?,
             None => Vec::new(),
         };
-        let input = args["input"].as_str().ok_or_else(|| anyhow::anyhow!("input: Required"))?;
         let preset = args["preset"].as_str().unwrap_or("smart");
         let preset = crate::models::PresetName::selectable(preset)
             .ok_or_else(|| anyhow::anyhow!("preset: unknown preset {preset}"))?;
@@ -527,6 +602,7 @@ async fn primary_loop(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
         let key = "primary";
         let id = ctx.child_id(key);
         let mut opts = LoopOptions::new(&id, session.clone());
+        opts.workflow = args["loop"].as_str().filter(|l| !l.is_empty()).unwrap_or(AGENT_LOOP_NAME).to_owned();
         opts.confirm =
             args.get("confirm").filter(|v| !v.is_null()).map(|v| serde_json::from_value(v.clone())).transpose()?;
         opts.earlier_user_messages = earlier;
@@ -544,29 +620,24 @@ async fn primary_loop(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
         opts.conversation = crate::supervisor::conversation(&signal);
         opts.signal_id = Some(host.signal_id);
         opts.session_id = Some(session.id.clone());
-        let prepared = crate::agent::prepare(&engine, &opts).await?;
-        let input = json!({
-            "messages": [providers::system(&prepared.system), providers::user(input)],
-            "memory": session.memory.snapshot(),
-        });
-        let loop_host =
-            crate::agent::loop_host(&engine, &opts, PRIMARY, &id, &prepared.skill_text(&opts.loaded_skill_text))
-                .await?;
         let scope = engine.scope_for(&ctx.run_id, &ctx.definition);
         let span = scope
             .span(SpanStart::new("agent_loop", SpanKind::Chain).metadata(metadata(json!({"activity":"primary_loop"}))));
-        anchor_child(&engine, &id, span, Some(session.id.clone())).await?;
-        let child = ctx
-            .start_child(ChildStart {
-                key: key.into(),
-                name: opts.workflow.clone(),
-                version: None,
-                input,
-                host: serde_json::to_value(&loop_host)?,
-            })
-            .await
-            .map_err(anyhow::Error::from)?;
-        Ok(serde_json::to_value(child)?)
+        anchor_child(&engine, &id, span.clone(), None, Some(session.id.clone())).await?;
+        let build = loop_builder(&engine, &opts, PRIMARY, &id, input, session.memory.snapshot());
+        let started = crate::runs::start_named_child(&engine, &ctx, key, &opts.workflow, Site::Loop, build).await;
+        if let Err(error) = &started {
+            unanchor(&engine, &id, &error.to_string()).await;
+        }
+        match started? {
+            Named::Started(child, ran) => {
+                if let Some(fallback) = &ran.fallback {
+                    crate::runs::trace_fallback(span.clone(), fallback, true);
+                }
+                Ok(serde_json::to_value(child)?)
+            }
+            Named::SetAside(fallback) => Err(anyhow::anyhow!("{}", fallback.line)),
+        }
     };
     start.await.map_err(failed)
 }
@@ -575,7 +646,8 @@ async fn primary_loop(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
 /// the failure report as an independent root `recovery:<signal id>` (design
 /// 03, R2-H2), so an exhausted tree budget never blocks it; returns at once
 /// and the signal raises its failure as before. Nothing before
-/// `signal_session` gets a report.
+/// `signal_session` gets a report. It runs `agent-loop`: an override of the
+/// agent's, or the built-in while that is set aside (design 04).
 async fn recovery_loop(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
     let start = async {
         let (host, _) = signal_of(&engine, &ctx, "recovery_loop").await?;
@@ -585,45 +657,50 @@ async fn recovery_loop(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -
         }
         let session = signal_session_of(&engine, &host, &records)?;
         let id = format!("{RECOVERY}:{}", host.signal_id);
-        let prompt = args["prompt"].as_str().ok_or_else(|| anyhow::anyhow!("prompt: Required"))?;
-        let preset = args["preset"].as_str().unwrap_or("base");
-        let preset = crate::models::PresetName::selectable(preset)
-            .ok_or_else(|| anyhow::anyhow!("preset: unknown preset {preset}"))?;
-        let iterations = args["max_iterations"]
-            .as_u64()
-            .filter(|n| *n > 0)
-            .and_then(|n| usize::try_from(n).ok())
-            .ok_or_else(|| anyhow::anyhow!("max_iterations: Expected positive integer"))?;
-        let mut opts = LoopOptions::new(&id, session.clone());
-        opts.parent_id = Some(session.id.clone());
-        opts.guard_request = engine.evidence_of(Some(&host.evidence.content))?;
-        opts.skills = strings(&args, "skills");
-        opts.include_engine_skills = false;
-        opts.preset = preset;
-        opts.max_iterations = iterations;
-        opts.system_prompt = Some(strings(&args, "system").join("\n\n"));
-        opts.session_id = Some(session.id.clone());
-        let prepared = crate::agent::prepare(&engine, &opts).await?;
-        let input = json!({
-            "messages": [providers::system(&prepared.system), providers::user(prompt)],
-            "memory": [],
-        });
-        let loop_host =
-            crate::agent::loop_host(&engine, &opts, RECOVERY, &id, &prepared.skill_text(&opts.loaded_skill_text))
-                .await?;
         let scope = engine.scope_for(&ctx.run_id, &ctx.definition);
         let span =
             scope.span(SpanStart::new("recovery", SpanKind::Agent).metadata(metadata(json!({"skill":"recovery"}))));
-        anchor_child(&engine, &id, span, Some(session.id.clone())).await?;
-        engine
-            .runtime
-            .start_with(
-                &id,
-                crate::agent::AGENT_LOOP_NAME,
-                input,
-                ouro_runtime::Start { version: None, host: serde_json::to_value(&loop_host)? },
-            )
-            .await?;
+        // A report that cannot be set up ends its span with the reason.
+        let setup = async {
+            let prompt = args["prompt"].as_str().ok_or_else(|| anyhow::anyhow!("prompt: Required"))?;
+            let preset = args["preset"].as_str().unwrap_or("base");
+            let preset = crate::models::PresetName::selectable(preset)
+                .ok_or_else(|| anyhow::anyhow!("preset: unknown preset {preset}"))?;
+            let iterations = args["max_iterations"]
+                .as_u64()
+                .filter(|n| *n > 0)
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| anyhow::anyhow!("max_iterations: Expected positive integer"))?;
+            let mut opts = LoopOptions::new(&id, session.clone());
+            opts.parent_id = Some(session.id.clone());
+            opts.guard_request = engine.evidence_of(Some(&host.evidence.content))?;
+            opts.skills = strings(&args, "skills");
+            opts.include_engine_skills = false;
+            opts.preset = preset;
+            opts.max_iterations = iterations;
+            opts.system_prompt = Some(strings(&args, "system").join("\n\n"));
+            opts.session_id = Some(session.id.clone());
+            // Fails before anything starts when its skills are missing.
+            crate::agent::prepare(&engine, &opts).await?;
+            Ok::<_, anyhow::Error>((opts, prompt))
+        };
+        let (opts, prompt) = match setup.await {
+            Ok(setup) => setup,
+            Err(error) => {
+                span.end(SpanEnd::error(error.to_string()));
+                return Err(error);
+            }
+        };
+        anchor_child(&engine, &id, span.clone(), None, Some(session.id.clone())).await?;
+        let build = loop_builder(&engine, &opts, RECOVERY, &id, prompt, json!([]));
+        let started = crate::runs::start_named_root(&engine, &id, AGENT_LOOP_NAME, Site::Loop, build).await;
+        if let Err(error) = &started {
+            unanchor(&engine, &id, &error.to_string()).await;
+        }
+        let (_, ran) = started?;
+        if let Some(fallback) = &ran.fallback {
+            crate::runs::trace_fallback(span.clone(), fallback, true);
+        }
         Ok(json!({"started": id}))
     };
     // A reporting failure is an observation, never the signal's error.
@@ -638,41 +715,210 @@ async fn recovery_loop(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -
     }
 }
 
-/// `run_saved_workflow { name }`: a scheduled task's saved workflow. No saved
-/// workflows run until the versions step (design 03, decision 9): the task
-/// goes to the agent loop.
+/// How the runtime starts a workflow on a signal it was not asked to pick:
+/// a route the dispatcher matched, or the saved workflow a scheduled task
+/// names (design 04, R-H3 and R2-M5). Either runs as the signal's primary
+/// run, admitted like `main`'s `admission(.., Launch)` with host data read
+/// from the activated version's own metadata (vetted by the gate).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Launch {
+    Route,
+    Saved,
+}
+
+pub const ROUTE: &str = "route";
+pub const SAVED: &str = "saved";
+
+impl Launch {
+    fn key(self) -> &'static str {
+        match self {
+            Launch::Route => ROUTE,
+            Launch::Saved => SAVED,
+        }
+    }
+}
+
+// The signal run's own fallback line, when it runs the built-in signal in
+// place of a set-aside override (runs.rs §10): every primary run hears it.
+async fn signal_fallback_line(engine: &Engine, ctx: &FunctionContext) -> anyhow::Result<Option<String>> {
+    let saved = engine.runtime.get(&ctx.run_id).await?.ok_or_else(|| anyhow::anyhow!("unknown run"))?;
+    Ok(saved.admission.input["signal"]["fallback"].as_str().map(str::to_owned))
+}
+
+// One start of `name` as the signal's primary run, at the route or saved
+// site. A version set aside starts nothing: its anchor, written before the
+// refused start, is taken back.
+async fn launch(
+    engine: &Arc<Engine>,
+    ctx: &FunctionContext,
+    launch: Launch,
+    name: &str,
+    context: &Value,
+) -> anyhow::Result<Named<ouro_runtime::ChildRef>> {
+    let function = if launch == Launch::Route { "route_signal" } else { "run_saved_workflow" };
+    let (host, signal) = signal_of(engine, ctx, function).await?;
+    let records = engine.runtime.records(&ctx.run_id).await?;
+    let session = signal_session_of(engine, &host, &records)?;
+    let key = launch.key();
+    let id = ctx.child_id(key);
+    let scope = engine.scope_for(&ctx.run_id, &ctx.definition);
+    let fallback_line = signal_fallback_line(engine, ctx).await?;
+    let content = engine.evidence_of(Some(&host.evidence.content))?;
+    let source_skill = match launch {
+        Launch::Saved => engine.deps.skill_store.read_skill(&signal.source).await?.is_some(),
+        Launch::Route => false,
+    };
+    // Whether the builder anchored the child (a refused start takes it back).
+    let anchored: Arc<std::sync::atomic::AtomicBool> = Default::default();
+    let handover = (launch == Launch::Route).then(|| context["handover"].as_str().map(str::to_owned)).flatten();
+    let build = {
+        let (engine, anchored, scope, id) = (engine.clone(), anchored.clone(), scope.clone(), id.clone());
+        move |choice: Choice| -> Build {
+            let (engine, anchored, scope, id) = (engine.clone(), anchored.clone(), scope.clone(), id.clone());
+            let (session, signal, host) = (session.clone(), signal.clone(), host.clone());
+            let (content, handover, fallback_line) = (content.clone(), handover.clone(), fallback_line.clone());
+            Box::pin(async move {
+                let wf = ouro_runtime::ows::model::parse_yaml(&choice.yaml)?;
+                let declared = crate::flows::agent_start(&wf)?;
+                let mut opts = LoopOptions::new(&id, session.clone());
+                opts.workflow = choice.name.clone();
+                opts.preset = declared.preset.unwrap_or(match launch {
+                    Launch::Route => crate::models::PresetName::Smart,
+                    Launch::Saved => crate::models::PresetName::Base,
+                });
+                opts.conversation = crate::supervisor::conversation(&signal);
+                opts.confirm = match declared.confirm.unwrap_or(crate::flows::Confirm::Conversation) {
+                    crate::flows::Confirm::Conversation => crate::supervisor::conversation(&signal).or_else(|| {
+                        let chat_id = session.env.telegram_chat_id.clone()?;
+                        Some(crate::agent::ConfirmTarget { chat_id, message_thread_id: None })
+                    }),
+                    crate::flows::Confirm::None => None,
+                };
+                if source_skill {
+                    opts.skills = vec![signal.source.clone()];
+                }
+                opts.guard_request = content;
+                let parts = [
+                    Some(crate::session::render_context(&session.env)?),
+                    Some(format!("Signal source: {}", signal.source)),
+                    signal.env_context.clone(),
+                    handover,
+                    fallback_line,
+                ];
+                opts.system_prompt =
+                    Some(parts.into_iter().flatten().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("\n\n"));
+                opts.signal_id = Some(host.signal_id);
+                opts.session_id = Some(session.id.clone());
+                let memory = session.memory.snapshot();
+                let (mut input, loop_host) =
+                    loop_admission(&engine, &opts, PRIMARY, &id, &signal.content, memory, None).await?;
+                let workflow_signal = crate::flows::WorkflowSignal {
+                    id: signal.id,
+                    source: signal.source.clone(),
+                    content: signal.content.clone(),
+                    env_context: signal.env_context.clone(),
+                };
+                if let Some(env) = crate::flows::signal_input(&workflow_signal, &session.env).remove("env") {
+                    input["env"] = env;
+                }
+                input["signal"] = crate::supervisor::signal_value(&signal);
+                // The route's or the task's span, and in it the primary run's.
+                let named = match launch {
+                    Launch::Route => format!("route:{}", choice.name),
+                    Launch::Saved => "runner".into(),
+                };
+                let outer = scope.span(
+                    SpanStart::new(named, SpanKind::Chain)
+                        .metadata(metadata(json!({"workflow": choice.name, "workflow_version": choice.version}))),
+                );
+                let span = outer.span(SpanStart::new("agent_loop", SpanKind::Chain).metadata(metadata(json!({
+                    "activity": "primary_loop", "kind": launch.key(), "workflow": choice.name,
+                    "workflow_version": choice.version, "preset": opts.preset.as_str(),
+                }))));
+                anchor_child(&engine, &id, span, Some(outer), Some(session.id.clone())).await?;
+                anchored.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok((input, serde_json::to_value(&loop_host)?))
+            })
+        }
+    };
+    let named = crate::runs::start_named_child(engine, ctx, key, name, Site::from(launch), build).await?;
+    if let Named::SetAside(fallback) = &named {
+        crate::runs::trace_fallback(scope.clone(), fallback, false);
+        // A start refused after its anchor was written: nothing ran.
+        if anchored.load(std::sync::atomic::Ordering::SeqCst) {
+            unanchor(engine, &id, &fallback.line).await;
+        }
+    }
+    Ok(named)
+}
+
+impl From<Launch> for Site {
+    fn from(launch: Launch) -> Site {
+        match launch {
+            Launch::Route => Site::Route,
+            Launch::Saved => Site::Saved,
+        }
+    }
+}
+
+/// `run_saved_workflow { name, context }`: the saved workflow a scheduled
+/// task names, as the signal's primary run (`{started}`), or `{handover}`
+/// for the default path when it has no active version or is set aside.
 async fn run_saved_workflow(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
     let call = async {
         signal_of(&engine, &ctx, "run_saved_workflow").await?;
         let name = args["name"].as_str().ok_or_else(|| anyhow::anyhow!("name: Required"))?;
-        let scope = engine.scope_for(&ctx.run_id, &ctx.definition);
-        scope.event(EventStart {
-            name: "fallback".into(),
-            level: Some(Level::Warning),
-            metadata: Some(metadata(json!({"stage":"saved_workflow","workflow":name,"reason":"missing"}))),
-            ..Default::default()
-        });
-        scope.update(ContextUpdate::metadata(metadata(
-            json!({"fallback":"agent-loop","workflow_failure_stage":"saved_workflow"}),
-        )));
-        Ok(json!({"done": false, "handover": format!(
-            "This task names the saved workflow `{name}`, which has no active version. Do the task yourself."
-        )}))
+        match launch(&engine, &ctx, Launch::Saved, name, &args["context"]).await? {
+            Named::Started(child, _) => Ok(json!({"started": child})),
+            Named::SetAside(fallback) => {
+                let scope = engine.scope_for(&ctx.run_id, &ctx.definition);
+                scope.update(ContextUpdate::metadata(metadata(
+                    json!({"fallback":"agent-loop","workflow_failure_stage":"saved_workflow"}),
+                )));
+                Ok(
+                    json!({"handover": format!("This task names the saved workflow `{name}`. {} Do the task yourself.", fallback.line)}),
+                )
+            }
+        }
     };
     call.await.map_err(failed)
 }
 
-/// `route_signal { context }`: no routes until the versions step (decision 9).
-async fn route_signal(engine: Arc<Engine>, _args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
-    signal_of(&engine, &ctx, "route_signal").await.map_err(failed)?;
-    Ok(json!({"routed": false}))
+/// `route_signal { context }`: the most specific active route the signal
+/// matches, started as the signal's primary run (`{started}`). A route set
+/// aside gives way to the next match (R2-L2); with none started, `{routed:
+/// false, fallback?}` and the default path runs, the line in its instructions.
+async fn route_signal(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
+    let call = async {
+        let (_, signal) = signal_of(&engine, &ctx, "route_signal").await?;
+        // A route started before (a re-dispatch) is joined, whatever matches now.
+        let names = match engine.runtime.get(&ctx.child_id(ROUTE)).await? {
+            Some(saved) => vec![saved.admission.name],
+            None => {
+                let payload = signal.payload.clone().unwrap_or(Value::Null);
+                let routes = crate::flows::signal_routes(&engine, &signal.source, &payload).await?;
+                routes.into_iter().map(|(name, _)| name).collect()
+            }
+        };
+        let mut first = None;
+        for name in names {
+            match launch(&engine, &ctx, Launch::Route, &name, &args["context"]).await? {
+                Named::Started(child, _) => return Ok(json!({"started": child})),
+                Named::SetAside(fallback) => {
+                    first.get_or_insert(fallback);
+                }
+            }
+        }
+        Ok(json!({"routed": false, "fallback": first}))
+    };
+    call.await.map_err(failed)
 }
 
 /// `settle_child { ref, kind }`: what a child's end means for the signal
 /// (design 03, decision 6), so YAML only switches on `action`: a primary or
-/// route that faulted raises; one that was cancelled is done, without a
-/// report; a saved workflow that changed nothing hands over, one that faulted
-/// after a write raises.
+/// a route that faulted raises; one that was cancelled is done, without a
+/// report; a saved workflow that changed nothing hands over, one that
+/// faulted after a write raises.
 async fn settle_child(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
     let settle = async {
         signal_of(&engine, &ctx, "settle_child").await?;
@@ -686,13 +932,24 @@ async fn settle_child(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
         if let Some(outcome) = &child.outcome {
             engine.ended_child(id, outcome).await;
         }
+        let scope = engine.scope_for(&ctx.run_id, &ctx.definition);
+        let workflow = child.admission.name.clone();
         let settled = match (&child.outcome, kind) {
+            // The signal's answer (and its trace's output) names the task's
+            // workflow beside what it answered.
+            (Some(Status::Completed(output)), SAVED) => {
+                let output = json!({"ok": true, "workflow": workflow, "output": output});
+                scope.update(ContextUpdate::output(output.clone()));
+                json!({"action": "done", "output": output})
+            }
             (Some(Status::Completed(output)), _) => {
                 let text = output.as_str().map(str::to_owned).unwrap_or_else(|| output.to_string());
-                if kind == PRIMARY {
+                // A route's run is the signal's primary run: its answer is
+                // the signal's; its skills are its own (no primary_loop record).
+                if kind == PRIMARY || kind == ROUTE {
                     let records = engine.runtime.records(&ctx.run_id).await?;
-                    let loaded = primary_loaded(&records);
-                    engine.scope_for(&ctx.run_id, &ctx.definition).update(ContextUpdate {
+                    let loaded = if kind == PRIMARY { primary_loaded(&records) } else { Vec::new() };
+                    scope.update(ContextUpdate {
                         output: Some(json!(text)),
                         metadata: Some(metadata(json!({"skills": loaded}))),
                         ..Default::default()
@@ -701,12 +958,33 @@ async fn settle_child(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
                 json!({"action": "done", "output": text})
             }
             (Some(Status::Cancelled), _) => json!({"action": "done", "output": null}),
-            (Some(Status::Faulted(error)), "saved") if !effects_started(&engine, id).await? => json!({
-                "action": "handover",
-                "handover": format!("The saved workflow for this task failed before changing anything: {}. Do the task yourself.", error.detail.clone().unwrap_or_else(|| error.to_string())),
-            }),
+            (Some(Status::Faulted(error)), SAVED) if !effects_started(&engine, id).await? => {
+                let detail = error.detail.clone().unwrap_or_else(|| error.to_string());
+                scope.event(EventStart {
+                    name: "fallback".into(),
+                    level: Some(Level::Warning),
+                    metadata: Some(metadata(
+                        json!({"stage":"saved_workflow","workflow":workflow,"error":error,"effects_started":false}),
+                    )),
+                    ..Default::default()
+                });
+                scope.update(ContextUpdate::metadata(metadata(
+                    json!({"fallback":"agent-loop","workflow_failure_stage":"saved_workflow"}),
+                )));
+                json!({
+                    "action": "handover",
+                    "handover": format!("The saved workflow `{workflow}` for this task failed before changing anything: {detail}. Do the task yourself."),
+                })
+            }
+            (Some(Status::Faulted(error)), SAVED) => {
+                let detail = error.detail.clone().unwrap_or_else(|| error.to_string());
+                json!({"action": "raise", "error": {
+                    "title": "Saved workflow failed",
+                    "detail": format!("Saved workflow `{workflow}` failed after it may have changed something: {detail}"),
+                }})
+            }
             (Some(Status::Faulted(error)), _) => json!({"action": "raise", "error": error}),
-            (_, "saved") => json!({"action": "done", "output": null}),
+            (_, SAVED) => json!({"action": "done", "output": null}),
             _ => json!({"action": "done", "output": json!({"ok": true, "resumes": true}).to_string()}),
         };
         Ok(settled)
@@ -1020,7 +1298,9 @@ async fn signal_transcript(engine: Arc<Engine>, args: Value, ctx: FunctionContex
         }
         let records = engine.runtime.records(id).await.unwrap_or_default();
         let messages = crate::agent::history_messages(&records);
-        let transcript = if messages.iter().any(|m| m["role"] != "system") {
+        // A run that took no turn (a saved workflow's steps) has only its
+        // admitted instructions: no transcript.
+        let transcript = if crate::agent::turned(&records) && messages.iter().any(|m| m["role"] != "system") {
             Value::Array(messages.to_vec()).to_string()
         } else {
             "[]".into()
@@ -1317,10 +1597,10 @@ pub const HOST_FUNCTIONS: &[HostFunction] = &[
     f(
         "start_worker",
         Read,
-        &["call", "i", "index", "memory"],
+        &["call", "i", "index", "memory", "loop"],
         &["call", "i", "index"],
         "agent-loop",
-        "Start the model's invoke_sub_agent call as a worker child. Returns id, key, done and waiting (id null when it cannot start); join it with listen, then tool_repeat with worker_run.",
+        "Start the model's invoke_sub_agent call as a worker child. loop names the loop it runs, before the call's own loop argument and its skills' preference (default agent-loop; one set aside runs agent-loop). Returns id, key, done and waiting (id null when it cannot start); join it with listen, then tool_repeat with worker_run.",
     ),
     f(
         "signal_session",
@@ -1341,10 +1621,10 @@ pub const HOST_FUNCTIONS: &[HostFunction] = &[
     f(
         "run_saved_workflow",
         Write,
-        &["name"],
+        &["name", "context"],
         &["name"],
         "signal",
-        "Run the active saved workflow a scheduled signal names. Until the versions step none run: returns done:false with handover for the primary loop.",
+        "Start the active saved workflow a scheduled signal names as the signal's primary run (base preset and the source's skill unless its metadata.agent says otherwise; it may take agent turns), after signal_session. Returns started (a child ref: join it with listen, child_outcome and settle_child with kind saved), or handover for the default path when it has no active version or is set aside.",
     ),
     f(
         "signal_input",
@@ -1384,7 +1664,7 @@ pub const HOST_FUNCTIONS: &[HostFunction] = &[
         &["input", "loop", "confirm", "skills", "loaded", "preset", "allow_skill_writes", "system"],
         &["input"],
         "signal",
-        "Start the signal's primary agent as a child after signal_session. Returns id, key, done and waiting: join it with listen on done, child_outcome and settle_child.",
+        "Start the signal's primary agent as a child after signal_session; loop names the loop it runs (default agent-loop; one set aside runs agent-loop). Returns id, key, done and waiting: join it with listen on done, child_outcome and settle_child.",
     ),
     f(
         "route_signal",
@@ -1392,7 +1672,7 @@ pub const HOST_FUNCTIONS: &[HostFunction] = &[
         &["context"],
         &["context"],
         "signal",
-        "Dispatch the incoming signal to a matching route. Until the versions step there are none: returns routed:false.",
+        "Start the most specific active metadata.route match (source and top-level payload fields) as the signal's primary run, admitted with the smart preset unless its metadata says otherwise; a route set aside gives way to the next match. Pass context: $context after session setup (its handover reaches the route). Returns started (a child ref: settle it with kind route), or routed:false with the fallback record of a set-aside route.",
     ),
     f(
         "settle_child",
@@ -1400,7 +1680,7 @@ pub const HOST_FUNCTIONS: &[HostFunction] = &[
         &["ref", "kind"],
         &["ref"],
         "signal",
-        "What a child's end means: action done (with output), handover (with handover) or raise (with error).",
+        "What a child's end means (kind primary, route or saved): action done (with output), handover (with handover: a saved workflow that changed nothing) or raise (with error).",
     ),
     f(
         "signal_transcript",

@@ -125,6 +125,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0013_guard_verdict_uses", include_str!("../migrations/0013_guard_verdict_uses.sql")),
     ("0014_trace_continuation", include_str!("../migrations/0014_trace_continuation.sql")),
     ("0015_engine_runs", include_str!("../migrations/0015_engine_runs.sql")),
+    ("0016_workflow_meta", include_str!("../migrations/0016_workflow_meta.sql")),
 ];
 
 pub struct Migration {

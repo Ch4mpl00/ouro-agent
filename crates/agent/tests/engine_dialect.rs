@@ -190,15 +190,16 @@ do:
   - tick: { call: tick }
 "#;
 
-// The definitions still written with flat keys: the Telegram loop fixture
-// (parked with the loop variants) and a synthetic one. The built-ins are
-// written in the engine's dialect since step 2 (below).
+// The definitions written with flat keys: the Telegram loop as the `owf`
+// era wrote it (tests/fixtures/telegram-loop.flat.yaml; the reference loop
+// itself is in the engine's dialect since the versions step) and a synthetic
+// one. The built-ins are written in the engine's dialect since step 2 (below).
 fn builtins() -> Vec<(&'static str, String)> {
     let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
     let mut files: Vec<(&'static str, String)> = Vec::new();
     files.push((
-        "telegram-loop.yaml",
-        std::fs::read_to_string(format!("{fixtures}/telegram-loop.yaml")).expect("fixture"),
+        "telegram-loop.flat.yaml",
+        std::fs::read_to_string(format!("{fixtures}/telegram-loop.flat.yaml")).expect("fixture"),
     ));
     files.push(("synthetic", SYNTHETIC.to_string()));
     files

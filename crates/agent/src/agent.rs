@@ -686,10 +686,9 @@ impl AgentLoop {
                 .and_then(providers::content)
                 .unwrap_or_default()
                 .to_owned();
-            (json!({"messages": *messages, "memory": self.opts.session.memory.snapshot()}), task)
+            (loop_input(json!(*messages), self.opts.session.memory.snapshot(), &self.opts), task)
         };
         self.admit_task(&task).await;
-        let host = loop_host(&engine, &self.opts, crate::runs::LOOP, &run, &self.loaded_skills).await?;
         if run != self.opts.id {
             engine.loops.lock().await.insert(run.clone(), self.clone());
         }
@@ -705,17 +704,38 @@ impl AgentLoop {
             };
             engine.deps.db.write(move |db| db.insert_run_trace(&row)).await?;
         }
-        engine.scopes.borrow(&run, scope);
+        engine.scopes.borrow(&run, scope.clone());
         *self.driving.lock().unwrap_or_else(|e| e.into_inner()) = Some(run.clone());
-        let started = engine
-            .runtime
-            .start_with(
-                &run,
-                &self.opts.workflow,
-                input,
-                ouro_runtime::Start { version: None, host: serde_json::to_value(&host)? },
-            )
-            .await;
+        // The loop's workflow, or the built-in agent-loop in place of one
+        // that is set aside (design 04): its line joins the instructions.
+        let build = {
+            let (loop_, engine, run, input) = (self.clone(), engine.clone(), run.clone(), input.clone());
+            move |choice: crate::runs::Choice| -> futures::future::BoxFuture<'static, anyhow::Result<(Value, Value)>> {
+                let (loop_, engine, run, mut input) = (loop_.clone(), engine.clone(), run.clone(), input.clone());
+                Box::pin(async move {
+                    let mut opts = loop_.opts.clone();
+                    opts.workflow = choice.name.clone();
+                    if let Some(fallback) = &choice.fallback
+                        && let Some(system) = input["messages"].get_mut(0).filter(|m| m["role"] == "system")
+                    {
+                        let prompt = system["content"].as_str().unwrap_or_default();
+                        system["content"] = json!(format!("{prompt}{INSTRUCTION_SEPARATOR}{}", fallback.line));
+                        let parts = [opts.system_prompt.clone().unwrap_or_default(), fallback.line.clone()];
+                        opts.system_prompt = Some(parts.join("\n\n"));
+                    }
+                    let mut host = loop_host(&engine, &opts, crate::runs::LOOP, &run, &loop_.loaded_skills).await?;
+                    host.fallback = choice.fallback;
+                    Ok((input, serde_json::to_value(&host)?))
+                })
+            }
+        };
+        let started =
+            crate::runs::start_named_root(&engine, &run, &self.opts.workflow, crate::runs::Site::Loop, build).await;
+        if let Ok((_, ran)) = &started
+            && let Some(fallback) = &ran.fallback
+        {
+            crate::runs::trace_fallback(scope.clone(), fallback, true);
+        }
         let result = match started {
             Ok(_) => crate::runs::wait_end(&engine, &run, &self.cancel).await,
             Err(error) => Err(error),
@@ -737,6 +757,11 @@ impl AgentLoop {
             engine.loops.lock().await.remove(&run);
         }
         check(&self.cancel)?;
+        // The run's answer is its trace's output, whatever step made it (a
+        // variant may answer from a step, not a final turn).
+        if let Ok(ouro_runtime::ows::run::Status::Completed(output)) = &result {
+            self.scope().update(ContextUpdate::output(output.clone()));
+        }
         match result? {
             ouro_runtime::ows::run::Status::Completed(Value::String(output)) => Ok(output),
             ouro_runtime::ows::run::Status::Completed(output) => Ok(output.to_string()),
@@ -760,8 +785,8 @@ impl AgentLoop {
             crate::mcp::model_tools(&*engine.deps.mcp).into_iter().filter(|t| self.allows(&t.name)).collect();
         tools.extend(synthetic_definitions().iter().filter(|t| self.visible(&t.name)).cloned());
         if let Some(tool) = tools.iter_mut().find(|t| t.name == "invoke_sub_agent") {
-            tool.description.get_or_insert_default().push_str(&format!("\nActive loops (optional loop argument; otherwise the first declared skill loop preference, then agent-loop):\n{}",
-                crate::flows::loop_catalog()));
+            let catalog = crate::flows::loop_catalog(engine).await?;
+            tool.description.get_or_insert_default().push_str(&format!("\nActive loops (optional loop argument; otherwise the first declared skill loop preference, then agent-loop):\n{catalog}"));
         }
         let mut params = providers::CompletionParams {
             model: self.model.clone(),
@@ -1080,11 +1105,26 @@ impl AgentLoop {
         opts.cancel = self.cancel.clone();
         opts.system_prompt = Some([Some(render_context(&self.opts.session.env)?), Some("You are a focused worker. Complete the assigned task and return the full result as your final answer; the runtime stores it automatically. Report missing data and failures explicitly. The parent owns delivery and bookkeeping unless it explicitly assigns them to you.".into()), system_prompt.filter(|s| !s.is_empty()).map(str::to_owned)].into_iter().flatten().collect::<Vec<_>>().join("\n\n"));
         opts.skills = if skills.is_empty() { vec!["worker".into()] } else { skills };
-        // Loop variants come back with the versions step (design 03,
-        // R2-M5): a `loop` argument or a skill's loop preference falls back
-        // to the built-in agent-loop until then.
-        optional_string(args, "loop")?;
-        opts.workflow = AGENT_LOOP_NAME.into();
+        // The loop it runs (design 04, R-M9): the call's `loop`, else the
+        // first of its skills that prefers one (frontmatter `loop:`), else
+        // agent-loop. A YAML's `start_worker { loop }` goes before both
+        // (functions.rs `start_worker`); a name set aside runs agent-loop.
+        opts.workflow = match optional_string(args, "loop")?.filter(|name| !name.is_empty()) {
+            Some(name) => name.to_owned(),
+            None => {
+                let engine = self.engine.upgrade().ok_or_else(aborted)?;
+                let mut selected = None;
+                for name in &opts.skills {
+                    if let Some(skill) = engine.deps.skill_store.read_skill(name).await?
+                        && let Some(loop_name) = skill.loop_name
+                    {
+                        selected = Some(loop_name);
+                        break;
+                    }
+                }
+                selected.unwrap_or_else(|| AGENT_LOOP_NAME.into())
+            }
+        };
         opts.allow_skill_writes = self.opts.allow_skill_writes && opts.skills.iter().any(|s| s == "dreaming");
         opts.include_engine_skills = false;
         // A workflow is written in a language the cheap preset gets wrong:
@@ -1392,6 +1432,21 @@ impl Engine {
     }
 }
 
+/// A loop run's input: its transcript and working memory, and, for the
+/// workflow's own steps to read, the conversation it serves and where its
+/// confirmations go. Informational: the host's functions read only the
+/// run's host data (invariant 3), never these.
+pub fn loop_input(messages: Value, memory: Value, opts: &LoopOptions) -> Value {
+    let mut input = json!({"messages": messages, "memory": memory});
+    if let Some(conversation) = &opts.conversation {
+        input["conversation"] = json!(conversation);
+    }
+    if let Some(confirm) = &opts.confirm {
+        input["confirm"] = json!(confirm);
+    }
+    input
+}
+
 /// The host data a loop run of `opts` is admitted with (`kind`), its
 /// evidence stored and linked to `run` first. `skill_text`: the skills and
 /// the preselected block the loop is told (the guard's evidence).
@@ -1449,6 +1504,7 @@ pub async fn loop_host(
         guard_request,
         signal_id: opts.signal_id,
         evidence: crate::runs::LoopEvidence { skills, earlier, preselect, system },
+        fallback: None,
     })
 }
 
@@ -2149,7 +2205,7 @@ fn setup_record(records: &Records) -> Option<Value> {
 }
 
 // Whether a run has started a turn.
-fn turned(records: &Records) -> bool {
+pub(crate) fn turned(records: &Records) -> bool {
     use ouro_runtime::ows::durable::Record;
     records.values().any(|r| matches!(r, Record::Call { function, .. } if function == "agent_turn"))
 }

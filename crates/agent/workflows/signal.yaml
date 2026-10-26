@@ -1,11 +1,14 @@
 document: { dsl: '1.0.4', namespace: agent, name: signal, version: '1.0.0', metadata: { ouro: { breaker: 'off' } } }
 # How one signal is handled, as a durable engine run `signal:<id>` admitted
 # with the signal as host data: a button press goes to the guard round that
-# waits for it; a saved workflow a scheduled task names (none until the
-# versions step: it hands over); else the primary agent loop, a host child,
-# with the context gathered for its first turn. Its catch starts a failure
+# waits for it; the saved workflow a scheduled task names; else the most
+# specific active route; else the primary agent loop with the context
+# gathered for its first turn. Each starts as the signal's primary run, a
+# host child the run waits for and settles. A saved workflow that changed
+# nothing hands its task over to routing, once. Its catch starts a failure
 # report outside this run's tree; reporting never retries the original actions.
-# Input: { signal: { id, source, content, env_context, workflow, button, payload, created_at } }.
+# Input: { signal: { id, source, content, env_context, workflow, button, payload, created_at, fallback } },
+# `fallback` the line of an override of this workflow set aside for this run.
 # Built-ins never trip (design 01, decision 10): a provider outage must not stop the agent.
 do:
   - handle:
@@ -22,20 +25,21 @@ do:
             call: signal_session
             export: { as: '${ $context + . }' }
         - saved:
-            if: '${ $context.signal.workflow != null }'
+            if: '${ $context.signal.workflow != null and $context.handover == null }'
             call: run_saved_workflow
-            with: { name: '${ $context.signal.workflow }' }
-            export: { as: '${ $context + { handover: .handover } }' }
+            with: { name: '${ $context.signal.workflow }', context: '${ $context }' }
+            export: { as: '${ $context + { primary: .started, kind: "saved", handover: .handover } }' }
         - after_saved:
             switch:
-              - done: { when: '${ .done == true }', then: end }
+              - started: { when: '${ $context.primary != null }', then: wait }
               - on: { then: route }
         - route:
             call: route_signal
             with: { context: '${ $context }' }
+            export: { as: '${ $context + { primary: .started, kind: "route", route_fallback: .fallback.line } }' }
         - after_route:
             switch:
-              - routed: { when: '${ .routed == true }', then: end }
+              - started: { when: '${ $context.primary != null }', then: wait }
               - default: { then: confirm_target }
         - confirm_target:
             set: >-
@@ -87,10 +91,12 @@ do:
                   (if $context.signal.source == "telegram" or $context.signal.source == "telegram_button" then "Delivery: use send_telegram_message for the current signal's chatId and optional messageThreadId. A final assistant message alone is not delivered to Telegram." else null end),
                   $context.signal.env_context,
                   $context.handover,
+                  $context.route_fallback,
+                  $context.signal.fallback,
                   $context.button.note
                 ] | map(select(. != null and . != "")) }
-            export: { as: '${ $context + { primary: . } }' }
-        - primary_wait:
+            export: { as: '${ $context + { primary: ., kind: "primary" } }' }
+        - wait:
             # No hold: the signal suspends until its primary ends, and the
             # supervisor takes the next signal once the tree is quiescent.
             # The engine reports a child that suspends (`waiting:`) too: it
@@ -109,9 +115,19 @@ do:
             with: { id: '${ $context.primary.id }', key: '${ $context.primary.key }' }
         - settled:
             call: settle_child
-            with: { ref: '${ $context.primary }', kind: primary }
+            with: { ref: '${ $context.primary }', kind: '${ $context.kind }' }
+        - after_settle:
+            switch:
+              - handover: { when: '${ .action == "handover" }', then: handed_over }
+              - raise: { when: '${ .action == "raise" }', then: primary_failed }
+              - done: { then: answer }
+        - handed_over:
+            # A saved workflow that changed nothing gives its task to the
+            # routes and the default path; it is tried once per signal.
+            set: '${ $context + { handover: .handover, primary: null, kind: null } }'
+            export: { as: '${ . }' }
+            then: route
         - primary_failed:
-            if: '${ .action == "raise" }'
             raise:
               error:
                 type: https://open-workflow-specification.org/spec/1.0.0/errors/runtime

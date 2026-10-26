@@ -1,15 +1,19 @@
 // The workflows the agent runs and the tools for authoring them:
-// 1. the built-in definitions (engine definitions at boot, runs.rs §7);
-// 2. model steps (composition, choice options, input rendering);
-// 3. what a workflow can call, checked before saving; 4. authoring tools:
-// saving, activating and dry runs come back with the versions and sandbox
-// steps (design 03, decision 9); 5. the evals workbench's in-memory adapter.
+// 1. the built-in definitions and the agent's notes on its versions
+// (`workflow_meta`); 2. model steps (composition, choice options, input
+// rendering); 3. what a workflow can call, and the gate every save and
+// activation passes; 4. routes, loops and the model's parameters a definition
+// declares; 5. authoring tools; 6. the evals workbench's in-memory adapter.
 //
 // Every run is an engine run: the registry the runs call is functions.rs,
-// the runtime wiring runs.rs.
+// the runtime wiring runs.rs. The engine is the version store
+// (docs/designs/04-versions-and-breaker.md, decision 2): a version's number,
+// text, digest, activation history, active version and breaker are the
+// engine's; the agent keeps only what the engine lacks, by content.
 use crate::errors::is_aborted;
 use crate::{
     agent::{Effect, Engine},
+    db::AgentDb,
     generation::{Observation, generation},
     mcp::{Mcp, model_tools},
     models::PresetName,
@@ -18,9 +22,13 @@ use crate::{
     skills::append_patch,
     tracing::{GenerationEnd, Scope},
 };
+use ouro_runtime::ows::model::{Flow, Kind, Task, TaskList, Workflow};
 use owf::durable::Delivery;
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 // ── 1. built-in definitions ─────────────────────────────────────────────────
@@ -41,21 +49,163 @@ pub fn built_in(name: &str) -> Option<&'static str> {
     builtins().into_iter().find(|(n, _)| *n == name).map(|(_, yaml)| yaml)
 }
 
-/// The names a workflow the agent saves can never take (design 01, decision 17).
-pub const RESERVED: &[&str] = &["signal", "agent-loop", "guard", "recovery"];
+/// The names the agent can never save or activate a version of (design 04,
+/// decision 1, narrowing design 01's 17): only the guard round, whose stored
+/// outcome authorizes the model's calls. `agent-loop` and `signal` are the
+/// agent's to override (#55).
+pub const RESERVED: &[&str] = &[GUARD_NAME];
 
-/// The loops a worker may run, one line each (`metadata.loop.description`):
-/// the built-in ones until the versions step.
-pub fn loop_catalog() -> String {
-    builtins()
-        .into_iter()
-        .filter_map(|(name, yaml)| {
-            let wf = ouro_runtime::ows::model::parse_yaml(yaml).ok()?;
-            let description = wf.definition["document"]["metadata"]["loop"]["description"].as_str()?.to_owned();
-            Some(format!("{name}: {description}"))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+/// The stored version of `name` whose content is the compiled built-in text
+/// (`None`: no built-in, or not saved yet).
+pub async fn builtin_version(runtime: &ouro_runtime::Runtime, name: &str) -> anyhow::Result<Option<u64>> {
+    let Some(yaml) = built_in(name) else { return Ok(None) };
+    let digest = ouro_runtime::durable::digest_of(yaml);
+    Ok(runtime.definitions(name).await?.versions.values().find(|d| d.digest == digest).map(|d| d.version))
+}
+
+/// What the agent knows of a version that the engine does not, by content
+/// (`name`, `digest`): its note, whether a dry run tried it (activation
+/// needs that), whether it is a built-in text, and when it was first saved.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Meta {
+    pub name: String,
+    pub digest: String,
+    pub note: Option<String>,
+    pub builtin: bool,
+    pub created_ms: i64,
+    pub tried_ms: Option<i64>,
+}
+
+/// The `workflow_meta` table (agent.db, migration 0016). Rows are written
+/// before the engine's save (R-L2): an orphan row (a crash between them) is
+/// harmless, and `tried` and the note attach to the content a dry run proves.
+pub trait WorkflowMeta: Send + Sync {
+    /// An upsert (R2-L6): the first write sets `created_ms`; a given note
+    /// replaces the stored one; `builtin` only goes from false to true;
+    /// `tried` is left as it is.
+    fn record(&self, name: &str, digest: &str, note: Option<&str>, builtin: bool) -> anyhow::Result<()>;
+    /// Records that a dry run of this content completed; never cleared.
+    fn mark_tried(&self, name: &str, digest: &str) -> anyhow::Result<()>;
+    fn get(&self, name: &str, digest: &str) -> anyhow::Result<Option<Meta>>;
+    /// Every name with a row, sorted.
+    fn names(&self) -> anyhow::Result<Vec<String>>;
+}
+
+fn meta_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Meta> {
+    Ok(Meta {
+        name: r.get(0)?,
+        digest: r.get(1)?,
+        note: r.get(2)?,
+        builtin: r.get(3)?,
+        created_ms: r.get(4)?,
+        tried_ms: r.get(5)?,
+    })
+}
+
+impl WorkflowMeta for AgentDb {
+    fn record(&self, name: &str, digest: &str, note: Option<&str>, builtin: bool) -> anyhow::Result<()> {
+        self.conn().execute(
+            "INSERT INTO workflow_meta (name, digest, note, builtin, created_ms) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (name, digest) DO UPDATE SET
+               note = COALESCE(excluded.note, workflow_meta.note),
+               builtin = MAX(workflow_meta.builtin, excluded.builtin)",
+            params![name, digest, note, builtin, crate::runs::now_ms()],
+        )?;
+        Ok(())
+    }
+
+    fn mark_tried(&self, name: &str, digest: &str) -> anyhow::Result<()> {
+        let changed = self.conn().execute(
+            "UPDATE workflow_meta SET tried_ms = COALESCE(tried_ms, ?3) WHERE name = ?1 AND digest = ?2",
+            params![name, digest, crate::runs::now_ms()],
+        )?;
+        anyhow::ensure!(changed > 0, "no saved version of workflow `{name}` has this content");
+        Ok(())
+    }
+
+    fn get(&self, name: &str, digest: &str) -> anyhow::Result<Option<Meta>> {
+        Ok(self
+            .read()
+            .query_row(
+                "SELECT name, digest, note, builtin, created_ms, tried_ms FROM workflow_meta
+                 WHERE name = ?1 AND digest = ?2",
+                params![name, digest],
+                meta_row,
+            )
+            .optional()?)
+    }
+
+    fn names(&self) -> anyhow::Result<Vec<String>> {
+        let conn = self.read();
+        let mut statement = conn.prepare("SELECT DISTINCT name FROM workflow_meta ORDER BY name")?;
+        Ok(statement.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)
+    }
+}
+
+/// The same contract without a database, for tests and tools that need none.
+#[derive(Default)]
+pub struct MemoryMeta(Mutex<BTreeMap<(String, String), Meta>>);
+
+impl WorkflowMeta for MemoryMeta {
+    fn record(&self, name: &str, digest: &str, note: Option<&str>, builtin: bool) -> anyhow::Result<()> {
+        let mut rows = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let row = rows.entry((name.into(), digest.into())).or_insert_with(|| Meta {
+            name: name.into(),
+            digest: digest.into(),
+            note: None,
+            builtin: false,
+            created_ms: crate::runs::now_ms(),
+            tried_ms: None,
+        });
+        if let Some(note) = note {
+            row.note = Some(note.into());
+        }
+        row.builtin |= builtin;
+        Ok(())
+    }
+
+    fn mark_tried(&self, name: &str, digest: &str) -> anyhow::Result<()> {
+        let mut rows = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let row = rows
+            .get_mut(&(name.to_owned(), digest.to_owned()))
+            .ok_or_else(|| anyhow::anyhow!("no saved version of workflow `{name}` has this content"))?;
+        row.tried_ms.get_or_insert_with(crate::runs::now_ms);
+        Ok(())
+    }
+
+    fn get(&self, name: &str, digest: &str) -> anyhow::Result<Option<Meta>> {
+        Ok(self.0.lock().unwrap_or_else(|e| e.into_inner()).get(&(name.to_owned(), digest.to_owned())).cloned())
+    }
+
+    fn names(&self) -> anyhow::Result<Vec<String>> {
+        let rows = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut names: Vec<String> = rows.keys().map(|(name, _)| name.clone()).collect();
+        names.dedup();
+        Ok(names)
+    }
+}
+
+/// A version's status, derived from the engine's catalog: the active one;
+/// one activated before (`retired`); one never activated (`draft`).
+pub fn status(definitions: &ouro_runtime::durable::Definitions, version: u64) -> &'static str {
+    if definitions.active == Some(version) {
+        "active"
+    } else if definitions.activations.contains_key(&version) {
+        "retired"
+    } else {
+        "draft"
+    }
+}
+
+/// Every name the agent has a version of, the built-ins first.
+pub fn names(db: &AgentDb) -> anyhow::Result<Vec<String>> {
+    let mut names: Vec<String> = builtins().into_iter().map(|(name, _)| name.to_owned()).collect();
+    for name in WorkflowMeta::names(db)? {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    Ok(names)
 }
 
 // ── 2. model steps ──────────────────────────────────────────────────────────
@@ -248,37 +398,23 @@ pub fn effect(mcp: &dyn Mcp, name: &str) -> Option<Effect> {
     Some(if mcp.read_only(name) { Effect::Read } else { Effect::Write })
 }
 
-// Parses and validates `definition` against what this agent can call, and
-// each call's argument names against the function's: a misspelt argument
-// fails here rather than on the first scheduled run.
-pub fn check(mcp: &dyn Mcp, definition: &str) -> Result<owf::model::Workflow, String> {
-    struct Known<'a>(&'a dyn Mcp);
-    impl owf::model::Catalog for Known<'_> {
-        fn events(&self) -> bool {
-            true
-        }
-        fn has(&self, name: &str) -> bool {
-            !matches!(name, "confirm_request" | "review" | "resolve_review") && effect(self.0, name).is_some()
-        }
-    }
-    let wf = owf::model::parse_yaml(definition).map_err(|e| e.to_string())?;
-    owf::model::validate(&wf, &Known(mcp)).map_err(|e| e.to_string())?;
+// Each call's argument names against the function's: a misspelt argument
+// fails at save rather than on the first run. The engine's own binding of
+// an MCP tool is permissive (design 01, decision 16: a tool's schema may
+// change under a run), so the names are checked here, against MCP's
+// current schemas and the host functions' own lists.
+fn argument_problems(mcp: &dyn Mcp, sites: &[(String, String, Option<Value>, bool)], local: &[String]) -> Vec<String> {
     let mut problems = Vec::new();
-    for site in owf::model::call_sites(&wf) {
-        if site.delivery == Delivery::AtMostOnce
-            && matches!(site.function.as_str(), "llm_compose" | "filter_relevant" | "choose")
-        {
-            problems
-                .push(format!("{}/metadata/delivery: model adapters do not yet support at_most_once", site.reference));
+    for (at, function, with, once) in sites {
+        if *once && matches!(function.as_str(), "llm_compose" | "filter_relevant" | "choose") {
+            problems.push(format!("{at}/metadata/delivery: model adapters do not yet support at_most_once"));
         }
-        if wf.uses.functions.iter().any(|(n, _)| *n == site.function) {
+        if local.contains(function) {
             continue;
         }
-        let Some((takes, needs)) = arguments(mcp, &site.function) else { continue };
+        let Some((takes, needs)) = arguments(mcp, function) else { continue };
         // The parser only accepts an object of arguments.
-        let given: Vec<String> =
-            site.with.iter().filter_map(Value::as_object).flat_map(|a| a.keys().cloned()).collect();
-        let (at, function) = (&site.reference, &site.function);
+        let given: Vec<String> = with.iter().filter_map(Value::as_object).flat_map(|a| a.keys().cloned()).collect();
         if let Some(takes) = &takes {
             for arg in given.iter().filter(|a| !takes.contains(a)) {
                 problems.push(format!(
@@ -291,14 +427,180 @@ pub fn check(mcp: &dyn Mcp, definition: &str) -> Result<owf::model::Workflow, St
             problems.push(format!("{at}/with: `{function}` needs the argument `{arg}`"));
         }
     }
-    if problems.is_empty() {
-        Ok(wf)
-    } else {
-        Err(format!(
-            "invalid workflow:\n{}",
-            problems.iter().map(|p| format!("  - {p}")).collect::<Vec<_>>().join("\n")
-        ))
+    problems
+}
+
+fn invalid(problems: &[String]) -> String {
+    format!("invalid workflow:\n{}", problems.iter().map(|p| format!("  - {p}")).collect::<Vec<_>>().join("\n"))
+}
+
+/// The `owf` reading of a definition, checked against what this agent can
+/// call: the evals workbench's (crates/evals), until the step that removes
+/// `owf`. Saving and activating use `gate`, on the engine's dialect.
+pub fn check(mcp: &dyn Mcp, definition: &str) -> Result<owf::model::Workflow, String> {
+    struct Known<'a>(&'a dyn Mcp);
+    impl owf::model::Catalog for Known<'_> {
+        fn events(&self) -> bool {
+            true
+        }
+        fn has(&self, name: &str) -> bool {
+            !matches!(name, "confirm_request" | "review" | "resolve_review") && effect(self.0, name).is_some()
+        }
     }
+    let wf = owf::model::parse_yaml(definition).map_err(|e| e.to_string())?;
+    owf::model::validate(&wf, &Known(mcp)).map_err(|e| e.to_string())?;
+    let sites: Vec<(String, String, Option<Value>, bool)> = owf::model::call_sites(&wf)
+        .into_iter()
+        .map(|s| (s.reference, s.function, s.with, s.delivery == Delivery::AtMostOnce))
+        .collect();
+    let local: Vec<String> = wf.uses.functions.iter().map(|(n, _)| n.clone()).collect();
+    let problems = argument_problems(mcp, &sites, &local);
+    if problems.is_empty() { Ok(wf) } else { Err(invalid(&problems)) }
+}
+
+// Every task of `wf` with its reference: the top level, reusable functions
+// and extensions, and every nested list.
+fn each_task(wf: &Workflow, visit: &mut dyn FnMut(&Task, &str)) {
+    fn list(tasks: &TaskList, at: &str, visit: &mut dyn FnMut(&Task, &str)) {
+        for (i, (name, t)) in tasks.iter().enumerate() {
+            task(t, &format!("{at}/{i}/{name}"), visit);
+        }
+    }
+    fn task(t: &Task, at: &str, visit: &mut dyn FnMut(&Task, &str)) {
+        visit(t, at);
+        match &t.kind {
+            Kind::Do(tasks) | Kind::For { tasks, .. } => list(tasks, &format!("{at}/do"), visit),
+            Kind::Fork { branches, .. } => list(branches, &format!("{at}/fork/branches"), visit),
+            Kind::Try { tasks, catch } => {
+                list(tasks, &format!("{at}/try"), visit);
+                if let Some(handler) = &catch.tasks {
+                    list(handler, &format!("{at}/catch/do"), visit);
+                }
+            }
+            Kind::Listen(listen) => {
+                if let Some(each) = &listen.foreach {
+                    list(&each.tasks, &format!("{at}/foreach/do"), visit);
+                }
+            }
+            _ => {}
+        }
+    }
+    for (name, f) in &wf.uses.functions {
+        task(f, &format!("/use/functions/{name}"), visit);
+    }
+    for (i, (name, e)) in wf.uses.extensions.iter().enumerate() {
+        for (key, tasks) in [("before", &e.before), ("after", &e.after)] {
+            if let Some(tasks) = tasks {
+                list(tasks, &format!("/use/extensions/{i}/{name}/{key}"), visit);
+            }
+        }
+    }
+    list(&wf.tasks, "/do", visit);
+}
+
+/// What an agent version may not contain (design 04, the gate, R2-M4): a
+/// schedule (activation would arm engine triggers that fire outside the
+/// supervisor, with no host data: the schedules step brings them), its own
+/// breaker policy (decision 3), `emit` (design 01, 17), `run: workflow` (its
+/// version resolution picks versions the agent never named), and the guard
+/// round's private functions. The engine's `call: start_child { name, input }`
+/// stays allowed: it starts the active version of a name the YAML names,
+/// with no host data, so only its own trusted steps run.
+fn denied(wf: &Workflow) -> Vec<String> {
+    let mut problems = Vec::new();
+    if wf.schedule.is_some() {
+        problems.push(
+            "/schedule: a version of yours cannot declare a schedule (schedule or metadata.ouro.at); schedule_task starts it on time"
+                .to_owned(),
+        );
+    }
+    if wf.breaker != ouro_runtime::ows::model::Breaker::Inherit {
+        problems.push(
+            "/document/metadata/ouro/breaker: remove `metadata.ouro.breaker`: your versions use the runtime's breaker"
+                .into(),
+        );
+    }
+    each_task(wf, &mut |task, at| {
+        match &task.kind {
+        Kind::Emit(_) => problems.push(format!("{at}/emit: a version of yours cannot emit events")),
+        Kind::Run(run) if matches!(run.process, ouro_runtime::ows::model::Process::Workflow { .. }) => problems.push(
+            format!("{at}/run: `run: workflow` is not available to your versions; start a child with `call: start_child` (name, input) and join it with listen and child_outcome"),
+        ),
+        Kind::Call { function, .. } if crate::functions::host_function(function).is_some_and(|f| f.context == "guard") => {
+            problems.push(format!("{at}/call: `{function}` belongs to the reserved guard round"))
+        }
+        _ => {}
+    }
+    });
+    problems
+}
+
+/// A definition that passed the gate, with the warnings for its author.
+pub struct Gated {
+    pub wf: Workflow,
+    pub warnings: Vec<String>,
+}
+
+/// The gate a save and an activation pass (design 04, R-H1): the name is not
+/// reserved; the engine validates the definition against its dialect and
+/// the registry now; the document is named as saved; `signal` declares no
+/// route and is no loop; nothing on the deny-list; every call's argument
+/// names; a guarded round wherever `agent_turn` is; the metadata a launch
+/// reads. Flows that are legal but usually a mistake come back as warnings,
+/// never refused (R2-L4).
+pub fn gate(engine: &Engine, name: &str, definition: &str) -> anyhow::Result<Gated> {
+    anyhow::ensure!(
+        !RESERVED.contains(&name),
+        "{name} is a reserved built-in workflow and cannot be saved or activated"
+    );
+    let wf = engine.runtime.validate(definition).map_err(|e| anyhow::anyhow!("invalid workflow: {e:#}"))?;
+    anyhow::ensure!(
+        wf.document.name == name,
+        "document.name is `{}` but the workflow is saved as `{name}`; make them the same",
+        wf.document.name
+    );
+    if name == crate::supervisor::SIGNAL_NAME {
+        let metadata = workflow_metadata(&wf);
+        anyhow::ensure!(metadata.get("route").is_none(), "the signal dispatcher cannot route to itself");
+        anyhow::ensure!(metadata.get("loop").is_none(), "the signal dispatcher is not a loop: remove metadata.loop");
+    }
+    let sites: Vec<(String, String, Option<Value>, bool)> = ouro_runtime::ows::model::call_sites(&wf)
+        .into_iter()
+        .map(|s| (s.reference, s.function, s.with, s.delivery == ouro_runtime::Delivery::AtMostOnce))
+        .collect();
+    let local: Vec<String> = wf.uses.functions.iter().map(|(n, _)| n.clone()).collect();
+    let mut problems = denied(&wf);
+    problems.extend(argument_problems(&*engine.deps.mcp, &sites, &local));
+    anyhow::ensure!(problems.is_empty(), "{}", invalid(&problems));
+    require_guarded_turns(&wf)?;
+    require_metadata(&wf)?;
+    let warnings = warnings(&wf);
+    Ok(Gated { wf, warnings })
+}
+
+/// The gate's rules that need no registry: the deny-list, the guarded
+/// round wherever `agent_turn` is, and the metadata a launch reads. The
+/// authoring skill's examples are held to them (tests/flows.rs).
+pub fn agent_rules(wf: &Workflow) -> anyhow::Result<()> {
+    let problems = denied(wf);
+    anyhow::ensure!(problems.is_empty(), "{}", invalid(&problems));
+    require_guarded_turns(wf)?;
+    require_metadata(wf)
+}
+
+// The model's calls go through the round's guard: a workflow that takes
+// agent turns starts the guard child (`start_guard`) on each round's calls,
+// whatever its kind. The check is structural (it does not prove the round
+// runs the calls under the verdicts); `tool_once`/`tool_repeat` still
+// enforce a verdict for a call that needs one, so a stored definition that
+// skips the round stays guarded.
+fn require_guarded_turns(wf: &Workflow) -> anyhow::Result<()> {
+    let sites = ouro_runtime::ows::model::call_sites(wf);
+    anyhow::ensure!(
+        !sites.iter().any(|s| s.function == "agent_turn") || sites.iter().any(|s| s.function == "start_guard"),
+        "a workflow that calls agent_turn requires a `call: start_guard` round before its tools run: copy agent-loop's guarded round (read_workflow agent-loop); the host still enforces a verdict for every call that needs one"
+    );
+    Ok(())
 }
 
 // Flows that are legal but usually a mistake, for the author: a task a jump
@@ -308,8 +610,7 @@ pub fn check(mcp: &dyn Mcp, definition: &str) -> Result<owf::model::Workflow, St
 // And a `choose` followed by its `switch` whose cases miss one of its
 // options (with no default case) or name one it doesn't have; only literal
 // options and `"label"` strings in `when` are compared, jq is not parsed.
-pub fn warnings(wf: &owf::model::Workflow) -> Vec<String> {
-    use owf::model::{Flow, Kind, Task, TaskList};
+pub fn warnings(wf: &Workflow) -> Vec<String> {
     fn jumps_to(task: &Task, target: &str) -> bool {
         let goto = |flow: &Flow| matches!(flow, Flow::Goto(t) if t == target);
         task.then.as_ref().is_some_and(goto)
@@ -396,12 +697,272 @@ pub fn warnings(wf: &owf::model::Workflow) -> Vec<String> {
     out
 }
 
-// ── 4. authoring tools ──────────────────────────────────────────────────────
+// ── 4. routes, loops and the model's parameters ─────────────────────────────
+// Active versions replace built-ins by name (#55). A route (`metadata.route`)
+// is declared by the workflow it routes to: the dispatcher's `route_signal`
+// starts it as the signal's primary run, and it gathers its own context
+// (`signal_input`, `loop_setup`); that is how a channel's flow is one
+// workflow. A loop (`metadata.loop`) is one a worker or the primary may
+// run instead of `agent-loop`. A workflow that calls the dispatcher's own
+// functions is a `signal` override, never a route (design 04, the gate).
+
+/// Metadata lives in document.metadata, the OWF extension point.
+pub fn workflow_metadata(wf: &Workflow) -> &Value {
+    &wf.definition["document"]["metadata"]
+}
+
+/// Whether the definition `name` runs as a loop: `agent-loop` itself, or one
+/// that declares `metadata.loop`.
+pub fn is_loop_definition(name: &str, definition: &str) -> bool {
+    name == crate::agent::AGENT_LOOP_NAME
+        || ouro_runtime::ows::model::parse_yaml(definition).is_ok_and(|wf| workflow_metadata(&wf).get("loop").is_some())
+}
+
+/// Whether a workflow calls the signal dispatcher's own functions.
+pub fn calls_dispatcher(wf: &Workflow) -> bool {
+    ouro_runtime::ows::model::call_sites(wf)
+        .iter()
+        .any(|s| crate::functions::host_function(&s.function).is_some_and(|f| f.context == "signal"))
+}
+
+/// Whether a workflow takes agent turns.
+pub fn takes_turns(wf: &Workflow) -> bool {
+    ouro_runtime::ows::model::call_sites(wf).iter().any(|s| s.function == "agent_turn")
+}
+
+#[derive(Clone, Debug)]
+pub struct Route {
+    pub when: BTreeMap<String, Vec<String>>,
+    pub priority: i64,
+}
+
+pub fn route(wf: &Workflow) -> anyhow::Result<Option<Route>> {
+    let Some(route) = workflow_metadata(wf).get("route") else { return Ok(None) };
+    let when = route
+        .get("when")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("metadata.route.when must be an object"))?;
+    anyhow::ensure!(!when.is_empty(), "metadata.route.when must have at least one key");
+    let mut fields = BTreeMap::new();
+    for (key, value) in when {
+        let values = match value {
+            Value::String(value) => vec![value.clone()],
+            Value::Array(values) if !values.is_empty() && values.iter().all(Value::is_string) => {
+                values.iter().filter_map(Value::as_str).map(str::to_owned).collect()
+            }
+            _ => anyhow::bail!("metadata.route.when.{key} must be a string or a nonempty list of strings"),
+        };
+        fields.insert(key.clone(), values);
+    }
+    let priority = match route.get("priority") {
+        None => 0,
+        Some(priority) => {
+            priority.as_i64().ok_or_else(|| anyhow::anyhow!("metadata.route.priority must be an integer"))?
+        }
+    };
+    Ok(Some(Route { when: fields, priority }))
+}
+
+impl Route {
+    /// Whether a signal of `source` with `payload` matches: every key, the
+    /// source or a top-level payload string, one of its values.
+    pub fn matches(&self, source: &str, payload: &Value) -> bool {
+        self.when.iter().all(|(key, values)| {
+            let field = if key == "source" { Some(source) } else { payload.get(key).and_then(Value::as_str) };
+            field.is_some_and(|field| values.iter().any(|value| value == field))
+        })
+    }
+}
+
+/// What the confirmation target of a run the runtime starts on a signal is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Confirm {
+    // The signal's conversation, else the default chat (the dispatcher's
+    // default path does the same).
+    Conversation,
+    None,
+}
+
+/// The model's parameters a workflow declares for the runs the runtime
+/// starts on a signal, pinned at admission: `metadata.agent.preset` (base,
+/// smart or smartest) and `metadata.agent.confirm` (`conversation` or
+/// `none`). A route may say the same under `metadata.route`. Unset, the
+/// launch decides (functions.rs §5, route and saved launches).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AgentStart {
+    pub preset: Option<PresetName>,
+    pub confirm: Option<Confirm>,
+}
+
+// Where the parameters are declared, if anywhere: `metadata.agent`, else a
+// route's own.
+fn start_block(wf: &Workflow) -> Option<(&'static str, &Value)> {
+    let metadata = workflow_metadata(wf);
+    if let Some(agent) = metadata.get("agent") {
+        return Some(("metadata.agent", agent));
+    }
+    let route = metadata.get("route")?;
+    (route.get("preset").is_some() || route.get("confirm").is_some()).then_some(("metadata.route", route))
+}
+
+pub fn agent_start(wf: &Workflow) -> anyhow::Result<AgentStart> {
+    let Some((at, block)) = start_block(wf) else { return Ok(AgentStart::default()) };
+    anyhow::ensure!(block.is_object(), "{at} must be an object of preset and confirm");
+    if at == "metadata.agent"
+        && let Some(other) =
+            block.as_object().into_iter().flatten().map(|(k, _)| k).find(|k| *k != "preset" && *k != "confirm")
+    {
+        anyhow::bail!("{at} takes preset and confirm, not `{other}`");
+    }
+    let preset = match block.get("preset") {
+        None | Some(Value::Null) => None,
+        Some(name) => Some(
+            name.as_str()
+                .and_then(PresetName::selectable)
+                .ok_or_else(|| anyhow::anyhow!("{at}.preset must be base, smart or smartest"))?,
+        ),
+    };
+    let confirm = match block.get("confirm") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(c)) if c == "conversation" => Some(Confirm::Conversation),
+        Some(Value::String(c)) if c == "none" => Some(Confirm::None),
+        _ => anyhow::bail!("{at}.confirm must be `conversation` or `none`"),
+    };
+    Ok(AgentStart { preset, confirm })
+}
+
+fn require_metadata(wf: &Workflow) -> anyhow::Result<()> {
+    let metadata = workflow_metadata(wf);
+    if let Some(loop_) = metadata.get("loop") {
+        anyhow::ensure!(
+            loop_["description"].as_str().is_some_and(|s| !s.trim().is_empty()),
+            "metadata.loop.description must be a nonempty string"
+        );
+    }
+    let route_starts = metadata.get("route").is_some_and(|r| r.get("preset").is_some() || r.get("confirm").is_some());
+    anyhow::ensure!(
+        !(route_starts && metadata.get("agent").is_some()),
+        "declare preset and confirm once: metadata.agent, or the route's own"
+    );
+    // The dispatcher's functions serve the signal's own run: a route runs
+    // as the signal's primary run, which has none of them.
+    anyhow::ensure!(
+        !(calls_dispatcher(wf) && (metadata.get("route").is_some() || metadata.get("agent").is_some())),
+        "a workflow that calls the dispatcher's functions (primary_loop, route_signal, …) is a `signal` override: it declares no metadata.route and no metadata.agent; a route is a workflow the dispatcher starts as the signal's primary run (a copy of agent-loop that declares the route, for one)"
+    );
+    agent_start(wf)?;
+    route(wf)?;
+    Ok(())
+}
+
+/// A name's active version as the engine holds it, for routing and the loop
+/// catalog: its text parsed, and whether its breaker or an operator set it
+/// aside.
+pub struct ActiveVersion {
+    pub name: String,
+    pub version: u64,
+    pub wf: Workflow,
+    pub set_aside: bool,
+}
+
+/// The active version of every name the agent has one of, built-ins first
+/// (`guard` left out: it is never routed to or run as a loop).
+pub async fn active_versions(engine: &Engine) -> anyhow::Result<Vec<ActiveVersion>> {
+    let mut active = Vec::new();
+    for name in names(&engine.deps.db)? {
+        if name == GUARD_NAME {
+            continue;
+        }
+        let definitions = engine.runtime.definitions(&name).await?;
+        let Some(d) = definitions.active.and_then(|v| definitions.versions.get(&v)) else { continue };
+        let Ok(wf) = ouro_runtime::ows::model::parse_yaml(&d.yaml) else { continue };
+        active.push(ActiveVersion { name, version: d.version, wf, set_aside: definitions.tripped.is_some() });
+    }
+    Ok(active)
+}
+
+/// The routes a signal of `source` with `payload` matches, the one to start
+/// first first: the most specific (most keys), then the highest priority,
+/// then the name. Activation refuses ties at equal specificity; two
+/// concurrent activations can both pass (R-L7), and the name breaks that tie.
+pub async fn signal_routes(engine: &Engine, source: &str, payload: &Value) -> anyhow::Result<Vec<(String, u64)>> {
+    let mut matches = Vec::new();
+    for active in active_versions(engine).await? {
+        if active.name == crate::supervisor::SIGNAL_NAME {
+            continue;
+        }
+        let Ok(Some(route)) = route(&active.wf) else { continue };
+        if route.matches(source, payload) {
+            matches.push((route.when.len(), route.priority, active.name, active.version));
+        }
+    }
+    matches.sort_by(|a, b| (b.0, b.1, &b.2).cmp(&(a.0, a.1, &a.2)));
+    Ok(matches.into_iter().map(|(_, _, name, version)| (name, version)).collect())
+}
+
+// Two routes at the same specificity whose values overlap need distinct
+// priorities: the dispatcher never decides a tie by a model.
+async fn require_route_priority(engine: &Engine, name: &str, wf: &Workflow) -> anyhow::Result<()> {
+    let Some(candidate) = route(wf)? else { return Ok(()) };
+    for active in active_versions(engine).await? {
+        if active.name == name {
+            continue;
+        }
+        let Some(existing) = route(&active.wf)? else { continue };
+        let overlaps = candidate.when.iter().all(|(key, values)| {
+            existing.when.get(key).is_none_or(|others| values.iter().any(|value| others.contains(value)))
+        });
+        anyhow::ensure!(
+            candidate.when.len() != existing.when.len() || !overlaps || candidate.priority != existing.priority,
+            "route `{name}` conflicts with `{}` at equal specificity; set distinct metadata.route.priority values to choose a winner",
+            active.name
+        );
+    }
+    Ok(())
+}
+
+/// The loops a worker or the primary may run, one line each
+/// (`metadata.loop.description`), from the active versions (R2-L7): the
+/// built-in `agent-loop` (an active override replaces its line) and every
+/// name whose active version declares a loop; one its breaker or an
+/// operator set aside is marked. A draft never hides an active version.
+pub async fn loop_catalog(engine: &Engine) -> anyhow::Result<String> {
+    let mut lines = Vec::new();
+    for active in active_versions(engine).await? {
+        let described = workflow_metadata(&active.wf)["loop"]["description"].as_str().map(str::to_owned);
+        let description = match described {
+            Some(description) => description,
+            None if active.name == crate::agent::AGENT_LOOP_NAME => built_in(&active.name)
+                .and_then(|yaml| ouro_runtime::ows::model::parse_yaml(yaml).ok())
+                .and_then(|wf| workflow_metadata(&wf)["loop"]["description"].as_str().map(str::to_owned))
+                .unwrap_or_default(),
+            None => continue,
+        };
+        let aside = if active.set_aside { " (set aside: the built-in agent-loop runs in its place)" } else { "" };
+        lines.push(format!("{}: {description}{aside}", active.name));
+    }
+    Ok(lines.join("\n"))
+}
+
+// ── 5. authoring tools ──────────────────────────────────────────────────────
+// Synthetic tools of the agent loop for writing workflows. Saving checks a
+// definition (the gate) and stores it as a draft version in the engine's
+// catalog; only activation (after the user agreed in the chat, and after a
+// dry run tried it) makes it run.
 
 pub const TOOLS: &[&str] = &["save_workflow", "activate_workflow", "list_workflows", "read_workflow"];
 
 // The workflow-author worker's own tools.
 pub const AUTHOR_TOOLS: &[&str] = &["workflow_functions", "probe_function", "try_workflow"];
+
+/// The never-activated versions an agent may keep of one name (design 04,
+/// decision 8, R2-M3): every version's text is in the engine's one catalog
+/// row per name, read by every admission and finish of that name. Activated
+/// ones are bounded by the user's confirmations and not counted.
+pub const MAX_DRAFTS: usize = 20;
+
+/// The engine issue for pruning never-activated versions.
+pub const PRUNING_ISSUE: &str = "Ch4mpl00/ouro#36";
 
 // What a probe returns at most: enough to see a reply's shape, never a
 // whole store.
@@ -413,6 +974,21 @@ pub fn unavailable(tool: &str, step: &str) -> String {
     json!({"ok": false, "error": format!("{tool} is unavailable until the engine migration's {step} step")}).to_string()
 }
 
+// How a call of `function` is delivered: at most once for a write the engine
+// cannot repeat safely (an MCP tool not marked read-only, the host's own
+// at-most-once functions), or as the task's `metadata.ouro.delivery` says.
+fn delivery(engine: &Engine, function: &str, declared_once: bool) -> &'static str {
+    let once = declared_once
+        || crate::functions::AT_MOST_ONCE.contains(&function)
+        || (crate::functions::host_function(function).is_none()
+            && effect(&*engine.deps.mcp, function) == Some(Effect::Write));
+    if once { "at_most_once" } else { "at_least_once" }
+}
+
+fn created_at(ms: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(ms).map(iso)
+}
+
 pub async fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> anyhow::Result<String> {
     let text = |key: &str| {
         args.get(key)
@@ -420,27 +996,186 @@ pub async fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> any
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow::anyhow!("{key}: Expected nonempty string"))
     };
+    let note = args.get("note").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned);
+    let version = || match args.get("version") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => {
+            v.as_u64().filter(|v| *v > 0).map(Some).ok_or_else(|| anyhow::anyhow!("version: Expected positive integer"))
+        }
+    };
+    let db = &engine.deps.db;
     match name {
-        "save_workflow" | "activate_workflow" => Ok(unavailable(name, "versions")),
-        // The engine's catalog: the built-ins until the versions step.
+        "save_workflow" => {
+            let (name, definition) = (text("name")?.to_owned(), text("definition")?.to_owned());
+            let gated = gate(engine, &name, &definition)?;
+            let digest = ouro_runtime::durable::digest_of(&definition);
+            let definitions = engine.runtime.definitions(&name).await?;
+            let existing = definitions.versions.values().find(|d| d.digest == digest).map(|d| d.version);
+            if existing.is_none() {
+                let mut drafts = 0;
+                for d in definitions.versions.values().filter(|d| !definitions.activations.contains_key(&d.version)) {
+                    if !WorkflowMeta::get(db, &name, &d.digest)?.is_some_and(|m| m.builtin) {
+                        drafts += 1;
+                    }
+                }
+                anyhow::ensure!(
+                    drafts < MAX_DRAFTS,
+                    "`{name}` already holds {drafts} versions that were never activated, the most it keeps; activate one of them, or ask the maintainer to prune them (engine pruning of never-activated versions: {PRUNING_ISSUE})"
+                );
+            }
+            let (record_name, record_digest, record_note) = (name.clone(), digest.clone(), note.clone());
+            db.write(move |db| WorkflowMeta::record(db, &record_name, &record_digest, record_note.as_deref(), false))
+                .await?;
+            let version = match existing {
+                Some(version) => version,
+                None => engine.runtime.save(&name, &definition).await?.version,
+            };
+            let wf = &gated.wf;
+            let calls: Vec<Value> = ouro_runtime::ows::model::call_sites(wf)
+                .into_iter()
+                .map(|c| {
+                    let once = c.delivery == ouro_runtime::Delivery::AtMostOnce;
+                    json!({"reference": c.reference, "function": c.function, "delivery": delivery(engine, &c.function, once)})
+                })
+                .collect();
+            let then = "before the user sees it, then describe in words what it will do, the at-most-once calls above all; activate this version only after they confirm it in the chat.";
+            let runtime_workflow = built_in(&name).is_some()
+                || workflow_metadata(wf).get("loop").is_some()
+                || workflow_metadata(wf).get("route").is_some();
+            let next = if runtime_workflow {
+                format!(
+                    "Dry-run it on a signal of the type it handles (try_workflow with `signal`, and `drafts` for the other drafts of the chain) {then}"
+                )
+            } else if takes_turns(wf) {
+                format!(
+                    "Dry-run it on a fire of its task (try_workflow with signal {{source: scheduler, content: the task's prompt, payload: {{workflow: \"{name}\"}}}}) {then}"
+                )
+            } else {
+                format!("Dry-run it (try_workflow) {then}")
+            };
+            let latest = engine.runtime.definitions(&name).await?;
+            let mut reply = json!({
+                "ok": true, "name": name, "version": version, "status": status(&latest, version),
+                "calls": calls, "next": next,
+            });
+            if existing.is_some() {
+                // The same text is the same version (decision 8, R-M6).
+                reply["reused"] = json!("This text is already saved as this version: no new version was made.");
+            }
+            if !gated.warnings.is_empty() {
+                reply["warnings"] = json!(gated.warnings);
+            }
+            Ok(reply.to_string())
+        }
+        "activate_workflow" => {
+            let name = text("name")?;
+            anyhow::ensure!(
+                !RESERVED.contains(&name),
+                "{name} is a reserved built-in workflow and cannot be saved or activated"
+            );
+            let version = version()?.ok_or_else(|| anyhow::anyhow!("version: Required"))?;
+            let definitions = engine.runtime.definitions(name).await?;
+            let d = definitions
+                .versions
+                .get(&version)
+                .ok_or_else(|| anyhow::anyhow!("no version {version} of workflow `{name}`"))?;
+            // An activation lifts an operator's pause: the agent never does
+            // (design 04, decision 5).
+            if let Some(manual) = definitions.tripped.as_ref().and_then(|t| t.manual.as_ref()) {
+                anyhow::bail!(
+                    "`{name}` is paused by an operator ({}): ask them to resume it; activating a version would lift the pause",
+                    manual.note
+                );
+            }
+            let meta = WorkflowMeta::get(db, name, &d.digest)?;
+            let note = note.or_else(|| meta.as_ref().and_then(|m| m.note.clone()));
+            // The current built-in text is how the agent undoes an override:
+            // always allowed, without the gate or a dry run (decision 3).
+            let builtin = built_in(name).is_some_and(|yaml| ouro_runtime::durable::digest_of(yaml) == d.digest);
+            let mut runs = "A matching signal";
+            if !builtin {
+                // Tools may have changed since it was saved.
+                let gated = gate(engine, name, &d.yaml)?;
+                require_route_priority(engine, name, &gated.wf).await?;
+                anyhow::ensure!(
+                    meta.as_ref().is_some_and(|m| m.tried_ms.is_some()),
+                    "version {version} of `{name}` has not completed a dry run; the workflow-author worker tries it (try_workflow) before it is shown to the user"
+                );
+                runs = match (is_loop_definition(name, &d.yaml), route(&gated.wf)?.is_some()) {
+                    (true, true) => "A matching signal, a loop selecting this name or a task scheduled with it,",
+                    (true, false) => "A loop selecting this name, or a task scheduled with it,",
+                    (false, true) => "A matching signal",
+                    (false, false) => "A task scheduled with it",
+                };
+            }
+            engine.runtime.activate_as(name, version, "agent", note.as_deref()).await?;
+            let next = if builtin {
+                format!("The built-in `{name}` runs again from now on.")
+            } else if built_in(name).is_some() {
+                format!(
+                    "Every `{name}` run started from now runs this version, the one the dry run tried. Its breaker counts all its runs: three faults in a row set it aside, and the built-in one runs in its place until a version is activated again."
+                )
+            } else {
+                format!(
+                    "{runs} started from now runs this version, the one the dry run tried. Three faults of its runs in a row set it aside until a version is activated again."
+                )
+            };
+            Ok(json!({
+                "ok": true, "name": name, "version": version, "builtin": builtin,
+                "next": format!("{next} Activating clears a tripped breaker and starts a fresh count, also for a version that tripped before."),
+            })
+            .to_string())
+        }
         "list_workflows" => {
             let mut workflows = Vec::new();
-            for (name, _) in builtins() {
-                let definitions = engine.runtime.definitions(name).await?;
-                workflows.push(json!({"name": name, "latest_version": definitions.versions.keys().max(),
-                    "active_version": definitions.active, "status": "built-in"}));
+            for name in names(db)? {
+                let definitions = engine.runtime.definitions(&name).await?;
+                // A meta row whose engine save never happened is an orphan.
+                let Some((&latest, d)) = definitions.versions.iter().next_back() else { continue };
+                let meta = WorkflowMeta::get(db, &name, &d.digest)?;
+                let trip = definitions.tripped.as_ref();
+                workflows.push(json!({
+                    "name": name, "latest_version": latest, "status": status(&definitions, latest),
+                    "active_version": definitions.active,
+                    "builtin": meta.as_ref().is_some_and(|m| m.builtin)
+                        || built_in(&name).is_some_and(|yaml| ouro_runtime::durable::digest_of(yaml) == d.digest),
+                    "tried": meta.as_ref().is_some_and(|m| m.tried_ms.is_some()),
+                    "tripped": trip.is_some_and(|t| t.breaker), "paused": trip.is_some_and(|t| t.manual.is_some()),
+                    "note": meta.as_ref().and_then(|m| m.note.clone()),
+                    "created_at": meta.as_ref().and_then(|m| created_at(m.created_ms)),
+                }));
             }
             Ok(json!({"count": workflows.len(), "workflows": workflows}).to_string())
         }
         "read_workflow" => {
             let name = text("name")?;
-            Ok(match built_in(name) {
-                Some(definition) => {
-                    let active = engine.runtime.definitions(name).await?.active;
-                    json!({"name":name,"found":true,"version":active,"status":"built-in","definition":definition})
-                }
-                None => json!({"name": name, "found": false}),
+            if name == GUARD_NAME {
+                return Ok(json!({"name": name, "found": true, "version": null, "status": "built-in",
+                    "builtin": true, "definition": GUARD})
+                .to_string());
             }
+            let definitions = engine.runtime.definitions(name).await?;
+            // The version asked for; else the one that runs; else the newest.
+            let chosen = match version()? {
+                Some(version) => definitions.versions.get(&version),
+                None => definitions
+                    .active
+                    .and_then(|v| definitions.versions.get(&v))
+                    .or_else(|| definitions.versions.values().next_back()),
+            };
+            let Some(d) = chosen else { return Ok(json!({"name": name, "found": false}).to_string()) };
+            let meta = WorkflowMeta::get(db, name, &d.digest)?;
+            let trip = definitions.tripped.as_ref();
+            Ok(json!({
+                "name": name, "found": true, "version": d.version, "status": status(&definitions, d.version),
+                "builtin": meta.as_ref().is_some_and(|m| m.builtin)
+                    || built_in(name).is_some_and(|yaml| ouro_runtime::durable::digest_of(yaml) == d.digest),
+                "tried": meta.as_ref().is_some_and(|m| m.tried_ms.is_some()),
+                "note": meta.as_ref().and_then(|m| m.note.clone()),
+                "active_version": definitions.active, "latest_version": definitions.versions.keys().next_back(),
+                "tripped": trip.is_some_and(|t| t.breaker), "paused": trip.is_some_and(|t| t.manual.is_some()),
+                "definition": d.yaml,
+            })
             .to_string())
         }
         _ => anyhow::bail!("unknown workflow tool {name}"),
@@ -615,7 +1350,7 @@ fn cut(value: &Value, max: usize) -> Value {
     Value::String(format!("{head}… [cut: {total} characters in all]"))
 }
 
-// ── 5. the evals workbench's adapter ────────────────────────────────────────
+// ── 6. the evals workbench's adapter ────────────────────────────────────────
 // The optimizer (crates/evals) runs candidate workflows in memory on the
 // `owf` interpreter until the step that removes it: the workflow steps and
 // MCP calls of this engine, with no admitted run behind them (no agent

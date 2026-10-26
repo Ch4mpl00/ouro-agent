@@ -538,17 +538,32 @@ impl Supervisor {
                 evidence: crate::runs::SignalEvidence { content },
             };
             let scope: Scope = trace.clone();
-            engine.scopes.borrow(&run, scope);
-            engine
-                .runtime
-                .start_with(
-                    &run,
-                    SIGNAL_NAME,
-                    json!({ "signal": signal_value(signal) }),
-                    ouro_runtime::Start { version: None, host: serde_json::to_value(&host)? },
-                )
-                .await
-                .map_err(|e| e.context("admitting the signal run"))?;
+            engine.scopes.borrow(&run, scope.clone());
+            // The agent's own `signal`, or the built-in in place of one set
+            // aside (design 04): its line reaches whichever primary runs
+            // (`signal.fallback`); the host data stays the signal's, so a
+            // start again joins.
+            let host = serde_json::to_value(&host)?;
+            let pending = signal_value(signal);
+            let build = move |choice: crate::runs::Choice| -> futures::future::BoxFuture<'static, anyhow::Result<(Value, Value)>> {
+                let (mut value, host) = (pending.clone(), host.clone());
+                Box::pin(async move {
+                    let mut input = json!({});
+                    if let Some(fallback) = choice.fallback {
+                        value["fallback"] = json!(fallback.line);
+                        input["fallback"] = serde_json::to_value(&fallback)?;
+                    }
+                    input["signal"] = value;
+                    Ok((input, host))
+                })
+            };
+            let (_, ran) =
+                crate::runs::start_named_root(engine, &run, SIGNAL_NAME, crate::runs::Site::Signal, build)
+                    .await
+                    .map_err(|e| e.context("admitting the signal run"))?;
+            if let Some(fallback) = &ran.fallback {
+                crate::runs::trace_fallback(scope, fallback, true);
+            }
             let recovery = format!("{}:{}", crate::runs::RECOVERY, signal.id);
             crate::runs::wait_quiescent(engine, &[run.clone(), recovery], &self.cancel)
                 .await

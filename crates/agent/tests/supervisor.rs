@@ -197,13 +197,13 @@ async fn a_scheduled_fire_runs_as_a_signal_with_mcps_note_and_its_workflow() {
     assert!(system.contains("Default Telegram chat id: 4242."), "the note reaches the prompt: {system}");
     assert!(f.db.get_trace(&format!("dreaming:{}", FIRST_FIRE_ID + 1)).unwrap().is_some());
 
-    // Saved workflows return with the versions step: the task goes to the
-    // agent loop, told that its workflow has no active version.
+    // A task naming a workflow with no active version goes to the agent
+    // loop, told so.
     assert_eq!(sink.fire(fire(2, "scheduler", Some("w"))).await, Fired::Started);
     let (_, obs) = f.db.get_trace(&format!("scheduler:{}", FIRST_FIRE_ID + 2)).unwrap().unwrap();
     assert!(obs.iter().any(|o| o.name == "fallback"), "the task is handed over");
     let system = model.seen.lock().unwrap()[1].messages[0]["content"].as_str().unwrap().to_owned();
-    assert!(system.contains("saved workflow `w`, which has no active version"), "{system}");
+    assert!(system.contains("saved workflow `w`") && system.contains("it has no active version"), "{system}");
 
     supervisor.shutdown().await;
     assert_eq!(sink.fire(fire(3, "scheduler", None)).await, Fired::NotStarted);
@@ -583,8 +583,8 @@ async fn recovery_failure_keeps_the_primary_error_and_transcript() {
         let model = Arc::new(Scripted::new(vec![calls(&[("t1", json!({"marker":"primary transcript marker"}))])]));
         let (f, _, supervisor) = setup(model.clone());
         if invalid_preset {
-            // A signal version of one's own returns with the versions step.
-            continue;
+            // An operator's (or an older rule's) signal version, past the gate.
+            store_definition(&f.engine, "signal", &SIGNAL.replace("preset: base", "preset: unknown")).await;
         }
         // After one tool round, both the primary and the recovery provider
         // fail. An invalid recovery preset also exercises setup failure.
@@ -658,6 +658,21 @@ async fn ended(engine: &agent::agent::Engine, run: &str) -> agent::runs::Status 
 // control API's listing redacts it).
 async fn primary_of(engine: &agent::agent::Engine, signal: i64) -> ouro_runtime::durable::SavedRun {
     children_of(engine, &format!("signal:{signal}")).await.into_iter().next().expect("the primary loop")
+}
+
+// The children of `run` that ended, with their host data.
+async fn ended_children_of(engine: &agent::agent::Engine, run: &str) -> Vec<ouro_runtime::durable::SavedRun> {
+    let filter = agent::runs::Runs {
+        parent: Some(run.into()),
+        since_ms: Some(0),
+        before_ms: Some(i64::MAX / 4),
+        ..Default::default()
+    };
+    let mut children = Vec::new();
+    for child in engine.control.history(&filter, None, 10).await.unwrap().items {
+        children.push(engine.runtime.get(&child.admission.id).await.unwrap().unwrap());
+    }
+    children
 }
 
 async fn children_of(engine: &agent::agent::Engine, run: &str) -> Vec<ouro_runtime::durable::SavedRun> {
@@ -1039,5 +1054,388 @@ async fn a_cancelled_primary_ends_its_signal_without_a_report() {
     assert!(!obs.iter().any(|o| o.name == "recovery"));
     let loops = f.engine.loop_ids().await;
     assert!(loops.is_empty(), "{loops:?} {:?}", primary.admission.id);
+    supervisor.shutdown().await;
+}
+
+// ── saved workflows, signal overrides and routes (design 04) ────────────────
+// Restored from tests/pending on the engine: a scheduled task's workflow
+// and a route are the signal's primary run; the agent's `signal` replaces
+// the dispatcher until its breaker sets it aside.
+
+// A scheduled task naming a saved workflow runs it without a model. A
+// run that faulted before any write hands the task to the agent loop; one
+// that faulted after a write only recovers, as a failed execution does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_saved_workflow_runs_and_faults_hand_over_by_effect() {
+    const HEAD: &str = "document: { dsl: '1.0.4', namespace: agent, name: w, version: '1.0.0' }\n";
+    let cases = [
+        ("completes", "do: [ { a: { set: { done: true } } } ]"),
+        ("faults first", "do: [ { a: { raise: { error: { type: 'https://x/e', status: 500 } } } } ]"),
+        (
+            "faults after a write",
+            "do: [ { a: { call: t1 } }, { b: { raise: { error: { type: 'https://x/e', status: 500 } } } } ]",
+        ),
+        ("is missing", ""),
+    ];
+    for (case, body) in cases {
+        let model = Arc::new(Scripted::new(vec![assistant("done"), assistant("done")]));
+        let (f, mcp, supervisor) = setup(model.clone());
+        if !body.is_empty() {
+            activate_definition(&f.engine, "w", &format!("{HEAD}{body}")).await;
+        }
+        let scheduled = PendingSignal { payload: Some(json!({"workflow":"w"})), ..signal("scheduler", 42) };
+        let result = supervisor.run_signal(&scheduled).await;
+
+        let seen = model.seen.lock().unwrap().clone();
+        let system = seen.first().map(|s| s.messages[0]["content"].as_str().unwrap().to_owned());
+        match case {
+            "completes" => {
+                let output: Value = serde_json::from_str(&result.unwrap()).unwrap();
+                assert_eq!(output, json!({"ok":true,"workflow":"w","output":{"done":true}}));
+                assert!(seen.is_empty(), "no model call");
+            }
+            "faults first" | "is missing" => {
+                assert_eq!(result.unwrap(), "done");
+                let system = system.unwrap();
+                assert!(system.contains("SCHEDULER"), "{case}: the agent loop takes the task");
+                let note =
+                    if case == "is missing" { "has no active version" } else { "failed before changing anything" };
+                assert!(system.contains(note), "{case}: {system}");
+            }
+            _ => {
+                assert!(result.unwrap_err().to_string().contains("may have changed something"));
+                let system = system.unwrap();
+                assert!(system.contains("RECOVERY"), "{case}: only a report");
+                assert!(!system.contains("SCHEDULER") && !system.contains("ROUTING"));
+                assert!(
+                    seen[0].messages[1]["content"].as_str().unwrap().contains("Do not repeat the original actions")
+                );
+                assert!(!seen[0].tools.iter().any(|t| t.name == "invoke_sub_agent"));
+                assert!(mcp.calls.lock().unwrap().iter().any(|(n, _)| n == "t1"));
+            }
+        }
+        let (trace, obs) = f.db.get_trace("scheduler:42").unwrap().unwrap();
+        assert_eq!(trace.tags, ["scheduler", "saved-workflow"]);
+        if matches!(case, "faults first" | "is missing") {
+            assert_eq!(trace.metadata.as_ref().unwrap()["fallback"], "agent-loop");
+            let primary = obs.iter().find(|o| o.name == "agent_loop").unwrap();
+            assert_eq!(primary.meta("preset"), Some(&json!("base")));
+            assert!(obs.iter().any(|o| o.name == "fallback" && o.level == "WARNING"));
+        }
+        assert_eq!(obs.iter().any(|o| o.name == "recovery"), case == "faults after a write");
+        let ran = obs.iter().any(|o| o.name == "runner" && o.meta("workflow") == Some(&json!("w")));
+        assert_eq!(ran, !body.is_empty(), "{case}");
+        supervisor.shutdown().await;
+    }
+    // A payload on another source is not a workflow.
+    let model = Arc::new(Scripted::new(vec![assistant("done"), assistant("done")]));
+    let (_f, _, supervisor) = setup(model);
+    let telegram = PendingSignal { payload: Some(json!({"workflow":"w"})), ..signal("telegram", 43) };
+    assert_eq!(telegram.saved_workflow(), None);
+    supervisor.run_signal(&telegram).await.unwrap();
+
+    supervisor.shutdown().await;
+}
+
+// A saved workflow left waiting (here, for an event) is still the engine's
+// to finish: the signal ends without a recovery report and without the
+// agent loop, and resumes when its event arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupted_saved_workflow_is_left_to_durable_recovery() {
+    let model = Arc::new(Scripted::new(vec![assistant("done"), assistant("done")]));
+    let (f, _, supervisor) = setup(model.clone());
+    let head = "document: { dsl: '1.0.4', namespace: agent, name: w, version: '1.0.0' }\n";
+    let waits = format!(
+        "{head}do: [ {{ a: {{ listen: {{ to: {{ one: {{ with: {{ type: go-on }} }} }} }} }} }}, {{ b: {{ set: {{ done: true }} }} }} ]"
+    );
+    activate_definition(&f.engine, "w", &waits).await;
+    let scheduled = PendingSignal { payload: Some(json!({"workflow":"w"})), ..signal("scheduler", 42) };
+    let output: Value = serde_json::from_str(&supervisor.run_signal(&scheduled).await.unwrap()).unwrap();
+    assert_eq!(output["resumes"], true);
+    assert!(model.seen.lock().unwrap().is_empty(), "neither the agent loop nor recovery ran");
+    let (_, obs) = f.db.get_trace("scheduler:42").unwrap().unwrap();
+    assert!(!obs.iter().any(|o| o.name == "recovery"));
+    let event = json!({"source":"test","id":"go-on-1","type":"go-on","data":{}});
+    f.engine.runtime.deliver(event, None).await.unwrap();
+    let ended = ended(&f.engine, "signal:42").await;
+    assert_eq!(ended, agent::runs::Status::Completed(json!({"ok":true,"workflow":"w","output":{"done":true}})));
+    supervisor.shutdown().await;
+}
+
+// The agent's `signal` (after a dry run) handles every signal started
+// after; three faults of it in a row set it aside and the built-in runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_activated_signal_workflow_handles_signals_until_its_breaker_opens() {
+    let model = Arc::new(Scripted::new((0..4).map(|_| assistant("done")).collect()));
+    let (f, _mcp, supervisor) = setup(model.clone());
+    f.engine.ready().await.unwrap();
+    let tool = async |name: &str, args: Value| {
+        let reply = agent::flows::tool(&f.engine, name, args.as_object().unwrap()).await.unwrap();
+        serde_json::from_str::<Value>(&reply).unwrap()
+    };
+    let read = tool("read_workflow", json!({"name": "signal"})).await;
+    assert_eq!((read["builtin"].as_bool(), read["definition"].as_str()), (Some(true), Some(agent::supervisor::SIGNAL)));
+    let last_system = || model.seen.lock().unwrap().last().unwrap().messages[0]["content"].as_str().unwrap().to_owned();
+
+    let terse = without_breaker(agent::supervisor::SIGNAL)
+        .replace(r#""Call find_skills only when"#, r#""Answer tersely.", "Call find_skills only when"#);
+    assert_ne!(terse, without_breaker(agent::supervisor::SIGNAL));
+    activate_definition(&f.engine, "signal", &terse).await;
+    supervisor.run_signal(&signal("peer", 1)).await.unwrap();
+    assert!(last_system().contains("Answer tersely."), "{}", last_system());
+
+    let broken = "document: { dsl: '1.0.4', namespace: agent, name: signal, version: '9.0.0' }\n\
+        do: [ { boom: { raise: { error: { type: 'https://example.com/boom', status: 500 } } } } ]\n";
+    activate_definition(&f.engine, "signal", broken).await;
+    for n in 2..5 {
+        assert!(supervisor.run_signal(&signal("peer", n)).await.is_err(), "fault {}", n - 1);
+    }
+    supervisor.run_signal(&signal("peer", 5)).await.unwrap();
+    assert!(!last_system().contains("Answer tersely."), "the built-in signal workflow is back");
+    assert!(last_system().contains("Workflow `signal`"), "told why: {}", last_system());
+    assert_eq!(model.seen.lock().unwrap().len(), 2);
+    supervisor.shutdown().await;
+}
+
+// Recovery policy belongs to the activated signal definition, even though
+// the host keeps the same report span and loop lifecycle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_activated_signal_override_changes_the_recovery_prompt() {
+    let model = Arc::new(Scripted::new(vec![assistant("reported")]));
+    let (f, _, supervisor) = setup(model.clone());
+    let definition =
+        without_breaker(SIGNAL).replace("Report the failure only.", "Explain this failure in one sentence.");
+    activate_definition(&f.engine, "signal", &definition).await;
+    let broken = r#"
+document: { dsl: '1.0.4', namespace: agent, name: broken, version: '1.0.0' }
+do:
+  - write: { call: t1 }
+  - fail: { raise: { error: { type: 'https://example.com/failure', status: 500, detail: 'original failure' } } }
+"#;
+    activate_definition(&f.engine, "broken", broken).await;
+    let pending = PendingSignal { payload: Some(json!({"workflow":"broken"})), ..signal("scheduler", 42) };
+    let error = supervisor.run_signal(&pending).await.unwrap_err().to_string();
+    assert!(error.contains("original failure"), "{error}");
+    let seen = model.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    let prompt = seen[0].messages[1]["content"].as_str().unwrap();
+    assert!(prompt.contains("Explain this failure in one sentence."), "{prompt}");
+    assert!(!prompt.contains("Report the failure only."));
+    assert!(prompt.contains("original failure"));
+    assert!(prompt.contains("Recent transcript (may be truncated):\n[]"));
+    let (trace, obs) = f.db.get_trace("scheduler:42").unwrap().unwrap();
+    let recovery = obs.iter().find(|o| o.name == "recovery").unwrap();
+    let root = obs.iter().find(|o| o.parent_observation_id.is_none()).unwrap();
+    assert_eq!(recovery.parent_observation_id.as_deref(), Some(root.id.as_str()));
+    assert_eq!(trace.output["error"], error);
+    let loop_span = obs.iter().find(|o| o.meta("agent_id") == Some(&json!("recovery:42"))).unwrap();
+    assert_eq!(loop_span.meta("max_iterations"), Some(&json!(5)));
+    supervisor.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_signal_override_without_a_catch_gets_no_automatic_recovery() {
+    let model = Arc::new(Scripted::new(vec![]));
+    let (f, _, supervisor) = setup(model.clone());
+    let definition = without_breaker(SIGNAL).split("      catch:").next().unwrap().replace("      try:", "      do:");
+    activate_definition(&f.engine, "signal", &definition).await;
+    assert!(supervisor.run_signal(&signal("peer", 42)).await.is_err());
+    assert_eq!(model.seen.lock().unwrap().len(), 1);
+    let (_, obs) = f.db.get_trace("peer:42").unwrap().unwrap();
+    assert!(!obs.iter().any(|o| o.name == "recovery"));
+    supervisor.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_catch_before_signal_session_cannot_start_recovery() {
+    let model = Arc::new(Scripted::new(vec![]));
+    let (f, _, supervisor) = setup(model.clone());
+    let definition = SIGNAL.replace("call: signal_session", "call: primary_loop");
+    // The gate refuses it (primary_loop needs its input); an older rule's
+    // version, stored past the gate, still gets no report.
+    let args = json!({"name":"signal","definition":without_breaker(&definition)});
+    let refused = agent::flows::tool(&f.engine, "save_workflow", args.as_object().unwrap()).await.unwrap_err();
+    assert!(refused.to_string().contains("needs the argument `input`"), "{refused}");
+    store_definition(&f.engine, "signal", &definition).await;
+    let error = supervisor.run_signal(&signal("peer", 42)).await.unwrap_err().to_string();
+    assert!(error.contains("input: Required"), "{error}");
+    assert!(model.seen.lock().unwrap().is_empty());
+    let (_, obs) = f.db.get_trace("peer:42").unwrap().unwrap();
+    assert!(!obs.iter().any(|o| o.name == "recovery"));
+    supervisor.shutdown().await;
+}
+
+// A route is a workflow the dispatcher starts as the signal's primary run
+// (design 04: a workflow calling the dispatcher's functions is a `signal`
+// override and declares no route).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn activated_signal_routes_share_the_session_and_trace_and_take_precedence_over_default() {
+    let model = Arc::new(Scripted::new(vec![assistant("route answer")]));
+    let (f, _, supervisor) = setup(model.clone());
+    f.engine.ready().await.unwrap();
+    let superseded = r#"document: {dsl: '1.0.4', namespace: agent, name: research-signal, version: '1.0.0', metadata: {route: {when: {source: telegram, topic: research}}}}
+do:
+  - primary:
+      call: primary_loop
+      with: {input: '${ $context.signal.content }', loop: agent-loop, skills: [telegram], preset: smart}
+output: {as: '${ .output }'}
+"#;
+    let args = json!({"name":"research-signal","definition":superseded});
+    let refused = agent::flows::tool(&f.engine, "save_workflow", args.as_object().unwrap()).await.unwrap_err();
+    assert!(refused.to_string().contains("primary_loop"), "{refused}");
+    let definition = variant("research-signal").replace(
+        "metadata: { loop: { description: 'General ReAct loop with guarded tools and workers.' } }",
+        "metadata: { route: { when: { source: telegram, topic: research } } }",
+    );
+    activate_definition(&f.engine, "research-signal", &definition).await;
+    let mut incoming = signal("telegram", 45);
+    incoming.payload = Some(json!({"topic":"research"}));
+    assert_eq!(supervisor.run_signal(&incoming).await.unwrap(), "route answer");
+    let (trace, observations) = f.db.get_trace("telegram:45").unwrap().unwrap();
+    assert_eq!(trace.session_id.as_deref(), Some("telegram:45"));
+    assert_eq!(trace.output, "route answer");
+    assert!(observations.iter().any(|o| o.name == "route:research-signal"));
+    assert!(!observations.iter().any(|o| o.name.starts_with("route:telegram")));
+    assert_eq!(model.seen.lock().unwrap().len(), 1);
+    supervisor.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_signal_route_has_its_own_breaker_and_reports_each_failure_once() {
+    let model = Arc::new(Scripted::new(vec![
+        assistant("report 1"),
+        assistant("report 2"),
+        assistant("report 3"),
+        assistant("reply restored"),
+    ]));
+    let (f, _, supervisor) = setup(model.clone());
+    let definition = r#"document: {dsl: '1.0.4', namespace: agent, name: signal-telegram, version: '2.0.0', metadata: {route: {when: {source: telegram}}}}
+do:
+  - failure: {raise: {error: {type: 'https://example.com/fault', status: 500}}}
+"#;
+    activate_definition(&f.engine, "signal-telegram", definition).await;
+    for id in 46..49 {
+        assert!(supervisor.run_signal(&signal("telegram", id)).await.is_err());
+    }
+    assert_eq!(model.seen.lock().unwrap().len(), 3, "one recovery turn per fault");
+    assert_eq!(supervisor.run_signal(&signal("telegram", 49)).await.unwrap(), "reply restored");
+    assert_eq!(model.seen.lock().unwrap().len(), 4);
+    let (trace, _) = f.db.get_trace("telegram:49").unwrap().unwrap();
+    assert_eq!(trace.output, "reply restored");
+    supervisor.shutdown().await;
+}
+
+// A loop that declares the Telegram route handles the signal alone: no
+// signal route, its own context, its own setup, and the guard sees what it
+// was told and what the user wrote before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_telegram_signal_runs_the_loop_that_declares_its_route() {
+    let model = Arc::new(Scripted::new(vec![
+        calls(&[("t1", json!({"note":"go ahead"}))]),
+        calls(&[("send_telegram_message", json!({"chatId":"-10042","messageThreadId":7,"text":"all done"}))]),
+    ]));
+    let api = Arc::new(GuardApi::default());
+    let mcp = Arc::new(ContextMcp::default());
+    let f = fixture_on(model.clone(), &[], SKILLS, |deps| {
+        deps.mcp = mcp.clone();
+        deps.skills = vec!["orchestrator".into(), "routing".into()];
+        deps.decisions = Some(agent::decisions::decision_client("guard-test".into(), api.clone()));
+        deps.env = agent::session::EnvConfig { user_email: None, telegram_chat_id: Some("999".into()) };
+    });
+    mcp.notes.lock().unwrap().push("Earlier activity from the journal".into());
+    mcp.history.lock().unwrap().push(history(100, "Earlier message", "user", -10042, Some(7), "2026-09-06 11:59:00"));
+    activate_telegram_loop(&f.engine).await;
+    let routes = agent::flows::signal_routes(&f.engine, "telegram", &Value::Null).await.unwrap();
+    assert_eq!(routes[0].0, "telegram-loop");
+    let definitions = f.engine.runtime.definitions("telegram-loop").await.unwrap();
+    assert!(agent::flows::is_loop_definition("telegram-loop", &definitions.versions[&routes[0].1].yaml));
+    let supervisor = create_supervisor(f.engine.clone());
+    assert_eq!(supervisor.run_signal(&signal("telegram", 42)).await.unwrap(), "all done");
+    let run = ended_children_of(&f.engine, "signal:42").await.into_iter().find(|c| c.admission.name == "telegram-loop");
+    let run = run.expect("the route's run");
+    assert_eq!(run.admission.input["signal"]["source"], "telegram");
+    let host = run.admission.host().unwrap();
+    assert_eq!(host["preset"], "smart");
+    assert_eq!(host["confirm"], json!({"chatId":"-10042","messageThreadId":7}));
+    let seen = model.seen.lock().unwrap().clone();
+    let system = seen[0].messages[0]["content"].as_str().unwrap();
+    for part in [
+        "Signal source: telegram",
+        "Default Telegram chat id: 999.",
+        "Earlier activity from the journal",
+        "TELEGRAM",
+        "ORCHESTRATOR",
+        "Delivery: use send_telegram_message",
+        "A message delivered to this conversation ends the session",
+    ] {
+        assert!(system.contains(part), "{part}: {system}");
+    }
+    assert!(system.ends_with(agent::tool_results::WORKING_MEMORY_INSTRUCTIONS), "the setup goes before the rules");
+    let user = seen[0].messages[1]["content"].as_str().unwrap();
+    assert!(user.contains("telegram.history") && user.contains("Earlier message") && user.contains("go ahead"));
+    let review = api.requests.lock().unwrap().iter().find(|r| r.to_string().contains("\\\"note\\\"")).unwrap().clone();
+    assert!(review["state"]["skills"].as_str().unwrap().contains("TELEGRAM"), "{review}");
+    assert!(review["state"]["earlier_user_messages"].as_str().unwrap().contains("Earlier message"), "{review}");
+    assert_eq!(review["state"]["task"], signal("telegram", 42).content);
+    let statuses: Vec<_> = mcp
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(n, _)| n == "telegram_send_status")
+        .map(|(_, a)| a["text"].clone())
+        .collect();
+    assert_eq!(statuses, [json!("👀"), json!("")], "opened before the first turn, cleared at the end");
+    let (trace, observations) = f.db.get_trace("telegram:42").unwrap().unwrap();
+    assert_eq!(trace.output, "all done");
+    assert!(observations.iter().any(|o| o.name == "route:telegram-loop"));
+    assert!(observations.iter().any(|o| o.name == "find_skills" && o.meta("automatic") == Some(&json!(true))));
+    supervisor.shutdown().await;
+}
+
+// What loop_setup added survives a restart: a loop rebuilt from its journal
+// in the next process still runs the skills it loaded and gives the guard
+// the same evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rebuilt_routed_loop_keeps_what_its_setup_added() {
+    let model = Arc::new(Scripted::new(vec![
+        calls(&[("t1", json!({"n":1}))]),
+        calls(&[("t1", json!({"n":2}))]),
+        calls(&[("send_telegram_message", json!({"chatId":"-10042","messageThreadId":7,"text":"finished"}))]),
+    ]));
+    let mcp = Arc::new(ContextMcp::default());
+    mcp.history.lock().unwrap().push(history(100, "Earlier message", "user", -10042, Some(7), "2026-09-06 11:59:00"));
+    let routed = |label: &str| {
+        let api = Arc::new(GuardApi::default());
+        *api.label.lock().unwrap() = Some(label.into());
+        let (mcp, decisions) = (mcp.clone(), agent::decisions::decision_client("guard-test".into(), api.clone()));
+        let configure = move |deps: &mut agent::agent::EngineDeps| {
+            deps.mcp = mcp;
+            deps.skills = vec!["orchestrator".into(), "routing".into()];
+            deps.decisions = Some(decisions);
+            deps.env = agent::session::EnvConfig { user_email: None, telegram_chat_id: Some("999".into()) };
+        };
+        (api, configure)
+    };
+    let (_, configure) = routed("needs_confirmation");
+    let f = fixture_on(model.clone(), &[], SKILLS, configure);
+    activate_telegram_loop(&f.engine).await;
+    let supervisor = create_supervisor(f.engine.clone());
+    assert!(supervisor.run_signal(&signal("telegram", 42)).await.unwrap().contains("resumes"));
+    let card = card_of(&mcp);
+    supervisor.shutdown().await;
+
+    // The next process, with a guard that allows: the press resumes the loop.
+    let (api, configure) = routed("allow");
+    let restarted = reopen(&f, model.clone(), Arc::new(ouro_runtime::durable::SystemClock), configure);
+    let supervisor = create_supervisor(restarted.clone());
+    let mut press = signal("telegram_button", 44);
+    press.content = json!({"chatId":-10042,"messageThreadId":7,"messageId":700,"data":card["buttons"][0][0]["data"],"text":"Confirm"}).to_string();
+    assert_eq!(supervisor.run_signal(&press).await.unwrap(), "Button delivered");
+    assert_eq!(ended(&restarted, "signal:42").await, agent::runs::Status::Completed(json!("finished")));
+    let review = api.requests.lock().unwrap().iter().find(|r| r.to_string().contains("\\\"n\\\":2")).unwrap().clone();
+    assert!(review["state"]["skills"].as_str().unwrap().contains("TELEGRAM"), "{review}");
+    assert!(review["state"]["earlier_user_messages"].as_str().unwrap().contains("Earlier message"), "{review}");
+    assert_eq!(mcp.calls.lock().unwrap().iter().filter(|(n, _)| n == "t1").count(), 2);
     supervisor.shutdown().await;
 }

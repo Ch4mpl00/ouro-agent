@@ -619,14 +619,62 @@ pub fn allow_guard() -> Arc<agent::decisions::DecisionClient> {
 }
 
 // Reference workflows are agent-authored examples, never runtime built-ins.
-// Saving and activating them return with the engine migration's versions
-// step (design 03, decision 9): the tests that use this are ignored until then.
-pub fn activate_definition(_engine: &Arc<Engine>, name: &str, _definition: &str) -> i64 {
-    panic!("activating `{name}` returns with the versions step (design 03, decision 9)")
+// The agent saves a version through its gate, a dry run marks its content
+// tried (the sandbox step's `try_workflow`; here directly), and the agent
+// activates it: what the user confirmed.
+pub async fn activate_definition(engine: &Arc<Engine>, name: &str, definition: &str) -> u64 {
+    engine.ready().await.unwrap();
+    let args = json!({"name": name, "definition": definition});
+    let saved = agent::flows::tool(engine, "save_workflow", args.as_object().unwrap())
+        .await
+        .unwrap_or_else(|e| panic!("saving {name}: {e:#}"));
+    let version = serde_json::from_str::<Value>(&saved).unwrap()["version"].as_u64().unwrap();
+    mark_tried(engine, name, definition);
+    let args = json!({"name": name, "version": version});
+    agent::flows::tool(engine, "activate_workflow", args.as_object().unwrap())
+        .await
+        .unwrap_or_else(|e| panic!("activating {name} v{version}: {e:#}"));
+    version
+}
+/// Marks `definition`'s content as tried, as a completed dry run would.
+pub fn mark_tried(engine: &Engine, name: &str, definition: &str) {
+    let digest = ouro_runtime::durable::digest_of(definition);
+    agent::flows::WorkflowMeta::mark_tried(&engine.deps.db, name, &digest).unwrap();
+}
+/// Stores and activates a version past the agent's gate: one an operator
+/// put there, or one older rules allowed. The engine still validates it.
+pub async fn store_definition(engine: &Arc<Engine>, name: &str, definition: &str) -> u64 {
+    engine.ready().await.unwrap();
+    let digest = ouro_runtime::durable::digest_of(definition);
+    agent::flows::WorkflowMeta::record(&engine.deps.db, name, &digest, None, false).unwrap();
+    let version = engine.runtime.save(name, definition).await.unwrap_or_else(|e| panic!("{name}: {e:#}")).version;
+    engine.runtime.activate_as(name, version, "operator", None).await.unwrap();
+    version
 }
 // The reference flow of a channel: one loop that declares its route.
 pub const TELEGRAM_LOOP: &str = include_str!("../fixtures/telegram-loop.yaml");
 pub const STATUS_TOOL: &str = "telegram_send_status";
-pub fn activate_telegram_loop(engine: &Arc<Engine>) -> i64 {
-    activate_definition(engine, "telegram-loop", TELEGRAM_LOOP)
+pub async fn activate_telegram_loop(engine: &Arc<Engine>) -> u64 {
+    activate_definition(engine, "telegram-loop", TELEGRAM_LOOP).await
+}
+/// A built-in definition as the agent may save it: without the breaker
+/// policy only the built-ins declare (design 04, decision 3).
+pub fn without_breaker(definition: &str) -> String {
+    definition.replace(", ouro: { breaker: 'off' }", "").replace(", metadata: { ouro: { breaker: 'off' } }", "")
+}
+/// A loop of the agent's own: a copy of agent-loop under `name`.
+pub fn variant(name: &str) -> String {
+    without_breaker(agent::agent::AGENT_LOOP).replace("name: agent-loop,", &format!("name: {name},"))
+}
+/// `definition` faulting before anything else (its top-level `do`, a block
+/// list or a flow list).
+pub fn faulting(definition: &str) -> String {
+    const BOOM: &str = "boom: { raise: { error: { type: 'https://example.com/boom', status: 500, detail: boom } } }";
+    let faulting = if definition.contains("\ndo:\n") {
+        definition.replacen("\ndo:\n", &format!("\ndo:\n  - {BOOM}\n"), 1)
+    } else {
+        definition.replacen("\ndo: [ ", &format!("\ndo: [ {{ {BOOM} }}, "), 1)
+    };
+    assert_ne!(faulting, definition, "a top-level do list");
+    faulting
 }

@@ -202,13 +202,25 @@ step results; `wait` and retry delays release the worker and resume from
 persisted deadlines. A run that fails before any write falls back to the
 agent; one that fails after a write is only reported.
 
-External calls default to `at_least_once`: a lost response can cause a
-duplicate effect. For calls where a duplicate is unacceptable, set
-`metadata: { delivery: at_most_once }` on the `call` task. An unknown outcome
-then stops the run without retry; execution can be lost if the agent crashes
-before dispatch. Put this metadata on external calls inside reusable
-functions, not on their callers. `llm_compose`, `filter_relevant` and `choose`
-currently support only the default policy. Do not wrap unknown outcomes in retries.
+Every version has a breaker, the runtime's: three faults of its runs in a
+row set it aside until a version is activated again (activating the same
+version again clears it too). Your versions cannot declare one of their own
+(`metadata.ouro.breaker` is refused). A set-aside version never runs: the
+built-in runs in its place, a route gives way to the next route or the
+default path, a scheduled task's workflow to the agent loop, and whatever
+runs instead is told why in one line of its instructions. An operator may
+pause a name: it falls back the same way, and you cannot activate it until
+they resume it.
+
+A call of an MCP tool the server does not mark read-only is delivered at
+most once: a lost answer is an unknown outcome, never sent again. A read is
+delivered at least once: a lost answer can repeat it. To hold any call to at
+most once, set `metadata: { ouro: { delivery: at_most_once } }` on its
+`call` task. An unknown outcome then stops the run without retry; execution
+can be lost if the agent crashes before dispatch. Put this metadata on
+external calls inside reusable functions, not on their callers.
+`llm_compose`, `filter_relevant` and `choose` support only the default
+policy. Do not wrap unknown outcomes in retries.
 
 A `try` retry does not repeat a write that already succeeded: the retry
 reuses its saved result and goes on, while a write that failed is sent
@@ -232,17 +244,20 @@ The task's prompt is the first user message. Later versions move what
 repeats into deterministic steps around the turns (a `for` calling a read
 directly, its results given to the model through `loop_setup`), leaving the
 model the judgement and the errors. Wherever `agent_turn` appears, keep
-agent-loop's guarded round (`turn`, the `guard` child, `tool`, `settle`):
-save and activation refuse a workflow without it. Three faults in a row
-hand the task to the agent loop until a new version is activated.
+agent-loop's guarded round (`turn`, `start_guard`, the `round` with
+`classify` → `tool_once` | `tool_repeat`, `settle`): save and activation
+refuse a workflow without it. Drop the built-in's `metadata.ouro.breaker`
+from your copy. Three faults in a row hand the task to the agent loop until
+a new version is activated.
 
 ## Loops
 
 Every agent loop, the parent's and each worker's, runs a named loop
 workflow; the built-in is `agent-loop`. Saving and activating a version
-named `agent-loop` changes every loop's default; a differently named loop
-runs when its route matches a signal, or when a worker selects it
-(`invoke_sub_agent(loop: …)`, or a worker skill's frontmatter `loop:`).
+named `agent-loop` changes every loop's default (the recovery report's too);
+activating the built-in's current version again undoes it. A differently
+named loop runs when its route matches a signal, or when a worker selects
+it (`invoke_sub_agent(loop: …)`, or a worker skill's frontmatter `loop:`).
 
 **A channel's or a source's flow is ONE loop that declares its route.**
 Never write a separate signal route for it, never copy `signal` or its
@@ -251,12 +266,14 @@ runs, opens the session, runs a scheduled workflow, picks the route and
 reports a failure. Start from `read_workflow("agent-loop")` and change the
 minimum:
 
-1. Rename `document.name` and add `metadata.loop.description` and
+1. Rename `document.name`, drop `metadata.ouro` (the breaker policy is the
+   built-in's alone) and add `metadata.loop.description` and
    `metadata.route.when` (below). Keep the guarded round as it is: `turn`,
-   the `guard` child, worker joins, `tool`, `settle`.
+   `start_guard`, the `round` (worker joins, `classify` → `tool_once` |
+   `tool_repeat`), `settle`.
 2. Before the first turn, gather context with the steps you need, under one
    `if: '${ $context.signal != null }'`: a worker running the same loop has
-   no signal and skips them. `signal_input` (the message with its source's
+   no signal and skips them (the route's input carries the signal). `signal_input` (the message with its source's
    history), `recent_activity` (the activity journal), `pending_confirmations`
    (`target:`, cards already waiting in the conversation) and
    `preselect_skills` (`request:`, `context:`, `loaded:`).
@@ -267,8 +284,8 @@ minimum:
    `messages` and `memory` into `$context`.
 4. Fixed steps of the loop (a status bubble before the first turn and its
    cleanup) are direct `call:` steps, trusted as any saved workflow's calls
-   once the user approved the definition. `tool` is only for the model's
-   calls: it carries the guard's verdict.
+   once the user approved the definition. `tool_once` and `tool_repeat` are
+   only for the model's calls: they carry the guard's verdict.
 5. Exit rules decide on `agent_settle`'s `outcomes` (below).
 
 ```yaml
@@ -286,7 +303,7 @@ do:
   - context:
       if: '${ $context.signal != null }'
       do:
-        - input: { call: signal_input, export: { as: '${ $context + { input: . } }' } }
+        - input: { call: signal_input, export: { as: '${ $context + { input: .input } }' } }
         - activity: { call: recent_activity, export: { as: '${ $context + { activity: . } }' } }
         - setup:
             call: loop_setup
@@ -296,29 +313,37 @@ do:
               system: '${ [ $context.activity, "Delivery: reply with send_telegram_message to the current chat." ] }'
             export: { as: '${ $context + { messages: .messages, memory: .memory } }' }
         - status:
-            if: '${ $context.loop.conversation != null }'
+            if: '${ $context.conversation != null }'
             call: telegram_send_status
-            with: { id: '${ "status:" + ($context.signal.id | tostring) }', text: 👀, chatId: '${ $context.loop.conversation.chatId }' }
+            with: { id: '${ "status:" + ($context.signal.id | tostring) }', text: 👀, chatId: '${ $context.conversation.chatId }' }
   - turn:
       call: agent_turn
-      with: { loop: '${ $context.loop }', messages: '${ $context.messages }', memory: '${ $context.memory }', i: '${ $context.i }' }
+      with: { messages: '${ $context.messages }', memory: '${ $context.memory }', i: '${ $context.i }' }
       export: { as: '${ $context + { messages: ($context.messages + [ .message ]), calls: .calls, i: ($context.i + 1) } }' }
-  # route, guard and round: as in agent-loop, unchanged
+  - route:
+      switch:
+        - answered: { when: '${ .calls == [] }', then: clear }
+        - act: { then: guard }
+  - guard:
+      call: start_guard
+      with: { calls: '${ $context.calls }', i: '${ $context.i }' }
+      export: { as: '${ $context + { guard_run: .run, guarded: (.guarded // []) } }' }
+  # round: as in agent-loop, unchanged (workers, classify, tool_once / tool_repeat)
   - settle:
       call: agent_settle
-      with: { loop: '${ $context.loop }', calls: '${ $context.calls }', results: '${ . }', memory: '${ $context.memory }' }
+      with: { calls: '${ $context.calls }', results: '${ . }', memory: '${ $context.memory }' }
       export: { as: '${ $context + { messages: ($context.messages + .replies), memory: .memory } }' }
   - next:
       switch:
         - replied:
-            when: '${ $context.loop.conversation as $c | $c != null and any(.outcomes[]; .ok and .name == "send_telegram_message" and (.arguments.chatId | tostring) == ($c.chatId | tostring)) }'
+            when: '${ $context.conversation as $c | $c != null and any(.outcomes[]; .ok and .name == "send_telegram_message" and (.arguments.chatId | tostring) == ($c.chatId | tostring)) }'
             then: clear
         - finished: { when: '${ .finished }', then: clear }
         - more: { then: turn }
   - clear:
-      if: '${ $context.signal != null and $context.loop.conversation != null }'
+      if: '${ $context.signal != null and $context.conversation != null }'
       call: telegram_send_status
-      with: { id: '${ "status:" + ($context.signal.id | tostring) }', text: '', chatId: '${ $context.loop.conversation.chatId }' }
+      with: { id: '${ "status:" + ($context.signal.id | tostring) }', text: '', chatId: '${ $context.conversation.chatId }' }
 ```
 
 **Route.** `when` matches `source` and top-level signal payload fields;
@@ -331,15 +356,21 @@ conversation (else the default chat) as its confirmation target;
 `metadata.route.confirm: none` (or the same under `metadata.agent`) change that. Its instructions start with the
 session context, the signal's source and its env addendum; its input carries
 `signal` (`id`, `source`, `content`, `env_context`, `payload`, `button`,
-`created_at`) besides `loop`, `messages`, `memory`. Telegram uses the
-default path until a matching loop is active. Older signal routes (a
-non-loop workflow with `route`, calling `primary_loop`) still run; do not
-write new ones.
+`created_at`) besides `messages`, `memory`, `env`, `conversation` and
+`confirm`. Telegram uses the default path until a matching loop is active.
+A route set aside (its breaker, an operator's pause, a tool it calls gone)
+gives way to the next matching route, then to the default path, which is
+told why. A workflow that calls the dispatcher's own functions
+(`primary_loop`, `route_signal`, …) is a `signal` override: it declares no
+route.
 
-**Contracts.** `loop` is the admitted host spec: `loop.conversation` is
-`{chatId, messageThreadId}` for the incoming conversation, else null
-(workers too). Every round must start the reserved `guard` child before
-running the model's calls; save and activation check it. `agent_turn` takes
+**Contracts.** The model's parameters (preset, skills, confirmation target)
+are the host's, fixed when the run is admitted; YAML can neither read nor
+set them. The input tells the loop's own steps `conversation` (`{chatId,
+messageThreadId}` of the incoming conversation; absent for workers) and
+`confirm` (where confirmations go). Every round must start the guard child
+(`start_guard`) before running the model's calls; save and activation check
+it. `agent_turn` takes
 `extra_turn: true` to allow one turn past the iteration limit (a single
 reminder; keep its flag in context so it fires once). `agent_settle`
 returns `finished`, `output`, `replies`, `memory` and ordered `outcomes`,
@@ -352,17 +383,20 @@ output if desired.
 
 **Workers.** `invoke_sub_agent` accepts `loop:`; otherwise the first worker
 skill with frontmatter `loop: <name>` supplies it, else `agent-loop`; its
-description lists the active loops. A worker's `start_child` can select one
-with `loop:`, which overrides those preferences. Workers inherit the
-confirmation target. Give `tool` the call's place (`i`, `index`) so owned
-workers, joined with `listen` (15 minute hold), survive restarts.
+description lists the active loops. A loop's `start_worker` can select one
+with `loop:`, which overrides those preferences. A name that is no loop, or
+is set aside, runs `agent-loop` instead. Workers inherit the confirmation
+target. Give `start_worker`, `tool_once` and `tool_repeat` the call's place
+(`i`, `index`) so owned workers, joined with `listen` (`metadata: { ouro: {
+hold: PT15M } }`), survive restarts.
 
-**Resolution and safety.** A name runs its active version, else its git
-definition, else `agent-loop`. Each name has its own breaker: three faults
-in a row fall back to its git definition (a routed loop: the default path).
-Definitions are fixed at admission. A loop or a `signal` override is
-activated like any workflow: after a completed dry run on a signal and the
-user's agreement. The guard child sequences review, host-rendered cards and
+**Resolution and safety.** A name runs its active version, pinned when its
+run starts. Each version has its own breaker (above): set aside, a loop
+gives way to the built-in `agent-loop` and `signal` to the built-in
+dispatcher, for that run only; your version stays active and shows as
+tripped in `list_workflows`. A loop or a `signal` override is activated like
+any workflow: after a completed dry run on a signal and the user's
+agreement. The guard child sequences review, host-rendered cards and
 confirmation listens (60 second hold, then a durable sleep); Rust verifies
 consumed button events against exact calls, so YAML cannot authorize a
 model's call. The built-in `signal` routes `telegram_button` presses through
@@ -423,7 +457,7 @@ worker; `timeout: { after: PT24H }` raises the standard catchable timeout.
 Dry runs fail on an empty listen. `all`, `until`, correlation, read and
 foreach listen options are unsupported.
 
-A `listen` task may set `metadata: { hold: PT5S }` (a literal ISO 8601
+A `listen` task may set `metadata: { ouro: { hold: PT5S } }` (a literal ISO 8601
 duration, default `PT0S`). It first consumes an available event, then waits
 in memory for host notifications during that hold, keeping its lease and
 heartbeat. Delivery continues the run without saving a waiting state. When
@@ -431,21 +465,25 @@ the hold or the task timeout ends, it suspends durably; recovery replays the
 listen and consumes the persisted event or handles the timeout. A crash during
 the hold is recovered through the ordinary lease and journal.
 
-`start_child(workflow, key, input?)` starts an active saved workflow immediately
-as an owned durable child and returns `{ run }`. The invocation path and key
-identify it across replay; its admitted definition and input stay immutable.
-Listen on `done:<run>` / `waiting:<run>` (use an in-memory hold for fast work).
-After `waiting`, listen on `done:<run>` without a hold to release the worker.
-`child_outcome(run, key)` reads the owned child's stored terminal outcome;
-event data alone is not authority. Ending a parent cancels unfinished children.
-The built-in `guard` workflow is reserved and readable, but cannot be saved or
-activated; its review and confirmation functions are private. An `agent-loop`
-override must start a `guard` child before its tool round.
+`start_child { name, input? }` starts the active version of a workflow
+immediately as an owned durable child and returns `{ id, key, done, waiting }`.
+The invocation path identifies it across replay; its admitted definition and
+input stay immutable. It gets no host data, so it cannot take agent turns:
+only its own steps run. Listen on its `done` / `waiting` event types (use
+an in-memory hold for fast work). After `waiting`, listen on `done` without a
+hold to release the worker. `child_outcome { id, key }` reads the owned
+child's stored terminal outcome; event data alone is not authority. Ending a
+parent cancels unfinished children. The built-in `guard` workflow is
+reserved and readable, but cannot be saved or activated; its review and
+confirmation functions are private. An `agent-loop` override must call
+`start_guard` before its tool round.
 
 
-A subset of the Open Workflow Specification 1.0, in YAML. Anything not
-listed here is rejected (`emit`, `run`, `schedule`, catalogs,
-secrets, authentication).
+A subset of the Open Workflow Specification 1.0, in YAML, with the
+runtime's extensions under `metadata.ouro`. Anything not listed here is
+rejected (`emit`, `run`, `schedule` and `metadata.ouro.at` — schedule_task
+starts work on time —, `metadata.ouro.breaker`, catalogs, secrets,
+authentication).
 
 ```
 document: { dsl: '1.0.4', namespace: agent, name: <name>, version: '1.0.0' }
@@ -472,8 +510,10 @@ A task is a map with exactly one of these keys:
 And any of: `if: '${ … }'` (false → skipped, its input passes on),
 `input: { from: '${ … }' }` (what the task sees), `output: { as: '${ … }' }`
 (what it returns), `export: { as: '${ … }' }` (the new `$context`),
-`timeout: { after: <duration> }`, `then: <flow>`, and on a `call`
-`metadata: { delivery: at_most_once }`.
+`timeout: { after: <duration> }`, `then: <flow>`, on a `call`
+`metadata: { ouro: { delivery: at_most_once } }`, and on a `for`
+`metadata: { ouro: { concurrency: 4 } }` (its passes at once, at most that
+many).
 
 A `<flow>` is `continue`, `exit` (this list), `end` (the run), or the name
 of a task in the same list — never a task body: to branch into work, name a
@@ -499,10 +539,12 @@ prompt: |
   Text over several lines, quotes ' and " as they are.
 ```
 
-Data flow: each task's output is the next task's input. The workflow's
-input is `{ env: { timezone, now, localNow, newsLastReadAt,
-techLastReadAt, userEmail, telegramChatId }, signal: { source, content,
-id } }`, available everywhere as `$workflow.input`. Keep a result for later tasks with
+Data flow: each task's output is the next task's input. A scheduled task's
+workflow gets `{ env: { timezone, now, localNow, newsLastReadAt,
+techLastReadAt, userEmail, telegramChatId }, signal: { id, source, content,
+env_context, payload, created_at }, messages, memory, confirm }` (`messages`:
+its instructions and the task's prompt, for a workflow that takes agent
+turns), available everywhere as `$workflow.input`. Keep a result for later tasks with
 `export: { as: '${ $context + { name: . } }' }` and read `$context.name`.
 
 Functions besides the ones `workflow_functions` lists from the tools:
