@@ -359,11 +359,16 @@ async fn a_recurring_task_fires_at_its_slot_as_one_scheduler_signal() {
 async fn a_prompt_that_looks_like_an_expression_arrives_verbatim() {
     let w = world_at("2026-11-10T06:00:00Z").await;
     let prompt = "Report ${ .x } and $run, \"quoted\" # not a comment: really\nsecond line: '${ 1 + 1 }'";
+    // A prompt that is a whole expression, which the engine would evaluate.
+    let whole = "${ .x }";
     let id = w.schedule("UTC", "now", false, prompt).await;
     w.until_fires(1).await;
-    assert_eq!(w.drain().await.ran, 1);
-    let input = &w.model.fires()[0];
-    assert!(input.ends_with(&format!("Recurring: no (one-shot)\n\n{prompt}")), "{input}");
+    w.schedule("UTC", "now", false, whole).await;
+    w.until_fires(2).await;
+    assert_eq!(w.drain().await.ran, 2);
+    let inputs = w.model.fires();
+    assert!(inputs[0].ends_with(&format!("Recurring: no (one-shot)\n\n{prompt}")), "{inputs:?}");
+    assert!(inputs[1].ends_with(&format!("Recurring: no (one-shot)\n\n{whole}")), "{inputs:?}");
     assert_eq!(w.active_task(id).await.prompt, prompt);
     // Crons a formatted YAML would break round-trip too (R2-L4).
     for cron in ["*/5 * * * *", "0 9 * * 1,3"] {
