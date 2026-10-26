@@ -603,3 +603,42 @@ above, measured with one full `scripts/test.py` run, and **reverted**:
   (Quint models no wake condition). Target release 0.2.1.
 - **Step 2 continuation** started with a fresh executor (the previous one was
   stopped at 68 passed / 31 failed).
+
+## 2026-10-26 (design 08: executor)
+
+Design 08 (the Telegram wrapper), implemented with the goldfish review's
+corrections and the maintainer's decisions (08, Deviations). Choices the
+executor took alone, each reversible:
+
+- **A built-in that does not fit the registry is not installed.**
+  `runs::install_builtins` validates each built-in first and skips (with a
+  log line) one the engine refuses, instead of failing the boot: an MCP
+  without `telegram_send_status` gets no Telegram route and its Telegram
+  signals take the default path. On the full MCP nothing changes.
+- **Default-path tests keep the default path by their MCP, not a seam.**
+  The test MCPs that drive Telegram signals down the default path no
+  longer offer `telegram_send_status` (`Harness::new`, `supervisor.rs`'s
+  `ContextMcp` unless a test opts in, `supervisor_e2e`), so the built-in
+  route is not installed there; the tests that activate the reference
+  `telegram-loop` opt in (`Harness::with_status`, `ContextMcp.status`).
+  `versions.rs`' set-aside-route tests moved to a source with no built-in
+  route (`chat`); the route-priority tests now expect the built-in
+  `telegram` last; the sandbox's narrowed and paused drafts now fall to the
+  built-in route (its MCP offers the four Telegram tools). The e2e property
+  therefore covers the default path only; the wrapper's own suite is
+  `tests/telegram_loop.rs`.
+- **`telegram_send_status` is journal noise** (`activity::NOISE`): the
+  bubble is progress, never what the user got; observers' spans are left
+  out by their `activity: observer` tag.
+- **`start_loop` inherits more than the review listed**, all narrowings:
+  the caller's tool whitelist, deny set, `parent_id` (a worker's loop stays
+  a worker), iteration limit and engine-skill choice; `allow_skill_writes`
+  only when the caller has it and asks.
+- **The observer also gets `reasoning`** when the provider returned
+  `reasoning_content` beside the calls (agent-loop passes
+  `.message.reasoning_content`), clipped to 400 like `content`.
+- **The status lines' unknown outcomes are caught by name** (a nested `try`
+  around each bubble call: ouro's catch-all never takes
+  `call.unknown`), then any other error by the outer catch.
+- **Test 11's failing run** was taken with the new skill moved aside; the
+  sleep case of G-M11 (the observer's PT20S bound) has no wall-clock test.
