@@ -22,9 +22,9 @@ serde_json = { version = "1.0.151", features = ["preserve_order"] }
 sha2 = "0.11.0"
 hex = "0.4.3"
 owf = { path = "../owf" }
-ows = { git = "https://github.com/Ch4mpl00/ouro", tag = "v0.2.2" }
-ouro-durable = { git = "https://github.com/Ch4mpl00/ouro", tag = "v0.2.2" }
-ouro-runtime = { git = "https://github.com/Ch4mpl00/ouro", tag = "v0.2.2" }
+ows = { git = "https://github.com/Ch4mpl00/ouro", tag = "v0.3.0" }
+ouro-durable = { git = "https://github.com/Ch4mpl00/ouro", tag = "v0.3.0" }
+ouro-runtime = { git = "https://github.com/Ch4mpl00/ouro", tag = "v0.3.0" }
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-util = "0.7.19"
