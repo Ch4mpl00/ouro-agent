@@ -1,35 +1,36 @@
-// The agent loop as an `agent-loop` run, over generated conversations: the
-// round protocol and `finish` hold, a round's calls stay within the loop's
-// limit, and a process that dies at any checkpoint (before or after the
-// commit) is resumed by a fresh process to the same conversation. A write is
-// never sent twice, a completed turn is never asked of the model again, and
-// the only trace a crash may leave is a write in flight reported to the
-// model as "outcome unknown".
+// The agent loop as an engine run of `agent-loop`, over generated
+// conversations: the round protocol and `finish` hold, a round's calls stay
+// within the loop's limit, and a process that dies at any call to the world
+// (a model request or a tool's dispatch, before it reached the world or
+// after) is resumed by a fresh process on the same stores to the same
+// conversation. A write is never sent twice (invariant 4), a completed turn
+// is never asked of the model again, and the only trace a death may leave is
+// a write in flight reported to the model as "outcome unknown". Deaths at
+// the store's own commits are the engine's conformance suite's.
 mod support;
 use agent::{
     agent::{Engine, EngineDeps, LoopOptions, Providers, create_engine},
-    flows::MemoryWorkflows,
+    db::AgentDb,
     mcp::Mcp,
     models::{ModelPreset, Presets, ReasoningEffort},
     providers::{
         ChatProvider, CompletionParams, CompletionResult, Message, ProviderKind, ToolDef, assistant, role, tool_calls,
     },
-    tracing::{SpanStart, null_scope},
 };
 use async_trait::async_trait;
-use owf::{
-    durable::{Journal, Record, check_transition},
-    run::Status,
-};
+use ouro_runtime::ows::run::Status;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
 use serde_json::{Map, Value, json};
-use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 use support::{AnySkill, NoCodex, PersistLog, task_context};
 use tokio_util::sync::CancellationToken;
 
+// Engine runs take the worker's ticks: fewer cases than a store-only
+// property by default; PROPERTY_RUNS raises them.
 fn runs(default: u32) -> u32 {
     std::env::var("PROPERTY_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
@@ -71,20 +72,49 @@ fn conversation() -> impl Strategy<Value = Vec<Vec<Call>>> {
     prop::collection::vec(round(), 0..=4)
 }
 
+fn call_id(turn: usize, at: usize) -> String {
+    format!("t{turn}c{at}")
+}
+
+// ── deaths ──────────────────────────────────────────────────────────────────
+
+// Where the process dies: the n-th call to the world (counted across
+// processes), before it reached the world or after. A death cancels `died`
+// (the test then stops the engine) and the call never answers.
+#[derive(Default)]
+struct Deaths {
+    calls: AtomicUsize,
+    at: Mutex<Vec<(usize, bool)>>,
+    died: Mutex<CancellationToken>,
+}
+
+impl Deaths {
+    // Some(after) when this call dies.
+    fn next(&self) -> Option<bool> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        self.at.lock().unwrap().iter().find(|(at, _)| *at == n).map(|(_, after)| *after)
+    }
+    async fn die(&self) -> ! {
+        self.died.lock().unwrap().cancel();
+        std::future::pending::<()>().await;
+        unreachable!("a dead call never answers")
+    }
+}
+
 // The model: turn `i` (the assistant messages already in the transcript)
 // always gets the same reply, so a turn asked again would be the same turn,
 // and the requests show which turns were asked.
 struct Model {
     rounds: Vec<Vec<Call>>,
-    // Every request: the turn asked and the transcript it was asked on.
+    // Every request answered: the turn asked and the transcript it was asked on.
     asked: Mutex<Vec<(usize, Vec<Message>)>>,
-}
-
-fn call_id(turn: usize, at: usize) -> String {
-    format!("t{turn}c{at}")
+    deaths: Arc<Deaths>,
 }
 
 impl Model {
+    fn new(rounds: Vec<Vec<Call>>, deaths: Arc<Deaths>) -> Arc<Model> {
+        Arc::new(Model { rounds, asked: Mutex::default(), deaths })
+    }
     fn reply(&self, turn: usize) -> Message {
         let Some(round) = self.rounds.get(turn) else { return assistant("answer") };
         // The keys put so far, in order: `Get(Some(n))` reads the n-th.
@@ -119,113 +149,6 @@ impl Model {
             .collect();
         json!({"role": "assistant", "content": null, "tool_calls": calls}).as_object().unwrap().clone()
     }
-}
-
-#[async_trait]
-impl ChatProvider for Model {
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::Openai
-    }
-    async fn complete(&self, p: &mut CompletionParams<'_>) -> anyhow::Result<CompletionResult> {
-        let turn = p.messages.iter().filter(|m| role(m) == "assistant").count();
-        self.asked.lock().unwrap().push((turn, p.messages.clone()));
-        Ok(CompletionResult { message: self.reply(turn), finish_reason: Some("stop".into()), usage: None })
-    }
-}
-
-// The tools, with every dispatch counted by its call (`q`) and the most
-// running at once.
-#[derive(Default)]
-struct World {
-    sent: Mutex<HashMap<String, usize>>,
-    running: AtomicUsize,
-    peak: AtomicUsize,
-}
-
-#[async_trait]
-impl Mcp for World {
-    fn tools(&self) -> Vec<ToolDef> {
-        let schema = json!({"type": "object", "properties": {"q": {}}});
-        ["lookup", "send", "broken"].into_iter().map(|n| ToolDef::new(n, n, schema.clone())).collect()
-    }
-    fn read_only(&self, name: &str) -> bool {
-        name != "send"
-    }
-
-    fn open_world(&self, _name: &str) -> bool {
-        false
-    }
-    async fn call_tool(&self, name: &str, args: Map<String, Value>, _: &CancellationToken) -> anyhow::Result<String> {
-        let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
-        self.peak.fetch_max(now, Ordering::SeqCst);
-        tokio::task::yield_now().await;
-        self.running.fetch_sub(1, Ordering::SeqCst);
-        let q = args["q"].as_str().unwrap_or_default().to_owned();
-        *self.sent.lock().unwrap().entry(format!("{name}:{q}")).or_default() += 1;
-        Ok(if name == "broken" { "[tool error] broken".into() } else { format!("{name} answered {q}") })
-    }
-}
-
-fn engine(model: Arc<Model>, world: Arc<World>) -> Arc<Engine> {
-    let p = |name: &str| ModelPreset { model: name.into(), reasoning_effort: ReasoningEffort::Disabled };
-    create_engine(EngineDeps {
-        providers: Providers { openai: model.clone(), gemini: model.clone(), deepseek: model, openrouter: None },
-        mcp: world,
-        presets: Presets {
-            base: p("gpt-5.4-mini"),
-            smart: p("gpt-5.4"),
-            smartest: p("gpt-5.4"),
-            compiler: p("gpt-5.4"),
-            compose: p("gpt-5.4"),
-        },
-        skills: Vec::new(),
-        skill_store: Arc::new(AnySkill),
-        memory: Arc::new(PersistLog::default()),
-        tracer: Arc::new(agent::tracing::NullTracer),
-        codex: Arc::new(NoCodex),
-        decisions: Some(support::allow_guard()),
-        env: Default::default(),
-        db: agent::db::AgentDb::open(":memory:").unwrap(),
-        store: agent::runs::memory_store(),
-        schedule: Arc::new(agent::schedule::MemorySchedule::default()),
-    })
-}
-
-const ID: &str = "peer:1/loop";
-
-async fn start(engine: &Arc<Engine>, limit: usize) -> Value {
-    let mut opts = LoopOptions::new(ID, task_context("peer:1"));
-    opts.skills = vec!["any".into()];
-    opts.include_engine_skills = false;
-    opts.max_concurrent_tools = limit;
-    engine.start_loop(opts).await.unwrap().workflow_input("go").await
-}
-
-static AGENT_LOOP: LazyLock<owf::model::Workflow> =
-    LazyLock::new(|| owf::model::parse_yaml(agent::agent::AGENT_LOOP).unwrap());
-
-// One process's attempt at the run on `journal` (None: no checkpoints).
-async fn attempt(engine: &Arc<Engine>, input: &Value, journal: Option<&dyn Journal>) -> Status {
-    let root = null_scope().span(SpanStart::new("runner", agent::tracing::SpanKind::Chain));
-    let host = agent::flows::loop_host(engine, &root, input.clone());
-    let cancel = CancellationToken::new();
-    let outcome = match journal {
-        None => owf::run::run(&host, &AGENT_LOOP, ID, input.clone(), &cancel).await,
-        Some(journal) => owf::run::resume(&host, &AGENT_LOOP, ID, input.clone(), &cancel, journal).await,
-    };
-    outcome.status
-}
-
-// Memory keys of stored tool results are fresh UUIDs: equal up to those.
-fn normal(messages: &[Message]) -> String {
-    static KEY: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"tool\.[0-9a-f-]{36}").unwrap());
-    KEY.replace_all(&serde_json::to_string(messages).unwrap(), "tool.KEY").into_owned()
-}
-
-impl Model {
-    fn new(rounds: Vec<Vec<Call>>) -> Arc<Model> {
-        Arc::new(Model { rounds, asked: Mutex::default() })
-    }
     fn turns(&self) -> Vec<usize> {
         self.asked.lock().unwrap().iter().map(|(t, _)| *t).collect()
     }
@@ -237,6 +160,161 @@ impl Model {
         all.push(self.reply(*turn));
         all
     }
+}
+
+#[async_trait]
+impl ChatProvider for Model {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Openai
+    }
+    async fn complete(&self, p: &mut CompletionParams<'_>) -> anyhow::Result<CompletionResult> {
+        let turn = p.messages.iter().filter(|m| role(m) == "assistant").count();
+        let death = self.deaths.next();
+        if death == Some(false) {
+            self.deaths.die().await;
+        }
+        self.asked.lock().unwrap().push((turn, p.messages.clone()));
+        if death == Some(true) {
+            self.deaths.die().await;
+        }
+        Ok(CompletionResult { message: self.reply(turn), finish_reason: Some("stop".into()), usage: None })
+    }
+}
+
+// The tools, with every dispatch counted by its call (`q`) and the most
+// running at once.
+#[derive(Default)]
+struct World {
+    sent: Mutex<HashMap<String, usize>>,
+    running: AtomicUsize,
+    peak: AtomicUsize,
+    deaths: Arc<Deaths>,
+}
+
+#[async_trait]
+impl Mcp for World {
+    fn tools(&self) -> Vec<ToolDef> {
+        let schema = json!({"type": "object", "properties": {"q": {}}});
+        ["lookup", "send", "broken"].into_iter().map(|n| ToolDef::new(n, n, schema.clone())).collect()
+    }
+    fn read_only(&self, name: &str) -> bool {
+        name != "send"
+    }
+    fn open_world(&self, _name: &str) -> bool {
+        false
+    }
+    async fn call_tool(&self, name: &str, args: Map<String, Value>, _: &CancellationToken) -> anyhow::Result<String> {
+        let death = self.deaths.next();
+        if death == Some(false) {
+            self.deaths.die().await;
+        }
+        let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        tokio::task::yield_now().await;
+        self.running.fetch_sub(1, Ordering::SeqCst);
+        let q = args["q"].as_str().unwrap_or_default().to_owned();
+        *self.sent.lock().unwrap().entry(format!("{name}:{q}")).or_default() += 1;
+        if death == Some(true) {
+            self.deaths.die().await;
+        }
+        Ok(if name == "broken" { "[tool error] broken".into() } else { format!("{name} answered {q}") })
+    }
+}
+
+// What outlives an engine: the stores, the world and the model.
+struct Parts {
+    store: Arc<dyn ouro_runtime::durable::RunStore>,
+    db: AgentDb,
+    model: Arc<Model>,
+    world: Arc<World>,
+    deaths: Arc<Deaths>,
+}
+
+fn parts(rounds: &[Vec<Call>]) -> Parts {
+    let deaths = Arc::new(Deaths::default());
+    Parts {
+        store: agent::runs::memory_store(),
+        db: AgentDb::open(":memory:").unwrap(),
+        model: Model::new(rounds.to_vec(), deaths.clone()),
+        world: Arc::new(World { deaths: deaths.clone(), ..World::default() }),
+        deaths,
+    }
+}
+
+fn engine(p: &Parts) -> Arc<Engine> {
+    let preset = |name: &str| ModelPreset { model: name.into(), reasoning_effort: ReasoningEffort::Disabled };
+    create_engine(EngineDeps {
+        providers: Providers {
+            openai: p.model.clone(),
+            gemini: p.model.clone(),
+            deepseek: p.model.clone(),
+            openrouter: None,
+        },
+        mcp: p.world.clone(),
+        presets: Presets {
+            base: preset("gpt-5.4-mini"),
+            smart: preset("gpt-5.4"),
+            smartest: preset("gpt-5.4"),
+            compiler: preset("gpt-5.4"),
+            compose: preset("gpt-5.4"),
+        },
+        skills: Vec::new(),
+        skill_store: Arc::new(AnySkill),
+        memory: Arc::new(PersistLog::default()),
+        tracer: Arc::new(agent::tracing::NullTracer),
+        codex: Arc::new(NoCodex),
+        decisions: Some(support::allow_guard()),
+        env: Default::default(),
+        db: p.db.clone(),
+        store: p.store.clone(),
+        schedule: Arc::new(agent::schedule::MemorySchedule::default()),
+    })
+}
+
+const ID: &str = "peer:1/loop";
+
+// One process's attempt at the conversation: the first starts the loop's
+// run, a later one resumes it from the store. Ends with the run's outcome,
+// or None when the process died first.
+async fn attempt(p: &Parts, limit: usize, first: bool) -> Option<Status> {
+    let died = CancellationToken::new();
+    *p.deaths.died.lock().unwrap() = died.clone();
+    let engine = engine(p);
+    let mut sent = None;
+    if first {
+        let mut opts = LoopOptions::new(ID, task_context("peer:1"));
+        opts.skills = vec!["any".into()];
+        opts.include_engine_skills = false;
+        opts.max_concurrent_tools = limit;
+        let live = engine.start_loop(opts).await.unwrap();
+        sent = Some(tokio::spawn(live.send("go".into())));
+    } else {
+        engine.ready().await.unwrap();
+    }
+    let ended = async {
+        loop {
+            if let Some(status) = engine.runtime.get(ID).await.unwrap().and_then(|r| r.outcome) {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let outcome = tokio::select! {
+        status = ended => Some(status),
+        _ = died.cancelled() => None,
+        _ = tokio::time::sleep(Duration::from_secs(60)) => panic!("the run neither ended nor died"),
+    };
+    engine.shutdown().await;
+    if let Some(sent) = sent {
+        let _ = sent.await;
+    }
+    outcome
+}
+
+// Memory keys of stored tool results are fresh UUIDs: equal up to those.
+fn normal(messages: &[Message]) -> String {
+    static KEY: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"tool\.[0-9a-f-]{36}").unwrap());
+    KEY.replace_all(&serde_json::to_string(messages).unwrap(), "tool.KEY").into_owned()
 }
 
 // The round that ends the session with `finish`, from the conversation
@@ -281,22 +359,18 @@ fn paired(messages: &[Message]) -> Result<(), String> {
 }
 
 fn block<T>(f: impl std::future::Future<Output = T>) -> T {
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
+    tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap().block_on(f)
 }
 
-// ── without a crash ─────────────────────────────────────────────────────────
+// ── without a death ─────────────────────────────────────────────────────────
 
 #[test]
 fn rounds_pair_their_replies_finish_ends_where_it_may_and_calls_stay_within_the_limit() {
-    let mut runner = TestRunner::new(Config { cases: runs(120), ..Config::default() });
+    let mut runner = TestRunner::new(Config { cases: runs(24), ..Config::default() });
     runner
         .run(&(conversation(), 1usize..=4), |(rounds, limit)| {
-            let (model, world) = (Model::new(rounds.clone()), Arc::new(World::default()));
-            let engine = engine(model.clone(), world.clone());
-            let status = block(async {
-                let input = start(&engine, limit).await;
-                attempt(&engine, &input, None).await
-            });
+            let p = parts(&rounds);
+            let status = block(attempt(&p, limit, true)).expect("nothing dies");
             let ends = finishing_round(&rounds);
             let want = match ends {
                 Some(r) => {
@@ -309,12 +383,12 @@ fn rounds_pair_their_replies_finish_ends_where_it_may_and_calls_stay_within_the_
             // Turns 0..=r, each asked once: a round that ends with finish
             // takes no closing turn.
             let last = ends.unwrap_or(rounds.len());
-            prop_assert_eq!(model.turns(), (0..=last).collect::<Vec<_>>());
-            for (_, messages) in model.asked.lock().unwrap().iter() {
+            prop_assert_eq!(p.model.turns(), (0..=last).collect::<Vec<_>>());
+            for (_, messages) in p.model.asked.lock().unwrap().iter() {
                 paired(messages).map_err(TestCaseError::fail)?;
             }
             // Every write of a round that ran was sent once.
-            let sent = world.sent.lock().unwrap();
+            let sent = p.world.sent.lock().unwrap();
             for (r, round) in rounds.iter().enumerate().take(ends.map_or(rounds.len(), |r| r + 1)) {
                 for (j, call) in round.iter().enumerate() {
                     if matches!(call, Call::Write) {
@@ -322,111 +396,55 @@ fn rounds_pair_their_replies_finish_ends_where_it_may_and_calls_stay_within_the_
                     }
                 }
             }
-            prop_assert!(world.peak.load(Ordering::SeqCst) <= limit, "peak over {}", limit);
+            prop_assert!(p.world.peak.load(Ordering::SeqCst) <= limit, "peak over {}", limit);
             Ok(())
         })
         .unwrap();
 }
 
-// ── crashes ─────────────────────────────────────────────────────────────────
-
-// A journal whose process dies at the given saves (counted across
-// processes), each before or after it commits, and saves nothing after
-// until `revive`, the next process.
-#[derive(Default)]
-struct Store {
-    records: Mutex<BTreeMap<String, Record>>,
-    saves: AtomicUsize,
-    deaths: Vec<(usize, bool)>,
-    dead: AtomicBool,
-}
-
-impl Store {
-    fn dying(deaths: Vec<(usize, bool)>) -> Store {
-        Store { deaths, ..Store::default() }
-    }
-    fn revive(&self) {
-        self.dead.store(false, Ordering::SeqCst);
-    }
-}
-
-impl Journal for Store {
-    fn load(&self) -> anyhow::Result<BTreeMap<String, Record>> {
-        Ok(self.records.lock().unwrap().clone())
-    }
-    fn save(&self, key: &str, record: &Record) -> anyhow::Result<()> {
-        anyhow::ensure!(!self.dead.load(Ordering::SeqCst), "the process is gone");
-        let n = self.saves.fetch_add(1, Ordering::SeqCst) + 1;
-        let death = self.deaths.iter().find(|(at, _)| *at == n).copied();
-        if let Some((_, after_commit)) = death {
-            self.dead.store(true, Ordering::SeqCst);
-            if !after_commit {
-                anyhow::bail!("died before commit {n}");
-            }
-        }
-        let mut records = self.records.lock().unwrap();
-        if let Some(old) = records.get(key) {
-            check_transition(old, record)?;
-        }
-        records.insert(key.into(), record.clone());
-        anyhow::ensure!(death.is_none(), "died after commit {n}");
-        Ok(())
-    }
-}
+// ── deaths ──────────────────────────────────────────────────────────────────
 
 const UNKNOWN: &str = "[tool error] outcome unknown: send";
 
-// Where the process dies: one or two saves, each before or after its commit.
-// Indices pick among the run's own saves, so every case crashes.
+// One or two deaths, each at a call to the world, before it got there or
+// after. Indices pick among the run's own calls, so every case dies.
 fn deaths() -> impl Strategy<Value = Vec<(prop::sample::Index, bool)>> {
     prop::collection::vec((any::<prop::sample::Index>(), any::<bool>()), 1..=2)
 }
 
 #[test]
-fn a_crash_at_any_checkpoint_resumes_to_the_same_conversation_and_never_sends_a_write_twice() {
-    let mut runner = TestRunner::new(Config { cases: runs(150), ..Config::default() });
+fn a_death_at_any_call_resumes_to_the_same_conversation_and_never_sends_a_write_twice() {
+    let mut runner = TestRunner::new(Config { cases: runs(24), ..Config::default() });
     runner
         .run(&(conversation(), deaths()), |(rounds, picks)| {
-            // The run without a crash, on a journal: what a crash must reproduce.
-            let baseline = Store::default();
-            let (model, world) = (Model::new(rounds.clone()), Arc::new(World::default()));
-            let first = engine(model.clone(), world);
-            let (input, done) = block(async {
-                let input = start(&first, 4).await;
-                let done = attempt(&first, &input, Some(&baseline)).await;
-                (input, done)
-            });
+            // The run without a death: what a death must reproduce.
+            let baseline = parts(&rounds);
+            let done = block(attempt(&baseline, 4, true)).expect("nothing dies");
             prop_assert!(matches!(done, Status::Completed(_)), "{:?}", done);
-            let want = normal(&model.last());
-            let checkpoints = baseline.saves.load(Ordering::SeqCst);
+            let want = normal(&baseline.model.last());
+            let calls = baseline.deaths.calls.load(Ordering::SeqCst);
             // The second death may fall in the longer run a first one causes.
-            let mut deaths: Vec<(usize, bool)> = picks
-                .iter()
-                .enumerate()
-                .map(|(k, (at, after))| (at.index(checkpoints * (k + 1)) + 1, *after))
-                .collect();
+            let mut deaths: Vec<(usize, bool)> =
+                picks.iter().enumerate().map(|(k, (at, after))| (at.index(calls * (k + 1)) + 1, *after)).collect();
             deaths.sort();
             deaths.dedup_by_key(|(at, _)| *at);
-            let at = format!("deaths {deaths:?} of {checkpoints} saves in {rounds:?}");
+            let at = format!("deaths {deaths:?} of {calls} calls in {rounds:?}");
 
-            let store = Store::dying(deaths.clone());
-            let (model, world) = (Model::new(rounds.clone()), Arc::new(World::default()));
+            let p = parts(&rounds);
+            *p.deaths.at.lock().unwrap() = deaths.clone();
             let status = block(async {
-                let dying = engine(model.clone(), world.clone());
-                start(&dying, 4).await;
-                let mut status = attempt(&dying, &input, Some(&store)).await;
-                // Each later process is a fresh engine on the same journal.
+                let mut status = attempt(&p, 4, true).await;
+                // Each later process is a fresh engine on the same stores.
                 for _ in 0..=deaths.len() {
-                    if matches!(status, Status::Completed(_) | Status::Faulted(_)) {
+                    if status.is_some() {
                         break;
                     }
-                    store.revive();
-                    status = attempt(&engine(model.clone(), world.clone()), &input, Some(&store)).await;
+                    status = attempt(&p, 4, false).await;
                 }
                 status
             });
-            prop_assert!(matches!(status, Status::Completed(_)), "{}: {:?}", at, status);
-            let sent = world.sent.lock().unwrap();
+            prop_assert!(matches!(status, Some(Status::Completed(_))), "{}: {:?}", at, status);
+            let sent = p.world.sent.lock().unwrap();
             prop_assert!(
                 sent.iter().all(|(call, n)| !call.starts_with("send:") || *n == 1),
                 "{}: a write went twice: {:?}",
@@ -434,19 +452,19 @@ fn a_crash_at_any_checkpoint_resumes_to_the_same_conversation_and_never_sends_a_
                 sent
             );
             // A turn is asked again only when a death cut it.
-            let turns = model.turns();
+            let turns = p.model.turns();
             let mut unique = turns.clone();
             unique.dedup();
             prop_assert!(turns.len() - unique.len() <= deaths.len(), "{}: turns {:?}", at, turns);
             prop_assert!(unique.windows(2).all(|w| w[1] == w[0] + 1), "{}: turns in order {:?}", at, turns);
-            let got = model.last();
+            let got = p.model.last();
             // The last reply is the model's own: its calls have no replies yet.
             paired(&got[..got.len() - 1]).map_err(|e| TestCaseError::fail(format!("{at}: {e}")))?;
             let got = normal(&got);
             prop_assert!(!got.contains("outcome unknown: lookup"), "{}: a read is rerun, never unknown", at);
             match got.find(UNKNOWN) {
                 None => {
-                    prop_assert_eq!(&status, &done, "{}", at);
+                    prop_assert_eq!(status.as_ref(), Some(&done), "{}", at);
                     prop_assert_eq!(&got, &want, "{}", at);
                 }
                 // A write in flight is the only thing a death may lose: up to

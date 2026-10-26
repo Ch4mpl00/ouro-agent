@@ -1,3 +1,15 @@
+// PARKED (not compiled). Ported to the engine in tests/durable_loop.rs
+// (step 2b): the loop's answers, restarts, workers, read_run and the guard
+// tests. Still here, for the versions step (design 03, decision 9; they need
+// a saved or activated agent-loop version): an_activated_agent_loop_runs_*,
+// guardless_overrides_*, arguments_swapped_after_guard_*,
+// a_loops_own_calls_run_as_workflow_steps_*, override_calls_are_in_the_host_chain_*,
+// a_legacy_loop_without_a_guard_step_*, worker_children_keep_the_active_loop_version_*.
+// Dropped: an_in_process_loop_reports_no_run_history (every loop is an engine
+// run now); a_restart_after_guard_rechecks_* (design 03: a round's verdict is
+// its guard child's stored outcome, durable across a restart, not reviewed
+// again); fast_guard_and_worker_children_never_suspend_the_parent (holds are
+// the engine's, its conformance covers them).
 // The agent loop as a durable `agent-loop` run (`agent.rs` section 4,
 // `flows.rs` `run_loop`): it answers like the in-process loop, and a process
 // that stops in the middle of a round is resumed by the next one from the
