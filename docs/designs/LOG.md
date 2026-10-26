@@ -176,3 +176,20 @@ Decisions and findings while finishing step 2, each reversible:
   CPU-bound in the engine (each holding listen polls the store; every task
   record carries the loop's context); 16 one-turn workers take ~30 s in a
   debug build. Recorded in docs/operations.md; not changed here.
+
+## 2026-10-26 (step 3: design 04, versions and breaker)
+
+- **Maintainer:** `engine.db` stays beside agent.db for now; the engine's
+  SQLite adapter gets read transactions (`BEGIN DEFERRED`) separately (ouro
+  `fix/sqlite-read-tx`).
+- **Design 04 decisions 1–8** (elephant, reversible), after goldfish round 1
+  (3 high, 10 medium, 9 low, all resolved in the document):
+  only `guard` reserved, `agent-loop`/`signal` overridable again (#55,
+  narrowing design 01 decision 17); the engine is the version store and
+  `workflow_meta` keeps only note/tried/builtin by `(name, digest)`; no YAML
+  copy, no automatic re-seeding (revises design 01 decision 15); agent
+  versions can't declare a breaker, built-in digests can always be
+  re-activated; one refusal table for fallbacks; an operator pause also stops
+  the built-in fallback (for the maintainer to confirm); the fallback record
+  and a line in the run's system parts; same-text saves reuse the version,
+  20 agent versions per name at most.

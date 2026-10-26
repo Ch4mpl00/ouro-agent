@@ -1,97 +1,94 @@
 # 04. Step 3: the agent's workflow versions and the breaker on the engine
 
-Status: draft · Overview: [01](01-engine-migration.md) step 3 · Epic: #62
-Decisions log: [LOG.md](LOG.md)
+Status: reviewed (goldfish round 1, findings resolved below as R-n) ·
+Overview: [01](01-engine-migration.md) step 3 · Epic: #62 · Decisions log: [LOG.md](LOG.md)
 
 ## Problem
 
 After step 2 every run is an engine run, but the agent cannot author
-workflows any more: `save_workflow`/`activate_workflow` answer "unavailable
-until the versions step", `route_signal` never routes, `run_saved_workflow`
-always hands over, the loop catalog lists only built-ins, and the suites for
-routes, loop variants, workflow kinds and the breaker are parked
-(`crates/agent/tests/pending/{loop_variants,workflow_kinds,flows,durable_loop}.rs`).
+workflows: `save_workflow`/`activate_workflow` answer "unavailable until the
+versions step", `route_signal` never routes, `run_saved_workflow` always
+hands over, loop selection is ignored, the loop catalog lists only
+built-ins, and the suites for routes, loop variants, workflow kinds, signal
+overrides and the breaker are parked (`crates/agent/tests/pending/`).
 
-On `main` these features exist on the agent's own store: a `workflows`
-table (draft → active → retired, `tried` gate), a memory-KV breaker per name
-(three faults in a row → the built-in text, or `agent-loop` for a name
-without one), active versions that replace built-ins by name (#55: the agent
-may override `agent-loop` and `signal`), routes in `metadata.route`, loop
-variants in `metadata.loop`, and scheduled tasks naming a saved workflow.
-The engine now owns versions (`save`, `activate_as`, `definitions`), the
-breaker (per definition, by content digest, `DefinitionTripped` on start),
-and pinned starts (`start_with { version }`). This step puts the agent's
-authoring on them and deletes the agent's copies.
+On `main` these features run on the agent's own store: a `workflows` table
+(draft → active → retired, `tried` gate), a memory-KV breaker per name (three
+faults in a row → the built-in text, or `agent-loop` for a name without
+one), active versions that replace built-ins by name (#55), routes
+(`metadata.route`), loop variants (`metadata.loop`) chosen four ways, and
+scheduled tasks naming a saved workflow, all launched with host-vouched
+parameters (`supervisor.rs` `admission(.., Launch)`). The engine now owns
+versions (`save`, `activate_as`, `definitions`), the breaker (per definition,
+by content digest, refusal at start) and pinned starts. This step puts the
+agent's authoring on them and deletes the agent's copies.
 
-Scenario: the agent saves `tg-loop` (a copy of `agent-loop` with a route on
+Scenario: the agent saves `tg-loop` (a copy of `agent-loop` routed on
 `source: telegram`), a dry run marks it tried (step 4), the user confirms,
-it is activated. Telegram signals now run `tg-loop`. It faults three times in
-a row: the engine trips it; the next Telegram signal is refused at the start
-of `tg-loop` and runs the built-in `agent-loop` instead, in the same trace,
-saying so; `list_workflows` shows `tg-loop` tripped; activating a new version
-clears it.
+it is activated; Telegram signals run it. It faults three times in a row; the
+engine trips it. The next Telegram signal's route start is refused, so
+`route_signal` answers "not routed" with a fallback record and the signal
+takes the default path, whose first turn says `tg-loop` v3 was set aside.
+`list_workflows` shows it tripped; activating a new version clears it.
 
 ## Decisions
 
-Maintainer (earlier, binding here):
+Maintainer (binding):
 
-- #55: built-in workflows are overridable by the agent ("the agent's freedom
-  and generality"); behaviour lives in YAML, not Rust.
+- #55: built-in workflows are overridable by the agent; behaviour lives in
+  YAML, not Rust.
 - Design 01, 7: on a trip of an agent version the agent runs the built-in
-  version for that run (`start_with` pinned); the tripped version stays
-  active (digest rule). The engine never picks a version; the agent does.
+  version for that run (pinned start); the tripped version stays active. The
+  engine never picks a version.
 - Design 01, 10: built-ins carry `metadata.ouro.breaker: off`.
-- Design 01, 15: saved sources also live in an agent table (`workflow_meta`)
-  so an engine store re-creation can be re-seeded.
-- The engine's store is `engine.db` beside agent.db (step 2b, LOG.md;
-  pending the maintainer's review): `workflow_meta` lives in agent.db, so
-  agent rows and engine rows are never in one transaction.
+- Engine store in `engine.db` beside agent.db (step 2b; the maintainer
+  accepted it and asked for the engine's SQLite read fix separately).
 
-Elephant (this document, reversible, logged in LOG.md):
+Elephant (reversible, logged in LOG.md):
 
-1. **Decision 17 of design 01 is narrowed:** only `guard` is reserved (its
-   round is pinned to the built-in digest, step 2b). The agent may save and
-   activate versions of `agent-loop` and `signal` again, as on `main` (#55).
-   `recovery` is not a definition (a host kind that runs `agent-loop`,
-   `recovery_loop` in functions.rs), so it needs no rule. `emit` stays
-   refused in agent-saved workflows.
-2. **The engine is the version store.** A version's number, YAML, digest,
-   activation history, active version, breaker state and trip are the
-   engine's. `workflow_meta` holds only what the engine lacks — note,
-   `tried`, `builtin` (which digests are built-in texts), created time — and
-   a copy of the YAML for re-seeding. No status column: status is derived.
-3. **The breaker of an agent version is the runtime's.** An agent-saved
-   version may not declare `metadata.ouro.breaker` (refused at save and at
-   activation): its threshold is the engine's default (`Config::breaker_threshold`,
-   3 — the old `LOOP_BREAKER`). Otherwise a broken override of `agent-loop`
-   with `breaker: off` would fault every signal forever.
-4. **One fallback rule, at every start of a name the agent may have
-   overridden:** if the engine refuses the start of the active version
-   (`DefinitionTripped`, or the start-time registry check — a
-   `MissingFunction` refusal, `execution.rs` `refusal()`: a tool the version
-   calls went away), the same run id is started pinned at the
-   built-in version of that name; a name without a built-in falls back to
-   `agent-loop`'s built-in version (routes, loop variants, workers), or hands
-   over to the agent loop (a scheduled task's workflow, as `main` did). A
-   fault *during* a run is not a refusal: it ends as a fault (the signal's
-   catch reports it) and counts toward the breaker.
-5. **The fallback informs.** The run's span records
-   `fallback: { from: {name, version}, to: {name, version}, reason }`; the
-   fallback run's first-turn context gets one line (`signal_session` adds
-   `fallback` to the session context: "workflow X v3 was set aside after 3
-   faults in a row; the built-in one runs") so the agent can tell the user
-   or fix its version. No automatic notice signal in this step (step 5
-   decides trip notices for scheduled definitions and may generalise it).
-6. **Activation needs `tried`**, as on `main`. Only `try_workflow` (step 4)
-   sets it; until step 4 lands, agent activation stays refused in practice.
-   Tests set it through a test seam (`WorkflowMeta::mark_tried`).
+1. **Only `guard` is reserved** (narrows design 01 decision 17, restores
+   #55): the agent may save and activate versions of `agent-loop` and
+   `signal`. `recovery` is not a definition (`recovery_loop` runs
+   `agent-loop`), so no rule. `signal` may not declare a route (as `main`).
+2. **The engine is the version store.** Number, YAML, digest, activation
+   history, active version, breaker state and trip are the engine's. The
+   agent table `workflow_meta` holds only what the engine lacks, keyed by
+   content: `(name, digest) → note, tried_ms, builtin, created_ms`. Status is
+   derived. **No YAML copy and no automatic re-seeding** (R-M5; design 01
+   decision 15 was the elephant's and is revised): the engine store migrates
+   in place; operations back up `engine.db` with `agent.db`.
+3. **The breaker of an agent version is the runtime's**: an agent-saved
+   version may not declare `metadata.ouro.breaker` (`Workflow::breaker !=
+   Inherit`), so it trips at the engine default (3). Activating a version
+   whose digest is a known built-in is always allowed, without `tried` —
+   that is how the agent undoes an override (R-M7).
+4. **One fallback rule at every start of a name the agent may have
+   overridden**, by an explicit refusal table (R-M1, below): a breaker trip or
+   a registry refusal of the active version → the same start pinned at the
+   name's built-in version, or the per-site outcome for names without one.
+   A fault *during* a run is not a refusal.
+5. **An operator pause stops the fallback too** (R-M2): a paused definition
+   refuses every start, built-in included; the start fails with the pause's
+   note. Deferred to the maintainer to confirm; reversible in the refusal
+   table.
+6. **The fallback informs, the agent decides**: a `fallback` record on the
+   span and one line in the run's own system parts (R-M4). No automatic
+   notice signal in this step (step 5 decides trip notices).
+7. **Activation needs `tried`** (set only by `try_workflow`, step 4; tests
+   use `WorkflowMeta::mark_tried`). Until step 4, agent activation is refused
+   in practice except for built-in digests.
+8. **Saving the same text twice reuses its version** (R-M6), and a name holds
+   at most 20 agent versions: every version's YAML is in the engine's one
+   `definitions` row per name, read by every admission and finish of that
+   name. Pruning never-activated versions is an engine issue to file.
 
 ## Non-goals
 
-- The sandbox and `try_workflow` (step 4). Schedules and trip notices for
-  scheduled definitions (step 5). Removing `crates/owf` (step 6).
-- Migrating saved workflows from `main` (design 01, decision 2: none).
-- Engine changes. Everything here uses the engine API at `v0.2.1`.
+- The sandbox and `try_workflow` (step 4); schedules, trip notices for
+  scheduled definitions (step 5); removing `crates/owf` (step 6).
+- Migrating saved workflows from `main` (design 01, decision 2).
+- Engine changes: everything uses ouro `v0.2.1` (v0.2.2 only if the SQLite
+  read fix lands first; no API change).
 
 ## Design
 
@@ -100,188 +97,256 @@ Elephant (this document, reversible, logged in LOG.md):
 ```sql
 CREATE TABLE workflow_meta (
     name TEXT NOT NULL,
-    version INTEGER NOT NULL,      -- the engine's version number
     digest TEXT NOT NULL,          -- ouro_durable::digest_of(yaml)
-    definition TEXT NOT NULL,      -- the YAML, for re-seeding
     note TEXT,
-    builtin INTEGER NOT NULL DEFAULT 0,  -- this digest is (was) a built-in text
+    builtin INTEGER NOT NULL DEFAULT 0,
     created_ms INTEGER NOT NULL,
     tried_ms INTEGER,
-    PRIMARY KEY (name, version)
+    PRIMARY KEY (name, digest)
 );
 ```
 
-- `flows.rs` §1 gets a small store: `WorkflowMeta` trait (`record`,
-  `mark_tried`, `get`, `list_names`) with `AgentDb` and in-memory impls, the
-  way `main` had `WorkflowStore`.
-- `install_builtins` (runs.rs §7) moves its "known built-in digests" from
-  the memory KV `engine.builtin_digests.<name>` to `workflow_meta.builtin`;
-  the KV keys are no longer read or written. Its rule is unchanged: an active
-  version that is not a known built-in digest (the agent's or an operator's)
-  is never replaced at boot.
-- Re-seeding: when `runtime.definitions(name)` has no versions but
-  `workflow_meta` has rows (a re-created engine store), boot saves them back
-  in version order and activates the newest one that was active, recording the
-  new numbers. Only the active choice is restored, not trips.
+- Written **before** `runtime.save` (R-L2): an orphan row (crash before the
+  engine save) is harmless; `tried` and the note attach to content, which is
+  what a dry run proves and what a trip refuses.
+- `flows.rs` §1: `WorkflowMeta` trait (`record`, `mark_tried`, `get`,
+  `names`) with `AgentDb` and in-memory impls.
+- `install_builtins` (runs.rs §7) records built-in digests with
+  `builtin = 1` instead of the memory KV `engine.builtin_digests.<name>`;
+  migration 0016 imports those KV entries once (R-L5) and the KV keys are
+  then unused. Its rule is unchanged: an active version that is not a known
+  built-in digest is never replaced at boot.
+- Status: `active` = the engine's active version; `retired` = in the engine's
+  `activations`, not active; `draft` = never activated; plus `tripped`
+  (`Trip.breaker`) and `paused` (`Trip.manual`).
 
-Status is derived: `active` = engine's `active`; `retired` = in the engine's
-`activations` but not active; `draft` = never activated. Plus `tripped`
-(`Definitions::tripped` with `breaker == true`) and `paused` (a manual trip).
+### The save/activate gate (R-H1)
 
-### Saving (`save_workflow { name, definition, note? }`)
+One function `flows::gate(yaml, name)` used by save and activation:
 
-As on `main` (`flows.rs` §5 there: `check`, `document.name == name`,
-`require_guarded_turns` — for the engine dialect: `agent_turn` requires a
-`call: start_guard` round —, `require_metadata`, warnings, the reply's
-`calls` and `next`), plus: `name != "guard"`; no `emit`; no
-`metadata.ouro.breaker`. Then `runtime.save(name, yaml)` and
-`workflow_meta.record(name, version, digest, yaml, note)`. Saving the same
-text twice gives two engine versions with one digest; both are recorded.
+1. `runtime.validate(yaml)` — the engine dialect and the current registry
+   (the old `owf` `check` is no longer used for saving; it stays only for
+   the evals workbench until step 6).
+2. The agent's argument check (`with` names against each function's schema)
+   ported to `ows` call sites; warnings (`main` §5 `warnings`) ported.
+3. `document.name == name`; `name != "guard"`; `signal` declares no route.
+4. Deny-list for agent versions: `emit`; `run: workflow` (the skill already
+   says it is rejected); `schedule` and `metadata.ouro.{at, timezone,
+   catchup, overlap}` until step 5 (an activation would arm engine triggers
+   that fire outside the supervisor with no host data);
+   `metadata.ouro.breaker` (decision 3) — the error says "remove
+   `metadata.ouro.breaker`: your versions use the runtime's breaker".
+5. `require_guarded_turns`: `agent_turn` requires a `call: start_guard`
+   round; the message points at `read_workflow agent-loop`'s round.
+6. `require_metadata` (`main`): `metadata.loop.description`, `metadata.agent`
+   / `metadata.route` preset and confirm (`agent_start`), route shape; a
+   workflow that calls dispatcher functions (`primary_loop`, …) declares no
+   route and no `metadata.agent` (routes that call `primary_loop` were
+   superseded on `main`; they are refused now).
 
-A crash between the engine save and the meta row leaves an engine version
-with no meta row: it is a draft with no note that is not tried, so it cannot
-be activated; the agent saves again. `list_workflows` shows it (from the
-engine).
+A verbatim copy of built-in `agent-loop` or `signal` minus the breaker key
+passes the gate (test).
 
-### Activating (`activate_workflow { name, version }`)
+### Tools
 
-Checks on `main` (re-`check` against the current tools, guarded turns,
-metadata, route priority conflicts) plus: `name != "guard"`, no
-`metadata.ouro.breaker`, `tried`. Then
-`runtime.activate_as(name, version, "agent", note)`. The engine clears a
-trip on activation; activating the tripped version again is allowed (new
-epoch). Reply texts as on `main`, with "three faults in a row put the
-built-in one back" (or "hand the task to the agent loop").
+- **`save_workflow { name, definition, note? }`:** gate; if the name already
+  has a version with this digest, reuse it (reply says so); else refuse
+  past 20 agent versions; `workflow_meta.record`, then `runtime.save`. Reply
+  as `main` (`calls` with their delivery instead of read/write, `next`,
+  `warnings`).
+- **`activate_workflow { name, version }`:** if the version's digest is a
+  known built-in → `activate_as(.., "agent", note)` (no gate, no `tried`).
+  Else gate (tools may have changed), route priority (`main`
+  `require_route_priority`; two concurrent activations can both pass, which
+  is harmless since `signal_route` breaks ties by name, R-L7), `tried` →
+  `activate_as`. Reply as `main`, plus: activation clears a trip and starts
+  a fresh count, also for the version that tripped (a change from `main`,
+  R-L1); a version's faults count all its runs, workers and recovery runs of
+  an `agent-loop` override and re-raised faults of a `signal` override
+  included (R-L6).
+- **`list_workflows`:** names from `workflow_meta` ∪ built-ins; per name the
+  latest version, derived status, active version, tripped/paused, note,
+  created time; built-in versions marked `builtin: true`.
+- **`read_workflow { name, version? }`:** the YAML from the engine, status,
+  note; `guard` its built-in text.
 
-### Reading (`list_workflows`, `read_workflow`)
+### Starting a name the agent may have overridden (R-M1)
 
-Engine names come from `Control::definitions` (paged; names in
-`workflow_meta` ∪ the built-ins are enough and avoid paging: use them).
-`list_workflows`: per name the latest version, its derived status, the
-active version, `tripped`/`paused`, note, created time; built-ins included
-with `builtin: true` for their built-in version. `read_workflow { name,
-version? }`: the version's YAML from the engine, its status and note; `guard`
-reads its built-in text.
+Two entry points over one decision function:
 
-### Which version a start runs (one helper)
+- `runs::start_named_root(runtime, id, name, input_fn, host, site)` for the
+  signal (`supervisor.rs`) and `recovery_loop` and `AgentLoop::send`
+  (agent.rs, used by evals);
+- `runs::start_named_child(ctx, key, name, input_fn, host, site)` for
+  `primary_loop`, `start_worker`, the route and saved launches.
 
-`runs::start_named(engine, StartNamed { id, name, input, host, kind })`
-replaces the direct `start_with`/`start_child` calls for every name the agent
-may override: the signal (`supervisor.rs`), `primary_loop`, workers and
-`recovery_loop` (`functions.rs`), `run_saved_workflow`, routed loops. It:
+`input_fn(fallback: Option<&Fallback>) -> Value` builds the input, so a
+fallback rebuilds it with the line (R-M4). Steps: start the active version;
+on a refusal in the table, rebuild input with the fallback line and start
+the same id/key pinned at the fallback version; return what ran, read from
+the joined admission (`version`, `runtime["pinned"]`), not assumed — a
+re-dispatched starter joins its first commit (R-M1.1). `LoopHost.workflow`
+names the definition that runs (R-M1.3).
 
-1. starts the active version (`version: None`);
-2. on refusal — `DefinitionTripped`, `ChildRefusal::Tripped`, or the
-   start-time registry/validation refusal — starts the same id pinned at the
-   fallback: the built-in version of `name` (digest lookup as `start_guard`
-   does), else for `kind = Loop | Route` the built-in `agent-loop`, else
-   (`kind = Scheduled`) returns `Handover { reason }`;
-3. returns which version ran and the fallback record (decision 5).
+Refusal table:
 
-An id that already exists joins as today (`AdmissionMismatch` stays fatal).
-`guard` keeps its own pinned start and never falls back.
+| Engine answer | Meaning | Outcome |
+|---|---|---|
+| `DefinitionTripped { paused: false }` / `ChildRefusal::Tripped` (breaker) | the agent's version tripped | fallback |
+| `MissingFunction`, `InvalidDefinition` / `ChildRefusal::Inadmissible` | the version no longer fits the registry | fallback |
+| no active version (checked with `definitions(name).active == None` before starting; `UnknownDefinition` is crate-private) | nothing activated | fallback |
+| `DefinitionTripped { paused: true }` | operator pause | no fallback: the start fails with the note (decision 5) |
+| `Depth`, `HostData`, `Unavailable`, `Mismatch`, `ResourceUnavailable` | not the version's fault | no fallback, error as today |
+| the fallback itself refused | pause or broken deploy | the original error, logged; no second fallback (R-L9) |
 
-### Routes, loop variants, scheduled workflows
+Fallback version per site: a name with a built-in → its built-in version
+(digest lookup, as `start_guard`); `site = Loop` (worker, primary) → built-in
+`agent-loop`; `site = Route` → no start, `route_signal` answers `{routed:
+false, fallback}` and the default path runs (R-M3, as `main` and the skill);
+`site = Saved` → `{handover: "<text>"}` (R-L3) and the agent loop takes the
+task, as `main`.
 
-- `route_signal` (functions.rs) gets `main`'s `signal_route` over the active
-  versions of the names in `workflow_meta` (built-ins declare no routes):
-  `metadata.route.when` on `source` and top-level payload fields, most
-  specific wins, ties refused at activation (`require_route_priority`). A
-  route whose start falls back runs the built-in `agent-loop` with the
-  route's admitted parameters; the routed path's own context gathering is
-  the fallback loop's (it is the default path).
-- The loop catalog (`flows::loop_catalog`) lists built-ins plus active agent
-  versions with `metadata.loop.description`; a worker names one, started
-  through `start_named(kind: Loop)`.
-- `run_saved_workflow { name }`: `start_named(kind: Scheduled)`; missing
-  active version or a refusal → `{handover: true}` (the signal continues to
-  the agent loop, as `main`). A run of it that faulted after any at-most-once
-  call was dispatched goes to recovery instead of the handover (the run's
-  call journal, `Runtime::calls`, has an `AtMostOnce` entry), as `main`.
-- `metadata.agent`/`metadata.route` preset and confirm: admitted as host
-  data by the launch (`agent_start` on `main`), never read from YAML by a
-  host function (agent invariant 3).
+**Loops only for loop sites (R-H2):** at `site = Loop` a name is accepted
+only if it is `agent-loop` or its active version declares `metadata.loop`;
+anything else (a scheduled workflow, `signal`, a route) runs built-in
+`agent-loop` with fallback reason `not_a_loop`. `invoke_sub_agent` is not
+guarded, so this is what keeps a worker from firing an unreviewed write
+workflow.
+
+### Loop selection (R-M9)
+
+Restored as `main`, each through `start_named_child(site = Loop)`, precedence
+highest first: the YAML's `start_worker { loop }`; `invoke_sub_agent`'s
+`loop:`; the worker skill's frontmatter `loop:`; `agent-loop`. The primary's
+`primary_loop(loop: …)` likewise. `tests/pending/loop_variants.rs` (:346,
+:370) pins the precedence.
+
+### Route and saved launches (R-H3)
+
+`route_signal` and `run_saved_workflow` start the route's or task's
+workflow as a host child of the signal (`site = Route | Saved`) with the
+host data `main`'s `admission(.., Launch)` built, read from the activated
+version's document metadata (vetted by the gate at save and activation —
+invariant 3 forbids run input and expressions as a source, not the vetted
+document):
+
+| | Routed | Scheduled |
+|---|---|---|
+| preset default | `smart` | `base` |
+| skills | the workflow sets up its own (`loop_setup`) | the source's skill if it exists (`scheduler`) |
+| confirm | `metadata.agent`/`metadata.route` `confirm`, default the conversation, else the default chat | same |
+| guard request | the signal content | same |
+| system parts | context, `Signal source: …`, env addendum, fallback line | same + handover note |
+
+`signal.yaml` gains, for both paths, the wait the primary path has: `listen`
+for the child's `done:`/`waiting:` → `child_outcome` → `settle_child { kind:
+route | saved }` (`settle_child` maps `route` like `primary`, `saved` as
+today: faulted before any at-most-once call → handover; after → recovery).
+Without it the signal ends and its owned child is cancelled.
 
 ### Deleted
 
-The memory-KV breaker (`<name>.breaker` keys are not read; old rows are
-left alone), `engine.builtin_digests.*` KV use, `unavailable(.., "versions")`
-for the four tools, the `route_signal` stub.
+The memory-KV breaker (old `<name>.breaker` rows are left alone),
+`engine.builtin_digests.*` use after the import, the `unavailable(..,
+"versions")` replies, the `route_signal` stub, `RESERVED` beyond `guard`.
 
 ## Contract and model
 
-No engine contract change. Agent invariants of design 01 hold; this step
-adds:
+No engine contract change. Design 01's agent invariants hold; added:
 
-- **A7.** A start of an overridable name never fails because of the agent's
-  version: a refusal of the active version runs the fallback (or hands over),
-  in the same run id and trace.
-- **A8.** No agent version can opt out of the breaker.
-- **A9.** `guard` is never saved, activated or started at a version other
-  than the built-in digest by the agent.
+- **A7.** A breaker trip or registry refusal of an agent version never fails
+  a start: the fallback runs (or the route/saved path falls back to the
+  default path), same id, same trace. A pause is not covered (decision 5).
+- **A8.** No agent version declares a breaker policy.
+- **A9.** The agent never saves or activates `guard`; the guard round runs
+  only the built-in digest.
+- **A10.** A loop site runs only a loop.
+- Accepted boundary of invariant 2 (as `main`, R-L8): calls written into an
+  activated workflow's YAML are trusted as the user confirmed them at
+  activation; only the model's calls go through the guard.
 
 ## Failure modes
 
-- **Crash between engine save and meta row:** see Saving.
-- **Crash between activation and reply:** the engine activated; the reply is
-  lost; `list_workflows` shows it active. No meta write is needed.
-- **Fallback start crash:** the refused start stored nothing; the retried
-  signal starts again, is refused again, falls back again (idempotent by id).
-- **Tool removed after activation:** start refused by the registry check →
-  fallback (decision 4), with reason in the fallback record.
-- **Concurrent activations** (two workers): the engine serialises them; the
-  later one wins, as on `main`.
-- **Breaker counting:** only runs admitted at the active version in the
-  current epoch count (engine). Fallback runs are of another digest and never
-  count against the agent's version.
-- **Re-seeding** after a store loss restores versions and the active choice,
-  not running runs (decision 2 of design 01).
+- **Crash after the meta row, before the engine save:** an orphan meta row;
+  the next save of that text records nothing new and saves.
+- **Crash between activation and reply:** activated; `list_workflows` shows it.
+- **Crash during a fallback start:** the refused start stored nothing; the
+  retried starter is refused again and falls back again (same id/key); a
+  starter that already committed joins and reads what ran from the
+  admission.
+- **Tool removed after activation:** registry refusal → fallback, reason in
+  the record.
+- **Hot rows:** bounded by decision 8.
+- **Breaker counting:** fallback runs have another digest and never count
+  against the agent's version.
 
 ## Tests
 
-Restore from `tests/pending/` (moving each back into `tests/`, adapted to
-the engine API, nothing weakened): `loop_variants.rs`, `workflow_kinds.rs`,
-the versions part of `flows.rs` and of `durable_loop.rs`. New, each failing
-before its code:
+Restore from `tests/pending/` into `tests/`, adapted, nothing weakened:
+`loop_variants.rs`, `workflow_kinds.rs`, the versions part of `flows.rs`
+(incl. `the_authoring_skills_reference_definition_is_valid` against the new
+gate) and `durable_loop.rs`, and the versions-step tests of
+`pending/supervisor.rs`: `a_saved_workflow_runs_and_faults_hand_over_by_effect`,
+`an_interrupted_saved_workflow_is_left_to_durable_recovery`,
+`an_activated_signal_workflow_handles_signals_until_its_breaker_opens`,
+`an_activated_signal_override_changes_the_recovery_prompt`,
+`a_signal_override_without_a_catch_gets_no_automatic_recovery`,
+`a_catch_before_signal_session_cannot_start_recovery`,
+`activated_signal_routes_*`, `a_signal_route_has_its_own_breaker_*`,
+`a_telegram_signal_runs_the_loop_that_declares_its_route`,
+`a_rebuilt_routed_loop_keeps_what_its_setup_added`. New, each failing before
+its code:
 
-1. Save → draft; activate refused until tried; tried → active; previous
-   active → retired (derived from the engine).
-2. `guard` refused for save/activate; `emit` refused; `metadata.ouro.breaker`
-   refused at save and at activation.
-3. An agent version of `agent-loop` that faults three times in a row trips;
-   the next signal runs the built-in `agent-loop` pinned, in the same run id
-   and trace, with the `fallback` record on the span and the line in the
-   session context; the tripped version stays active; activating a new
-   version clears the trip and runs it.
-4. Same for `signal` and for a route (route trip → default path with the
-   built-in loop) and for a worker's loop variant (→ built-in `agent-loop`).
-5. A scheduled saved workflow: missing / tripped → handover to the agent
-   loop; faulted after an at-most-once call → recovery, not handover.
-6. A version calling a tool that the snapshot no longer has: start refused →
-   fallback with reason.
-7. A saved copy with identical text to a tripped version is still refused
-   (digest) and falls back.
-8. `install_builtins` keeps an agent-activated `agent-loop` across a restart
-   and replaces a known built-in digest with a new built-in text; known
-   digests come from `workflow_meta`, not the memory KV.
-9. Re-seeding: an empty engine store with `workflow_meta` rows restores the
-   versions and the active one.
-10. Route priority conflict refused at activation; most specific route wins.
-11. `list_workflows`/`read_workflow` show derived status, tripped/paused and
+1. Save → draft; activation refused until tried; tried → active; the
+   previous active → retired (derived).
+2. Gate: a verbatim copy of built-in `agent-loop`/`signal` minus the breaker
+   saves; `guard`, `emit`, `run: workflow`, `schedule`, `metadata.ouro.at`,
+   `metadata.ouro.breaker` refused at save and at activation, and no engine
+   trigger exists after a refused activation.
+3. An `agent-loop` override that faults three times trips; the next primary
+   runs the built-in pinned, same run id and trace, `fallback` record on the
+   span, the line in its system parts; the override stays active; activating
+   a new version clears the trip.
+4. Same for a `signal` override, and for a worker's loop variant (→ built-in
+   `agent-loop`, line in the worker's system parts).
+5. A tripped route → `routed: false` with the fallback record; the default
+   path runs with its context gathering and the line.
+6. A scheduled saved workflow: missing or tripped → handover with text;
+   faulted after an at-most-once call → recovery.
+7. A version calling a tool the snapshot no longer has → fallback, reason.
+8. `start_named_*` never pins an agent version (only built-in digests).
+9. A worker naming a scheduled write workflow or `signal` runs `agent-loop`;
+   the fake MCP sees no write.
+10. Loop selection precedence (four paths).
+11. A paused `agent-loop` refuses the built-in fallback too: the primary
+    start fails with the pause's note and the signal reports it.
+12. A re-dispatched starter after a fallback joins and reports the version
+    that ran.
+13. Saving the same text twice reuses the version; the 21st version is
+    refused.
+14. Activating the built-in digest back needs no `tried`; the next boot
+    upgrades it to a new built-in text.
+15. `install_builtins` keeps an agent-activated override across a restart;
+    0016 imports the KV digests.
+16. Route priority conflict refused at activation; most specific route wins.
+17. `list_workflows`/`read_workflow` show derived status, tripped/paused,
     built-ins.
+18. Route and saved launches: preset/skills/confirm defaults and system parts
+    as the table; the signal waits for the child and settles it.
 
 Full suite green twice (`scripts/test.py`), fmt, clippy.
 
 ## Rollout
 
-Migration `0016_workflow_meta.sql`. `CLAUDE.md` text about overrides and the
-breaker stays true; update its "three faults of a name in a row fall back"
-sentence to name the engine's breaker and the fallback record; skills
-`workflow-author` mention of `metadata.ouro.breaker` (agent versions can't
-set it). LOG.md entries for decisions 1–6. Nothing deploys.
+Migration `0016_workflow_meta.sql`. `skills.default/workflow-author.md`: its
+DSL part rewritten for the engine dialect (`metadata.ouro.*`, `start_guard`,
+`classify`/`tool_once`/`tool_repeat`, `start_worker { loop }`, no
+`hold` under flat metadata, the deny-list and the breaker rule) (R-M8).
+`CLAUDE.md`: overrides, the engine's breaker and the fallback record.
+`docs/operations.md`: back up `engine.db` with `agent.db`. LOG.md: decisions
+1–8. An ouro issue: pruning never-activated versions. Nothing deploys.
 
 ## Open questions
 
-None blocking. For the maintainer, reversible: decision 1 (overrides of
-`agent-loop`/`signal` restored per #55, narrowing design 01's
-decision 17).
+For the maintainer, reversible, not blocking: decision 5 (a pause also stops
+the built-in fallback) and decision 2 (no re-seeding, no YAML copy).
