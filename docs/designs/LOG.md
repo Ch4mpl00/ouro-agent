@@ -389,3 +389,20 @@ Deviations 1 and 2):
   ouro as an issue; it does not block the migration.
 - The full-suite failure (`an_empty_queue_is_waited_on…`) is the known
   load-sensitive timing test; supervisor 34/34 and sandbox 24/24 alone.
+
+## 2026-10-26 (step 5: design 06, schedules)
+
+- Design 06 approved after goldfish rounds 1 (4 high) and 2 (1 high).
+  Round 1 moved the fire out of the engine: `fire_scheduled` only records a
+  row in `scheduled_fires` and the supervisor's drain runs it as a signal,
+  so no handler waits on the supervisor (no permit, drive or cycle
+  deadlock).
+- Revises the overview's step 5: no trip notice signal. A task's run only
+  records a fire, so a signal's failure never faults it (its catch reports
+  to the user); task definitions run with `breaker: off`. Reversible.
+- No overlap knob on `schedule_task` (runs end at once).
+- Revises the overview's risk line "schedules re-generated": the engine's
+  store is the only copy of the tasks; export them before any store
+  re-creation (design 06, Rollout).
+- A cap of 50 live tasks. Reversible.
+- Design 05's open question on the no-signal try's input closes unchanged.
