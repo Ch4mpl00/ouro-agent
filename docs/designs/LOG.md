@@ -90,3 +90,15 @@ or reverses each entry.
   `feat/engine` commits for how far phases A–F got; continue from the design
   `03-runs-on-the-engine.md` and the executor report if present
   (scratchpad agent-step2-report.md).
+
+## 2026-10-26 (continued)
+
+- **ouro v0.2.0 tagged** (137767a) after verifying `fix/child-ids` on a working
+  Docker (315 tests). Docker Desktop needed a full restart (VM filesystem had
+  gone read-only); `mcp-tools-test-pg` started again by hand.
+- **Engine design 05 (waiting parents stay asleep):** one `wakes()` rule for
+  all wake sites; lifecycle notices wake only an exact current listen (not `*`,
+  not internal `child:*` listeners); `notify` gated; pinned by conformance only
+  (Quint models no wake condition). Target release 0.2.1.
+- **Step 2 continuation** started with a fresh executor (the previous one was
+  stopped at 68 passed / 31 failed).
