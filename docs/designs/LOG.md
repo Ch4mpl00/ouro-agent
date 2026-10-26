@@ -642,3 +642,13 @@ executor took alone, each reversible:
   `call.unknown`), then any other error by the outer catch.
 - **Test 11's failing run** was taken with the new skill moved aside; the
   sleep case of G-M11 (the observer's PT20S bound) has no wall-clock test.
+- **Hand mutants** (once each, on a scratch worktree of the committed tree):
+  the observer joined (a `listen` on its `done:` after `observe`): caught
+  by `a_hanging_status_model_delays_nothing` (24 s against its 15 s bound);
+  the tombstone removed: caught by the MCP seq test (a late line dropped as
+  `stale`, not `cleared`: with the clear at seq 1 000 000 the stale rule
+  alone already keeps late lines out, so the tombstone guards a clear sent
+  without a seq); `exclude_tools` ignored: caught by four `telegram_loop`
+  tests. The scratch worktree shared the target directory, and one full
+  run picked up the mutants' artifacts; the reported run is a clean one
+  after a rebuild.
