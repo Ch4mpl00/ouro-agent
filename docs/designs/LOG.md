@@ -376,3 +376,16 @@ Deviations 1 and 2):
   ways, and the one that drops the dry run's own status survived until test
   6 gained a try whose routed draft completes while a `signal` draft faults
   after it (nothing is tried).
+
+## 2026-10-26 (step 4 verified)
+
+- Deviations 1–3 of design 05 accepted: no-signal `steps` from the observer
+  (the engine's call journal carries no results); the no-signal write answer
+  stays `main`'s `{"ok":true,"dryRun":true}` (skill-index checks `ok`); the
+  wall-clock bounds of tests 1 and 10 are relative to the try's own cost.
+- `try_workflow`'s description now names the no-signal write answer, so it
+  no longer tells the model something untrue.
+- The engine's per-start/resume cost in a debug build (100–200 ms) goes to
+  ouro as an issue; it does not block the migration.
+- The full-suite failure (`an_empty_queue_is_waited_on…`) is the known
+  load-sensitive timing test; supervisor 34/34 and sandbox 24/24 alone.
