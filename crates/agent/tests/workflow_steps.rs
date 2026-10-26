@@ -2,9 +2,9 @@
 // called straight from a definition, with their outcomes typed by how far
 // they got and never sent twice when at most once; `llm_compose` and
 // `choose`; `set_memory`. Definitions are saved and started with the runtime
-// itself here: the agent's authoring tools return with the versions step
-// (design 03, decision 9). What the parked saved-workflow suite tested of the
-// steps (tests/pending/flows.rs), on engine runs.
+// itself here; the agent's authoring tools and a saved workflow's launch are
+// tested in tests/flows.rs. What the parked saved-workflow suite tested of the
+// steps, on engine runs.
 mod support;
 use agent::{
     agent::{Engine, EngineDeps, Providers, create_engine},

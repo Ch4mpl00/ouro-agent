@@ -366,9 +366,9 @@ async fn a_signal_starts_with_the_skills_jev_selects_for_it() {
     assert!(request["state"]["current_request"].as_str().unwrap().contains("go ahead"));
     assert!(request["state"]["context"].as_str().unwrap().starts_with("Signal source: telegram"));
     let (trace, obs) = f.db.get_trace("telegram:42").unwrap().unwrap();
-    // The engine's skills, then what preselection inlined (the default path:
-    // the Telegram loop that loaded its channel skill returns with the
-    // versions step).
+    // The engine's skills, then what preselection inlined (the default
+    // path; a routed loop's preselection:
+    // a_telegram_signal_runs_the_loop_that_declares_its_route).
     assert_eq!(trace.metadata.as_ref().unwrap()["skills"], json!(["orchestrator", "routing", "dreaming"]));
     let search = obs.iter().find(|o| o.name == "find_skills").expect("an automatic find_skills span");
     assert_eq!(search.meta("automatic"), Some(&json!(true)));

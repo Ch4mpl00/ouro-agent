@@ -696,9 +696,8 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
                 assert_eq!(
                     *mcp.calls.lock().unwrap(),
                     // The session's clock, the history, the activity and the
-                    // skill index, all before the first turn. (The default
-                    // path: a Telegram loop's status bubble returns with the
-                    // versions step, design 03 decision 9.)
+                    // skill index, all before the first turn (the default
+                    // path; the routed Telegram loop: the next test).
                     [
                         ("get_timezone".to_owned(), obj(json!({}))),
                         ("get_telegram_chat_history".to_owned(), obj(json!({"chatId":"42","limit":20}))),
@@ -733,6 +732,65 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
     assert_eq!(fetch.meta("memory_key"), Some(&json!("telegram.history")));
     // The parent's two turns and the worker's.
     assert_eq!(trace.observations.iter().filter(|o| o.kind == ObservationType::Generation).count(), 3);
+}
+
+// The same on the reference Telegram loop that declares its route: it
+// gathers the same context itself and opens its status bubble before the
+// first turn, and ends on its reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_routed_telegram_loop_loads_history_before_its_first_generation_and_shares_it_with_workers() {
+    let (tracer, written) = recording();
+    let history = json!({"messages":[
+        {"id":1,"chat_id":42,"thread_id":null,"role":"assistant","text":"Put together a weekly summary?","created_at":"2026-09-06 11:59:00"},
+    ]});
+    let mcp_calls: Arc<Mutex<Option<Arc<ToolMcp>>>> = Arc::default();
+    let seen = mcp_calls.clone();
+    let h = Harness::new(
+        task_context("task"),
+        vec![
+            turn(move |p| {
+                let mcp = seen.lock().unwrap().clone().unwrap();
+                assert_eq!(
+                    *mcp.calls.lock().unwrap(),
+                    [
+                        ("get_timezone".to_owned(), obj(json!({}))),
+                        ("get_telegram_chat_history".to_owned(), obj(json!({"chatId":"42","limit":20}))),
+                        ("journal_tail".to_owned(), obj(json!({"stream":"ouro/activity","n":10}))),
+                        ("read_doc".to_owned(), obj(json!({"project":"agent-system","doc":"skill-index.md"}))),
+                        (
+                            "telegram_send_status".to_owned(),
+                            obj(json!({"id":"status:1","text":"👀","chatId":"42","messageThreadId":null}))
+                        ),
+                    ]
+                );
+                assert!(mentions(&p.messages, "Put together a weekly summary?"));
+                call("invoke_sub_agent", json!({"prompt":"summarize","input_refs":["telegram.history"]}))
+            }),
+            turn(|p| {
+                assert!(mentions(&p.messages, "Put together a weekly summary?"));
+                answer("summary")
+            }),
+            turn(|_| answer("done")),
+            turn(|_| answer("done")),
+        ],
+        &history.to_string(),
+        tracer,
+    );
+    *mcp_calls.lock().unwrap() = Some(h.mcp.clone());
+    activate_telegram_loop(&h.engine).await;
+    let runner = supervisor(&h);
+    let content = "Telegram message in chat 42.\nText: \"go ahead\"";
+    assert_eq!(runner.run_signal(&signal("telegram", content)).await.unwrap(), "done");
+    // Clock, history, activity, skill-index lookup and the loop's status
+    // bubble, opened and cleared; no worker fetch or extra LLM retrieval turn.
+    assert_eq!(h.mcp.calls.lock().unwrap().len(), 6);
+    let trace = &written.all()[0];
+    assert_eq!(trace.input, Some(json!(content)));
+    let fetch = find(&trace.observations, "get_telegram_chat_history");
+    assert_eq!(fetch.kind, ObservationType::Tool);
+    assert_eq!(fetch.meta("automatic"), Some(&json!(true)));
+    assert_eq!(fetch.meta("memory_key"), Some(&json!("telegram.history")));
+    assert_eq!(trace.observations.iter().filter(|o| o.kind == ObservationType::Generation).count(), 4);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

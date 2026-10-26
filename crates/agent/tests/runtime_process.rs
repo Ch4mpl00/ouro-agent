@@ -105,6 +105,38 @@ impl Drop for Fixture {
         self.task.abort();
     }
 }
+// The reference Telegram loop, activated through the authoring checks in the
+// files the child process opens at startup (agent.db and the engine's store
+// beside it).
+async fn activate_reference_loop(root: &std::path::Path) {
+    let db = AgentDb::open(root.join("agent.db")).unwrap();
+    let provider: Arc<dyn agent::providers::ChatProvider> = Arc::new(support::Scripted::new(vec![]));
+    let status = agent::providers::ToolDef::new(support::STATUS_TOOL, support::STATUS_TOOL, json!({"type":"object"}));
+    let mcp = Arc::new(support::FakeMcp { defs: vec![status], ..Default::default() });
+    let author = agent::agent::create_engine(agent::agent::EngineDeps {
+        providers: agent::agent::Providers {
+            openai: provider.clone(),
+            gemini: provider.clone(),
+            deepseek: provider.clone(),
+            openrouter: Some(provider),
+        },
+        mcp,
+        presets: agent::models::default_presets(),
+        skills: Vec::new(),
+        skill_store: Arc::new(support::AnySkill),
+        memory: Arc::new(db.clone()),
+        tracer: Arc::new(agent::tracing::NullTracer),
+        codex: Arc::new(support::NoCodex),
+        decisions: None,
+        schedule: Arc::new(agent::schedule::MemorySchedule::default()),
+        env: Default::default(),
+        db,
+        store: agent::runs::open_store(&root.join("agent.db")).unwrap(),
+    });
+    support::activate_telegram_loop(&author).await;
+    author.shutdown().await;
+}
+
 impl Fixture {
     async fn new(source: &str, fail_send: bool, wait_model: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -115,6 +147,9 @@ impl Fixture {
             .conn()
             .execute("DELETE FROM scheduled_tasks WHERE workflow = 'skill-index'", [])
             .unwrap();
+        if source == "telegram" {
+            activate_reference_loop(&root).await;
+        }
         std::fs::create_dir(root.join("skills.default")).unwrap();
         for (name, tools, body) in [
             ("orchestrator", "*", "ORCHESTRATOR"),
@@ -311,9 +346,8 @@ async fn binary_journal_records_one_completed_run_without_creating_recursive_tra
     assert_eq!(entries[0]["metadata"]["trace_id"], trace.id);
     assert_eq!(entries[0]["metadata"]["source"], "telegram");
     assert!(entries[0]["body"].as_str().unwrap().contains("Sent a message"));
-    // The default path takes a closing turn after the reply (the Telegram
-    // loop variant that ended on it returns with the versions step).
-    assert_eq!(f.state.requests.lock().unwrap().len(), 3, "a reply turn, a closing turn and one journal composition");
+    // The Telegram loop ends on its reply: no closing turn.
+    assert_eq!(f.state.requests.lock().unwrap().len(), 2, "one reply turn and one journal composition");
     for export in f.state.exports.lock().unwrap().iter() {
         for span in export["resourceSpans"][0]["scopeSpans"][0]["spans"].as_array().unwrap() {
             assert_eq!(span["traceId"], trace.id);
