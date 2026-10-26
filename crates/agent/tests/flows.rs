@@ -1,69 +1,43 @@
-// Saved workflows (`flows.rs`): the store contract on both implementations,
-// validation against what the agent can call, and runs on a real engine —
-// MCP tools go to a recording fake, `llm_compose` to a scripted provider —
-// with the trace they leave.
+// Workflows (`flows.rs`): the gate a definition passes, the authoring
+// tools over the engine's catalog, the author's catalog and probes, the
+// model steps, and a scheduled task's saved workflow as the signal's primary
+// run (design 04), and a dry run of a draft without a signal (the sandbox
+// step, design 05, test 2).
 mod support;
 use agent::{
     agent::{Engine, EngineDeps, Providers, create_engine},
-    db::AgentDb,
-    flows::{FlowResult, MemoryWorkflows, Status, WorkflowSignal, WorkflowStore, check, create_flows},
+    flows::check,
     mcp::Mcp,
     models::{ModelPreset, Presets, ReasoningEffort},
     providers::{ToolDef, assistant},
+};
+use agent::{
+    supervisor::{PendingSignal, create_supervisor},
     trace_model::Observation,
-    tracing::{Scope, TraceStart, Tracer},
 };
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
-use support::{AnySkill, NoCodex, PersistLog, Scripted, TELEGRAM_LOOP, ToolMcp, TraceLog, recording, task_context};
+use support::{AnySkill, NoCodex, PersistLog, Scripted, ToolMcp, activate_definition, mark_tried, recording};
 use tokio_util::sync::CancellationToken;
 
 // ── the store ───────────────────────────────────────────────────────────────
 
-fn store_contract(store: &dyn WorkflowStore) {
-    assert_eq!(store.get("digest", None).unwrap(), None);
-    let v1 = store.save("digest", "one", Some("first")).unwrap();
-    let v2 = store.save("digest", "two", None).unwrap();
-    store.save("other", "x", None).unwrap();
-    assert_eq!((v1.version, v1.status, v2.version), (1, Status::Draft, 2));
-    assert_eq!(store.active("digest").unwrap(), None, "a saved version is a draft");
-
-    assert!(!v1.tried, "a saved version is untried");
-    store.mark_tried("digest", 1).unwrap();
-    assert!(store.get("digest", Some(1)).unwrap().unwrap().tried);
-    assert!(!store.get("digest", Some(2)).unwrap().unwrap().tried, "per version");
-    assert!(store.mark_tried("digest", 9).is_err());
-    store.activate("digest", 1).unwrap();
-    assert_eq!(store.active("digest").unwrap().map(|w| w.definition), Some("one".into()));
-    store.activate("digest", 2).unwrap();
-    assert_eq!(store.active("digest").unwrap().map(|w| w.version), Some(2));
-    assert_eq!(store.get("digest", Some(1)).unwrap().map(|w| w.status), Some(Status::Retired));
-    assert_eq!(store.get("digest", None).unwrap().map(|w| (w.version, w.note)), Some((2, None)));
-    assert_eq!(store.get("digest", Some(1)).unwrap().and_then(|w| w.note), Some("first".into()));
-
-    assert!(store.activate("digest", 9).is_err());
-    assert_eq!(store.active("digest").unwrap().map(|w| w.version), Some(2), "a failed activation changes nothing");
-    let listed: Vec<(String, i64)> =
-        store.list().unwrap().into_iter().filter(|w| w.name != "skill-index").map(|w| (w.name, w.version)).collect();
-    assert_eq!(listed, [("digest".to_string(), 2), ("other".to_string(), 1)]);
-}
-
-#[test]
-fn the_store_keeps_versions_and_one_active_each() {
-    store_contract(&MemoryWorkflows::default());
-    let dir = tempfile::tempdir().unwrap();
-    store_contract(&AgentDb::open(dir.path().join("agent.db")).unwrap());
-}
-
-// The language card of workflow-author.md stays true to the interpreter:
-// its reference definition parses and validates. Its function names stand
-// for real ones, so any name is callable here.
+// The language card of workflow-author.md stays true to the engine: its
+// reference definitions parse and validate in the engine's dialect, and pass
+// the gate's own rules for an agent version (design 04). Their function
+// names stand for real ones, so any name is callable here.
 #[test]
 fn the_authoring_skills_reference_definition_is_valid() {
     struct Any;
-    impl owf::model::Catalog for Any {
+    impl ouro_runtime::ows::model::Catalog for Any {
         fn has(&self, _: &str) -> bool {
+            true
+        }
+        fn events(&self) -> bool {
+            true
+        }
+        fn children(&self) -> bool {
             true
         }
     }
@@ -73,8 +47,9 @@ fn the_authoring_skills_reference_definition_is_valid() {
     let examples: Vec<&str> = skill.split("```yaml\n").skip(1).filter_map(|block| block.split("```").next()).collect();
     assert!(!examples.is_empty(), "workflow-author shows a reference");
     for example in examples {
-        let wf = owf::model::parse_yaml(example).unwrap_or_else(|e| panic!("{e}\n{example}"));
-        owf::model::validate(&wf, &Any).unwrap_or_else(|e| panic!("{e}\n{example}"));
+        let wf = ouro_runtime::ows::model::parse_yaml(example).unwrap_or_else(|e| panic!("{e}\n{example}"));
+        ouro_runtime::ows::model::validate(&wf, &Any).unwrap_or_else(|e| panic!("{e}\n{example}"));
+        agent::flows::agent_rules(&wf).unwrap_or_else(|e| panic!("{e}\n{example}"));
     }
 }
 
@@ -112,9 +87,9 @@ impl Mcp for Marked {
 struct World {
     engine: Arc<Engine>,
     mcp: Arc<ToolMcp>,
-    tracer: Arc<dyn Tracer>,
-    written: Arc<TraceLog>,
+    written: Arc<support::TraceLog>,
     persist: Arc<PersistLog>,
+    store: (Arc<dyn ouro_runtime::durable::RunStore>, Arc<dyn ouro_runtime::durable::RunStore>),
 }
 
 fn world(replies: Vec<&str>) -> World {
@@ -122,6 +97,17 @@ fn world(replies: Vec<&str>) -> World {
 }
 
 fn world_with(replies: Vec<&str>, decisions: Option<Arc<agent::decisions::DecisionClient>>) -> World {
+    world_on(replies, decisions, agent::runs::memory_store_with_view(), &[])
+}
+
+// A world on the engine store `store` (another process's, after a restart),
+// MCP offering `extra` tools too.
+fn world_on(
+    replies: Vec<&str>,
+    decisions: Option<Arc<agent::decisions::DecisionClient>>,
+    store: (Arc<dyn ouro_runtime::durable::RunStore>, Arc<dyn ouro_runtime::durable::RunStore>),
+    extra: &[&str],
+) -> World {
     let llm: Arc<Scripted> = Arc::new(Scripted::new(replies.into_iter().map(assistant).collect()));
     let schema = |properties: &[&str], required: &[&str]| {
         let properties: Map<String, Value> = properties.iter().map(|p| (p.to_string(), json!({}))).collect();
@@ -131,7 +117,10 @@ fn world_with(replies: Vec<&str>, decisions: Option<Arc<agent::decisions::Decisi
         ToolDef::new("search_news", "search", schema(&["query", "k"], &[])),
         ToolDef::new("send_telegram_message", "send", schema(&["chatId", "text"], &["text"])),
         ToolDef::new("get_next_signal", "pop", schema(&[], &[])),
-    ];
+    ]
+    .into_iter()
+    .chain(extra.iter().map(|name| ToolDef::new(name, name, json!({"type":"object"}))))
+    .collect();
     let mcp = ToolMcp::returning(defs, "");
     mcp.always(Arc::new(|name, args, _| {
         let out = match name.as_str() {
@@ -160,42 +149,44 @@ fn world_with(replies: Vec<&str>, decisions: Option<Arc<agent::decisions::Decisi
         tracer: tracer.clone(),
         codex: Arc::new(NoCodex),
         decisions,
-        workflows: Arc::new(MemoryWorkflows::default()),
-        schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
+        env: Default::default(),
+        db: agent::db::AgentDb::open(":memory:").unwrap(),
+        store: store.0.clone(),
+        dry_store: store.1.clone(),
+        schedule: std::sync::Arc::new(agent::schedule::Schedules::in_memory()),
     });
-    World { engine, mcp, tracer, written, persist }
+    World { engine, mcp, written, persist, store }
 }
 
 impl World {
-    fn activate(&self, name: &str, definition: &str) {
-        let saved = self.engine.deps.workflows.save(name, definition, None).unwrap();
-        self.engine.deps.workflows.activate(name, saved.version).unwrap();
-    }
-
-    async fn run(&self, name: &str) -> (FlowResult, Vec<Observation>) {
-        let trace = self.tracer.trace(TraceStart { id: "scheduler:7".into(), name: "t".into(), ..Default::default() });
-        let scope: Scope = trace.clone();
-        let signal = WorkflowSignal {
-            id: 7,
-            source: "scheduler".into(),
-            content: "Daily digest tick.".into(),
-            env_context: None,
-        };
-        let flows = create_flows(self.engine.clone());
-        let result = flows.run(name, &signal, &task_context("scheduler:7"), &scope, &CancellationToken::new()).await;
-        trace.end();
-        (result, self.written.all().pop().map(|t| t.observations).unwrap_or_default())
-    }
-
     fn calls(&self) -> Vec<(String, Map<String, Value>)> {
         self.mcp.calls.lock().unwrap().clone()
     }
-}
 
-fn named<'a>(observations: &'a [Observation], name: &str) -> &'a Observation {
-    observations.iter().find(|o| o.name == name).unwrap_or_else(|| {
-        panic!("no observation {name} in {:?}", observations.iter().map(|o| &o.name).collect::<Vec<_>>())
-    })
+    async fn tool(&self, name: &str, args: Value) -> anyhow::Result<Value> {
+        self.engine.ready().await?;
+        let reply = agent::flows::tool(&self.engine, name, args.as_object().unwrap()).await?;
+        Ok(serde_json::from_str(&reply).unwrap())
+    }
+
+    // A scheduled task's fire (signal `id`) naming the saved workflow `name`:
+    // the signal's answer, and what its trace holds once it ended.
+    async fn run(&self, name: &str, id: i64) -> (anyhow::Result<String>, Vec<Observation>) {
+        let supervisor = create_supervisor(self.engine.clone());
+        let signal = PendingSignal {
+            id,
+            source: "scheduler".into(),
+            content: "Daily digest tick.".into(),
+            env_context: None,
+            created_at: "2026-09-06 12:00:00".into(),
+            payload: Some(json!({"workflow": name})),
+        };
+        let result = supervisor.run_signal(&signal).await;
+        let trace = format!("scheduler:{id}");
+        let observations =
+            self.written.all().into_iter().filter(|t| t.id == trace).flat_map(|t| t.observations).collect();
+        (result, observations)
+    }
 }
 
 const DIGEST: &str = r#"
@@ -270,7 +261,7 @@ do:
 "#
         )
     };
-    let parse = |text: &str| owf::model::parse_yaml(text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+    let parse = |text: &str| ouro_runtime::ows::model::parse_yaml(text).unwrap_or_else(|e| panic!("{e}\n{text}"));
     let warned = agent::flows::warnings(&parse(&definition("")));
     assert_eq!(warned.len(), 2, "{warned:?}");
     assert!(
@@ -283,237 +274,11 @@ do:
 
 // ── runs ────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn a_saved_workflow_runs_tools_and_model_steps_and_traces_each_task() {
-    let w = world(vec!["Today: Rust 2.0"]);
-    w.activate("digest", DIGEST);
-    let (result, observations) = w.run("digest").await;
-    let FlowResult::Completed(output) = result else { panic!("{result:?}") };
-    assert_eq!(output, json!({"ok": true, "key": "news_digest.last_read_at"}));
-
-    let calls = w.calls();
-    assert_eq!(calls.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["search_news", "send_telegram_message"]);
-    assert_eq!(calls[0].1["query"], "rust since ever");
-    assert_eq!(calls[1].1["text"], "Today: Rust 2.0");
-    assert_eq!(*w.persist.0.lock().unwrap(), [("news_digest.last_read_at".into(), "2026-09-06T12:00:00.000Z".into())]);
-
-    let runner = named(&observations, "runner");
-    assert_eq!(runner.metadata.as_ref().unwrap()["workflow"], "digest");
-    assert_eq!(runner.input["signal"]["content"], "Daily digest tick.");
-    let search = named(&observations, "call:search");
-    assert_eq!(search.parent_observation_id.as_deref(), Some(runner.id.as_str()));
-    assert_eq!(search.metadata.as_ref().unwrap()["reference"], "/do/0/search");
-    let call = named(&observations, "search_news");
-    assert_eq!(call.parent_observation_id.as_deref(), Some(search.id.as_str()));
-    assert_eq!(search.meta("tool_span"), Some(&json!(call.id)));
-    assert_eq!(call.meta("tool"), Some(&json!("search_news")));
-    assert_eq!(call.input, json!({"query": "rust since ever"}));
-    assert_eq!(serde_json::from_str::<Value>(call.output.as_str().unwrap()).unwrap()["items"][0]["title"], "Rust 2.0");
-    // The compose generation sits under its task and is tagged for the judge.
-    let compose = named(&observations, "call:compose");
-    let generation = named(&observations, "llm_compose:compose");
-    assert_eq!(generation.parent_observation_id.as_deref(), Some(compose.id.as_str()));
-    assert_eq!(generation.metadata.as_ref().unwrap()["judge_node"], "compose");
-    assert_eq!(generation.metadata.as_ref().unwrap()["skill"], "news-digest");
-    let prompt = generation.input.to_string();
-    assert!(
-        prompt.contains("Write the digest.") && prompt.contains("<items>") && prompt.contains("Rust 2.0"),
-        "{prompt}"
-    );
-}
-
-#[tokio::test]
-async fn durable_wait_reopens_on_the_pinned_definition_without_repeating_a_send() {
-    use agent::{durable::RunStore, flows::create_durable_flows};
-    let w = world(vec![]);
-    let definition = r#"document: { dsl: '1.0.4', namespace: t, name: durable, version: '0.1.0' }
-do:
-  - before: { call: send_telegram_message, with: { text: before }, metadata: { delivery: at_most_once } }
-  - pause: { wait: PT0.01S }
-  - after: { call: send_telegram_message, with: { text: after }, metadata: { delivery: at_most_once } }
-"#;
-    w.activate("durable", definition);
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("agent.db");
-    let signal = WorkflowSignal { id: 44, source: "scheduler".into(), content: "go".into(), env_context: None };
-    let trace = w.tracer.trace(TraceStart { id: "durable-test".into(), name: "test".into(), ..Default::default() });
-    let scope: Scope = trace.clone();
-    let cancel = CancellationToken::new();
-    let session = task_context("scheduler:44");
-    {
-        let flows = create_durable_flows(w.engine.clone(), AgentDb::open(&path).unwrap());
-        assert!(matches!(flows.run("durable", &signal, &session, &scope, &cancel).await, FlowResult::Waiting { .. }));
-    }
-    assert_eq!(w.calls().len(), 1);
-    w.activate("durable", &definition.replace("text: after", "text: changed"));
-    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
-    let db = AgentDb::open(&path).unwrap();
-    let runs = RunStore::new(db.clone());
-    let flows = create_durable_flows(w.engine.clone(), db);
-    assert_eq!(flows.recover_once(&cancel).await.unwrap(), 1);
-    assert!(matches!(runs.get("scheduler:44").unwrap().unwrap().outcome, Some(owf::run::Status::Completed(_))));
-    let calls = w.calls();
-    assert_eq!(calls.iter().map(|(_, args)| args["text"].as_str().unwrap()).collect::<Vec<_>>(), ["before", "after"]);
-    assert!(matches!(flows.run("durable", &signal, &session, &scope, &cancel).await, FlowResult::Completed(_)));
-    assert_eq!(w.calls().len(), 2);
-    assert_eq!(flows.recover_once(&cancel).await.unwrap(), 0);
-    trace.end();
-}
-
-// A retry that outlives the process: the message went out, the read after
-// it failed, the agent restarted before the retry. The retry reuses the
-// send from agent.db instead of messaging the chat again.
-#[tokio::test]
-async fn a_retry_after_restart_does_not_resend_a_delivered_message() {
-    use agent::{durable::RunStore, flows::create_durable_flows};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let w = world(vec![]);
-    let searches = Arc::new(AtomicUsize::new(0));
-    let counter = searches.clone();
-    w.mcp.always(Arc::new(move |name, args, _| {
-        let out = match name.as_str() {
-            "search_news" if counter.fetch_add(1, Ordering::SeqCst) == 0 => "[tool error] index offline".to_string(),
-            "search_news" => json!({"items": []}).to_string(),
-            _ => json!({"ok": true, "text": args.get("text")}).to_string(),
-        };
-        Box::pin(async move { Ok(out) })
-    }));
-    w.activate(
-        "retried",
-        r#"document: { dsl: '1.0.4', namespace: t, name: retried, version: '0.1.0' }
-do:
-  - deliver:
-      try:
-        - send: { call: send_telegram_message, with: { text: digest } }
-        - check: { call: search_news, with: { query: sent } }
-      catch:
-        retry: { delay: PT0.01S, limit: { attempt: { count: 3 } } }
-"#,
-    );
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("agent.db");
-    let signal = WorkflowSignal { id: 46, source: "scheduler".into(), content: "go".into(), env_context: None };
-    let trace = w.tracer.trace(TraceStart { id: "retry-test".into(), name: "test".into(), ..Default::default() });
-    let scope: Scope = trace.clone();
-    let cancel = CancellationToken::new();
-    {
-        let flows = create_durable_flows(w.engine.clone(), AgentDb::open(&path).unwrap());
-        let session = task_context("scheduler:46");
-        assert!(matches!(flows.run("retried", &signal, &session, &scope, &cancel).await, FlowResult::Waiting { .. }));
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
-    let db = AgentDb::open(&path).unwrap();
-    assert_eq!(create_durable_flows(w.engine.clone(), db.clone()).recover_once(&cancel).await.unwrap(), 1);
-    assert!(matches!(
-        RunStore::new(db).get("scheduler:46").unwrap().unwrap().outcome,
-        Some(owf::run::Status::Completed(_))
-    ));
-    let sends = w.calls().iter().filter(|(name, _)| name == "send_telegram_message").count();
-    assert_eq!(sends, 1, "the retry reused the delivered message");
-    assert_eq!(searches.load(Ordering::SeqCst), 2, "the failed read did run again");
-    trace.end();
-}
-
-#[tokio::test]
-async fn shutdown_leaves_an_in_flight_run_recoverable_without_resending_at_most_once() {
-    use agent::{durable::RunStore, flows::create_durable_flows};
-    let w = world(vec![]);
-    w.activate(
-        "durable",
-        r#"document: { dsl: '1.0.4', namespace: t, name: durable, version: '0.1.0' }
-do: [ { send: { call: send_telegram_message, with: { text: once }, metadata: { delivery: at_most_once } } } ]
-"#,
-    );
-    w.mcp.always(Arc::new(|_, _, _| Box::pin(std::future::pending())));
-    let dir = tempfile::tempdir().unwrap();
-    let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
-    let flows = create_durable_flows(w.engine.clone(), db.clone());
-    let trace = w.tracer.trace(TraceStart { id: "shutdown-test".into(), name: "test".into(), ..Default::default() });
-    let scope: Scope = trace.clone();
-    let cancel = CancellationToken::new();
-    let signal = WorkflowSignal { id: 45, source: "scheduler".into(), content: "go".into(), env_context: None };
-    let session = task_context("scheduler:45");
-    let future = flows.run("durable", &signal, &session, &scope, &cancel);
-    tokio::pin!(future);
-    tokio::select! {
-        result = &mut future => panic!("call should be pending: {result:?}"),
-        _ = async { while w.calls().is_empty() { tokio::task::yield_now().await; } } => {},
-    }
-    cancel.cancel();
-    assert!(matches!(future.await, FlowResult::Interrupted { .. }));
-    let runs = RunStore::new(db.clone());
-    assert!(runs.get("scheduler:45").unwrap().unwrap().outcome.is_none());
-    db.conn().execute("UPDATE workflow_runs SET wake_at_ms = 0", []).unwrap();
-    flows.recover_once(&CancellationToken::new()).await.unwrap();
-    assert!(matches!(runs.get("scheduler:45").unwrap().unwrap().outcome,
-        Some(owf::run::Status::Faulted(ref error)) if error.is("outcome_unknown")));
-    assert_eq!(w.calls().len(), 1);
-    trace.end();
-    let observations = w.written.all().pop().unwrap().observations;
-    let calls: Vec<_> =
-        observations.iter().filter(|o| o.meta("tool") == Some(&json!("send_telegram_message"))).collect();
-    assert_eq!(calls.len(), 1, "resuming an unknown write must not fabricate a second call span");
-    assert_eq!(calls[0].input, json!({"text":"once"}));
-    assert_eq!(calls[0].level, "ERROR");
-    assert!(!calls[0].end_time.is_empty());
-    assert!(calls[0].status_message.as_deref().unwrap().contains("interrupted"));
-}
-
-#[tokio::test]
-async fn direct_loop_calls_record_reported_and_transport_errors_in_both_runners() {
-    use agent::flows::create_durable_flows;
-    for durable in [false, true] {
-        for transport in [false, true] {
-            let w = world(vec![]);
-            w.activate("failing", r#"document: { dsl: '1.0.4', namespace: t, name: failing, version: '1.0.0', metadata: {loop: {description: Fixed read}} }
-do: [{read: {call: search_news, with: {query: failing}}}]
-"#);
-            w.mcp.once(Box::new(move |_, _, _| {
-                Box::pin(async move {
-                    if transport {
-                        anyhow::bail!("connection reset")
-                    }
-                    Ok("[tool error] refused".into())
-                })
-            }));
-            let dir = tempfile::tempdir().unwrap();
-            let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
-            let flows =
-                if durable { create_durable_flows(w.engine.clone(), db) } else { create_flows(w.engine.clone()) };
-            let trace =
-                w.tracer.trace(TraceStart { id: "failed-call".into(), name: "test".into(), ..Default::default() });
-            let scope: Scope = trace.clone();
-            let signal = WorkflowSignal { id: 99, source: "scheduler".into(), content: "go".into(), env_context: None };
-            let result =
-                flows.run("failing", &signal, &task_context("scheduler:99"), &scope, &CancellationToken::new()).await;
-            assert!(matches!(result, FlowResult::Faulted { effects_started: false, .. }), "{result:?}");
-            trace.end();
-            let observations = w.written.all().pop().unwrap().observations;
-            let call = named(&observations, "search_news");
-            assert_eq!(call.meta("tool"), Some(&json!("search_news")));
-            assert_eq!(call.meta("workflow_run"), Some(&json!("scheduler:99")));
-            assert_eq!(call.meta("reference"), Some(&json!("/do/0/read")));
-            assert_eq!(call.input, json!({"query":"failing"}));
-            assert_eq!(call.level, "ERROR");
-            assert!(!call.end_time.is_empty());
-            if transport {
-                assert_eq!(call.output["error"], "connection reset");
-            } else {
-                assert_eq!(call.output, "[tool error] refused");
-            }
-            assert!(
-                named(&observations, "runner").input["loop"].is_object(),
-                "call tracing must not overwrite admission"
-            );
-        }
-    }
-}
-
 // A workflow sends to the user's chat from its input, not from an id
 // written into the definition.
 // The author's catalog: every callable function one line each, one in
 // full on request; the probe runs reads only, cut to their shape.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_author_sees_the_functions_and_probes_only_reads() {
     use agent::flows::{functions, probe};
     let w = world(vec![]);
@@ -551,17 +316,16 @@ async fn the_author_sees_the_functions_and_probes_only_reads() {
     assert!(cut.len() < 7_000 && cut.contains("20000 characters in all"), "{}", cut.len());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_author_can_inspect_signal_and_loop_hosts_but_probes_cannot_execute_them() {
     use agent::flows::{functions, probe};
     let w = world(vec![]);
     let catalog = functions(&w.engine, &Map::new()).unwrap();
     // Follow the definitions an author actually copies, rather than a second
     // list of expected names that could omit the next host function too.
-    for definition in [agent::supervisor::SIGNAL, agent::agent::AGENT_LOOP, TELEGRAM_LOOP] {
-        let wf = owf::model::parse_yaml(definition).unwrap();
-        // The fixture's status steps call an MCP tool this world lacks.
-        for site in owf::model::call_sites(&wf).into_iter().filter(|s| s.function != "telegram_send_status") {
+    for definition in [agent::supervisor::SIGNAL, agent::agent::AGENT_LOOP] {
+        let wf = ouro_runtime::ows::model::parse_yaml(definition).unwrap();
+        for site in ouro_runtime::ows::model::call_sites(&wf) {
             let name = &site.function;
             assert!(catalog.lines().any(|line| line.starts_with(&format!("{name}("))), "missing {name}");
             let detail: Value =
@@ -573,7 +337,7 @@ async fn the_author_can_inspect_signal_and_loop_hosts_but_probes_cannot_execute_
             }
         }
     }
-    for function in agent::supervisor::SIGNAL_FUNCTIONS {
+    for function in agent::functions::HOST_FUNCTIONS.iter().filter(|f| f.context.starts_with("signal")) {
         let detail: Value =
             serde_json::from_str(&functions(&w.engine, json!({"name":function.name}).as_object().unwrap()).unwrap())
                 .unwrap();
@@ -592,12 +356,11 @@ async fn the_author_can_inspect_signal_and_loop_hosts_but_probes_cannot_execute_
         serde_json::from_str(&functions(&w.engine, json!({"name":"route_signal"}).as_object().unwrap()).unwrap())
             .unwrap();
     assert_eq!(route["needs"], json!(["context"]));
-    assert!(route["description"].as_str().unwrap().contains("Dispatcher only"));
     let primary: Value =
         serde_json::from_str(&functions(&w.engine, json!({"name":"primary_loop"}).as_object().unwrap()).unwrap())
             .unwrap();
     assert!(primary["parameters"]["properties"].get("loop").is_some());
-    for name in ["agent_turn", "tool", "agent_settle", "loop_setup"] {
+    for name in ["agent_turn", "tool_once", "tool_repeat", "classify", "agent_settle", "loop_setup"] {
         assert!(
             probe(&w.engine, json!({"name":name}).as_object().unwrap(), &CancellationToken::new())
                 .await
@@ -609,213 +372,287 @@ async fn the_author_can_inspect_signal_and_loop_hosts_but_probes_cannot_execute_
     assert!(w.calls().is_empty(), "inspecting host contracts must not execute anything");
 }
 
-// A dry run runs a draft's reads and model steps on the session's input and
-// only records its writes: nothing is sent, no watermark moves, and a wait
-// does not sleep.
-#[tokio::test]
-async fn a_dry_run_records_the_writes_and_changes_nothing() {
-    use agent::flows::try_draft;
-    let w = world(vec!["Today: Rust 2.0"]);
-    let draft = DIGEST.replace("do:\n", "do:\n  - pause: { wait: PT1H }\n");
-    w.engine.deps.workflows.save("digest", &draft, None).unwrap();
-    let env = task_context("author").env.clone();
-    let cancel = CancellationToken::new();
-    let trace = w.tracer.trace(TraceStart { id: "author".into(), name: "t".into(), ..Default::default() });
-    let scope: Scope = trace.clone();
-    let args = |v: Value| v.as_object().unwrap().clone();
-    let reply = try_draft(&w.engine, &args(json!({"name": "digest"})), &env, &scope, &cancel).await.unwrap();
-    trace.end();
-    let reply: Value = serde_json::from_str(&reply).unwrap();
-    assert_eq!((reply["status"].as_str(), reply["version"].as_i64()), (Some("completed"), Some(1)), "{reply}");
+// ── authoring tools ─────────────────────────────────────────────────────────
 
-    assert_eq!(w.calls().iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["search_news"], "only the read ran");
-    assert!(w.persist.0.lock().unwrap().is_empty(), "no watermark moved");
-    let writes: Vec<(&str, &str)> = reply["writes"]
+// The engine keeps the versions: numbered, one active per name, the one
+// before it retired, each with the note and the dry run the agent recorded
+// by its content (the store contract the agent's own table had).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_catalog_keeps_versions_and_one_active_each() {
+    let w = world(Vec::new());
+    let text = |name: &str, n: u32| {
+        format!(
+            "document: {{ dsl: '1.0.4', namespace: agent, name: {name}, version: '1.0.0' }}\ndo: [ {{ a: {{ set: {{ n: {n} }} }} }} ]\n"
+        )
+    };
+    assert_eq!(w.tool("read_workflow", json!({"name":"digest"})).await.unwrap()["found"], false);
+    let v1 =
+        w.tool("save_workflow", json!({"name":"digest","definition":text("digest", 1),"note":"first"})).await.unwrap();
+    let v2 = w.tool("save_workflow", json!({"name":"digest","definition":text("digest", 2)})).await.unwrap();
+    w.tool("save_workflow", json!({"name":"other","definition":text("other", 1)})).await.unwrap();
+    assert_eq!(
+        (v1["version"].as_u64(), v1["status"].as_str(), v2["version"].as_u64()),
+        (Some(1), Some("draft"), Some(2))
+    );
+    let read = |version: u64| w.tool("read_workflow", json!({"name":"digest","version":version}));
+    assert_eq!(w.engine.runtime.definitions("digest").await.unwrap().active, None, "a saved version is a draft");
+
+    assert_eq!(read(1).await.unwrap()["tried"], false, "a saved version is untried");
+    mark_tried(&w.engine, "digest", &text("digest", 1));
+    assert_eq!(read(1).await.unwrap()["tried"], true);
+    assert_eq!(read(2).await.unwrap()["tried"], false, "per version");
+    let unknown = ouro_runtime::durable::digest_of(&text("digest", 9));
+    assert!(agent::flows::WorkflowMeta::mark_tried(&w.engine.deps.db, "digest", &unknown).is_err());
+    w.tool("activate_workflow", json!({"name":"digest","version":1})).await.unwrap();
+    assert_eq!(w.tool("read_workflow", json!({"name":"digest"})).await.unwrap()["definition"], text("digest", 1));
+    mark_tried(&w.engine, "digest", &text("digest", 2));
+    w.tool("activate_workflow", json!({"name":"digest","version":2})).await.unwrap();
+    assert_eq!(w.engine.runtime.definitions("digest").await.unwrap().active, Some(2));
+    assert_eq!(read(1).await.unwrap()["status"], "retired");
+    assert_eq!(
+        (read(2).await.unwrap()["version"].as_u64(), read(2).await.unwrap()["note"].clone()),
+        (Some(2), Value::Null)
+    );
+    assert_eq!(read(1).await.unwrap()["note"], "first");
+
+    assert!(w.tool("activate_workflow", json!({"name":"digest","version":9})).await.is_err());
+    assert_eq!(
+        w.engine.runtime.definitions("digest").await.unwrap().active,
+        Some(2),
+        "a failed activation changes nothing"
+    );
+    let listed = w.tool("list_workflows", json!({})).await.unwrap();
+    let mine: Vec<(String, u64)> = listed["workflows"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|w| (w["function"].as_str().unwrap(), w["task"].as_str().unwrap()))
+        .filter(|w| !w["builtin"].as_bool().unwrap())
+        .map(|w| (w["name"].as_str().unwrap().to_owned(), w["latest_version"].as_u64().unwrap()))
         .collect();
-    assert_eq!(writes, [("send_telegram_message", "/do/3/send"), ("set_memory", "/do/4/mark")]);
-    assert_eq!(reply["writes"][0]["arguments"]["text"], "Today: Rust 2.0");
-    let compose = reply["steps"].as_array().unwrap().iter().find(|s| s["task"] == "/do/2/compose").unwrap();
-    assert_eq!(compose["output"], "Today: Rust 2.0");
-    assert_eq!(reply["path"], json!(["pause", "search", "compose", "send", "mark"]));
-    assert!(w.engine.deps.workflows.get("digest", Some(1)).unwrap().unwrap().tried, "a completed dry run marks it");
-    assert!(reply["next"].as_str().unwrap().contains("fix"), "{reply}");
-    let observations = w.written.all().pop().unwrap().observations;
-    let run = named(&observations, "dry-run");
-    assert_eq!(run.metadata.as_ref().unwrap()["workflow"], "digest");
-    assert_eq!(named(&observations, "call:search").parent_observation_id.as_deref(), Some(run.id.as_str()));
-
-    assert!(try_draft(&w.engine, &args(json!({"name": "nope"})), &env, &scope, &cancel).await.is_err());
-    w.engine.deps.workflows.save("digest", &DIGEST.replace("call: search_news", "call: search_web"), None).unwrap();
-    let invalid = try_draft(&w.engine, &args(json!({"name": "digest"})), &env, &scope, &cancel).await;
-    assert!(invalid.unwrap_err().to_string().contains("search_web"));
+    assert_eq!(mine, [("digest".to_string(), 2), ("other".to_string(), 1)]);
 }
 
-#[tokio::test]
-async fn a_workflow_sends_to_the_chat_its_input_names_on_the_users_clock() {
-    use agent::session::{EnvData, session};
-    let w = world(vec![]);
-    w.activate(
-        "ping",
-        r#"document: { dsl: '1.0.4', namespace: t, name: ping, version: '0.1.0' }
-do: [ { send: { call: send_telegram_message, with: { chatId: '${ $workflow.input.env.telegramChatId }', text: '${ $workflow.input.env.localNow }' } } } ]
-"#,
-    );
-    let env = EnvData {
-        telegram_chat_id: Some("4242".into()),
-        timezone: "Europe/Kiev".into(),
-        ..task_context("scheduler:8").env.clone()
-    };
-    let signal = WorkflowSignal { id: 8, source: "scheduler".into(), content: "go".into(), env_context: None };
-    let trace = w.tracer.trace(TraceStart { id: "scheduler:8".into(), name: "t".into(), ..Default::default() });
-    let scope: Scope = trace.clone();
-    let result = create_flows(w.engine.clone())
-        .run("ping", &signal, &session("scheduler:8", env), &scope, &CancellationToken::new())
-        .await;
-    trace.end();
-    assert!(matches!(result, FlowResult::Completed(_)), "{result:?}");
-    assert_eq!(
-        w.calls(),
-        [(
-            "send_telegram_message".to_string(),
-            json!({"chatId":"4242","text":"2026-09-06T15:00:00+03:00"}).as_object().unwrap().clone()
-        )]
-    );
-}
-
-#[tokio::test]
-async fn a_fault_before_any_write_reports_that_nothing_changed() {
-    let w = world(Vec::new());
-    w.activate(
-        "digest",
-        &DIGEST.replace("call: search_news", "call: search_news\n      output: { as: '${ error(\"no news\") }' }"),
-    );
-    let (result, observations) = w.run("digest").await;
-    let FlowResult::Faulted { error, effects_started } = result else { panic!("{result:?}") };
-    assert!(!effects_started);
-    assert_eq!(error.instance.as_deref(), Some("/do/0/search"));
-    assert!(error.is("expression"), "{error:?}");
-    assert_eq!(named(&observations, "call:search").level, "ERROR");
-    assert_eq!(named(&observations, "runner").level, "ERROR");
-}
-
-#[tokio::test]
-async fn a_fault_after_a_write_reports_that_something_may_have_changed() {
-    let w = world(vec!["text"]);
-    w.activate(
-        "digest",
-        &DIGEST.replace("  - mark:", "  - stop: { raise: { error: { type: 'https://x/e', status: 500 } } }\n  - mark:"),
-    );
-    let (result, _) = w.run("digest").await;
-    let FlowResult::Faulted { error, effects_started } = result else { panic!("{result:?}") };
-    assert!(effects_started);
-    assert_eq!(error.instance.as_deref(), Some("/do/3/stop"));
-}
-
-#[tokio::test]
-async fn only_an_active_version_runs() {
-    let w = world(Vec::new());
-    assert!(matches!(w.run("digest").await.0, FlowResult::Missing));
-    w.engine.deps.workflows.save("digest", DIGEST, None).unwrap();
-    assert!(matches!(w.run("digest").await.0, FlowResult::Missing), "a draft does not run");
-    assert!(w.calls().is_empty());
-}
-
-#[tokio::test]
-async fn a_definition_that_no_longer_validates_changes_nothing() {
-    let w = world(Vec::new());
-    w.activate("digest", &DIGEST.replace("call: search_news", "call: search_web"));
-    let (result, _) = w.run("digest").await;
-    let FlowResult::Faulted { error, effects_started: false } = result else { panic!("{result:?}") };
-    assert!(error.is("validation") && error.detail.unwrap_or_default().contains("search_web"));
-    assert!(w.calls().is_empty());
-}
-
-// ── authoring tools ─────────────────────────────────────────────────────────
-
-fn tool(w: &World, name: &str, args: Value) -> anyhow::Result<Value> {
-    let args = args.as_object().cloned().unwrap();
-    agent::flows::tool(&w.engine, name, &args).map(|reply| serde_json::from_str(&reply).unwrap())
-}
-
-#[test]
-fn the_authoring_tools_save_drafts_and_activate_only_valid_versions() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_authoring_tools_save_drafts_and_activate_only_valid_versions() {
     let w = world(Vec::new());
     // Every tool is offered to the model, so the loop can reach it.
     let offered: Vec<&str> = agent::agent::synthetic_definitions().iter().map(|t| t.name.as_str()).collect();
     assert!(agent::flows::TOOLS.iter().all(|t| offered.contains(t)), "{offered:?}");
 
-    let broken = tool(
-        &w,
-        "save_workflow",
-        json!({"name":"digest","definition":DIGEST.replace("call: search_news", "call: nope")}),
-    );
-    assert!(broken.unwrap_err().to_string().contains("/do/0/search/call"));
-    let renamed = tool(&w, "save_workflow", json!({"name":"other","definition":DIGEST}));
+    let broken = w
+        .tool("save_workflow", json!({"name":"digest","definition":DIGEST.replace("call: search_news", "call: nope")}))
+        .await;
+    let broken = broken.unwrap_err().to_string();
+    assert!(broken.contains("/do/0/search") && broken.contains("nope"), "{broken}");
+    let renamed = w.tool("save_workflow", json!({"name":"other","definition":DIGEST})).await;
     assert!(renamed.unwrap_err().to_string().contains("document.name is `digest`"));
 
-    let saved = tool(&w, "save_workflow", json!({"name":"digest","definition":DIGEST,"note":"first"})).unwrap();
+    let saved = w.tool("save_workflow", json!({"name":"digest","definition":DIGEST,"note":"first"})).await.unwrap();
     assert_eq!((saved["version"].clone(), saved["status"].clone()), (json!(1), json!("draft")));
-    let effects: Vec<(String, String)> = saved["calls"]
+    let deliveries: Vec<(String, String)> = saved["calls"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|c| (c["function"].as_str().unwrap().into(), c["effect"].as_str().unwrap().into()))
+        .map(|c| (c["function"].as_str().unwrap().into(), c["delivery"].as_str().unwrap().into()))
         .collect();
     assert_eq!(
-        effects,
+        deliveries,
         [
-            ("search_news".to_string(), "read".to_string()),
-            ("llm_compose".into(), "read".into()),
-            ("send_telegram_message".into(), "write".into()),
-            ("set_memory".into(), "write".into()),
+            ("search_news".to_string(), "at_least_once".to_string()),
+            ("llm_compose".into(), "at_least_once".into()),
+            ("send_telegram_message".into(), "at_most_once".into()),
+            ("set_memory".into(), "at_most_once".into()),
         ]
     );
-    let listed = tool(&w, "list_workflows", json!({})).unwrap();
-    assert_eq!(listed["workflows"][0]["active_version"], Value::Null);
+    let digest = |listed: &Value| {
+        listed["workflows"].as_array().unwrap().iter().find(|w| w["name"] == "digest").unwrap().clone()
+    };
+    let listed = w.tool("list_workflows", json!({})).await.unwrap();
+    assert_eq!(digest(&listed)["active_version"], Value::Null);
 
-    assert!(tool(&w, "activate_workflow", json!({"name":"digest","version":2})).is_err());
-    let untried = tool(&w, "activate_workflow", json!({"name":"digest","version":1})).unwrap_err();
+    assert!(w.tool("activate_workflow", json!({"name":"digest","version":2})).await.is_err());
+    let untried = w.tool("activate_workflow", json!({"name":"digest","version":1})).await.unwrap_err();
     assert!(untried.to_string().contains("has not completed a dry run"), "{untried}");
-    w.engine.deps.workflows.mark_tried("digest", 1).unwrap();
-    tool(&w, "activate_workflow", json!({"name":"digest","version":1})).unwrap();
-    let listed = tool(&w, "list_workflows", json!({})).unwrap();
-    assert_eq!((listed["count"].clone(), listed["workflows"][0]["active_version"].clone()), (json!(1), json!(1)));
-    let read = tool(&w, "read_workflow", json!({"name":"digest"})).unwrap();
+    mark_tried(&w.engine, "digest", DIGEST);
+    w.tool("activate_workflow", json!({"name":"digest","version":1})).await.unwrap();
+    let listed = w.tool("list_workflows", json!({})).await.unwrap();
+    assert_eq!(digest(&listed)["active_version"], json!(1));
+    let read = w.tool("read_workflow", json!({"name":"digest"})).await.unwrap();
     assert_eq!((read["definition"].as_str(), read["status"].as_str()), (Some(DIGEST), Some("active")));
-    assert_eq!(tool(&w, "read_workflow", json!({"name":"nope"})).unwrap()["found"], false);
+    assert_eq!(w.tool("read_workflow", json!({"name":"nope"})).await.unwrap()["found"], false);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_gate_checks_definitions_against_what_the_agent_can_call() {
+    let w = world(Vec::new());
+    let save = |definition: String| w.tool("save_workflow", json!({"name":"digest","definition":definition}));
+    let unknown = save(DIGEST.replace("call: search_news", "call: search_web")).await.unwrap_err().to_string();
+    assert!(unknown.contains("/do/0/search") && unknown.contains("search_web"), "{unknown}");
+    let withheld = save(DIGEST.replace("call: search_news", "call: get_next_signal")).await.unwrap_err().to_string();
+    assert!(withheld.contains("get_next_signal"), "{withheld}");
+    assert!(save("not: [ a workflow".into()).await.is_err());
+    // Argument names are checked against the tool's schema and the model steps'.
+    let misspelt = save(DIGEST.replace("with: { query:", "with: { qeury:")).await.unwrap_err().to_string();
+    assert!(
+        misspelt.contains("/do/0/search/with: `search_news` takes no argument `qeury` (it takes: query, k)"),
+        "{misspelt}"
+    );
+    let missing =
+        save(DIGEST.replace("with: { text: '${ . }' }", "with: { chatId: 1 }")).await.unwrap_err().to_string();
+    assert!(missing.contains("/do/2/send/with: `send_telegram_message` needs the argument `text`"), "{missing}");
+    let model = save(DIGEST.replace("skill: news-digest", "skills: news-digest")).await.unwrap_err().to_string();
+    assert!(model.contains("`llm_compose` takes no argument `skills`"), "{model}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn guard_is_reserved_readable_and_its_private_functions_are_not_in_the_catalog() {
+    let w = world(vec![]);
+    for name in ["save_workflow", "activate_workflow"] {
+        let args = json!({"name":"guard","version":1,"definition":agent::flows::built_in("guard")});
+        assert!(w.tool(name, args).await.unwrap_err().to_string().contains("reserved"));
+    }
+    let read = w.tool("read_workflow", json!({"name":"guard"})).await.unwrap();
+    assert!(read["definition"].as_str().unwrap().contains("call: review"));
+    // Even a directly stored override never replaces the reserved
+    // definition: the rounds start the built-in text (engine_runs.rs,
+    // an_activated_guard_version_never_reviews_a_round).
+    let forged = "document: { dsl: '1.0.4', namespace: agent, name: guard, version: '9.0.0' }\ndo: [ { allow: { set: { verdicts: [] } } } ]\n";
+    let version = w.engine.runtime.save("guard", forged).await.unwrap().version;
+    w.engine.runtime.activate("guard", version).await.unwrap();
+    let builtin = agent::flows::builtin_version(&w.engine.runtime, "guard").await.unwrap().unwrap();
+    let definitions = w.engine.runtime.definitions("guard").await.unwrap();
+    assert_eq!(definitions.versions[&builtin].yaml, agent::flows::built_in("guard").unwrap());
+    assert_eq!(w.tool("read_workflow", json!({"name":"guard"})).await.unwrap()["definition"], agent::flows::GUARD);
+    for function in ["review", "confirm_request", "resolve_review"] {
+        let def = format!(
+            "document: {{ dsl: '1.0.4', namespace: t, name: other, version: '1.0.0' }}\ndo: [ {{ step: {{ call: {function} }} }} ]"
+        );
+        assert!(check(&*w.engine.deps.mcp, &def).is_err(), "{function}");
+        let refused = w.tool("save_workflow", json!({"name":"other","definition":def})).await.unwrap_err();
+        assert!(refused.to_string().contains("reserved guard round"), "{function}: {refused}");
+        assert!(agent::flows::functions(&w.engine, json!({"name":function}).as_object().unwrap()).is_err());
+    }
+}
+
+// ── a scheduled task's saved workflow (design 04) ───────────────────────────
+// It runs as the signal's primary run; one that faulted before any write
+// hands its task to the agent loop, one that faulted after a write goes to
+// the report.
+
+fn first<'a>(observations: &'a [Observation], name: &str) -> &'a Observation {
+    observations.iter().find(|o| o.name == name).unwrap_or_else(|| {
+        panic!("no observation {name} in {:?}", observations.iter().map(|o| &o.name).collect::<Vec<_>>())
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fault_before_any_write_reports_that_nothing_changed() {
+    let w = world(vec!["did the task myself"]);
+    let failing =
+        DIGEST.replace("call: search_news", "call: search_news\n      output: { as: '${ error(\"no news\") }' }");
+    activate_definition(&w.engine, "digest", &failing).await;
+    let (result, observations) = w.run("digest", 7).await;
+    assert_eq!(result.unwrap(), "did the task myself", "handed over");
+    let fallback = first(&observations, "fallback");
+    let error = &fallback.meta("error").unwrap();
+    assert_eq!(fallback.meta("effects_started"), Some(&json!(false)));
+    assert_eq!(error["instance"], "/do/0/search");
+    assert!(error["type"].as_str().unwrap().contains("expression"), "{error}");
+    assert_eq!(first(&observations, "runner").level, "ERROR");
+    assert!(w.calls().iter().all(|(n, _)| n != "send_telegram_message"), "nothing was written");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fault_after_a_write_reports_that_something_may_have_changed() {
+    let w = world(vec!["text", "reported"]);
+    let failing = DIGEST.replace(
+        "  - mark:",
+        "  - stop: { raise: { error: { type: 'https://x/e', status: 500, detail: stopped } } }\n  - mark:",
+    );
+    activate_definition(&w.engine, "digest", &failing).await;
+    let (result, observations) = w.run("digest", 7).await;
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("may have changed something") && error.contains("stopped"), "{error}");
+    assert!(observations.iter().any(|o| o.name == "recovery"), "the failure is reported");
+    assert!(w.calls().iter().any(|(n, _)| n == "send_telegram_message"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_an_active_version_runs() {
+    let w = world(vec!["handled 1", "handled 2"]);
+    let (result, _) = w.run("digest", 7).await;
+    assert_eq!(result.unwrap(), "handled 1");
+    w.tool("save_workflow", json!({"name":"digest","definition":DIGEST})).await.unwrap();
+    let (result, observations) = w.run("digest", 8).await;
+    assert_eq!(result.unwrap(), "handled 2", "a draft does not run");
+    assert!(observations.iter().any(|o| o.name == "fallback"));
+    let digest = ["search_news", "send_telegram_message"];
+    assert!(w.calls().iter().all(|(n, _)| !digest.contains(&n.as_str())), "the draft ran nothing");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_definition_that_no_longer_validates_changes_nothing() {
+    let before = world_on(vec![], None, agent::runs::memory_store_with_view(), &["search_web"]);
+    activate_definition(&before.engine, "digest", &DIGEST.replace("call: search_news", "call: search_web")).await;
+    before.engine.halt().await;
+    // The next process's MCP has no `search_web` (and no snapshot of it).
+    let w = world_on(vec!["handled"], None, before.store.clone(), &[]);
+    let (result, observations) = w.run("digest", 7).await;
+    assert_eq!(result.unwrap(), "handled", "handed over, nothing ran");
+    let fallback = first(&observations, "fallback");
+    let record = fallback.meta("fallback").unwrap();
+    assert_eq!(record["reason"], "invalid");
+    assert!(record["error"].as_str().unwrap().contains("search_web"), "{record}");
+    let digest = ["search_web", "search_news", "send_telegram_message"];
+    assert!(w.calls().iter().all(|(n, _)| !digest.contains(&n.as_str())), "nothing of it ran");
+}
+
+// A saved workflow waiting on its own child (a workflow's `start_child`)
+// suspends the signal; the event wakes it in the engine's worker, and the
+// signal's trace goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_waiting_saved_child_recovers_in_its_parents_session() {
+    let w = world(vec![]);
+    let child = r#"document: { dsl: '1.0.4', namespace: t, name: child, version: '1.0.0' }
+do:
+ - event: { listen: { to: { one: { with: { type: child-answer } } } } }
+ - result: { set: '${ 42 }' }
+"#;
+    activate_definition(&w.engine, "child", child).await;
+    let parent = r#"document: { dsl: '1.0.4', namespace: t, name: parent, version: '1.0.0' }
+do:
+ - start:
+     call: start_child
+     with: { name: child, input: {} }
+     export: { as: '${ $context + { child: . } }' }
+ - wait:
+     listen: { to: { one: { with: { type: '${ $context.child.done }' } } } }
+ - result:
+     call: child_outcome
+     with: { id: '${ $context.child.id }', key: '${ $context.child.key }' }
+"#;
+    activate_definition(&w.engine, "parent", parent).await;
+    let (result, _) = w.run("parent", 2).await;
+    assert_eq!(serde_json::from_str::<Value>(&result.unwrap()).unwrap()["resumes"], true);
+    let event = json!({"source":"test","id":"answer-1","type":"child-answer","data":{}});
+    w.engine.runtime.deliver(event, None).await.unwrap();
+    let ended = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        agent::runs::wait_end(&w.engine, "signal:2", &CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let agent::runs::Status::Completed(output) = ended else { panic!("{ended:?}") };
+    assert_eq!(output["workflow"], "parent");
+    assert_eq!(output["output"]["Completed"], 42);
+    agent::runs::flushed(&w.engine, std::time::Duration::from_secs(2)).await;
+    let traces: Vec<_> = w.written.all().into_iter().filter(|t| t.id == "scheduler:2").collect();
+    assert!(!traces.is_empty());
+    assert!(traces.iter().all(|t| t.session_id.as_deref() == Some("scheduler:2")), "one session");
 }
 
 // ── choose: a jump where Jev decides ────────────────────────────────────────
-
-// Jev answering every choice with `choice` at `confidence`, or failing.
-struct Jev {
-    choice: &'static str,
-    confidence: f64,
-    fail: bool,
-    requests: std::sync::Mutex<Vec<Value>>,
-}
-#[async_trait]
-impl agent::providers::JsonApi for Jev {
-    async fn post(&self, _: &str, body: Value, _: &CancellationToken) -> anyhow::Result<Value> {
-        self.requests.lock().unwrap().push(body.clone());
-        anyhow::ensure!(!self.fail, "Jev is down");
-        let labels = body["questions"]["choice"]["criteria"].as_object().unwrap();
-        let probabilities: Map<String, Value> = labels
-            .keys()
-            .map(|l| (l.clone(), json!(if l == self.choice { self.confidence } else { 1.0 - self.confidence })))
-            .collect();
-        Ok(json!({"model":"jev-test","answers":{"choice":{"type":"choice","choice":self.choice,
-            "confidence":self.confidence,"probabilities":probabilities}}}))
-    }
-}
-fn jev_world(choice: &'static str, confidence: f64, fail: bool) -> (World, Arc<Jev>) {
-    let api = Arc::new(Jev { choice, confidence, fail, requests: Default::default() });
-    (world_with(vec![], Some(agent::decisions::decision_client("jev-test".into(), api.clone()))), api)
-}
 
 fn routed(with: &str) -> String {
     format!(
@@ -842,64 +679,9 @@ do:
 }
 const CHOOSE: &str = "{ question: Is there news worth a digest?, options: { digest: Something new and significant, quiet: Nothing worth sending }, input: { items: '${ .items }' } }";
 
-#[tokio::test]
-async fn choose_jumps_where_jev_decides() {
-    for (choice, expected) in [("digest", "digest"), ("quiet", "quiet")] {
-        let (w, api) = jev_world(choice, 0.9, false);
-        w.activate("routed", &routed(CHOOSE));
-        let (result, observations) = w.run("routed").await;
-        let FlowResult::Completed(output) = result else { panic!("{result:?}") };
-        assert_eq!(output, json!(expected));
-        let request = api.requests.lock().unwrap()[0].clone();
-        assert_eq!(request["state"]["input"]["items"][0]["title"], "Rust 2.0", "Jev judges the input");
-        assert!(request["questions"]["choice"]["instructions"].as_str().unwrap().starts_with("Is there news"));
-        let route = named(&observations, "call:route");
-        assert_eq!(route.metadata.as_ref().unwrap()["choice"], choice);
-        assert_eq!(route.metadata.as_ref().unwrap()["fallback"], false);
-        assert!(
-            observations
-                .iter()
-                .any(|o| o.name == "decide:choose" && o.parent_observation_id.as_deref() == Some(route.id.as_str()))
-        );
-    }
-}
-
-#[tokio::test]
-async fn an_unsure_choice_takes_the_default() {
-    let (w, _) = jev_world("quiet", 0.55, false);
-    w.activate("routed", &routed(&CHOOSE.replace(" }, input:", " }, min_confidence: 0.7, default: digest, input:")));
-    let (result, observations) = w.run("routed").await;
-    assert!(matches!(result, FlowResult::Completed(ref v) if v == "digest"), "{result:?}");
-    assert_eq!(named(&observations, "call:route").metadata.as_ref().unwrap()["fallback"], true);
-}
-
-#[tokio::test]
-async fn a_bad_choose_or_a_failed_jev_faults_before_any_write() {
-    let cases = [
-        ("valid", CHOOSE.to_owned(), true),
-        ("label", CHOOSE.replace("quiet: Nothing", "Quiet: Nothing"), false),
-        ("one option", "{ question: q, options: { only: x } }".to_owned(), false),
-        ("default alone", CHOOSE.replace(" }, input:", " }, default: digest, input:"), false),
-        ("unknown default", CHOOSE.replace(" }, input:", " }, min_confidence: 0.7, default: busy, input:"), false),
-        ("confidence range", CHOOSE.replace(" }, input:", " }, min_confidence: 2, default: digest, input:"), false),
-    ];
-    for (case, with, jev_down) in cases {
-        let (w, _) = jev_world("digest", 0.9, jev_down);
-        w.activate("routed", &routed(&with));
-        let (result, _) = w.run("routed").await;
-        let FlowResult::Faulted { error, effects_started } = result else { panic!("{case}: {result:?}") };
-        assert!(!effects_started, "{case}");
-        assert!(error.is(if jev_down { "runtime" } else { "validation" }), "{case}: {error:?}");
-    }
-    let w = world(vec![]);
-    w.activate("routed", &routed(CHOOSE));
-    let (result, _) = w.run("routed").await;
-    assert!(matches!(result, FlowResult::Faulted { ref error, .. } if error.to_string().contains("no decision model")));
-}
-
 #[test]
 fn a_switch_that_misses_or_invents_a_choose_option_is_a_warning() {
-    let parse = |text: &str| owf::model::parse_yaml(text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+    let parse = |text: &str| ouro_runtime::ows::model::parse_yaml(text).unwrap_or_else(|e| panic!("{e}\n{text}"));
     assert_eq!(agent::flows::warnings(&parse(&routed(CHOOSE))), Vec::<String>::new());
     let three = CHOOSE.replace("quiet: Nothing worth sending", "quiet: Nothing worth sending, later: Wait a day");
     let warned = agent::flows::warnings(&parse(&routed(&three)));
@@ -926,68 +708,12 @@ fn choose_is_in_the_catalog_and_refuses_at_most_once() {
         "{catalog}"
     );
     let pinned = routed(CHOOSE)
-        .replace("      call: choose\n", "      call: choose\n      metadata: { delivery: at_most_once }\n");
+        .replace("      call: choose\n", "      call: choose\n      metadata: { ouro: { delivery: at_most_once } }\n");
     let error = check(&*w.engine.deps.mcp, &pinned).unwrap_err();
     assert!(error.contains("model adapters do not yet support at_most_once"), "{error}");
 }
 
 // ── llm_compose json ────────────────────────────────────────────────────────
-
-const QUIET_OR_DIGEST: &str = r#"
-document: { dsl: '1.0.4', namespace: agent, name: digest, version: '1.0.0' }
-do:
-  - compose:
-      call: llm_compose
-      with: { prompt: 'Answer {"quiet": true} or {"quiet": false, "text": the digest}.', json: true }
-  - route:
-      switch:
-        - quiet: { when: '${ .quiet == true }', then: end }
-        - digest: { then: send }
-  - send:
-      call: send_telegram_message
-      with: { text: '${ .text }' }
-"#;
-
-// A compose step asked for JSON holds the provider to one object, and the
-// switch reads a field of it: no sentinel phrase to misspell.
-#[tokio::test]
-async fn a_json_compose_answers_an_object_a_switch_branches_on() {
-    for (reply, sent) in [(r#"{"quiet": true}"#, None), (r#"{"quiet": false, "text": "Rust 2.0"}"#, Some("Rust 2.0"))] {
-        let w = world(vec![reply]);
-        w.activate("digest", QUIET_OR_DIGEST);
-        let (result, observations) = w.run("digest").await;
-        assert!(matches!(result, FlowResult::Completed(_)), "{reply}: {result:?}");
-        let texts: Vec<Value> = w.calls().into_iter().map(|(_, args)| args["text"].clone()).collect();
-        assert_eq!(texts, sent.map(|t| json!(t)).into_iter().collect::<Vec<_>>(), "{reply}");
-        let generation = named(&observations, "llm_compose:compose");
-        assert_eq!(generation.model_parameters.as_ref().unwrap()["response_format"], "json_object");
-        assert!(generation.input.to_string().contains("Reply with one JSON object."), "{}", generation.input);
-    }
-}
-
-// A reply that is not one object faults before the send: the text a
-// sentinel branch would have mistaken for a digest never goes out.
-#[tokio::test]
-async fn a_json_compose_that_answers_text_faults_before_any_write() {
-    for reply in ["Quiet day.", "[1, 2]", r#"{"quiet": tr"#] {
-        let w = world(vec![reply]);
-        w.activate("digest", QUIET_OR_DIGEST);
-        let (result, _) = w.run("digest").await;
-        let FlowResult::Faulted { error, effects_started } = result else { panic!("{reply}: {result:?}") };
-        assert!(!effects_started && error.to_string().contains("not a JSON object"), "{reply}: {error}");
-        assert!(w.calls().is_empty(), "{reply}");
-    }
-    let w = world(vec![]);
-    let bad = QUIET_OR_DIGEST.replace("json: true", "json: 'yes'");
-    w.activate("digest", &bad);
-    let (result, _) = w.run("digest").await;
-    assert!(
-        matches!(result, FlowResult::Faulted { ref error, .. } if error.to_string().contains("`json` must be true or false")),
-        "{result:?}"
-    );
-}
-
-// ── composition and input helpers (shared with the saved-workflow host) ─────
 
 #[test]
 fn input_xml_keeps_strings_and_pretty_prints_structured_values() {
@@ -1016,7 +742,7 @@ fn tool_result_parsing_keeps_non_json_and_only_parses_objects_and_arrays() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compose_layers_base_skill_and_patch_and_keeps_prompt_only_calls_tool_free() {
     for (base, skill) in [(true, true), (true, false), (false, true), (false, false)] {
         let model = Arc::new(Scripted::new(vec![assistant(r#"{"text":"done"}"#)]));
@@ -1067,7 +793,7 @@ async fn compose_layers_base_skill_and_patch_and_keeps_prompt_only_calls_tool_fr
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_compose_with_a_missing_skill_fails_before_generation() {
     let model = Arc::new(Scripted::new(vec![]));
     let f = support::fixture(model.clone(), &[], &[]);
@@ -1088,185 +814,70 @@ async fn a_compose_with_a_missing_skill_fails_before_generation() {
     f.engine.shutdown().await;
 }
 
-#[tokio::test]
-async fn a_saved_compose_renders_prompt_before_input_xml() {
-    let w = world(vec!["written"]);
-    w.activate(
-        "draft",
-        r#"
-document: { dsl: '1.0.4', namespace: agent, name: draft, version: '1.0.0' }
-do:
-  - draft:
-      call: llm_compose
-      with: { prompt: 'Write the digest.', input: { posts: [ { id: 1 } ] } }
-"#,
-    );
-    let (result, observations) = w.run("draft").await;
-    assert!(matches!(result, FlowResult::Completed(_)));
-    let generation = named(&observations, "llm_compose:draft");
-    let messages = generation.input.as_array().unwrap();
-    assert_eq!(
-        messages.last().unwrap()["content"],
-        "Write the digest.\n\n<posts>\n[\n  {\n    \"id\": 1\n  }\n]\n</posts>"
-    );
-    assert!(generation.model_parameters.as_ref().unwrap().get("response_format").is_none());
-}
+// ── dry runs without a signal (design 05, test 2) ───────────────────────────
 
-#[tokio::test]
-async fn fast_child_starts_immediately_and_parent_never_saves_waiting() {
-    use agent::{durable::RunStore, flows::create_durable_flows};
-    let w = world(vec![]);
-    w.activate(
-        "child",
-        "document: { dsl: '1.0.4', namespace: t, name: child, version: '1.0.0' }\ndo: [ { answer: { set: '${ 42 }' } } ]",
-    );
-    w.activate(
-        "parent",
-        r#"document: { dsl: '1.0.4', namespace: t, name: parent, version: '1.0.0' }
-do:
- - start:
-     call: start_child
-     with: { workflow: child, key: one }
-     export: { as: '${ . }' }
- - wait:
-     listen: { to: { one: { with: { type: '${ "done:" + $context.run }' } } } }
-     metadata: { hold: PT1S }
- - result:
-     call: child_outcome
-     with: { run: '${ $context.run }', key: one }
-"#,
-    );
-    let dir = tempfile::tempdir().unwrap();
-    let db = AgentDb::open(dir.path().join("agent.db")).unwrap();
-    db.conn().execute_batch("CREATE TABLE waiting_saved (id TEXT); CREATE TRIGGER record_waiting AFTER UPDATE OF state ON workflow_runs WHEN NEW.state='waiting' BEGIN INSERT INTO waiting_saved VALUES (NEW.id); END;").unwrap();
-    let flows = create_durable_flows(w.engine.clone(), db.clone());
-    let trace = w.tracer.trace(TraceStart { id: "children".into(), name: "test".into(), ..Default::default() });
-    let scope: Scope = trace.clone();
-    let signal = WorkflowSignal { id: 1, source: "test".into(), content: "".into(), env_context: None };
-    let started = std::time::Instant::now();
-    let result = flows.run("parent", &signal, &task_context("test:1"), &scope, &CancellationToken::new()).await;
-    assert!(matches!(result, FlowResult::Completed(ref v) if v == &json!({"Completed":42})), "{result:?}");
-    assert!(started.elapsed() < std::time::Duration::from_secs(1));
-    assert_eq!(db.conn().query_row("SELECT count(*) FROM waiting_saved", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
-    assert_eq!(RunStore::new(db).get("test:1").unwrap().unwrap().state, "completed");
-    trace.end();
-}
-
-#[test]
-fn guard_is_reserved_readable_and_its_private_functions_are_not_in_the_catalog() {
-    let w = world(vec![]);
-    for name in ["save_workflow", "activate_workflow"] {
-        let args = json!({"name":"guard","version":1,"definition":agent::flows::built_in("guard")});
-        assert!(
-            agent::flows::tool(&w.engine, name, args.as_object().unwrap())
-                .unwrap_err()
-                .to_string()
-                .contains("reserved")
-        );
-    }
-    let args = json!({"name":"guard"});
-    let read = agent::flows::tool(&w.engine, "read_workflow", args.as_object().unwrap()).unwrap();
-    assert!(read.contains("call: review"));
-    // Even a directly stored override never replaces the reserved definition.
-    let version = w.engine.deps.workflows.save("guard", "forged", None).unwrap();
-    w.engine.deps.workflows.activate("guard", version.version).unwrap();
-    assert_eq!(agent::flows::definition(&w.engine, "guard").0, agent::flows::built_in("guard").unwrap());
-    for function in ["review", "confirm_request", "resolve_review"] {
-        let def = format!(
-            "document: {{ dsl: '1.0.4', namespace: t, name: other, version: '1.0.0' }}\ndo: [ {{ step: {{ call: {function} }} }} ]"
-        );
-        assert!(check(&*w.engine.deps.mcp, &def).is_err(), "{function}");
-        assert!(agent::flows::functions(&w.engine, json!({"name":function}).as_object().unwrap()).is_err());
-    }
-}
-
-#[tokio::test]
-async fn a_waiting_saved_child_recovers_in_its_parents_session() {
-    use agent::{db::TraceStore, durable::RunStore, flows::create_durable_flows};
-    let mut w = world(vec![]);
-    w.activate(
-        "child",
-        r#"document: { dsl: '1.0.4', namespace: t, name: child, version: '1.0.0' }
-do:
- - event: { listen: { to: { one: { with: { type: child-answer } } } } }
- - result: { set: '${ 42 }' }
-"#,
-    );
-    w.activate("parent",r#"document: { dsl: '1.0.4', namespace: t, name: parent, version: '1.0.0' }
-do:
- - start:
-     call: start_child
-     with: { workflow: child, key: one }
-     export: { as: '${ . }' }
- - first:
-     listen: { to: { any: [{ with: { type: '${ "done:" + $context.run }' } },{ with: { type: '${ "waiting:" + $context.run }' } }] } }
-     metadata: { hold: PT1S }
- - final:
-     if: '${ .[0].type == ("waiting:" + $context.run) }'
-     listen: { to: { one: { with: { type: '${ "done:" + $context.run }' } } } }
- - result:
-     call: child_outcome
-     with: { run: '${ $context.run }', key: one }
-"#);
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("agent.db");
-    let db = AgentDb::open(&path).unwrap();
-    w.tracer = Arc::new(agent::local_recorder::local_recorder_tracer(Arc::new(db.clone())));
-    Arc::get_mut(&mut w.engine).unwrap().deps.tracer = w.tracer.clone();
-    let flows = create_durable_flows(w.engine.clone(), db.clone());
-    let trace = w.tracer.trace(TraceStart {
-        id: "parents-session".into(),
-        session_id: Some("shared-session".into()),
-        name: "test".into(),
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dry_run_records_the_writes_and_changes_nothing() {
+    let w = world(vec!["Today: Rust 2.0"]);
+    let draft = DIGEST.replace("do:\n", "do:\n  - pause: { wait: PT1H }\n");
+    let saved = w.tool("save_workflow", json!({"name": "digest", "definition": draft})).await.unwrap();
+    assert_eq!(saved["version"], 1, "{saved}");
+    let session = support::task_context("author");
+    let cancel = CancellationToken::new();
+    let trace = w.engine.deps.tracer.trace(agent::tracing::TraceStart {
+        id: "author".into(),
+        name: "t".into(),
         ..Default::default()
     });
-    let scope: Scope = trace.clone();
-    let signal = WorkflowSignal { id: 2, source: "test".into(), content: "".into(), env_context: None };
-    let cancel = CancellationToken::new();
-    assert!(matches!(
-        flows.run("parent", &signal, &task_context("shared-session"), &scope, &cancel).await,
-        FlowResult::Waiting { .. }
-    ));
+    let scope: agent::tracing::Scope = trace.clone();
+    let args = |v: Value| v.as_object().unwrap().clone();
+    let try_draft = agent::sandbox::try_draft;
+    let reply = try_draft(&w.engine, &args(json!({"name": "digest"})), &session, &scope, &cancel).await.unwrap();
     trace.end();
-    drop(flows);
-    let db = AgentDb::open(&path).unwrap();
-    let runs = RunStore::new(db.clone());
-    assert!(runs.deliver("child-answer", &json!({})).unwrap());
-    let flows = create_durable_flows(w.engine.clone(), db.clone());
-    assert_eq!(flows.recover_once(&cancel).await.unwrap(), 1);
-    assert_eq!(flows.recover_once(&cancel).await.unwrap(), 1);
-    assert_eq!(
-        runs.get("test:2").unwrap().unwrap().outcome,
-        Some(owf::run::Status::Completed(json!({"Completed":42})))
-    );
-    let (trace, observations) = db.get_trace("parents-session").unwrap().unwrap();
-    assert_eq!(trace.session_id.as_deref(), Some("shared-session"));
-    assert_eq!(trace.output, json!({"Completed":42}));
-    assert_eq!(db.list_recent(20, None).unwrap().len(), 1);
-    let child = observations.iter().find(|o| o.name == "resume:child").unwrap();
-    let anchor_span = observations.iter().find(|o| Some(&o.id) == child.parent_observation_id.as_ref()).unwrap();
-    assert_eq!(anchor_span.name, "call:start");
-    assert!(observations.iter().any(|o| o.name == "resume:parent"));
+    let reply: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!((reply["status"].as_str(), reply["version"].as_u64()), (Some("completed"), Some(1)), "{reply}");
+
+    assert_eq!(w.calls().iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["search_news"], "only the read ran");
+    assert!(w.persist.0.lock().unwrap().is_empty(), "no watermark moved");
+    let writes: Vec<(&str, &str, &str)> = reply["writes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| (w["function"].as_str().unwrap(), w["task"].as_str().unwrap(), w["via"].as_str().unwrap()))
+        .collect();
+    assert_eq!(writes, [("send_telegram_message", "/do/3/send", "yaml"), ("set_memory", "/do/4/mark", "yaml")]);
+    assert_eq!(reply["writes"][0]["arguments"]["text"], "Today: Rust 2.0");
+    let compose = reply["steps"].as_array().unwrap().iter().find(|s| s["task"] == "/do/2/compose").unwrap();
+    assert_eq!(compose["output"], "Today: Rust 2.0");
+    assert_eq!(reply["path"], json!(["pause", "search", "compose", "send", "mark"]));
+    let digest = ouro_runtime::durable::digest_of(&draft);
+    let meta = agent::flows::WorkflowMeta::get(&w.engine.deps.db, "digest", &digest).unwrap().unwrap();
+    assert!(meta.tried_ms.is_some(), "a completed dry run marks it");
+    assert!(reply["next"].as_str().unwrap().contains("fix"), "{reply}");
+    let observations = w.written.all().into_iter().find(|t| t.id == "author").unwrap().observations;
+    let run = observations.iter().find(|o| o.name == "dry-run").unwrap();
+    assert_eq!(run.metadata.as_ref().unwrap()["workflow"], "digest");
+    let search = observations.iter().find(|o| o.name == "search_news").unwrap();
+    assert_eq!(search.parent_observation_id.as_deref(), Some(run.id.as_str()));
+    assert!(try_draft(&w.engine, &args(json!({"name": "nope"})), &session, &scope, &cancel).await.is_err());
 }
 
-#[tokio::test]
-async fn a_run_admitted_without_an_anchor_retains_its_separate_resume_trace() {
-    use agent::{db::TraceStore, durable::RunStore, flows::create_durable_flows};
-    let mut w = world(vec![]);
-    let dir = tempfile::tempdir().unwrap();
-    let db = Arc::new(AgentDb::open(dir.path().join("agent.db")).unwrap());
-    Arc::get_mut(&mut w.engine).unwrap().deps.tracer =
-        Arc::new(agent::local_recorder::local_recorder_tracer(db.clone()));
-    let definition = "document: {dsl: '1.0.4', namespace: t, name: legacy, version: '1.0.0'}\ndo:\n  - done: {set: '${ \"finished\" }'}\n";
-    let runs = RunStore::new((*db).clone());
-    runs.admit("legacy", "legacy", definition, &json!({"__session_id":"original"})).unwrap();
-    assert!(runs.get("legacy").unwrap().unwrap().trace_anchor.is_none());
-    let flows = create_durable_flows(w.engine, (*db).clone());
-    assert_eq!(flows.recover_once(&CancellationToken::new()).await.unwrap(), 1);
-    let rows = db.list_recent(20, None).unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].name, "resume:legacy");
-    let (trace, _) = db.get_trace(&rows[0].id).unwrap().unwrap();
-    assert_eq!(trace.session_id.as_deref(), Some("original"));
-    assert_eq!(trace.output, "finished");
+// A version that no longer passes the gate (a tool went away) is not tried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dry_run_of_a_version_that_no_longer_fits_the_tools_is_refused() {
+    let before = world_on(vec![], None, agent::runs::memory_store_with_view(), &["search_web"]);
+    let calling = DIGEST.replace("call: search_news", "call: search_web").replace("query:", "q:");
+    before.tool("save_workflow", json!({"name": "digest", "definition": calling})).await.unwrap();
+    let w = world_on(vec![], None, before.store.clone(), &[]);
+    let session = support::task_context("author");
+    let args = json!({"name": "digest", "version": 1});
+    let invalid = agent::sandbox::try_draft(
+        &w.engine,
+        args.as_object().unwrap(),
+        &session,
+        &agent::tracing::null_scope(),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(invalid.unwrap_err().to_string().contains("search_web"));
 }

@@ -16,7 +16,6 @@ use agent::{
     mcp::{Client, ConnectOptions, McpClient, Open, SharedMcp},
     models::{ModelPreset, Presets, ReasoningEffort},
     providers::{ChatProvider, CompletionParams, CompletionResult, Message, ProviderKind, role},
-    session::EnvDeps,
     skills::FsSkillStore,
     supervisor::{create_supervisor, run_poll_loop},
     tracing::TokenUsage,
@@ -123,12 +122,7 @@ fn expected(id: i64, p: &Plan) -> Expected {
         let mut texts = Vec::new();
         for (i, act) in acts.iter().enumerate() {
             match act {
-                Act::Send(true) => {
-                    texts.push(send_text(id, i, true));
-                    if p.source() == "telegram" {
-                        break;
-                    }
-                }
+                Act::Send(true) => texts.push(send_text(id, i, true)),
                 Act::Send(false) => {}
                 Act::Crash => {
                     texts.push(recovery_text(id));
@@ -374,6 +368,7 @@ async fn run(plans: &[(i64, Plan)]) -> Run {
     std::fs::create_dir(&live_dir).unwrap();
     std::fs::write(live_dir.join("telegram.md"), "---\ntools: *\n---\nFixture Telegram transport rules.\n").unwrap();
     let skill_store = Arc::new(FsSkillStore { live_dir, defaults_dir: repo.join("skills.default") });
+    let (store, dry_store) = agent::runs::memory_store_with_view();
     let engine = create_engine(EngineDeps {
         providers: Providers {
             openai: provider.clone(),
@@ -389,15 +384,13 @@ async fn run(plans: &[(i64, Plan)]) -> Run {
         tracer: Arc::new(local_recorder_tracer(db.clone())),
         codex: Arc::new(NoCodex),
         decisions: Some(support::allow_guard()),
-        workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
-        schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
+        env: agent::session::EnvConfig { user_email: None, telegram_chat_id: Some(CHAT.to_string()) },
+        db: (*db).clone(),
+        store,
+        dry_store,
+        schedule: std::sync::Arc::new(agent::schedule::Schedules::in_memory()),
     });
-    support::activate_telegram_loop(&engine);
-    let supervisor = create_supervisor(
-        engine.clone(),
-        EnvDeps { mcp: mcp.clone(), memory: db.clone(), user_email: None, telegram_chat_id: Some(CHAT.to_string()) },
-        agent::flows::create_flows(engine.clone()),
-    );
+    let supervisor = create_supervisor(engine.clone());
     run_poll_loop(mcp, supervisor.clone(), world.drained.clone(), std::time::Duration::ZERO).await.unwrap();
 
     let traced = plans

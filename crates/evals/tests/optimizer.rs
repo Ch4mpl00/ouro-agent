@@ -9,7 +9,9 @@ use evals::optimizer::{compact_trace, prompt, proposal_yaml, propose};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-const DEFINITION: &str = include_str!("../../agent/workflows/agent-loop.yaml");
+// The reference loop, a definition in the engine's dialect the workbench
+// runs (design 07).
+const DEFINITION: &str = agent::agent::AGENT_LOOP;
 
 fn observation(id: &str, kind: ObservationType, parent: Option<&str>) -> Observation {
     Observation {

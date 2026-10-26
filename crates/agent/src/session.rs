@@ -169,6 +169,14 @@ pub fn format_local_time(now: DateTime<Utc>, tz: &str) -> anyhow::Result<String>
     Ok(now.with_timezone(&zone).format("%Y-%m-%d %H:%M").to_string())
 }
 
+/// What the host configures about the user (read from env once, in main):
+/// their email and the default Telegram chat.
+#[derive(Clone, Debug, Default)]
+pub struct EnvConfig {
+    pub user_email: Option<String>,
+    pub telegram_chat_id: Option<String>,
+}
+
 // What gathering env data needs: one MCP call, one memory read and the
 // user's email (read from env once, in main).
 pub struct EnvDeps {

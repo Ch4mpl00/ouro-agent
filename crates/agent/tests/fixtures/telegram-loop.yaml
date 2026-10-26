@@ -2,7 +2,10 @@ document: { dsl: '1.0.4', namespace: agent, name: telegram-loop, version: '1.0.0
 # The reference for a channel's flow as ONE loop: it declares the route that
 # starts it, gathers its own first-turn context and sets up its instructions;
 # a worker running it has no signal and skips all of that. Fixed steps (the
-# status bubble) are direct calls; `tool` is only for the model's calls.
+# status bubble) are direct calls; only the model's calls go through the
+# guarded round (`start_guard`, `classify`, `tool_once` / `tool_repeat`).
+# Its input names the signal it was started for (a route's) and the
+# conversation it serves; the host's functions read their own host data.
 # Keep the guarded round in sync with ../../workflows/agent-loop.yaml.
 input:
   from: '${ . + { i: 0 } }'
@@ -12,14 +15,14 @@ do:
       do:
         - input:
             call: signal_input
-            export: { as: '${ $context + { input: . } }' }
+            export: { as: '${ $context + { input: .input } }' }
         - activity:
             call: recent_activity
             export: { as: '${ $context + { activity: . } }' }
         - pending_confirmations:
-            if: '${ $context.loop.confirm != null }'
+            if: '${ $context.confirm != null }'
             call: pending_confirmations
-            with: { target: '${ $context.loop.confirm }' }
+            with: { target: '${ $context.confirm }' }
             export: { as: '${ $context + { pending_confirmations: . } }' }
         - preselect:
             call: preselect_skills
@@ -43,25 +46,25 @@ do:
                 ] }
             export: { as: '${ $context + { messages: .messages, memory: .memory } }' }
         - status:
-            if: '${ $context.loop.conversation != null }'
+            if: '${ $context.conversation != null }'
             call: telegram_send_status
             with:
               id: '${ "status:" + ($context.signal.id | tostring) }'
               text: 👀
-              chatId: '${ $context.loop.conversation.chatId }'
-              messageThreadId: '${ $context.loop.conversation.messageThreadId }'
+              chatId: '${ $context.conversation.chatId }'
+              messageThreadId: '${ $context.conversation.messageThreadId }'
             export: { as: '${ $context + { status: true } }' }
   - turn:
       call: agent_turn
-      with: { loop: '${ $context.loop }', messages: '${ $context.messages }', memory: '${ $context.memory }', i: '${ $context.i }', extra_turn: '${ $context.nudged // false }' }
+      with: { messages: '${ $context.messages }', memory: '${ $context.memory }', i: '${ $context.i }', extra_turn: '${ $context.nudged // false }' }
       export: { as: '${ $context + { messages: ($context.messages + [ .message ]), calls: .calls, i: ($context.i + 1) } }' }
   - route:
       switch:
         - answered: { when: '${ .calls == [] }', then: answer }
         - act: { then: guard }
   - guard:
-      call: start_child
-      with: { workflow: guard, calls: '${ $context.calls }', i: '${ $context.i }' }
+      call: start_guard
+      with: { calls: '${ $context.calls }', i: '${ $context.i }' }
       export: { as: '${ $context + { guard_run: .run, guarded: (.guarded // []) } }' }
   - round:
       # Independent calls keep progressing while the guard waits for a press.
@@ -69,32 +72,47 @@ do:
         branches:
           - ready:
               for: { each: entry, in: '${ $context.calls | to_entries | map(select(.key as $k | ($context.guarded // [] | index($k)) == null)) }' }
-              metadata: { concurrency: 16 }
+              metadata: { ouro: { concurrency: 16 } }
               do:
                 - start_worker:
                     if: '${ $entry.value.name == "invoke_sub_agent" }'
-                    call: start_child
-                    with: { workflow: agent-loop, call: '${ $entry.value }', i: '${ $context.i }', index: '${ $entry.key }', memory: '${ $context.memory }' }
-                    export: { as: '${ $context + { worker: .run, worker_loop: .loop } }' }
+                    call: start_worker
+                    with: { call: '${ $entry.value }', i: '${ $context.i }', index: '${ $entry.key }', memory: '${ $context.memory }' }
+                    export: { as: '${ $context + { worker: .id } }' }
                 - wait_worker:
                     if: '${ $context.worker != null }'
                     listen:
+                      read: envelope
                       to:
                         any:
                           - with: { type: '${ "done:" + $context.worker }' }
                           - with: { type: '${ "waiting:" + $context.worker }' }
-                    metadata: { hold: PT15M }
+                    metadata: { ouro: { hold: PT15M } }
                 - sleep_worker:
                     if: '${ $context.worker != null and .[0].type == ("waiting:" + $context.worker) }'
                     listen: { to: { one: { with: { type: '${ "done:" + $context.worker }' } } } }
-                - one:
-                    call: tool
+                - classify:
+                    call: classify
+                    with: { call: '${ $entry.value }', guard_run: null, worker_run: '${ $context.worker // null }' }
+                    export: { as: '${ $context + { once: .once } }' }
+                - once:
+                    if: '${ $context.once }'
+                    try:
+                      - send:
+                          call: tool_once
+                          with: { call: '${ $entry.value }', guard_run: null, i: '${ $context.i }', index: '${ $entry.key }', memory: '${ if ($entry.value.name | startswith("working_memory_")) then $context.memory else null end }' }
+                    catch:
+                      errors: { with: { type: urn:ouro:errors:call.unknown } }
+                      do:
+                        - unknown:
+                            set: '${ { presented: ("[tool error] outcome unknown: " + $entry.value.name + " was sent before a restart and its reply was lost, so it may or may not have run. Check its effect before repeating it."), failed: true } }'
+                - repeat:
+                    if: '${ $context.once | not }'
+                    call: tool_repeat
                     with:
-                      loop: '${ $context.loop }'
                       call: '${ $entry.value }'
                       guard_run: null
                       worker_run: '${ $context.worker // null }'
-                      worker_loop: '${ $context.worker_loop // null }'
                       i: '${ $context.i }'
                       index: '${ $entry.key }'
                       memory: '${ if ($entry.value.name | startswith("working_memory_")) or $entry.value.name == "invoke_sub_agent" then $context.memory else null end }'
@@ -105,32 +123,44 @@ do:
                 - wait_guard:
                     if: '${ $context.guard_run != null }'
                     listen:
+                      read: envelope
                       to:
                         any:
                           - with: { type: '${ "done:" + $context.guard_run }' }
                           - with: { type: '${ "waiting:" + $context.guard_run }' }
-                    metadata: { hold: PT60S }
+                    metadata: { ouro: { hold: PT60S } }
                 - sleep_guard:
                     if: '${ $context.guard_run != null and .[0].type == ("waiting:" + $context.guard_run) }'
                     listen: { to: { one: { with: { type: '${ "done:" + $context.guard_run }' } } } }
                 - calls:
                     for: { each: entry, in: '${ $context.calls | to_entries | map(select(.key as $k | ($context.guarded // [] | index($k)) != null)) }' }
-                    metadata: { concurrency: 16 }
+                    metadata: { ouro: { concurrency: 16 } }
                     do:
-                      - one:
-                          call: tool
-                          with:
-                            loop: '${ $context.loop }'
-                            call: '${ $entry.value }'
-                            guard_run: '${ $context.guard_run // null }'
-                            i: '${ $context.i }'
-                            index: '${ $entry.key }'
+                      - classify:
+                          call: classify
+                          with: { call: '${ $entry.value }', guard_run: '${ $context.guard_run // null }', worker_run: null }
+                          export: { as: '${ $context + { once: .once } }' }
+                      - once:
+                          if: '${ $context.once }'
+                          try:
+                            - send:
+                                call: tool_once
+                                with: { call: '${ $entry.value }', guard_run: '${ $context.guard_run // null }', i: '${ $context.i }', index: '${ $entry.key }' }
+                          catch:
+                            errors: { with: { type: urn:ouro:errors:call.unknown } }
+                            do:
+                              - unknown:
+                                  set: '${ { presented: ("[tool error] outcome unknown: " + $entry.value.name + " was sent before a restart and its reply was lost, so it may or may not have run. Check its effect before repeating it."), failed: true } }'
+                      - repeat:
+                          if: '${ $context.once | not }'
+                          call: tool_repeat
+                          with: { call: '${ $entry.value }', guard_run: '${ $context.guard_run // null }', i: '${ $context.i }', index: '${ $entry.key }' }
                       - indexed:
                           set: '${ { index: $entry.key, result: . } }'
       output: { as: '${ (.[0] + .[1]) | sort_by(.index) | map(.result) }' }
   - settle:
       call: agent_settle
-      with: { loop: '${ $context.loop }', calls: '${ $context.calls }', results: '${ . }', memory: '${ $context.memory }' }
+      with: { calls: '${ $context.calls }', results: '${ . }', memory: '${ $context.memory }' }
       export: { as: '${ $context + { messages: ($context.messages + .replies), memory: .memory } }' }
   - delivery:
       # Decide on what the call asked for and whether it succeeded, never on
@@ -138,9 +168,9 @@ do:
       set: >-
         ${ . + { reply: ([ .outcomes[]
           | select(.ok and .name == "send_telegram_message" and (.arguments | type) == "object")
-          | select($context.loop.conversation != null)
-          | select((.arguments.chatId | tostring) == ($context.loop.conversation.chatId | tostring))
-          | select(.arguments.messageThreadId == $context.loop.conversation.messageThreadId)
+          | select($context.conversation != null)
+          | select((.arguments.chatId | tostring) == ($context.conversation.chatId | tostring))
+          | select(.arguments.messageThreadId == $context.conversation.messageThreadId)
           | .arguments.text | select(type == "string") ] | last) } }
       export: { as: '${ $context + { replied: (($context.replied // false) or .reply != null) } }' }
   - next:
@@ -155,7 +185,7 @@ do:
       set: '${ { output: .content } }'
   - ending:
       switch:
-        - silent: { when: '${ $context.loop.conversation != null and ($context.replied // false) == false and ($context.nudged // false) == false }', then: nudge }
+        - silent: { when: '${ $context.conversation != null and ($context.replied // false) == false and ($context.nudged // false) == false }', then: nudge }
         - done: { then: clear }
   - nudge:
       set: { role: user, content: "Nothing was sent to the user in this conversation yet. Reply there, or finish if no reply is needed." }
@@ -168,8 +198,8 @@ do:
       with:
         id: '${ "status:" + ($context.signal.id | tostring) }'
         text: ''
-        chatId: '${ $context.loop.conversation.chatId }'
-        messageThreadId: '${ $context.loop.conversation.messageThreadId }'
+        chatId: '${ $context.conversation.chatId }'
+        messageThreadId: '${ $context.conversation.messageThreadId }'
       output: { as: '${ $task.input }' }
 output:
   as: '${ .output }'

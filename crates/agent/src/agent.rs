@@ -42,43 +42,120 @@ pub struct EngineDeps {
     pub tracer: Arc<dyn Tracer>,
     pub codex: SharedCodex,
     pub decisions: Option<Arc<crate::decisions::DecisionClient>>,
-    pub workflows: Arc<dyn crate::flows::WorkflowStore>,
-    pub schedule: Arc<dyn crate::schedule::ScheduleStore>,
+    // The schedule's seam: the fire table, the task-write mutex, the
+    // drain's wake-up (schedule.rs §1).
+    pub schedule: Arc<crate::schedule::Schedules>,
+    // The user's email and default chat, for a signal's session.
+    pub env: crate::session::EnvConfig,
+    // The agent's tables beside the engine's: evidence, run anchors, the MCP
+    // tool snapshot, confirmation cards (runs.rs §2, confirmation.rs).
+    pub db: crate::db::AgentDb,
+    // The engine's run store (runs.rs §1): `ouro_*` tables in engine.db.
+    pub store: Arc<dyn ouro_runtime::durable::RunStore>,
+    // A read-only view of `store`, opened by the composition root after
+    // `store` migrated (`runs::open_store_view`; tests:
+    // `runs::memory_store_with_view`): the definitions a dry run reads
+    // (sandbox.rs, design 05 decision 1).
+    pub dry_store: Arc<dyn ouro_runtime::durable::RunStore>,
 }
 
 pub struct Engine {
     pub deps: EngineDeps,
+    // Every workflow run is an engine run (runs.rs). Its registry's handlers
+    // hold this engine weakly, so neither keeps the other alive.
+    pub runtime: Arc<ouro_runtime::Runtime>,
+    pub control: ouro_runtime::control::Control,
+    // The runtime's time (its timers, leases, wake-ups).
+    pub clock: Arc<dyn ouro_runtime::durable::Clock>,
+    pub scopes: crate::runs::Scopes,
+    lifecycle: Arc<crate::runs::Lifecycle>,
+    events: std::sync::Mutex<Option<ouro_runtime::BufferedEvents>>,
+    pub(crate) drained: crate::runs::Drained,
+    // Live loops by run id; a run's functions rebuild its loop from its host
+    // data when it is not here (after a restart, in another process).
     loops: tokio::sync::Mutex<HashMap<String, Arc<AgentLoop>>>,
+    // Working memories by session id, shared by the loops of one task while
+    // they live.
+    sessions: std::sync::Mutex<HashMap<String, Weak<crate::session::SessionContext>>>,
     stopping: AtomicBool,
+    stop: CancellationToken,
+    background: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    booted: tokio::sync::OnceCell<()>,
     shutdown: tokio::sync::Mutex<bool>,
-    // A dry run's own engine (sandbox.rs): its writes answer with a mock and
-    // its confirmations are answered on the spot.
-    sandbox: Option<Arc<crate::sandbox::Sandbox>>,
+    // Set on a dry run's engine only (sandbox.rs): the few places a dry run
+    // differs in kind ask it (design 05, decision 12): the confirmation
+    // press, the card edit, a model's write, the turn and call records, the
+    // recovery start, the version set aside.
+    pub sandbox: Option<Arc<crate::sandbox::Sandbox>>,
 }
 
 pub fn create_engine(deps: EngineDeps) -> Arc<Engine> {
-    create(deps, None)
+    create_engine_with(deps, crate::runs::config())
 }
 
-/// The engine of one dry run, over the sandbox's stores.
-pub(crate) fn create_sandbox_engine(deps: EngineDeps, sandbox: Arc<crate::sandbox::Sandbox>) -> Arc<Engine> {
-    create(deps, Some(sandbox))
+/// An engine with the runtime configured as `config` (capacity, budget).
+pub fn create_engine_with(deps: EngineDeps, config: ouro_runtime::Config) -> Arc<Engine> {
+    create_engine_on(deps, config, Arc::new(ouro_runtime::durable::SystemClock))
 }
 
-fn create(deps: EngineDeps, sandbox: Option<Arc<crate::sandbox::Sandbox>>) -> Arc<Engine> {
-    Arc::new(Engine {
-        deps,
-        loops: Default::default(),
-        stopping: AtomicBool::new(false),
-        shutdown: Default::default(),
-        sandbox,
+/// An engine whose runtime keeps time by `clock` (its timers, leases and
+/// timeouts): tests move it past a 24-hour confirmation.
+pub fn create_engine_on(
+    deps: EngineDeps,
+    config: ouro_runtime::Config,
+    clock: Arc<dyn ouro_runtime::durable::Clock>,
+) -> Arc<Engine> {
+    build_engine(deps, config, clock, None)
+}
+
+/// A dry run's engine (sandbox.rs): its runtime's store is `deps.store` (the
+/// sandbox's guard store), its registry is built over itself, so every
+/// handler of a dry run uses its dry deps, and it is never started.
+pub fn create_sandbox_engine(deps: EngineDeps, sandbox: Arc<crate::sandbox::Sandbox>) -> Arc<Engine> {
+    build_engine(deps, crate::runs::config(), Arc::new(ouro_runtime::durable::SystemClock), Some(sandbox))
+}
+
+fn build_engine(
+    deps: EngineDeps,
+    config: ouro_runtime::Config,
+    clock: Arc<dyn ouro_runtime::durable::Clock>,
+    sandbox: Option<Arc<crate::sandbox::Sandbox>>,
+) -> Arc<Engine> {
+    let (lifecycle, events) = crate::runs::Lifecycle::new(10_000);
+    let store = deps.store.clone();
+    Arc::new_cyclic(|engine: &Weak<Engine>| {
+        let registry = crate::functions::registry(engine.clone(), &deps);
+        let runtime = ouro_runtime::Runtime::new(
+            store.clone(),
+            Arc::new(registry),
+            config,
+            clock.clone(),
+            ouro_runtime::opentelemetry::global::tracer("agent-supervisor"),
+        )
+        .expect("a valid runtime configuration")
+        .with_observer(lifecycle.clone());
+        Engine {
+            deps,
+            runtime: Arc::new(runtime),
+            control: ouro_runtime::control::Control::new(store, clock.clone()),
+            clock,
+            scopes: Default::default(),
+            lifecycle,
+            events: std::sync::Mutex::new(Some(events)),
+            drained: Default::default(),
+            loops: Default::default(),
+            sessions: Default::default(),
+            stopping: AtomicBool::new(false),
+            stop: CancellationToken::new(),
+            background: Default::default(),
+            booted: Default::default(),
+            shutdown: Default::default(),
+            sandbox,
+        }
     })
 }
 
 impl Engine {
-    pub fn sandbox(&self) -> Option<&Arc<crate::sandbox::Sandbox>> {
-        self.sandbox.as_ref()
-    }
     pub fn resolve_provider(&self, model: &str) -> anyhow::Result<SharedProvider> {
         let providers = &self.deps.providers;
         if providers::is_openrouter_model(model) {
@@ -94,58 +171,83 @@ impl Engine {
             providers.openai.clone()
         })
     }
+    /// The working memory of session `id`: the live one its loops share, or
+    /// a new one.
+    pub fn session(&self, id: &str, env: crate::session::EnvData) -> Session {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.retain(|_, s| s.strong_count() > 0);
+        if let Some(live) = sessions.get(id).and_then(Weak::upgrade) {
+            return live;
+        }
+        let created = crate::session::session(id, env);
+        sessions.insert(id.into(), Arc::downgrade(&created));
+        created
+    }
+    /// Shares `session` with the loops started under its id from now on.
+    pub fn adopt_session(&self, session: &Session) {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.entry(session.id.clone()).or_insert_with(|| Arc::downgrade(session));
+    }
+    /// Where `run`'s functions trace now (runs.rs §4); a run without an
+    /// anchor traces nowhere.
+    pub fn scope_for(&self, run: &str, name: &str) -> Scope {
+        self.scopes.scope(run, &self.deps.db, &*self.deps.tracer, name).unwrap_or_else(crate::tracing::null_scope)
+    }
+    /// Adds MCP's current tools to the snapshot and installs the registry
+    /// built from it (design 03, A; decision 10).
+    pub fn refresh_tools(self: &Arc<Self>) -> anyhow::Result<()> {
+        let tools: Vec<(String, bool)> =
+            self.deps.mcp.tools().into_iter().map(|t| (t.name.clone(), self.deps.mcp.read_only(&t.name))).collect();
+        self.deps.db.snapshot_tools(&tools)?;
+        self.runtime.set_registry(Arc::new(crate::functions::registry(Arc::downgrade(self), &self.deps)));
+        Ok(())
+    }
+    /// Starts the engine's background work once (runs.rs §5, §8): the
+    /// engine worker in a restart loop, the lifecycle drain and the
+    /// reconciler. Started after MCP answered (decision 10); idempotent.
+    pub fn start(self: &Arc<Self>) {
+        let mut background = self.background.lock().unwrap_or_else(|e| e.into_inner());
+        if background.is_some() || self.stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        let events = self.events.lock().unwrap_or_else(|e| e.into_inner()).take();
+        *background = Some(tokio::spawn(crate::runs::background(Arc::downgrade(self), events, self.stop.clone())));
+    }
+    /// Boots once (the built-ins, the cut-over; runs.rs `boot`) and starts
+    /// the background work: what a signal or a loop run needs first.
+    pub async fn ready(self: &Arc<Self>) -> anyhow::Result<()> {
+        self.booted.get_or_try_init(|| crate::runs::boot(self)).await?;
+        self.start();
+        Ok(())
+    }
+    pub fn started(&self) -> bool {
+        self.background.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+    pub(crate) fn lifecycle(&self) -> &crate::runs::Lifecycle {
+        &self.lifecycle
+    }
     pub async fn start_loop(self: &Arc<Self>, opts: LoopOptions) -> anyhow::Result<Arc<AgentLoop>> {
         self.create_or_join_loop(opts, false).await
     }
     async fn create_or_join_loop(self: &Arc<Self>, opts: LoopOptions, join: bool) -> anyhow::Result<Arc<AgentLoop>> {
         self.check_start(&opts)?;
-        if let Some(live) = self.loops.lock().await.get(&opts.id).cloned() {
+        if let Some(live) = self.loops.lock().await.get(&opts.id).cloned().filter(|l| !l.is_closed()) {
             if join {
                 return Ok(live);
             }
             anyhow::bail!("agent-loop id {} already exists", opts.id);
         }
-        let mut resolved: Map<String, Value> = Map::new();
-        let mut accumulated = HashSet::new();
-        let mut wildcard = false;
-        for (required, names) in [
-            (true, opts.skills.as_slice()),
-            (false, if opts.include_engine_skills { self.deps.skills.as_slice() } else { &[] }),
-        ] {
-            for name in names {
-                let Some(skill) = self.deps.skill_store.read_skill(name).await? else {
-                    if required {
-                        anyhow::bail!(
-                            "session skill \"{name}\" not found (skills/{name}.md and skills.default/{name}.md both missing)"
-                        );
-                    }
-                    eprintln!("[{}] [warn] engine skill \"{name}\" not found, skipping", opts.id);
-                    continue;
-                };
-                resolved.insert(name.clone(), skill.body.into());
-                match skill.tools {
-                    SkillTools::All => wildcard = true,
-                    SkillTools::Named(tools) => accumulated.extend(tools),
-                }
-            }
-        }
-        let mut allowed = if wildcard { None } else { Some(accumulated) };
-        if let Some(whitelist) = &opts.tool_whitelist {
-            allowed = Some(match allowed {
-                None => whitelist.clone(),
-                Some(set) => set.intersection(whitelist).cloned().collect(),
-            });
-        }
+        let prepared = prepare(self, &opts).await?;
         // IO above may have overlapped shutdown or another start of this id.
         let mut registry = self.loops.lock().await;
         self.check_start(&opts)?;
-        if let Some(live) = registry.get(&opts.id) {
+        if let Some(live) = registry.get(&opts.id).filter(|l| !l.is_closed()) {
             if join {
                 return Ok(live.clone());
             }
             anyhow::bail!("agent-loop id {} already exists", opts.id);
         }
-        let loop_ = create_loop(self, opts, resolved, allowed)?;
+        let loop_ = create_loop(self, opts, prepared)?;
         if join {
             loop_.memory_restored.store(false, Ordering::SeqCst);
         }
@@ -169,11 +271,59 @@ impl Engine {
             }
         }
     }
+    /// Ends the live loop of run `id` if the engine built it for the run.
+    pub async fn end_run_loop(&self, id: &str) {
+        let owned = self.loops.lock().await.get(id).is_some_and(|l| l.run_owned.load(Ordering::SeqCst));
+        if owned {
+            self.end_loop(id).await;
+        }
+    }
+    /// A child its parent found ended: its span ends with its outcome and
+    /// its loop closes now, before the parent goes on (the lifecycle drain
+    /// would, later; both are idempotent).
+    pub async fn ended_child(&self, id: &str, outcome: &crate::runs::Status) {
+        self.end_run_loop(id).await;
+        self.scopes.stop(id, Some(crate::runs::span_end(outcome)));
+    }
+    /// Ends the engine-built loops of `run`'s descendants: a host-driven
+    /// loop closed mid-run cancelled its tree with it.
+    pub async fn end_tree_loops(&self, run: &str) {
+        let mut pending = vec![run.to_owned()];
+        while let Some(parent) = pending.pop() {
+            let filter = crate::runs::Runs { parent: Some(parent), ..Default::default() };
+            let Ok(page) = self.control.list(&filter, None, 1_000).await else { continue };
+            for child in page.items {
+                let id = child.admission.id;
+                Box::pin(self.end_run_loop(&id)).await;
+                // Cut off with its parent: an aborted observation.
+                self.scopes.stop(&id, Some(SpanEnd::error(aborted().to_string())));
+                pending.push(id);
+            }
+        }
+    }
     // The loops alive now: a started loop stays registered until end_loop.
     pub async fn loop_ids(&self) -> Vec<String> {
         let mut ids: Vec<_> = self.loops.lock().await.keys().cloned().collect();
         ids.sort();
         ids
+    }
+    /// Stops the engine's background work and waits for it: the worker
+    /// releases its runs for recovery (shutdown is not an end), and the
+    /// loops' calls in flight are dropped, ending their spans as aborted.
+    pub async fn halt(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        self.stop.cancel();
+        let background = self.background.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(background) = background {
+            let _ = background.await;
+        }
+    }
+    /// Whether the engine is shutting down (its runs resume at the next start).
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+    pub fn stopping(&self) -> &CancellationToken {
+        &self.stop
     }
     pub async fn shutdown(&self) {
         self.stopping.store(true, Ordering::SeqCst);
@@ -181,12 +331,16 @@ impl Engine {
         if *done {
             return;
         }
+        self.halt().await;
         let loops: Vec<_> = self.loops.lock().await.drain().map(|(_, l)| l).collect();
         // Cancel everyone first, then join their finalizers before clients close.
         for loop_ in &loops {
             loop_.cancel.cancel();
         }
         futures::future::join_all(loops.iter().map(|l| l.close())).await;
+        // What the runs traced in this process, written before the tracer
+        // closes; a resumed run continues in a segment of its own.
+        self.scopes.stop_all();
         self.deps.tracer.shutdown().await;
         self.deps.mcp.close().await;
         *done = true;
@@ -194,7 +348,7 @@ impl Engine {
 }
 
 // ── 2. loop lifecycle ───────────────────────────────────────────────────────
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfirmTarget {
     pub chat_id: String,
@@ -224,10 +378,9 @@ pub struct LoopOptions {
     pub confirm: Option<ConfirmTarget>,
     pub earlier_user_messages: Vec<String>,
     pub loaded_skill_text: String,
-    // The signal the runtime started this run for, a route's or a scheduled
-    // task's (the dispatcher's `$context.signal`): its input carries it, for
-    // its context functions.
-    pub signal: Option<Value>,
+    // The signal the runtime started this loop's run for (its `signal:<id>`
+    // run): a routed loop's context functions read it from that run.
+    pub signal_id: Option<i64>,
     pub session_id: Option<String>,
     pub tags: Option<Vec<String>>,
     pub metadata: Metadata,
@@ -257,7 +410,7 @@ impl LoopOptions {
             confirm: None,
             earlier_user_messages: Vec::new(),
             loaded_skill_text: String::new(),
-            signal: None,
+            signal_id: None,
             session_id: None,
             tags: None,
             metadata: Map::new(),
@@ -272,7 +425,9 @@ pub struct AgentLoop {
     pub model: String,
     pub reasoning_effort: crate::models::ReasoningEffort,
     pub messages: tokio::sync::Mutex<Vec<Message>>,
-    pub scope: Scope,
+    // Where its generations and tool calls trace: the scope of the run's
+    // current execution (runs.rs §4), refreshed by every host function.
+    scope: std::sync::Mutex<Scope>,
     trace: Option<Arc<dyn Trace>>,
     trace_ended: AtomicBool,
     cancel: CancellationToken,
@@ -281,7 +436,10 @@ pub struct AgentLoop {
     skills: std::sync::RwLock<LoadedSkills>,
     loaded_skills: String,
     setup: std::sync::Mutex<Setup>,
-    sub_counter: AtomicUsize,
+    sends: AtomicUsize,
+    // Built by the engine for a run's functions (`loop_for`), so ended with
+    // the run; a loop a caller started (`start_loop`) is the caller's.
+    run_owned: AtomicBool,
     observation_meta: Metadata,
     // False for a loop rebuilt after a restart until a host function has
     // put its working memory back from the run's context.
@@ -289,6 +447,27 @@ pub struct AgentLoop {
     guard: tokio::sync::Mutex<crate::guard::State>,
     // The round's calls running at once: at most max_concurrent_tools.
     slots: tokio::sync::Semaphore,
+    // Held (read) by every handler of the loop's run while it works (`enter`):
+    // `close` takes it (write), so a closed loop's calls have stopped and
+    // ended their spans before its trace ends.
+    busy: Arc<tokio::sync::RwLock<()>>,
+    // The run a send drives now (`drive`): closing the loop cancels it, so
+    // the engine never resumes a run nobody waits for.
+    driving: std::sync::Mutex<Option<String>>,
+}
+
+/// A loop entered by a handler of its run (`AgentLoop::enter`): while it
+/// lives, `AgentLoop::close` waits.
+pub struct Entered {
+    loop_: Arc<AgentLoop>,
+    _busy: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+impl std::ops::Deref for Entered {
+    type Target = Arc<AgentLoop>;
+    fn deref(&self) -> &Arc<AgentLoop> {
+        &self.loop_
+    }
 }
 
 // The skills a loop runs and the tools they allow (None: every tool).
@@ -298,15 +477,11 @@ struct LoadedSkills {
     allowed: Option<HashSet<String>>,
 }
 
-// What `loop_setup` did, and what the context functions before it captured
-// for it (§4): the guard's evidence of earlier user messages and of the
-// skills preselected for the request.
+// What `loop_setup` did, read back from the run's journal (§4).
 #[derive(Default)]
 struct Setup {
     turned: bool,
     done: bool,
-    earlier_user_messages: Option<Vec<String>>,
-    preselected: Option<(Vec<String>, String)>,
     // The preselected skills setup put into the instructions.
     loaded: Vec<String>,
 }
@@ -315,32 +490,86 @@ struct Setup {
 // working-memory rules.
 const INSTRUCTION_SEPARATOR: &str = "\n\n---\n\n";
 
-fn create_loop(
-    engine: &Arc<Engine>,
-    mut opts: LoopOptions,
-    resolved: Map<String, Value>,
-    allowed: Option<HashSet<String>>,
-) -> anyhow::Result<Arc<AgentLoop>> {
+/// What a loop's instructions are made of, read from the skill store: its
+/// skills (name and body, in order), the tools they allow (None: every tool)
+/// and the system prompt. A starter computes it for a child's admission
+/// without building the child's loop (design 03, R2-M1).
+pub struct Prepared {
+    pub names: Vec<String>,
+    pub bodies: Vec<String>,
+    pub allowed: Option<HashSet<String>>,
+    pub system: String,
+}
+
+impl Prepared {
+    /// The skill text the guard counts as what the loop was told.
+    pub fn skill_text(&self, loaded_skill_text: &str) -> String {
+        self.bodies
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(loaded_skill_text))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+}
+
+pub async fn prepare(engine: &Engine, opts: &LoopOptions) -> anyhow::Result<Prepared> {
     if opts.max_concurrent_tools == 0 {
         anyhow::bail!("maxConcurrentTools must be a positive integer");
     }
-    opts.session_id = Some(opts.session_id.clone().unwrap_or_else(|| opts.session.id.clone()));
-    let preset = engine.deps.presets.get(opts.preset).clone();
-    let opts_slots = opts.max_concurrent_tools;
-    let skill_names: Vec<_> = resolved.keys().cloned().collect();
+    let (mut names, mut bodies) = (Vec::new(), Vec::new());
+    let mut accumulated = HashSet::new();
+    let mut wildcard = false;
+    for (required, list) in [
+        (true, opts.skills.as_slice()),
+        (false, if opts.include_engine_skills { engine.deps.skills.as_slice() } else { &[] }),
+    ] {
+        for name in list {
+            if names.contains(name) {
+                continue;
+            }
+            let Some(skill) = engine.deps.skill_store.read_skill(name).await? else {
+                if required {
+                    anyhow::bail!(
+                        "session skill \"{name}\" not found (skills/{name}.md and skills.default/{name}.md both missing)"
+                    );
+                }
+                eprintln!("[{}] [warn] engine skill \"{name}\" not found, skipping", opts.id);
+                continue;
+            };
+            names.push(name.clone());
+            bodies.push(skill.body);
+            match skill.tools {
+                SkillTools::All => wildcard = true,
+                SkillTools::Named(tools) => accumulated.extend(tools),
+            }
+        }
+    }
+    let mut allowed = if wildcard { None } else { Some(accumulated) };
+    if let Some(whitelist) = &opts.tool_whitelist {
+        allowed = Some(match allowed {
+            None => whitelist.clone(),
+            Some(set) => set.intersection(whitelist).cloned().collect(),
+        });
+    }
     let mut parts = Vec::new();
     if let Some(prompt) = opts.system_prompt.as_ref().filter(|s| !s.is_empty()) {
         parts.push(prompt.as_str());
     }
-    parts.extend(resolved.values().filter_map(Value::as_str));
-    let loaded_skills = resolved
-        .values()
-        .filter_map(Value::as_str)
-        .chain(std::iter::once(opts.loaded_skill_text.as_str()))
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    parts.extend(bodies.iter().map(String::as_str));
     parts.push(WORKING_MEMORY_INSTRUCTIONS);
-    let messages = vec![providers::system(&parts.join(INSTRUCTION_SEPARATOR))];
+    let system = parts.join(INSTRUCTION_SEPARATOR);
+    Ok(Prepared { names, bodies, allowed, system })
+}
+
+fn create_loop(engine: &Arc<Engine>, mut opts: LoopOptions, prepared: Prepared) -> anyhow::Result<Arc<AgentLoop>> {
+    opts.session_id = Some(opts.session_id.clone().unwrap_or_else(|| opts.session.id.clone()));
+    engine.adopt_session(&opts.session);
+    let preset = engine.deps.presets.get(opts.preset).clone();
+    let opts_slots = opts.max_concurrent_tools;
+    let loaded_skills = prepared.skill_text(&opts.loaded_skill_text);
+    let Prepared { names: skill_names, allowed, system, .. } = prepared;
+    let messages = vec![providers::system(&system)];
     let mut metadata = opts.metadata.clone();
     metadata.extend(json!({"agent_id": opts.id, "skills": skill_names, "preset": opts.preset.as_str(), "model": preset.model, "reasoning_effort": preset.reasoning_effort.as_str(), "max_iterations": opts.max_iterations}).as_object().cloned().unwrap_or_default());
     let mut observation_meta = Map::new();
@@ -368,12 +597,12 @@ fn create_loop(
     };
     Ok(Arc::new(AgentLoop {
         engine: Arc::downgrade(engine),
-        cancel: opts.cancel.child_token(),
+        cancel: engine.stop.child_token(),
         opts,
         model: preset.model,
         reasoning_effort: preset.reasoning_effort,
         messages: tokio::sync::Mutex::new(messages),
-        scope,
+        scope: std::sync::Mutex::new(scope),
         trace,
         trace_ended: AtomicBool::new(false),
         closed: AtomicBool::new(false),
@@ -381,11 +610,14 @@ fn create_loop(
         skills: std::sync::RwLock::new(LoadedSkills { names: skill_names, allowed }),
         loaded_skills,
         setup: Default::default(),
-        sub_counter: AtomicUsize::new(0),
+        sends: AtomicUsize::new(0),
+        run_owned: AtomicBool::new(false),
         observation_meta,
         memory_restored: AtomicBool::new(true),
         slots: tokio::sync::Semaphore::new(opts_slots),
         guard: Default::default(),
+        busy: Default::default(),
+        driving: Default::default(),
     }))
 }
 
@@ -397,11 +629,42 @@ impl AgentLoop {
             trace.end();
         }
     }
+    /// Closes the loop: its generation and calls are cancelled, the run a
+    /// send drives is cancelled with its tree (and the loops of that tree
+    /// closed), and the trace ends once every call has stopped.
     pub async fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
         self.cancel.cancel();
+        let driving = self.driving.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let (Some(run), Some(engine)) = (driving, self.engine.upgrade())
+            && !engine.is_stopping()
+        {
+            if let Err(error) = engine.runtime.cancel(&run).await {
+                eprintln!("[{}] cancelling run {run}: {error:#}", self.opts.id);
+            }
+            engine.end_tree_loops(&run).await;
+        }
         let _joined = self.gate.lock().await;
+        let _idle = self.busy.write().await;
         self.end_trace();
+    }
+    /// Enters the loop for one handler of its run; a closed loop refuses.
+    pub(crate) async fn enter(self: &Arc<Self>) -> anyhow::Result<Entered> {
+        let busy = self.busy.clone().read_owned().await;
+        if self.is_closed() {
+            return Err(aborted());
+        }
+        Ok(Entered { loop_: self.clone(), _busy: busy })
+    }
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+    /// Where this loop traces now.
+    pub fn scope(&self) -> Scope {
+        self.scope.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+    fn rescope(&self, scope: Scope) {
+        *self.scope.lock().unwrap_or_else(|e| e.into_inner()) = scope;
     }
     pub fn run(self: &Arc<Self>) -> BoxFuture<'static, anyhow::Result<String>> {
         self.execute(None)
@@ -413,6 +676,7 @@ impl AgentLoop {
         let loop_ = self.clone();
         async move {
             check(&loop_.cancel)?;
+            check(&loop_.opts.cancel)?;
             if loop_.closed.load(Ordering::SeqCst) {
                 return Err(aborted());
             }
@@ -421,7 +685,7 @@ impl AgentLoop {
             check(&loop_.cancel)?;
             let outcome = loop_.drive(text).await;
             if let Err(error) = &outcome {
-                loop_.scope.update(ContextUpdate {
+                loop_.scope().update(ContextUpdate {
                     output: Some(json!({"error": error.to_string()})),
                     metadata: Some(json!({"error": true}).as_object().cloned().unwrap_or_default()),
                     ..Default::default()
@@ -432,27 +696,106 @@ impl AgentLoop {
         }
         .boxed()
     }
-    // Runs this loop's `agent-loop` workflow here, from its transcript plus
-    // `text`, to its answer.
+    // Runs this loop's workflow as an engine run (kind `loop`), from its
+    // transcript plus `text`, to its answer: the run's functions find this
+    // live loop under the run's id.
     async fn drive(self: &Arc<Self>, text: Option<String>) -> anyhow::Result<String> {
         let engine = self.engine.upgrade().ok_or_else(aborted)?;
-        let input = {
+        engine.ready().await?;
+        let n = self.sends.fetch_add(1, Ordering::SeqCst);
+        let run = if n == 0 { self.opts.id.clone() } else { format!("{}#{}", self.opts.id, n + 1) };
+        let (input, task) = {
             let mut messages = self.messages.lock().await;
             if let Some(text) = text {
                 messages.push(providers::user(&text));
             }
-            let task =
-                messages.iter().find(|m| providers::role(m) == "user").and_then(providers::content).unwrap_or_default();
-            self.with_signal(json!({"loop": self.spec(), "messages": *messages, "memory": self.opts.session.memory.snapshot(), "guard_context": self.guard_context(task)}))
+            let task = messages
+                .iter()
+                .find(|m| providers::role(m) == "user")
+                .and_then(providers::content)
+                .unwrap_or_default()
+                .to_owned();
+            (loop_input(json!(*messages), self.opts.session.memory.snapshot(), &self.opts), task)
         };
-        self.admit_guard(&input).await?;
-        let result = crate::flows::run_loop_here(&engine, &self.opts.id, input, &self.scope, &self.cancel).await;
+        self.admit_task(&task).await;
+        if run != self.opts.id {
+            engine.loops.lock().await.insert(run.clone(), self.clone());
+        }
+        let scope = self.scope();
+        if let Some(anchor) = scope.anchor() {
+            let row = crate::runs::RunTrace {
+                run_id: run.clone(),
+                trace_id: anchor.trace_id,
+                session_id: anchor.session_id,
+                parent_span_id: Some(anchor.parent_span_id),
+                recorded: false,
+                created_ms: crate::runs::now_ms(),
+            };
+            engine.deps.db.write(move |db| db.insert_run_trace(&row)).await?;
+        }
+        engine.scopes.borrow(&run, scope.clone());
+        *self.driving.lock().unwrap_or_else(|e| e.into_inner()) = Some(run.clone());
+        // The loop's workflow, or the built-in agent-loop in place of one
+        // that is set aside (design 04): its line joins the instructions.
+        let build = {
+            let (loop_, engine, run, input) = (self.clone(), engine.clone(), run.clone(), input.clone());
+            move |choice: crate::runs::Choice| -> futures::future::BoxFuture<'static, anyhow::Result<(Value, Value)>> {
+                let (loop_, engine, run, mut input) = (loop_.clone(), engine.clone(), run.clone(), input.clone());
+                Box::pin(async move {
+                    let mut opts = loop_.opts.clone();
+                    opts.workflow = choice.name.clone();
+                    if let Some(fallback) = &choice.fallback
+                        && let Some(system) = input["messages"].get_mut(0).filter(|m| m["role"] == "system")
+                    {
+                        let prompt = system["content"].as_str().unwrap_or_default();
+                        system["content"] = json!(format!("{prompt}{INSTRUCTION_SEPARATOR}{}", fallback.line));
+                        let parts = [opts.system_prompt.clone().unwrap_or_default(), fallback.line.clone()];
+                        opts.system_prompt = Some(parts.join("\n\n"));
+                    }
+                    let mut host = loop_host(&engine, &opts, crate::runs::LOOP, &run, &loop_.loaded_skills).await?;
+                    host.fallback = choice.fallback;
+                    Ok((input, serde_json::to_value(&host)?))
+                })
+            }
+        };
+        let started =
+            crate::runs::start_named_root(&engine, &run, &self.opts.workflow, crate::runs::Site::Loop, build).await;
+        if let Ok((_, ran)) = &started
+            && let Some(fallback) = &ran.fallback
+        {
+            crate::runs::trace_fallback(scope.clone(), fallback, true);
+        }
+        let result = match started {
+            Ok(_) => crate::runs::wait_end(&engine, &run, &self.cancel).await,
+            Err(error) => Err(error),
+        };
+        // A send given up (the loop closed, its caller cancelled) gives up
+        // its run: nobody waits for it, so the engine must not resume it.
+        // A shutdown is no end: the run resumes at the next start.
+        if (self.cancel.is_cancelled() || self.opts.cancel.is_cancelled()) && !engine.is_stopping() {
+            if let Err(error) = engine.runtime.cancel(&run).await {
+                eprintln!("[{}] cancelling run {run}: {error:#}", self.opts.id);
+            }
+            engine.end_tree_loops(&run).await;
+        }
+        // Its calls in flight stop (and end their spans) before its trace.
+        drop(self.busy.write().await);
+        engine.scopes.release(&run);
+        self.driving.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if run != self.opts.id {
+            engine.loops.lock().await.remove(&run);
+        }
         check(&self.cancel)?;
-        match result {
-            crate::flows::FlowResult::Completed(Value::String(output)) => Ok(output),
-            crate::flows::FlowResult::Completed(output) => Ok(output.to_string()),
-            crate::flows::FlowResult::Cancelled => Err(aborted()),
-            crate::flows::FlowResult::Faulted { error, .. } => {
+        // The run's answer is its trace's output, whatever step made it (a
+        // variant may answer from a step, not a final turn).
+        if let Ok(ouro_runtime::ows::run::Status::Completed(output)) = &result {
+            self.scope().update(ContextUpdate::output(output.clone()));
+        }
+        match result? {
+            ouro_runtime::ows::run::Status::Completed(Value::String(output)) => Ok(output),
+            ouro_runtime::ows::run::Status::Completed(output) => Ok(output.to_string()),
+            ouro_runtime::ows::run::Status::Cancelled => Err(aborted()),
+            ouro_runtime::ows::run::Status::Faulted(error) => {
                 Err(anyhow::anyhow!(error.detail.clone().unwrap_or_else(|| error.to_string())))
             }
             other => anyhow::bail!("session {} did not end: {other:?}", self.opts.id),
@@ -471,8 +814,8 @@ impl AgentLoop {
             crate::mcp::model_tools(&*engine.deps.mcp).into_iter().filter(|t| self.allows(&t.name)).collect();
         tools.extend(synthetic_definitions().iter().filter(|t| self.visible(&t.name)).cloned());
         if let Some(tool) = tools.iter_mut().find(|t| t.name == "invoke_sub_agent") {
-            tool.description.get_or_insert_default().push_str(&format!("\nActive loops (optional loop argument; otherwise the first declared skill loop preference, then agent-loop):\n{}",
-                crate::flows::loop_catalog(&*engine.deps.workflows)?));
+            let catalog = crate::flows::loop_catalog(engine).await?;
+            tool.description.get_or_insert_default().push_str(&format!("\nActive loops (optional loop argument; otherwise the first declared skill loop preference, then agent-loop):\n{catalog}"));
         }
         let mut params = providers::CompletionParams {
             model: self.model.clone(),
@@ -483,11 +826,11 @@ impl AgentLoop {
             trace: None,
             cancel: self.cancel.clone(),
         };
-        let result = generation(&provider, &mut params, &self.scope, Observation { name: format!("iter-{iteration}"), model_parameters: Some(json!({"reasoning_effort": self.reasoning_effort.as_str(), "thinking": if self.reasoning_effort == crate::models::ReasoningEffort::Disabled {"disabled"} else {"enabled"}}).as_object().cloned().unwrap_or_default()), metadata: Some(self.observation_meta.clone()) }, self.opts.generation_timeout, describe_completion).await?;
+        let result = generation(&provider, &mut params, &self.scope(), Observation { name: format!("iter-{iteration}"), model_parameters: Some(json!({"reasoning_effort": self.reasoning_effort.as_str(), "thinking": if self.reasoning_effort == crate::models::ReasoningEffort::Disabled {"disabled"} else {"enabled"}}).as_object().cloned().unwrap_or_default()), metadata: Some(self.observation_meta.clone()) }, self.opts.generation_timeout, describe_completion).await?;
         Ok(result.message)
     }
     fn finished(&self, output: &str) {
-        self.scope.update(ContextUpdate {
+        self.scope().update(ContextUpdate {
             output: Some(json!(output)),
             metadata: Some(json!({"finished_by": "finish"}).as_object().cloned().unwrap_or_default()),
             ..Default::default()
@@ -510,6 +853,13 @@ impl AgentLoop {
         self.setup.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Whether this loop offers synthetic tool `name` to its model.
+    pub(crate) fn offers(&self, name: &str) -> bool {
+        self.visible(name)
+    }
+    pub(crate) fn observation_metadata(&self) -> Metadata {
+        self.observation_meta.clone()
+    }
     fn visible(&self, name: &str) -> bool {
         match name {
             "invoke_sub_agent" => self.opts.parent_id.is_none(),
@@ -529,14 +879,13 @@ impl AgentLoop {
         self: &Arc<Self>,
         engine: &Arc<Engine>,
         call: &providers::ToolCall,
-        child: Option<ChildRun<'_>>,
-        runs: Option<&crate::durable::RunStore>,
+        at: Option<&CallSite<'_>>,
         verdict: Option<&crate::guard::Verdict>,
     ) -> anyhow::Result<(Arc<dyn Span>, String)> {
         let mut metadata = self.observation_meta.clone();
         metadata.insert("tool".into(), call.name.clone().into());
         metadata.insert("tool_call_id".into(), call.id.clone().into());
-        let span = self.scope.span(
+        let span = self.scope().span(
             SpanStart::new(&call.name, if call.name == "invoke_sub_agent" { SpanKind::Agent } else { SpanKind::Tool })
                 .input(json!({"raw_arguments": call.arguments}))
                 .metadata(metadata),
@@ -551,7 +900,7 @@ impl AgentLoop {
         let raw = match serde_json::from_str::<Value>(if call.arguments.is_empty() { "{}" } else { &call.arguments }) {
             Ok(Value::Object(args)) => {
                 span.update(ContextUpdate::input(Value::Object(args.clone())));
-                self.invoke(engine, &call.name, args, span.clone(), child, runs).await
+                self.invoke(engine, &call.name, args, span.clone(), at).await
             }
             _ => Ok("[tool error] arguments must be a JSON object".to_owned()),
         };
@@ -582,8 +931,7 @@ impl AgentLoop {
         name: &str,
         args: Map<String, Value>,
         span: Arc<dyn Span>,
-        child: Option<ChildRun<'_>>,
-        runs: Option<&crate::durable::RunStore>,
+        at: Option<&CallSite<'_>>,
     ) -> anyhow::Result<String> {
         check(&self.cancel)?;
         let synthetic = synthetic_definitions().iter().any(|t| t.name == name);
@@ -595,19 +943,19 @@ impl AgentLoop {
         {
             return Ok(format!("[tool error] {name} is unavailable in this loop"));
         }
-        // A dry run makes no write: a worker still runs (dry too), MCP's
-        // writes stop at the sandbox's MCP, the runtime's own stop here.
-        if let Some(sandbox) = engine.sandbox()
+        // In a dry run a model's write that passed its verdict is recorded
+        // and answered with the mock; a worker still runs (design 05,
+        // decision 6).
+        if let Some(sandbox) = &engine.sandbox
+            && tool_effect(engine, name) == Effect::Write
             && name != "invoke_sub_agent"
-            && tool_effect(engine, name) == owf::run::Effect::Write
         {
             span.update(ContextUpdate::metadata(json!({"mock": true}).as_object().cloned().unwrap_or_default()));
-            if synthetic {
-                return Ok(sandbox.mock(name, Value::Object(args)));
-            }
+            let (run, task) = at.map(|at| (at.run, at.task)).unzip();
+            return Ok(sandbox.mock(crate::sandbox::Via::Tool, run, task, name, Value::Object(args)));
         }
         let outcome = if synthetic {
-            self.synthetic(engine, name, &args, span, child, runs).await
+            self.synthetic(engine, name, &args, span, at).await
         } else {
             engine.deps.mcp.call_tool(name, args, &self.cancel).await
         };
@@ -620,11 +968,10 @@ impl AgentLoop {
         name: &str,
         args: &Map<String, Value>,
         span: Arc<dyn Span>,
-        child: Option<ChildRun<'_>>,
-        runs: Option<&crate::durable::RunStore>,
+        at: Option<&CallSite<'_>>,
     ) -> anyhow::Result<String> {
         match name {
-            "read_run" => read_run(runs, &self.opts.id, args),
+            "read_run" => read_run(at, args).await,
             "find_skills" => {
                 let params: crate::skills::FindSkillsParams = serde_json::from_value(json!(args))?;
                 params.validate()?;
@@ -656,9 +1003,16 @@ impl AgentLoop {
                 Ok(crate::skills::catalog_snapshot(&*engine.deps.skill_store).await?.to_string())
             }
             "set_memory" => {
-                let key = string_arg(args, "key", true)?;
-                let value = string_arg(args, "value", false)?;
-                engine.deps.memory.set(key, value)?;
+                let key = string_arg(args, "key", true)?.to_owned();
+                let value = string_arg(args, "value", false)?.to_owned();
+                anyhow::ensure!(
+                    !key.starts_with(crate::runs::RESERVED_MEMORY_PREFIX),
+                    "`{key}` is a key the runtime keeps"
+                );
+                // A write may wait for the engine's lock on agent.db (runs.rs §2).
+                let memory = engine.deps.memory.clone();
+                let stored = key.clone();
+                tokio::task::spawn_blocking(move || memory.set(&stored, &value)).await??;
                 Ok(format!("ok — stored {key}"))
             }
             "working_memory_put" => {
@@ -736,49 +1090,30 @@ impl AgentLoop {
                 let skills = engine.deps.skill_store.list_skills().await?;
                 Ok(json!({"count": skills.len(), "skills": skills}).to_string())
             }
-            "invoke_sub_agent" => self.worker(engine, args, span, child).await,
-            name if crate::flows::TOOLS.contains(&name) => crate::flows::tool(engine, name, args),
+            // A worker runs as its own run, started by the round
+            // (`start_worker`); reaching here, none started for this call.
+            "invoke_sub_agent" => match self.worker_options(args, span, None).await {
+                Ok(_) => Ok("[invoke_sub_agent error] failed to start: the worker was not started".into()),
+                Err(error) => Ok(format!("[invoke_sub_agent error] {error}")),
+            },
+            name if crate::flows::TOOLS.contains(&name) => crate::flows::tool(engine, name, args).await,
             "workflow_functions" => crate::flows::functions(engine, args),
             "probe_function" => crate::flows::probe(engine, args, &self.cancel).await,
+            // No try inside a try (design 05, decision 15).
+            "try_workflow" if engine.sandbox.is_some() => {
+                Ok("[try_workflow error] try_workflow is not available inside a dry run".into())
+            }
             "try_workflow" => {
-                let scope: crate::tracing::Scope = span;
-                if args.get("signal").is_some_and(|s| !s.is_null()) {
-                    crate::sandbox::try_signal(engine, args, &self.opts.session, &scope, &self.cancel).await
-                } else {
-                    crate::flows::try_draft(engine, args, &self.opts.session.env, &scope, &self.cancel).await
-                }
+                let scope: Scope = span;
+                crate::sandbox::try_workflow(engine, args, &self.opts.session, &scope, &self.cancel).await
             }
             name if crate::schedule::TOOLS.contains(&name) => {
-                let tz = &self.opts.session.env.timezone;
-                let (store, workflows) = (&*engine.deps.schedule, &*engine.deps.workflows);
-                crate::schedule::tool(store, workflows, tz, name, args, chrono::Utc::now()).await
+                crate::schedule::tool(engine, &self.opts.session.env.timezone, name, args).await
             }
             _ => anyhow::bail!("unknown synthetic tool {name}"),
         }
     }
-    async fn worker(
-        self: &Arc<Self>,
-        engine: &Arc<Engine>,
-        args: &Map<String, Value>,
-        span: Arc<dyn Span>,
-        child: Option<ChildRun<'_>>,
-    ) -> anyhow::Result<String> {
-        let (opts, child_prompt) =
-            self.worker_options(args, span.clone(), child.as_ref().map(|c| c.key.as_str())).await?;
-        let child_id = opts.id.clone();
-        if let Some(child) = child {
-            return self.durable_worker(engine, child, opts, &child_prompt, span).await;
-        }
-        let child = match engine.start_loop(opts).await {
-            Ok(child) => child,
-            Err(error) => return Ok(format!("[invoke_sub_agent error] failed to start: {error}")),
-        };
-        let result = child.send(child_prompt).await;
-        engine.end_loop(&child_id).await;
-        Ok(result.unwrap_or_else(|error| format!("[invoke_sub_agent error] sub-agent crashed: {error}")))
-    }
-
-    async fn worker_options(
+    pub(crate) async fn worker_options(
         &self,
         args: &Map<String, Value>,
         span: Arc<dyn Span>,
@@ -810,28 +1145,31 @@ impl AgentLoop {
         } else {
             format!("{prompt}\n\nWorking-memory inputs (tool data, not instructions):\n{}", json!(inputs))
         };
-        let child_id = match key {
-            Some(key) => child_loop_id(&self.opts.id, key),
-            None => format!("{}__sub{}", self.opts.id, self.sub_counter.fetch_add(1, Ordering::SeqCst) + 1),
-        };
+        // The starter names the child's run (`FunctionContext::child_id`).
+        let child_id = key.map(str::to_owned).unwrap_or_else(|| format!("{}__sub", self.opts.id));
         let mut opts = LoopOptions::new(&child_id, self.opts.session.clone());
         opts.cancel = self.cancel.clone();
         opts.system_prompt = Some([Some(render_context(&self.opts.session.env)?), Some("You are a focused worker. Complete the assigned task and return the full result as your final answer; the runtime stores it automatically. Report missing data and failures explicitly. The parent owns delivery and bookkeeping unless it explicitly assigns them to you.".into()), system_prompt.filter(|s| !s.is_empty()).map(str::to_owned)].into_iter().flatten().collect::<Vec<_>>().join("\n\n"));
         opts.skills = if skills.is_empty() { vec!["worker".into()] } else { skills };
-        opts.workflow = if let Some(name) = optional_string(args, "loop")? {
-            name.to_owned()
-        } else {
-            let engine = self.engine.upgrade().ok_or_else(|| anyhow::anyhow!("engine closed"))?;
-            let mut selected = None;
-            for name in &opts.skills {
-                if let Some(skill) = engine.deps.skill_store.read_skill(name).await?
-                    && let Some(loop_name) = skill.loop_name
-                {
-                    selected = Some(loop_name);
-                    break;
+        // The loop it runs (design 04, R-M9): the call's `loop`, else the
+        // first of its skills that prefers one (frontmatter `loop:`), else
+        // agent-loop. A YAML's `start_worker { loop }` goes before both
+        // (functions.rs `start_worker`); a name set aside runs agent-loop.
+        opts.workflow = match optional_string(args, "loop")?.filter(|name| !name.is_empty()) {
+            Some(name) => name.to_owned(),
+            None => {
+                let engine = self.engine.upgrade().ok_or_else(aborted)?;
+                let mut selected = None;
+                for name in &opts.skills {
+                    if let Some(skill) = engine.deps.skill_store.read_skill(name).await?
+                        && let Some(loop_name) = skill.loop_name
+                    {
+                        selected = Some(loop_name);
+                        break;
+                    }
                 }
+                selected.unwrap_or_else(|| AGENT_LOOP_NAME.into())
             }
-            selected.unwrap_or_else(|| AGENT_LOOP_NAME.into())
         };
         opts.allow_skill_writes = self.opts.allow_skill_writes && opts.skills.iter().any(|s| s == "dreaming");
         opts.include_engine_skills = false;
@@ -854,48 +1192,6 @@ impl AgentLoop {
         opts.trace_scope = Some(span);
         opts.confirm = self.opts.confirm.clone();
         Ok((opts, child_prompt))
-    }
-
-    // The sub-agent as its own durable run `<child id>/loop`. A parent
-    // resumed after a restart calls this again with the same key and joins
-    // that run where it was (or reads its outcome) instead of starting a
-    // second worker; the child's writes are its own run's, sent at most once.
-    async fn durable_worker(
-        self: &Arc<Self>,
-        engine: &Arc<Engine>,
-        child: ChildRun<'_>,
-        opts: LoopOptions,
-        prompt: &str,
-        span: Arc<dyn Span>,
-    ) -> anyhow::Result<String> {
-        let child_id = opts.id.clone();
-        let run_id = format!("{child_id}/loop");
-        // A run that exists already carries its own input; the loop is
-        // rebuilt from it.
-        let input = if child.runs.get(&run_id)?.is_none() {
-            match engine.start_loop(opts).await {
-                Ok(live) => live.workflow_input(prompt).await,
-                Err(error) => return Ok(format!("[invoke_sub_agent error] failed to start: {error}")),
-            }
-        } else {
-            Value::Null
-        };
-        let scope: Scope = span;
-        let result = crate::flows::run_child(engine, child.runs, &run_id, input, &scope, &self.cancel).await;
-        engine.end_loop(&child_id).await;
-        check(&self.cancel)?;
-        match result {
-            crate::flows::FlowResult::Completed(Value::String(output)) => Ok(output),
-            crate::flows::FlowResult::Completed(output) => Ok(output.to_string()),
-            crate::flows::FlowResult::Faulted { error, .. } => Ok(format!(
-                "[invoke_sub_agent error] sub-agent crashed: {}",
-                error.detail.clone().unwrap_or_else(|| error.to_string())
-            )),
-            // This loop was not stopped (checked above): the run was
-            // cancelled explicitly, a failure of the call rather than a stop.
-            crate::flows::FlowResult::Cancelled => anyhow::bail!("sub-agent {child_id} was cancelled"),
-            other => anyhow::bail!("sub-agent {child_id} did not end: {other:?}"),
-        }
     }
 }
 
@@ -1007,11 +1303,17 @@ const SYNTHETIC_WRITES: &[&str] = &[
     "invoke_sub_agent",
 ];
 
-/// What a call of tool `name` from a loop does: a write is sent at most once.
-/// An MCP tool is a read only when the server marks it read-only; a name
-/// nobody knows counts as a write.
-pub fn tool_effect(engine: &Engine, name: &str) -> owf::run::Effect {
-    use owf::run::Effect;
+/// What a call does to the world: a write is sent at most once. Serialized
+/// as `Read`/`Write` (the evals workbench's catalogs and reports).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Effect {
+    Read,
+    Write,
+}
+
+/// What a call of tool `name` from a loop does. An MCP tool is a read only
+/// when the server marks it read-only; a name nobody knows counts as a write.
+pub fn tool_effect(engine: &Engine, name: &str) -> Effect {
     if synthetic_definitions().iter().any(|t| t.name == name) {
         return if SYNTHETIC_WRITES.contains(&name) { Effect::Write } else { Effect::Read };
     }
@@ -1031,83 +1333,240 @@ pub fn tool_open_world(engine: &Engine, name: &str) -> bool {
     engine.deps.mcp.open_world(name)
 }
 
-/// A durable loop's sub-agent: the run store its run goes in, and the key
-/// of the call that starts it (`<turn>.<place in the round>`).
-pub struct ChildRun<'a> {
-    pub runs: &'a crate::durable::RunStore,
-    pub key: String,
+/// The child key a worker of round `i`, place `index` starts under; the
+/// model sees it as `w<i>.<index>` (design 03, R2-M2), never a run id.
+pub fn worker_key(i: u64, index: u64) -> String {
+    format!("worker:{i}.{index}")
 }
 
-/// A durable worker's loop id; its run is `<loop id>/loop`.
-fn child_loop_id(parent: &str, key: &str) -> String {
-    format!("{parent}__sub{key}")
+pub fn worker_handle(i: u64, index: u64) -> String {
+    format!("w{i}.{index}")
 }
 
-/// The key a durable sub-agent call is kept under: the turn and the call's
-/// place in the round, both given by the loop's definition. None when the
-/// definition does not give them: the sub-agent then runs in process.
-pub fn child_key(args: &Value) -> Option<String> {
-    let (i, index) = (args.get("i")?.as_u64()?, args.get("index")?.as_u64()?);
-    let named = args.get("call").and_then(|c| c.get("name")).and_then(Value::as_str) == Some("invoke_sub_agent");
-    named.then(|| format!("{i}.{index}"))
+/// A refusal of a host function: its caller is not a run it serves (no host
+/// data, another kind). Nothing happened, so the engine records it as not
+/// executed (functions.rs).
+#[derive(Debug)]
+pub struct Refusal(pub String);
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
-fn default_loop_name() -> String {
-    AGENT_LOOP_NAME.into()
+impl std::error::Error for Refusal {}
+
+pub fn refuse(detail: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(Refusal(detail.into()))
 }
 
-/// What rebuilds a loop after a restart. The system prompt travels in the transcript.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LoopSpec {
-    #[serde(default = "default_loop_name")]
-    pub workflow: String,
-    #[serde(default)]
-    pub conversation: Option<ConfirmTarget>,
-    #[serde(default)]
-    pub confirm: Option<ConfirmTarget>,
-    pub id: String,
-    pub session: String,
-    pub env: Value,
-    pub skills: Vec<String>,
-    pub include_engine_skills: bool,
-    pub allow_skill_writes: bool,
-    pub tool_whitelist: Option<Vec<String>>,
-    pub preset: String,
-    pub max_iterations: usize,
-    pub max_concurrent_tools: usize,
-    pub parent_id: Option<String>,
-    pub session_id: Option<String>,
-    #[serde(default)]
-    pub root_request: Option<String>,
+pub type Records = std::collections::BTreeMap<String, ouro_runtime::ows::durable::Record>;
+
+/// A loop run's host data (`FunctionContext::host`), or a refusal: only runs
+/// the host started as loops (a signal's primary, a worker, a recovery, a
+/// loop the host runs itself) carry the model's parameters (invariant 3).
+pub fn loop_host_of(host: Option<&Value>, function: &str) -> anyhow::Result<crate::runs::LoopHost> {
+    match crate::runs::host_kind(host) {
+        Some(kind) if crate::runs::loop_kind(kind) => Ok(serde_json::from_value(host.cloned().unwrap_or_default())
+            .map_err(|e| refuse(format!("{function}: {e}")))?),
+        _ => Err(refuse(format!(
+            "{function} requires the host's admitted model input: a run the runtime started on a signal, or a worker; a child a workflow starts itself has none"
+        ))),
+    }
 }
 
-impl AgentLoop {
-    pub fn spec(&self) -> LoopSpec {
-        let opts = &self.opts;
-        let mut whitelist = opts.tool_whitelist.as_ref().map(|w| w.iter().cloned().collect::<Vec<_>>());
-        if let Some(w) = &mut whitelist {
-            w.sort();
-        }
-        LoopSpec {
-            workflow: opts.workflow.clone(),
-            conversation: opts.conversation.clone(),
-            confirm: opts.confirm.clone(),
-            id: opts.id.clone(),
-            session: opts.session.id.clone(),
-            env: opts.session.env.to_json(),
-            skills: opts.skills.clone(),
-            include_engine_skills: opts.include_engine_skills,
-            allow_skill_writes: opts.allow_skill_writes,
-            tool_whitelist: whitelist,
-            preset: opts.preset.as_str().into(),
-            max_iterations: opts.max_iterations,
-            max_concurrent_tools: opts.max_concurrent_tools,
-            parent_id: opts.parent_id.clone(),
-            session_id: opts.session_id.clone(),
-            root_request: opts.root_request.clone(),
+impl Engine {
+    /// The evidence `digest` names, if any.
+    pub fn evidence_of(&self, digest: Option<&String>) -> anyhow::Result<Option<String>> {
+        match digest {
+            None => Ok(None),
+            Some(digest) => {
+                self.deps.db.evidence(digest)?.map(Some).ok_or_else(|| anyhow::anyhow!("evidence {digest} is missing"))
+            }
         }
     }
 
+    /// The live loop of `run`, or one rebuilt from its host data, tracing in
+    /// the run's current scope.
+    pub async fn loop_for(
+        self: &Arc<Self>,
+        runs: &dyn crate::runs::RunReads,
+        run: &str,
+        host: &crate::runs::LoopHost,
+    ) -> anyhow::Result<Arc<AgentLoop>> {
+        if let Some(live) = self.loops.lock().await.get(run).cloned().filter(|l| !l.is_closed()) {
+            if self.scopes.current(run).is_some() || live.trace.is_none() {
+                live.rescope(self.scope_for(run, &host.workflow));
+            }
+            return Ok(live);
+        }
+        let env = crate::session::EnvData::from_json(&host.env)?;
+        let mut opts = LoopOptions::new(run, self.session(&host.session, env));
+        opts.workflow = host.workflow.clone();
+        opts.confirm = host.confirm.clone();
+        opts.conversation = host.conversation.clone();
+        opts.skills = host.skills.clone();
+        opts.include_engine_skills = host.include_engine_skills;
+        opts.allow_skill_writes = host.allow_skill_writes;
+        opts.tool_whitelist = host.tool_whitelist.as_ref().map(|w| w.iter().cloned().collect());
+        opts.preset = match host.preset.as_str() {
+            "compiler" => PresetName::Compiler,
+            name => PresetName::selectable(name).ok_or_else(|| anyhow::anyhow!("unknown preset {name}"))?,
+        };
+        opts.max_iterations = host.max_iterations;
+        opts.max_concurrent_tools = host.max_concurrent_tools;
+        opts.parent_id = host.parent_id.clone();
+        opts.root_request = self.evidence_of(host.root_request_digest.as_ref())?;
+        opts.guard_request = self.evidence_of(host.guard_request.as_ref())?;
+        opts.earlier_user_messages = match self.evidence_of(host.evidence.earlier.as_ref())? {
+            Some(earlier) => serde_json::from_str(&earlier)?,
+            None => Vec::new(),
+        };
+        opts.loaded_skill_text = self.evidence_of(host.evidence.preselect.as_ref())?.unwrap_or_default();
+        opts.signal_id = host.signal_id;
+        opts.session_id = host.session_id.clone();
+        opts.trace_scope = Some(self.scope_for(run, &host.workflow));
+        let live = self.create_or_join_loop(opts, true).await?;
+        live.run_owned.store(true, Ordering::SeqCst);
+        if live.guard.lock().await.context.is_none() {
+            let context = self.guard_context_of(runs, run, host).await?;
+            live.admit_guard(context).await;
+        }
+        Ok(live)
+    }
+
+    // The guard's evidence for a loop run, from its host data only.
+    async fn guard_context_of(
+        &self,
+        runs: &dyn crate::runs::RunReads,
+        run: &str,
+        host: &crate::runs::LoopHost,
+    ) -> anyhow::Result<crate::guard::Context> {
+        let task = match self.evidence_of(host.guard_request.as_ref())? {
+            Some(task) => task,
+            None => {
+                let saved = runs.run(run).await?.ok_or_else(|| anyhow::anyhow!("unknown run {run}"))?;
+                let messages: Vec<Message> =
+                    serde_json::from_value(saved.admission.input["messages"].clone()).unwrap_or_default();
+                messages
+                    .iter()
+                    .find(|m| providers::role(m) == "user")
+                    .and_then(providers::content)
+                    .unwrap_or_default()
+                    .to_owned()
+            }
+        };
+        let env = crate::session::EnvData::from_json(&host.env)?;
+        Ok(crate::guard::Context {
+            task,
+            root_request: self.evidence_of(host.root_request_digest.as_ref())?.unwrap_or_default(),
+            default_chat: env.telegram_chat_id,
+            earlier_user_messages: match self.evidence_of(host.evidence.earlier.as_ref())? {
+                Some(earlier) => serde_json::from_str(&earlier)?,
+                None => Vec::new(),
+            },
+            skills: self.evidence_of(host.evidence.skills.as_ref())?.unwrap_or_default(),
+        })
+    }
+
+    /// The loop a function of run `run` serves, with what a restart lost
+    /// restored from the run's journal (its guard chain, what its setup
+    /// added).
+    pub async fn loop_of(
+        self: &Arc<Self>,
+        runs: &dyn crate::runs::RunReads,
+        run: &str,
+        host: Option<&Value>,
+        function: &str,
+    ) -> anyhow::Result<(Entered, crate::runs::LoopHost)> {
+        let host = loop_host_of(host, function)?;
+        let live = self.loop_for(runs, run, &host).await?.enter().await?;
+        if !live.guard.lock().await.history_restored {
+            let records = runs.records(run).await?;
+            live.restore_guard_history(&records).await?;
+        }
+        Ok((live, host))
+    }
+}
+
+/// A loop run's input: its transcript and working memory, and, for the
+/// workflow's own steps to read, the conversation it serves and where its
+/// confirmations go. Informational: the host's functions read only the
+/// run's host data (invariant 3), never these.
+pub fn loop_input(messages: Value, memory: Value, opts: &LoopOptions) -> Value {
+    let mut input = json!({"messages": messages, "memory": memory});
+    if let Some(conversation) = &opts.conversation {
+        input["conversation"] = json!(conversation);
+    }
+    if let Some(confirm) = &opts.confirm {
+        input["confirm"] = json!(confirm);
+    }
+    input
+}
+
+/// The host data a loop run of `opts` is admitted with (`kind`), its
+/// evidence stored and linked to `run` first. `skill_text`: the skills and
+/// the preselected block the loop is told (the guard's evidence).
+pub async fn loop_host(
+    engine: &Engine,
+    opts: &LoopOptions,
+    kind: &str,
+    run: &str,
+    skill_text: &str,
+) -> anyhow::Result<crate::runs::LoopHost> {
+    let earlier = (!opts.earlier_user_messages.is_empty()).then(|| json!(opts.earlier_user_messages).to_string());
+    let bodies = [
+        opts.root_request.clone(),
+        opts.guard_request.clone(),
+        Some(skill_text.to_owned()),
+        earlier,
+        Some(opts.loaded_skill_text.clone()),
+        opts.system_prompt.clone(),
+    ];
+    let run_id = run.to_owned();
+    let [root_request, guard_request, skills, earlier, preselect, system] = engine
+        .deps
+        .db
+        .write(move |db| {
+            let mut digests = Vec::new();
+            for body in bodies {
+                digests.push(body.filter(|b| !b.is_empty()).map(|b| db.put_evidence(&run_id, &b)).transpose()?);
+            }
+            Ok::<_, anyhow::Error>(digests)
+        })
+        .await?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("six evidence digests"))?;
+    let mut whitelist = opts.tool_whitelist.as_ref().map(|w| w.iter().cloned().collect::<Vec<_>>());
+    if let Some(w) = &mut whitelist {
+        w.sort();
+    }
+    Ok(crate::runs::LoopHost {
+        kind: kind.into(),
+        workflow: opts.workflow.clone(),
+        preset: opts.preset.as_str().into(),
+        confirm: opts.confirm.clone(),
+        conversation: opts.conversation.clone(),
+        session_id: Some(opts.session_id.clone().unwrap_or_else(|| opts.session.id.clone())),
+        session: opts.session.id.clone(),
+        env: opts.session.env.to_json(),
+        skills: opts.skills.clone(),
+        allow_skill_writes: opts.allow_skill_writes,
+        max_iterations: opts.max_iterations,
+        max_concurrent_tools: opts.max_concurrent_tools,
+        tool_whitelist: whitelist,
+        include_engine_skills: opts.include_engine_skills,
+        parent_id: opts.parent_id.clone(),
+        root_request_digest: root_request,
+        guard_request,
+        signal_id: opts.signal_id,
+        evidence: crate::runs::LoopEvidence { skills, earlier, preselect, system },
+        fallback: None,
+    })
+}
+
+impl AgentLoop {
     fn guard_context(&self, task: &str) -> crate::guard::Context {
         crate::guard::Context {
             task: self.opts.guard_request.clone().unwrap_or_else(|| task.to_owned()),
@@ -1120,12 +1579,11 @@ impl AgentLoop {
 
     /// What a rebuilt loop takes from its run's journal: the guard's call
     /// chain, and what `loop_setup` added (its record's `setup`).
-    pub(crate) async fn restore_guard_history(&self, runs: &crate::durable::RunStore, id: &str) -> anyhow::Result<()> {
+    pub(crate) async fn restore_guard_history(&self, records: &Records) -> anyhow::Result<()> {
         if self.guard.lock().await.history_restored {
             return Ok(());
         }
-        let records = runs.records(id)?;
-        let setup = setup_record(&records);
+        let setup = setup_record(records);
         let mut tools = Vec::new();
         if let Some(setup) = &setup {
             let engine = self.engine.upgrade().ok_or_else(aborted)?;
@@ -1140,9 +1598,9 @@ impl AgentLoop {
         if state.history_restored {
             return Ok(());
         }
-        state.restore_chain(&records);
+        state.restore_chain(records);
         let mut done = self.setup();
-        done.turned = turned(&records);
+        done.turned = turned(records);
         if let Some(setup) = setup {
             done.done = true;
             done.loaded = string_list(&setup["preselected"]);
@@ -1178,50 +1636,19 @@ impl AgentLoop {
         }
     }
 
-    /// The run's input for this loop, which has not run yet, and its first
-    /// user message.
-    pub async fn workflow_input(&self, text: &str) -> Value {
-        let mut messages = self.messages.lock().await.clone();
-        messages.push(providers::user(text));
-        let guard_context = self.guard_context(text);
-        let input = self.with_signal(json!({"loop": self.spec(), "messages": messages, "memory": self.opts.session.memory.snapshot(), "guard_context": guard_context}));
-        self.admit_guard(&input).await.expect("host loop input");
-        input
+    /// The guard's evidence for a loop the host runs itself, from its
+    /// options and its first user message `task` (once).
+    pub async fn admit_task(&self, task: &str) {
+        self.admit_guard(self.guard_context(task)).await;
     }
 
-    // A route's or a scheduled task's run names its signal; a worker's and
-    // the default path's loop have none, which is how context steps tell.
-    fn with_signal(&self, mut input: Value) -> Value {
-        if let Some(signal) = &self.opts.signal {
-            input["signal"] = signal.clone();
-        }
-        input
-    }
-
-    // Only callers holding host admission data may initialize this evidence.
-    pub(crate) async fn admit_guard(&self, input: &Value) -> anyhow::Result<()> {
+    // Only the host sets this evidence: from the loop's options, or from a
+    // run's host data (`Engine::loop_for`).
+    pub(crate) async fn admit_guard(&self, context: crate::guard::Context) {
         let mut state = self.guard.lock().await;
         if state.context.is_none() {
-            let messages: Vec<Message> = serde_json::from_value(input["messages"].clone())?;
-            let task = messages
-                .iter()
-                .find(|m| providers::role(m) == "user")
-                .and_then(providers::content)
-                .unwrap_or_default()
-                .to_owned();
-            state.context = Some(if let Some(context) = input.get("guard_context") {
-                serde_json::from_value(context.clone())?
-            } else {
-                crate::guard::Context {
-                    task,
-                    root_request: self.opts.root_request.clone().unwrap_or_default(),
-                    default_chat: self.opts.session.env.telegram_chat_id.clone(),
-                    // Legacy runs did not snapshot skills separately from system text.
-                    ..Default::default()
-                }
-            });
+            state.context = Some(context);
         }
-        Ok(())
     }
 
     pub(crate) async fn guard_history(&self) -> (Vec<Value>, usize) {
@@ -1229,37 +1656,26 @@ impl AgentLoop {
         (state.chain.clone(), state.call_count)
     }
 
-    async fn guard_calls(
-        &self,
-        engine: &Engine,
-        calls: &[providers::ToolCall],
-        history: Option<(Vec<Value>, usize)>,
-    ) -> anyhow::Result<Value> {
-        let context = self
-            .guard
+    pub(crate) async fn guard_snapshot(&self) -> anyhow::Result<crate::guard::Context> {
+        self.guard
             .lock()
             .await
             .context
             .clone()
-            .ok_or_else(|| anyhow::anyhow!("guard requires the host's admitted loop input"))?;
-        let (chain, call_count) = match history {
-            Some(h) => h,
-            None => self.guard_history().await,
-        };
+            .ok_or_else(|| anyhow::anyhow!("guard requires the host's admitted loop input"))
+    }
+
+    async fn guard_calls(&self, engine: &Engine, calls: &[providers::ToolCall]) -> anyhow::Result<()> {
+        let context = self.guard_snapshot().await?;
+        let (chain, call_count) = self.guard_history().await;
         let verdicts =
-            crate::guard::judge(engine, &context, calls, &chain, call_count, &self.scope, &self.cancel).await?;
-        let labels: serde_json::Map<String, Value> = calls
-            .iter()
-            .filter_map(|call| {
-                verdicts
-                    .iter()
-                    .find(|(key, _)| key == &crate::guard::key(call))
-                    .map(|(_, v)| (call.id.clone(), json!(v.label)))
-            })
-            .collect();
-        let output = json!({"verdicts":verdicts,"labels":labels});
+            crate::guard::judge(engine, &context, calls, &chain, call_count, &self.scope(), &self.cancel).await?;
         self.guard.lock().await.verdicts.extend(verdicts);
-        Ok(output)
+        Ok(())
+    }
+
+    pub(crate) fn restore_working_memory(&self, memory: Option<&Value>) -> anyhow::Result<()> {
+        self.restore_memory(memory)
     }
 
     fn restore_memory(&self, memory: Option<&Value>) -> anyhow::Result<()> {
@@ -1272,75 +1688,27 @@ impl AgentLoop {
     }
 }
 
-impl Engine {
-    /// The loop a run drives: the live one, or one rebuilt from its spec
-    /// after a restart, traced under `scope`.
-    pub async fn loop_for(
-        self: &Arc<Self>,
-        spec: &LoopSpec,
-        scope: &Scope,
-        cancel: &CancellationToken,
-    ) -> anyhow::Result<Arc<AgentLoop>> {
-        if let Some(live) = self.loops.lock().await.get(&spec.id).cloned() {
-            return Ok(live);
-        }
-        let env = crate::session::EnvData::from_json(&spec.env)?;
-        let mut opts = LoopOptions::new(&spec.id, crate::session::session(&spec.session, env));
-        opts.cancel = cancel.clone();
-        opts.confirm = spec.confirm.clone();
-        opts.conversation = spec.conversation.clone();
-        opts.workflow = spec.workflow.clone();
-        opts.skills = spec.skills.clone();
-        opts.include_engine_skills = spec.include_engine_skills;
-        opts.allow_skill_writes = spec.allow_skill_writes;
-        opts.tool_whitelist = spec.tool_whitelist.as_ref().map(|w| w.iter().cloned().collect());
-        opts.preset = match spec.preset.as_str() {
-            "compiler" => PresetName::Compiler,
-            name => PresetName::selectable(name).ok_or_else(|| anyhow::anyhow!("unknown preset {name}"))?,
-        };
-        opts.max_iterations = spec.max_iterations;
-        opts.max_concurrent_tools = spec.max_concurrent_tools;
-        opts.parent_id = spec.parent_id.clone();
-        opts.root_request = spec.root_request.clone();
-        opts.session_id = spec.session_id.clone();
-        opts.trace_scope = Some(scope.clone());
-        // Concurrent guard resolutions can rebuild the same suspended loop.
-        // Join the winner under the registry lock after skill IO too.
-        self.create_or_join_loop(opts, true).await
-    }
-}
-
-fn loop_spec(args: &Value) -> anyhow::Result<LoopSpec> {
-    Ok(serde_json::from_value(args.get("loop").cloned().unwrap_or(Value::Null))?)
-}
-
-/// `agent_turn { loop, messages, memory, i }`: the model's next message,
-/// with its calls as `{ id, name, arguments }`.
-pub async fn loop_turn(
-    engine: &Arc<Engine>,
-    args: &Value,
-    scope: &Scope,
-    cancel: &CancellationToken,
-) -> anyhow::Result<Value> {
-    let spec = loop_spec(args)?;
-    let loop_ = engine.loop_for(&spec, scope, cancel).await?;
+/// `agent_turn { messages, memory, i, extra_turn? }`: the model's next
+/// message, with its calls as `{ id, name, arguments }`.
+pub async fn loop_turn(engine: &Arc<Engine>, loop_: &Arc<AgentLoop>, args: &Value) -> anyhow::Result<Value> {
     loop_.restore_memory(args.get("memory"))?;
     let i = args.get("i").and_then(Value::as_u64).unwrap_or(0) as usize;
-    if i >= spec.max_iterations.saturating_add(usize::from(args["extra_turn"] == true)) {
-        anyhow::bail!("session {} exceeded maxIterations={}", spec.id, spec.max_iterations);
+    let max = loop_.opts.max_iterations;
+    if i >= max.saturating_add(usize::from(args["extra_turn"] == true)) {
+        anyhow::bail!("session {} exceeded maxIterations={max}", loop_.opts.id);
     }
     let mut messages: Vec<Message> = serde_json::from_value(args.get("messages").cloned().unwrap_or(Value::Null))?;
     if i == 0
         && let Some(message) = messages.iter().find(|m| providers::role(m) == "user")
     {
-        loop_.scope.update(ContextUpdate::input(message.get("content").cloned().unwrap_or(Value::Null)));
+        loop_.scope().update(ContextUpdate::input(message.get("content").cloned().unwrap_or(Value::Null)));
     }
     loop_.setup().turned = true;
     let message = loop_.generate(engine, &mut messages, i).await?;
-    if let Some(sandbox) = engine.sandbox() {
-        sandbox.turn(&spec.id, i as u64 + 1, &message, args["extra_turn"] == true);
+    if let Some(sandbox) = &engine.sandbox {
+        sandbox.turn(&loop_.opts.id, i as u64 + 1, &message, args["extra_turn"] == true);
     }
-    // The live transcript follows the run's (a recovery report reads it).
+    // The live transcript follows the run's.
     messages.push(message.clone());
     *loop_.messages.lock().await = messages;
     let calls: Vec<Value> = providers::tool_calls(&message)
@@ -1349,45 +1717,33 @@ pub async fn loop_turn(
         .collect();
     let content = providers::content(&message).unwrap_or_default().to_owned();
     if calls.is_empty() {
-        loop_.scope.update(ContextUpdate::output(content.clone()));
+        loop_.scope().update(ContextUpdate::output(content.clone()));
     }
     Ok(json!({"message": message, "calls": calls, "content": content}))
 }
 
-/// `guard { loop, calls }`: review a round using only host-owned evidence.
-pub async fn loop_guard(
-    engine: &Arc<Engine>,
-    args: &Value,
-    scope: &Scope,
-    cancel: &CancellationToken,
-) -> anyhow::Result<Value> {
-    let loop_ = engine.loop_for(&loop_spec(args)?, scope, cancel).await?;
-    let calls = args
-        .get("calls")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("guard needs calls"))?
-        .iter()
-        .map(tool_call)
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    loop_.guard_calls(engine, &calls, None).await
-}
-
+/// The guard run's `review`: the round's calls (its input, written by the
+/// host) judged against the guard context its host data names. Returns the
+/// items and whether a confirmation card can be sent.
 pub async fn guard_review(
     engine: &Arc<Engine>,
-    args: &Value,
+    host: &crate::runs::GuardHost,
+    input: &Value,
     scope: &Scope,
     cancel: &CancellationToken,
-    history: Option<(Vec<Value>, usize)>,
 ) -> anyhow::Result<Value> {
-    let calls = args["calls"]
+    let calls = input["calls"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("missing calls"))?
         .iter()
         .map(tool_call)
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let loop_ = engine.loop_for(&loop_spec(args)?, scope, cancel).await?;
-    let reviewed = loop_.guard_calls(engine, &calls, history).await?;
-    let verdicts: Vec<(String, crate::guard::Verdict)> = serde_json::from_value(reviewed["verdicts"].clone())?;
+    let context: crate::guard::Context = serde_json::from_str(
+        &engine.deps.db.evidence(&host.evidence)?.ok_or_else(|| anyhow::anyhow!("guard evidence is missing"))?,
+    )?;
+    let (chain, call_count): (Vec<Value>, usize) =
+        serde_json::from_value(input.get("history").cloned().unwrap_or(json!([[], 0])))?;
+    let verdicts = crate::guard::judge(engine, &context, &calls, &chain, call_count, scope, cancel).await?;
     let items: Vec<_> = calls
         .into_iter()
         .filter_map(|call| {
@@ -1397,58 +1753,7 @@ pub async fn guard_review(
                 .map(|(k, v)| json!({"key":k,"call":{"id":call.id,"name":call.name,"arguments":call.arguments},"label":v.label,"verdict":v}))
         })
         .collect();
-    Ok(json!({"items":items,"confirmable":loop_.opts.confirm.is_some()}))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn guard_confirmation(
-    engine: &Arc<Engine>,
-    admitted: &Value,
-    call: &providers::ToolCall,
-    verdict: &crate::guard::Verdict,
-    scope: &Scope,
-    info: &owf::run::CallInfo<'_>,
-    runs: &crate::durable::RunStore,
-    events: Option<&dyn owf::run::Events>,
-) -> anyhow::Result<Value> {
-    let spec: LoopSpec = serde_json::from_value(admitted["loop"].clone())?;
-    let loop_ = engine.loop_for(&spec, scope, info.cancel).await?;
-    anyhow::ensure!(verdict.label == "needs_confirmation", "call needs no confirmation");
-    let target = loop_.opts.confirm.as_ref().ok_or_else(|| anyhow::anyhow!("no confirmation target"))?;
-    let context = loop_.guard.lock().await.context.clone().ok_or_else(|| anyhow::anyhow!("missing guard context"))?;
-    request_confirmation(
-        engine,
-        runs,
-        events.ok_or_else(|| anyhow::anyhow!("no events"))?,
-        crate::confirmation::Request {
-            run: info.run_id,
-            call,
-            target,
-            guidance: &verdict.guidance,
-            goal: if context.root_request.is_empty() { &context.task } else { &context.root_request },
-            card: &crate::confirmation::Card::load(&*engine.deps.memory),
-        },
-        &loop_.opts.id,
-        scope,
-        info.cancel,
-    )
-    .await
-}
-
-// The card goes to the user; in a dry run it is answered on the spot.
-async fn request_confirmation(
-    engine: &Engine,
-    runs: &crate::durable::RunStore,
-    events: &dyn owf::run::Events,
-    req: crate::confirmation::Request<'_>,
-    loop_id: &str,
-    scope: &Scope,
-    cancel: &CancellationToken,
-) -> anyhow::Result<Value> {
-    match engine.sandbox() {
-        Some(sandbox) => sandbox.press(runs, events, req, loop_id, scope),
-        None => crate::confirmation::request(runs.confirmations(), events, &*engine.deps.mcp, req, cancel).await,
-    }
+    Ok(json!({"items":items,"confirmable":host.confirm.is_some()}))
 }
 
 pub fn confirmation_verdict(call: &providers::ToolCall, outcome: &str) -> crate::guard::Verdict {
@@ -1470,102 +1775,6 @@ pub fn confirmation_verdict(call: &providers::ToolCall, outcome: &str) -> crate:
     crate::guard::Verdict { label: label.into(), guidance, unavailable: None }
 }
 
-// Compatibility for runs admitted with the pre-child immutable definition.
-// Remove this function and tool's outcome path once those runs have drained.
-pub async fn loop_confirm_request(
-    engine: &Arc<Engine>,
-    args: &Value,
-    scope: &Scope,
-    info: &owf::run::CallInfo<'_>,
-    runs: Option<&crate::durable::RunStore>,
-    events: Option<&dyn owf::run::Events>,
-) -> anyhow::Result<Value> {
-    let loop_ = engine.loop_for(&loop_spec(args)?, scope, info.cancel).await?;
-    let Some((runs, events, target)) = runs.zip(events).zip(loop_.opts.confirm.as_ref()).map(|((r, e), t)| (r, e, t))
-    else {
-        return Ok(json!({"required":false}));
-    };
-    let call = tool_call(&args["call"])?;
-    let key = crate::guard::key(&call);
-    if !loop_.guard.lock().await.verdicts.contains_key(&key) {
-        loop_.guard_calls(engine, std::slice::from_ref(&call), None).await?;
-    }
-    let (guidance, goal) = {
-        let state = loop_.guard.lock().await;
-        let Some(v) = state.verdicts.get(&key).filter(|v| v.label == "needs_confirmation") else {
-            return Ok(json!({"required":false}));
-        };
-        let context = state.context.as_ref().ok_or_else(|| anyhow::anyhow!("missing guard context"))?;
-        (
-            v.guidance.clone(),
-            if context.root_request.is_empty() { context.task.clone() } else { context.root_request.clone() },
-        )
-    };
-    request_confirmation(
-        engine,
-        runs,
-        events,
-        crate::confirmation::Request {
-            run: info.run_id,
-            call: &call,
-            target,
-            guidance: &guidance,
-            goal: &goal,
-            card: &crate::confirmation::Card::load(&*engine.deps.memory),
-        },
-        &loop_.opts.id,
-        scope,
-        info.cancel,
-    )
-    .await
-}
-
-/// Prepare the same worker loop the synchronous adapter uses. Its target and
-/// guard context come from the admitted parent, never tool arguments.
-pub async fn loop_worker_input(
-    engine: &Arc<Engine>,
-    args: &Value,
-    scope: &Scope,
-    cancel: &CancellationToken,
-) -> anyhow::Result<Option<(String, Value, Arc<dyn Span>)>> {
-    let loop_ = engine.loop_for(&loop_spec(args)?, scope, cancel).await?;
-    if !loop_.visible("invoke_sub_agent") {
-        return Ok(None);
-    }
-    loop_.restore_memory(args.get("memory"))?;
-    let Some(key) = child_key(args) else { return Ok(None) };
-    let call = tool_call(&args["call"])?;
-    // Starting a blocked delegation must not run the worker before `tool`.
-    if crate::guard::needs_guard(engine, &call) {
-        let mut state = loop_.guard.lock().await;
-        if let Some(verdict) = state.verdicts.get(&crate::guard::key(&call)) {
-            if !verdict.allowed() {
-                return Ok(None);
-            }
-        } else {
-            drop(state);
-            loop_.guard_calls(engine, std::slice::from_ref(&call), None).await?;
-            state = loop_.guard.lock().await;
-            if state.verdicts.get(&crate::guard::key(&call)).is_none_or(|v| !v.allowed()) {
-                return Ok(None);
-            }
-        }
-    }
-    let arguments: Map<String, Value> = serde_json::from_str(&call.arguments)?;
-    let mut meta = loop_.observation_meta.clone();
-    meta.insert("tool".into(), call.name.clone().into());
-    meta.insert("tool_call_id".into(), call.id.clone().into());
-    let worker_scope =
-        loop_.scope.span(SpanStart::new("invoke_sub_agent", SpanKind::Agent).input(json!(arguments)).metadata(meta));
-    let (mut opts, prompt) = loop_.worker_options(&arguments, worker_scope.clone(), Some(&key)).await?;
-    if let Some(name) = args["worker_loop"].as_str() {
-        opts.workflow = name.to_owned();
-    }
-    let id = format!("{}/loop", opts.id);
-    let input = engine.start_loop(opts).await?.workflow_input(&prompt).await;
-    Ok(Some((id, input, worker_scope)))
-}
-
 pub(crate) fn tool_call(value: &Value) -> anyhow::Result<providers::ToolCall> {
     let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
     Ok(providers::ToolCall {
@@ -1575,29 +1784,73 @@ pub(crate) fn tool_call(value: &Value) -> anyhow::Result<providers::ToolCall> {
     })
 }
 
-fn guard_child_verdict(
-    runs: Option<&crate::durable::RunStore>,
-    parent: Option<&str>,
+/// Whether a call of the round runs at most once (`tool_once`): a write
+/// (an MCP tool without `readOnlyHint`, a synthetic write, a name nobody
+/// knows), except a worker joined durably (its outcome is re-readable), and
+/// a confirmed open-world read (a card exists for its guard run and call).
+pub fn runs_once(
+    engine: &Engine,
+    call: &providers::ToolCall,
+    guard_run: Option<&str>,
+    worker: bool,
+) -> anyhow::Result<bool> {
+    if call.name == "invoke_sub_agent" && worker {
+        return Ok(false);
+    }
+    if tool_effect(engine, &call.name) == Effect::Write {
+        return Ok(true);
+    }
+    Ok(match guard_run {
+        Some(guard) => crate::confirmation::Store::get(&engine.deps.db, guard, &crate::guard::key(call))?.is_some(),
+        None => false,
+    })
+}
+
+// The verdict of the round's guard child for `call`, read from its stored
+// outcome, never from YAML: `guard_run` must be this run's own child named
+// guard for round `i` (design 03, A), and one verdict authorizes one
+// invocation (`guard_verdict_uses`, keyed by the call's idempotency key).
+async fn guard_child_verdict(
+    engine: &Engine,
+    at: &CallSite<'_>,
     args: &Value,
     call: &providers::ToolCall,
-    invocation: Option<&str>,
 ) -> anyhow::Result<Option<crate::guard::Verdict>> {
-    let Some(((runs, parent), id)) = runs.zip(parent).zip(args["guard_run"].as_str()) else { return Ok(None) };
+    let (run, invocation) = (at.run, at.invocation);
+    let Some(id) = args["guard_run"].as_str() else { return Ok(None) };
     let round = args["i"].as_u64().ok_or_else(|| anyhow::anyhow!("guard requires a round"))?;
-    let Some(owf::run::Status::Completed(output)) = runs.child_outcome(parent, &format!("guard:{round}"), id)? else {
-        return Ok(None);
-    };
-    let saved = runs.get(id)?.ok_or_else(|| anyhow::anyhow!("missing guard child"))?;
-    anyhow::ensure!(saved.name == "guard" && saved.input["round"] == round, "invalid guard child");
+    let refused = || refuse(format!("guard run {id} is not this run's guard for round {round}"));
+    let saved = at.runs.run(id).await?.ok_or_else(refused)?;
+    let host: Option<crate::runs::GuardHost> =
+        saved.admission.host().and_then(|h| serde_json::from_value(h.clone()).ok());
+    // The reserved round's own definition: a version an operator activated
+    // under the name authorizes nothing.
+    let own = saved.admission.name == crate::flows::GUARD_NAME
+        && saved.admission.definition == crate::flows::GUARD
+        && saved.child.as_ref().is_some_and(|link| link.parent == run)
+        && host.is_some_and(|h| h.kind == crate::runs::GUARD && h.round == round && h.parent_loop == run);
+    if !own {
+        return Err(refused());
+    }
+    if let Some(outcome) = &saved.outcome {
+        engine.ended_child(id, outcome).await;
+    }
+    let Some(ouro_runtime::ows::run::Status::Completed(output)) = saved.outcome else { return Ok(None) };
     let verdicts: Vec<(String, crate::guard::Verdict)> = serde_json::from_value(output["verdicts"].clone())?;
     let verdict = verdicts.into_iter().find(|(key, _)| key == &crate::guard::key(call)).map(|(_, v)| v);
-    if verdict.is_some()
-        && !runs.use_guard_verdict(
-            id,
-            &crate::guard::key(call),
-            invocation.ok_or_else(|| anyhow::anyhow!("guard result requires a host invocation"))?,
-        )?
-    {
+    let spent = match verdict {
+        // A write may wait for the engine's lock on agent.db (runs.rs §2).
+        Some(_) => {
+            let (child, key, invocation) = (id.to_owned(), crate::guard::key(call), invocation.to_owned());
+            !engine
+                .deps
+                .db
+                .write(move |db| crate::confirmation::Store::use_guard_verdict(db, &child, &key, &invocation))
+                .await?
+        }
+        None => false,
+    };
+    if spent {
         return Ok(Some(crate::guard::Verdict {
             label: "unverified_confirmation".into(),
             guidance: "This verdict was already used by another call. Do not retry it.".into(),
@@ -1607,85 +1860,56 @@ fn guard_child_verdict(
     Ok(verdict)
 }
 
-/// `tool { loop, call, memory?, i?, index? }`: one call of the round: its reply as the
+/// `tool_once` / `tool_repeat { call, guard_run, worker_run?, i, index,
+/// memory? }`: one call of the round under its verdict: its reply as the
 /// model sees it (`presented`), whether it `failed`, and the working-memory
 /// entries it made (`stored`, `op`), which `agent_settle` applies again: a
-/// call that completed before a restart is not run again.
-pub async fn loop_tool(
-    engine: &Arc<Engine>,
-    args: &Value,
-    scope: &Scope,
-    cancel: &CancellationToken,
-    runs: Option<&crate::durable::RunStore>,
-    run_id: Option<&str>,
-) -> anyhow::Result<Value> {
-    loop_tool_at(engine, args, scope, cancel, runs, run_id, None).await
+/// call that completed before a restart is not run again. A tool's own
+/// failure is a definite result, never a fault (design 03, R-M8);
+/// `tool_repeat` refuses a call that must run at most once (R2-M3).
+/// Where one of a loop's calls runs (functions.rs `tool`): the run tree it
+/// may read (the call's run access, design 05 decision 3), its run, and its
+/// engine call's task and idempotency key.
+pub struct CallSite<'a> {
+    pub runs: &'a dyn crate::runs::RunReads,
+    pub run: &'a str,
+    pub task: &'a str,
+    pub invocation: &'a str,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn loop_tool_at(
+pub async fn loop_tool(
     engine: &Arc<Engine>,
+    loop_: &Arc<AgentLoop>,
     args: &Value,
-    scope: &Scope,
-    cancel: &CancellationToken,
-    runs: Option<&crate::durable::RunStore>,
-    run_id: Option<&str>,
-    invocation: Option<&str>,
+    at: &CallSite<'_>,
+    once: bool,
 ) -> anyhow::Result<Value> {
-    let loop_ = engine.loop_for(&loop_spec(args)?, scope, cancel).await?;
+    let run = at.run;
     loop_.restore_memory(args.get("memory"))?;
-    let mut call = tool_call(args.get("call").unwrap_or(&Value::Null))?;
-    // In-process children have no durable run to carry the YAML selection.
-    // Pass that selection to the same worker adapter used by tool arguments.
-    if call.name == "invoke_sub_agent"
-        && runs.is_none()
-        && let Some(name) = args["worker_loop"].as_str()
-    {
-        let mut arguments: Map<String, Value> = serde_json::from_str(&call.arguments)?;
-        arguments.insert("loop".into(), json!(name));
-        call.arguments = serde_json::to_string(&arguments)?;
+    let call = tool_call(args.get("call").unwrap_or(&Value::Null))?;
+    let worker_run = args.get("worker_run").and_then(Value::as_str);
+    let round = args["i"].as_u64().zip(args["index"].as_u64());
+    if !once && runs_once(engine, &call, args["guard_run"].as_str(), worker_run.is_some())? {
+        return Ok(json!({
+            "presented": format!("[tool error] {} changes something, so it runs only through tool_once (at most once)", call.name),
+            "failed": true,
+        }));
     }
-    let child = runs.zip(child_key(args)).map(|(runs, key)| ChildRun { runs, key });
-    let worker_run = child.as_ref().map(|c| format!("{}/loop", child_loop_id(&loop_.opts.id, &c.key)));
     let _slot = loop_.slots.acquire().await?;
-    let pending = runs
-        .zip(run_id)
-        .map(|(runs, id)| runs.confirmations().get(id, &crate::guard::key(&call)))
-        .transpose()?
-        .flatten()
-        .is_some();
-    let claimed = args.get("outcome").and_then(Value::as_str);
-    // Once a card exists, omitting the workflow outcome cannot fall back to
-    // a fresh guard decision and bypass that pending human decision.
-    let outcome = if let Some(claimed) = claimed.or(pending.then_some("unverified")) {
-        Some(if let Some((runs, id)) = runs.zip(run_id).filter(|_| loop_.opts.confirm.is_some()) {
-            runs.confirmations().resolve(id, &crate::guard::key(&call), claimed)?
-        } else {
-            "unverified".into()
-        })
-    } else {
-        None
-    };
-    let verdict = if let Some(outcome) = &outcome {
-        Some(confirmation_verdict(&call, outcome))
-    } else if let Some(verdict) = guard_child_verdict(runs, run_id, args, &call, invocation)? {
+    let verdict = if let Some(verdict) = guard_child_verdict(engine, at, args, &call).await? {
         loop_.guard.lock().await.verdicts.remove(&crate::guard::key(&call));
         Some(verdict)
-    } else if runs
-        .zip(run_id)
-        .map(|(runs, parent)| runs.pending_child_confirmation(parent, &crate::guard::key(&call)))
-        .transpose()?
-        .unwrap_or(false)
-    {
+    } else if crate::confirmation::Store::pending_loop_confirmation(&engine.deps.db, run, &crate::guard::key(&call))? {
         // Omitting a guard child cannot bypass its outstanding human decision.
         Some(confirmation_verdict(&call, "unverified"))
     } else if crate::guard::needs_guard(engine, &call) {
+        // The inline review a round without a guard child still gets (R-L2).
         let key = crate::guard::key(&call);
         let recorded = loop_.guard.lock().await.verdicts.remove(&key);
         Some(match recorded {
             Some(verdict) => verdict,
             None => {
-                loop_.guard_calls(engine, std::slice::from_ref(&call), None).await?;
+                loop_.guard_calls(engine, std::slice::from_ref(&call)).await?;
                 loop_
                     .guard
                     .lock()
@@ -1699,55 +1923,50 @@ pub async fn loop_tool_at(
         None
     };
     let guard_call = loop_.guard.lock().await.record_call(&call, verdict.as_ref().is_some_and(|v| !v.allowed()));
-    let dispatched = if let Some((runs, parent, id, key)) = runs
-        .zip(run_id)
-        .zip(args.get("worker_run").and_then(Value::as_str))
-        .zip(child_key(args))
-        .map(|(((r, p), id), key)| (r, p, id, key))
-    {
-        let status = runs.child_outcome(parent, &key, id)?.ok_or_else(|| anyhow::anyhow!("worker has not ended"))?;
-        let raw = match status {
-            owf::run::Status::Completed(Value::String(s)) => s,
-            owf::run::Status::Completed(v) => v.to_string(),
-            owf::run::Status::Faulted(e) => format!(
+    let joined = match (worker_run, round) {
+        (Some(id), Some((i, index))) if call.name == "invoke_sub_agent" => {
+            Some((id, worker_handle(i, index), worker_key(i, index)))
+        }
+        _ => None,
+    };
+    let dispatched = if let Some((id, _, key)) = &joined {
+        let saved = at.runs.run(id).await?.ok_or_else(|| anyhow::anyhow!("unknown worker run"))?;
+        anyhow::ensure!(
+            saved.child.as_ref().is_some_and(|link| link.parent == run && link.key.ends_with(&format!("/{key}"))),
+            "worker run does not belong to this call"
+        );
+        if let Some(outcome) = &saved.outcome {
+            engine.ended_child(id, outcome).await;
+        }
+        let raw = match saved.outcome {
+            Some(ouro_runtime::ows::run::Status::Completed(Value::String(s))) => s,
+            Some(ouro_runtime::ows::run::Status::Completed(v)) => v.to_string(),
+            Some(ouro_runtime::ows::run::Status::Faulted(e)) => format!(
                 "[invoke_sub_agent error] sub-agent crashed: {}",
                 e.detail.clone().unwrap_or_else(|| e.to_string())
             ),
-            // Cancelled explicitly (`RunStore::cancel`): a failure of this
-            // call, not a stop of the parent, which would resume it forever.
-            owf::run::Status::Cancelled => anyhow::bail!("sub-agent {id} was cancelled"),
+            // Cancelled explicitly: a failure of this call.
+            Some(ouro_runtime::ows::run::Status::Cancelled) => {
+                format!("[invoke_sub_agent error] sub-agent {id} was cancelled")
+            }
             _ => anyhow::bail!("worker has not ended"),
         };
-        Ok((loop_.scope.span(SpanStart::new("invoke_sub_agent:result", SpanKind::Tool)), raw))
+        Ok((loop_.scope().span(SpanStart::new("invoke_sub_agent:result", SpanKind::Tool)), raw))
     } else {
-        loop_.start_call(engine, &call, child, runs, verdict.as_ref()).await
+        loop_.start_call(engine, &call, Some(at), verdict.as_ref()).await
     };
-    // A dry run's card was never sent: there is nothing to edit.
-    if let Some((outcome, (runs, id))) = outcome.as_deref().zip(runs.zip(run_id)).filter(|_| engine.sandbox().is_none())
-    {
-        crate::confirmation::close_card(
-            runs.confirmations(),
-            &*engine.deps.mcp,
-            id,
-            &call,
-            outcome,
-            &crate::confirmation::Card::load(&*engine.deps.memory),
-            cancel,
-        )
-        .await;
-    }
     let (span, raw) = dispatched?;
     let failed = raw.starts_with("[guard] blocked:") || is_tool_error(&raw);
-    if let Some(sandbox) = engine.sandbox() {
+    if let Some(sandbox) = &engine.sandbox {
         sandbox.call(&loop_.opts.id, args["i"].as_u64(), &call, verdict.as_ref(), !failed, &raw);
     }
     let (mut presented, stored) = loop_.present(&call.name, &raw, &span);
-    // A durable worker's run, for read_run: beside its answer, not in it,
+    // A durable worker's handle, for read_run: beside its answer, not in it,
     // so the answer can still be passed on as it is.
-    if let Some(run) = worker_run
+    if let Some((_, handle, _)) = joined
         && let Ok(Value::Object(mut reply)) = serde_json::from_str::<Value>(&presented)
     {
-        reply.insert("worker_run".into(), run.into());
+        reply.insert("worker_run".into(), handle.into());
         presented = Value::Object(reply).to_string();
     }
     span.end(if failed { SpanEnd::error(raw.clone()).with_output(raw.clone()) } else { SpanEnd::output(raw.clone()) });
@@ -1775,22 +1994,18 @@ fn outcome_result(raw: &str) -> Value {
     serde_json::from_str(&bounded).unwrap_or(Value::String(bounded))
 }
 
-/// What a write that may have run before a restart answers the model.
+/// What a write that may have run before a restart answers the model; the
+/// built-in loop's `catch` of `call.unknown` around `tool_once` builds the
+/// same shape in YAML.
 pub fn unknown_tool_outcome(name: &str) -> Value {
     json!({"presented": format!("[tool error] outcome unknown: {name} was sent before a restart and its reply was lost, so it may or may not have run. Check its effect before repeating it."), "failed": true})
 }
 
-/// `agent_settle { loop, calls, results, memory }`: the round's replies as
-/// the model sees them, the working memory after the round, and whether
+/// `agent_settle { calls, results, memory }`: the round's replies as the
+/// model sees them, the working memory after the round, and whether
 /// `finish` ended the session (with its `output`), plus ordered generic tool
 /// outcomes for workflow-defined exit rules.
-pub async fn loop_settle(
-    engine: &Arc<Engine>,
-    args: &Value,
-    scope: &Scope,
-    cancel: &CancellationToken,
-) -> anyhow::Result<Value> {
-    let loop_ = engine.loop_for(&loop_spec(args)?, scope, cancel).await?;
+pub async fn loop_settle(loop_: &Arc<AgentLoop>, args: &Value) -> anyhow::Result<Value> {
     // The memory before the round, then what its calls stored and changed,
     // applied again from their results: after a restart they are not rerun.
     let memory = &loop_.opts.session.memory;
@@ -1823,8 +2038,6 @@ pub async fn loop_settle(
             "name": call.name,
             "arguments": serde_json::from_str::<Value>(&call.arguments).unwrap_or_else(|_| json!(call.arguments)),
             "ok": !failed,
-            // Older admitted rounds kept the full reply in working-memory
-            // storage only. Preserve that evidence when resuming their records.
             "result": result.get("result").cloned().unwrap_or_else(|| {
                 let raw = result.get("stored").and_then(|stored| stored.get(1)).and_then(Value::as_str);
                 outcome_result(raw.unwrap_or(&presented))
@@ -1834,14 +2047,14 @@ pub async fn loop_settle(
         round.push((call, presented, failed, finish));
     }
     let finished = settle_round(&mut round);
-    if let Some(sandbox) = engine.sandbox() {
-        sandbox.settled(&loop_.opts.id, finished.is_some());
-    }
     let replies: Vec<Message> =
         round.iter().map(|(call, presented, _, _)| providers::tool_reply(&call.id, presented)).collect();
     loop_.messages.lock().await.extend(replies.iter().cloned());
     if let Some(output) = &finished {
         loop_.finished(output);
+    }
+    if let Some(sandbox) = loop_.engine.upgrade().and_then(|engine| engine.sandbox.clone()) {
+        sandbox.settled(&loop_.opts.id, finished.is_some());
     }
     Ok(json!({
         "replies": replies,
@@ -1852,46 +2065,65 @@ pub async fn loop_settle(
     }))
 }
 
+/// Where a context function (`signal_input`, `recent_activity`,
+/// `pending_confirmations`, `preselect_skills`) runs: the signal's run or a
+/// loop's (design 03, R-M11), its session, its scope, and the signal the
+/// runtime started it for.
+pub struct ContextHost {
+    pub run: String,
+    pub session: Session,
+    pub scope: Scope,
+    pub signal: Option<crate::supervisor::PendingSignal>,
+    // Skills its loop already runs, for preselection.
+    pub loaded: Vec<String>,
+}
+
 /// The first-turn context a run gathers itself (`signal_input`,
-/// `recent_activity`, `pending_confirmations`, `preselect_skills`): the
-/// dispatcher's functions (supervisor.rs §1) on the signal the runtime
-/// started it for, read from the admitted input, never from YAML. What they
-/// capture for the guard waits in the live loop for `loop_setup`. A restart
-/// between them and `loop_setup` replays their results without that
-/// evidence, which leaves the guard only stricter.
-#[allow(clippy::too_many_arguments)]
+/// `recent_activity`, `pending_confirmations`, `preselect_skills`), on the
+/// signal the runtime started it for, read from the host's records, never
+/// from YAML. What they capture for the guard is recorded in their own
+/// output (design 03, decision 4): `signal_input`'s earlier user messages
+/// and working memory as evidence digests, `preselect_skills`' block.
 pub async fn loop_context(
     engine: &Arc<Engine>,
-    live: &Arc<AgentLoop>,
-    admitted: &Value,
+    at: &ContextHost,
     name: &str,
     args: &Value,
-    runs: Option<&crate::durable::RunStore>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Value> {
-    live.restore_memory(admitted.get("memory"))?;
-    let (mcp, scope) = (&*engine.deps.mcp, &live.scope);
+    let (mcp, scope) = (&*engine.deps.mcp, &at.scope);
     match name {
         "signal_input" => {
-            let signal = crate::supervisor::admitted_signal(&admitted["signal"]).ok_or_else(|| {
+            let signal = at.signal.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
                     "signal_input reads the signal the runtime started this run for (a route's or a scheduled task's), and this run has none (a worker's, or the default path's loop): skip the step with `if: '${{ $context.signal != null }}'`"
                 )
             })?;
-            let (input, earlier) =
-                crate::supervisor::signal_input(&signal, &live.opts.session, mcp, scope, cancel).await?;
-            live.setup().earlier_user_messages = Some(earlier);
-            Ok(json!(input))
+            let (input, earlier) = crate::supervisor::signal_input(signal, &at.session, mcp, scope, cancel).await?;
+            let snapshot = at.session.memory.snapshot();
+            let earlier = (!earlier.is_empty()).then(|| json!(earlier).to_string());
+            let memory = (snapshot.as_array().is_some_and(|m| !m.is_empty())).then(|| snapshot.to_string());
+            // A write may wait for the engine's lock on agent.db (runs.rs §2).
+            let run = at.run.clone();
+            let (earlier, memory) = engine
+                .deps
+                .db
+                .write(move |db| {
+                    let earlier = earlier.map(|body| db.put_evidence(&run, &body)).transpose()?;
+                    Ok((earlier, memory.map(|body| db.put_evidence(&run, &body)).transpose()?))
+                })
+                .await?;
+            Ok(json!({"input": input, "earlier": earlier, "memory": memory}))
         }
         "recent_activity" => Ok(json!(crate::supervisor::load_recent_activity(mcp, scope, cancel).await?)),
         "pending_confirmations" => {
             let target = serde_json::from_value(args["target"].clone())?;
-            let pending = runs.map_or(Ok(json!([])), |runs| runs.confirmations().pending(&target))?;
+            let pending = crate::confirmation::pending(engine, &target).await?;
             Ok(crate::supervisor::pending_text(pending))
         }
         "preselect_skills" => {
             let text = |key: &str| args[key].as_str().unwrap_or_default().to_owned();
-            let mut loaded = live.skill_names();
+            let mut loaded = at.loaded.clone();
             loaded.extend(string_list(&args["loaded"]));
             let found = crate::supervisor::preselect_skills(
                 &engine.deps,
@@ -1902,11 +2134,20 @@ pub async fn loop_context(
                 cancel,
             )
             .await?;
-            live.setup().preselected = found.clone();
             Ok(found.map_or(Value::Null, |(names, block)| json!({"names": names, "block": block})))
         }
         _ => anyhow::bail!("unknown loop context function {name}"),
     }
+}
+
+/// What a run's own context functions recorded: `signal_input`'s earlier
+/// user messages and `preselect_skills`' answer (the last of each).
+pub(crate) fn recorded_output<'a>(records: &'a Records, function: &str) -> Option<&'a Value> {
+    use ouro_runtime::ows::durable::{CallState, Record};
+    records.values().rev().find_map(|record| match record {
+        Record::Call { function: f, state: CallState::Done(Ok(output)), .. } if f == function => Some(output),
+        _ => None,
+    })
 }
 
 /// `loop_setup { system?, skills?, input? }`, once and only before the
@@ -1923,18 +2164,15 @@ pub async fn loop_setup(
     live: &Arc<AgentLoop>,
     admitted: &Value,
     args: &Value,
-    records: Option<&[owf::durable::Record]>,
+    records: &Records,
 ) -> anyhow::Result<Value> {
     {
         let setup = live.setup();
         anyhow::ensure!(
-            !setup.turned && !records.is_some_and(turned),
+            !setup.turned && !turned(records),
             "loop_setup must run before the loop's first agent_turn: its instructions are fixed once a turn has run"
         );
-        anyhow::ensure!(
-            !setup.done && records.is_none_or(|r| setup_record(r).is_none()),
-            "loop_setup runs once per loop"
-        );
+        anyhow::ensure!(!setup.done && setup_record(records).is_none(), "loop_setup runs once per loop");
     }
     let system = match &args["system"] {
         Value::Null => Vec::new(),
@@ -1995,10 +2233,16 @@ pub async fn loop_setup(
     {
         first.insert("content".into(), input.into());
     }
-    let (earlier, preselected) = {
-        let setup = live.setup();
-        (setup.earlier_user_messages.clone(), setup.preselected.clone())
+    // What this run's context functions captured, from their records.
+    let earlier = match recorded_output(records, "signal_input").and_then(|o| o["earlier"].as_str()) {
+        Some(digest) => Some(serde_json::from_str::<Vec<String>>(
+            &engine.deps.db.evidence(digest)?.ok_or_else(|| anyhow::anyhow!("evidence {digest} is missing"))?,
+        )?),
+        None => recorded_output(records, "signal_input").map(|_| Vec::new()),
     };
+    let preselected = recorded_output(records, "preselect_skills")
+        .filter(|o| !o.is_null())
+        .map(|o| (string_list(&o["names"]), o["block"].as_str().unwrap_or_default().to_owned()));
     let preselected =
         preselected.filter(|(_, text)| !text.is_empty() && system.iter().any(|part| part.contains(text.as_str())));
     let evidence = bodies.iter().map(String::as_str).chain(preselected.as_ref().map(|(_, text)| text.as_str()));
@@ -2021,7 +2265,7 @@ pub async fn loop_setup(
         setup.done = true;
         setup.loaded = preselected.clone();
     }
-    live.scope.update(ContextUpdate::metadata(
+    live.scope().update(ContextUpdate::metadata(
         json!({"skills": live.skill_names()}).as_object().cloned().unwrap_or_default(),
     ));
     Ok(json!({
@@ -2032,21 +2276,31 @@ pub async fn loop_setup(
     }))
 }
 
-// The `setup` a completed `loop_setup` recorded in a run's journal.
-fn setup_record(records: &[owf::durable::Record]) -> Option<Value> {
-    records.iter().find_map(|record| match record {
-        owf::durable::Record::Call { function, state: owf::durable::CallState::Done(Ok(output)), .. }
-            if function == "loop_setup" =>
-        {
-            Some(output["setup"].clone())
+/// The skills a loop run (a route's) ran, as `AgentLoop::skill_names` names
+/// them live: its host's skills, the engine's unless excluded, then what
+/// `loop_setup` added and preselected, read from the run's journal.
+pub fn loop_skill_names(engine: &Engine, host: &crate::runs::LoopHost, records: &Records) -> Vec<String> {
+    let engine_skills = if host.include_engine_skills { engine.deps.skills.as_slice() } else { &[] };
+    let setup = setup_record(records);
+    let setup = setup.iter().flat_map(|s| string_list(&s["skills"]).into_iter().chain(string_list(&s["preselected"])));
+    let mut names: Vec<String> = Vec::new();
+    for name in host.skills.iter().cloned().chain(engine_skills.iter().cloned()).chain(setup) {
+        if !names.contains(&name) {
+            names.push(name);
         }
-        _ => None,
-    })
+    }
+    names
+}
+
+// The `setup` a completed `loop_setup` recorded in a run's journal.
+fn setup_record(records: &Records) -> Option<Value> {
+    recorded_output(records, "loop_setup").map(|output| output["setup"].clone())
 }
 
 // Whether a run has started a turn.
-fn turned(records: &[owf::durable::Record]) -> bool {
-    records.iter().any(|r| matches!(r, owf::durable::Record::Call { function, .. } if function == "agent_turn"))
+pub(crate) fn turned(records: &Records) -> bool {
+    use ouro_runtime::ows::durable::Record;
+    records.values().any(|r| matches!(r, Record::Call { function, .. } if function == "agent_turn"))
 }
 
 fn string_list(value: &Value) -> Vec<String> {
@@ -2062,7 +2316,8 @@ fn add_evidence(context: &mut crate::guard::Context, text: &str) {
 
 // ── 5. run history ──────────────────────────────────────────────────────────
 // History is evidence on demand, not a second summary attached to delegation.
-// The store only reads generic records; transcript interpretation stays here.
+// It reads the engine's records of the loop's own workers only (R-M3); the
+// model names a worker by its handle, never by a run id (R2-M2).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadRunArgs {
@@ -2082,11 +2337,12 @@ fn history_cut(text: &str, limit: usize) -> String {
     }
 }
 
-fn history_messages(records: &[owf::durable::Record]) -> &[Value] {
+pub(crate) fn history_messages(records: &Records) -> &[Value] {
+    use ouro_runtime::ows::durable::Record;
     records
-        .iter()
+        .values()
         .filter_map(|record| match record {
-            owf::durable::Record::Task { result: Some(result), .. } => result.context.get("messages")?.as_array(),
+            Record::Task { result: Some(result), .. } => result.context.get("messages")?.as_array(),
             _ => None,
         })
         .max_by_key(|messages| messages.len())
@@ -2152,58 +2408,58 @@ fn history_turn(messages: &[Value]) -> Vec<String> {
     entries
 }
 
-// The durable runs of `loop_id`'s own workers (not their workers' workers).
-fn worker_runs(runs: &crate::durable::RunStore, loop_id: &str) -> anyhow::Result<Vec<String>> {
-    let prefix = format!("{loop_id}__sub");
-    Ok(runs
-        .loop_ids_prefix(&prefix)?
-        .into_iter()
-        .filter(|id| {
-            id.strip_prefix(&prefix)
-                .and_then(|tail| tail.strip_suffix("/loop"))
-                .is_some_and(|key| !key.contains("__sub") && !key.contains('/'))
-        })
-        .collect())
+// The loop's own worker runs (not their workers'), by handle, oldest first.
+async fn worker_runs(
+    runs: &dyn crate::runs::RunReads,
+    run: &str,
+) -> anyhow::Result<Vec<(String, ouro_runtime::durable::SavedRun)>> {
+    let mut workers = Vec::new();
+    for child in runs.children(run).await? {
+        let handle = child.child.as_ref().and_then(|link| {
+            let (i, index) = link.key.rsplit_once("/worker:")?.1.split_once('.')?;
+            Some(worker_handle(i.parse().ok()?, index.parse().ok()?))
+        });
+        if let Some(handle) = handle {
+            workers.push((handle, child));
+        }
+    }
+    Ok(workers)
 }
 
-fn read_run(
-    runs: Option<&crate::durable::RunStore>,
-    loop_id: &str,
-    args: &Map<String, Value>,
-) -> anyhow::Result<String> {
-    let Some(runs) = runs else {
+fn run_state(run: &ouro_runtime::durable::SavedRun) -> String {
+    format!("{:?}", run.state).to_lowercase()
+}
+
+async fn read_run(at: Option<&CallSite<'_>>, args: &Map<String, Value>) -> anyhow::Result<String> {
+    let Some(CallSite { runs, run, .. }) = at else {
         return Ok("No run history is available in an in-process loop; its workers have no durable runs.".into());
     };
+    let (runs, run) = (*runs, *run);
     let args: ReadRunArgs = serde_json::from_value(json!(args))?;
     let limit = args.limit.unwrap_or(10);
     anyhow::ensure!((1..=100).contains(&limit), "limit must be between 1 and 100");
+    let workers = worker_runs(runs, run).await?;
     let (mut output, entries, total) = if let Some(id) = &args.id {
         anyhow::ensure!(!id.is_empty(), "id must not be empty");
-        let Some(run) = runs.get(id)? else {
+        let Some((_, worker)) = workers.iter().find(|(handle, _)| handle == id) else {
             // A guessed id is the usual cause: name the ones that exist.
-            let workers = worker_runs(runs, loop_id)?;
             return Ok(if workers.is_empty() {
                 "No durable run has this id, and this loop has no worker runs. In-process workers have no run history."
                     .into()
             } else {
                 format!(
                     "No durable run has this id. This loop's worker runs: {}. Use one of these ids; never build one.",
-                    workers.join(", ")
+                    workers.iter().map(|(h, _)| h.as_str()).collect::<Vec<_>>().join(", ")
                 )
             });
         };
-        anyhow::ensure!(
-            crate::flows::is_loop_definition(&run.name, &run.definition),
-            "read_run only reads agent-loop runs; this run is {}",
-            run.name
-        );
-        let records = runs.records(id)?;
+        let records = runs.records(&worker.admission.id).await.unwrap_or_default();
         let messages = history_messages(&records);
         let header = format!(
             "Run: {}\nState: {}\nOutcome: {}\nTask: {}\n",
             history_cut(id, 500),
-            run.state,
-            history_cut(&serde_json::to_string(&run.outcome)?, 500),
+            run_state(worker),
+            history_cut(&serde_json::to_string(&worker.outcome)?, 500),
             history_task(messages),
         );
         if messages.is_empty() {
@@ -2226,20 +2482,19 @@ fn read_run(
         (header, entries, turns.len())
     } else {
         anyhow::ensure!(args.entry_offset == 0, "entry_offset requires a run id");
-        let ids = worker_runs(runs, loop_id)?;
         let mut entries = Vec::new();
-        for id in ids.iter().skip(args.offset).take(limit) {
-            let Some(run) = runs.get(id)? else { continue };
-            let records = runs.records(id)?;
+        for (handle, worker) in workers.iter().skip(args.offset).take(limit) {
+            let records = runs.records(&worker.admission.id).await.unwrap_or_default();
             let messages = history_messages(&records);
             // Admission retains the original user task even after sweeping.
-            let initial = run.input.get("messages").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+            let initial =
+                worker.admission.input.get("messages").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
             entries.push(vec![format!(
                 "Run: {}\nState: {}\nTask: {}\nOutcome: {}\n{}\n",
-                history_cut(id, 500),
-                run.state,
+                history_cut(handle, 500),
+                run_state(worker),
                 history_task(if messages.is_empty() { initial } else { messages }),
-                history_cut(&serde_json::to_string(&run.outcome)?, 500),
+                history_cut(&serde_json::to_string(&worker.outcome)?, 500),
                 if messages.is_empty() {
                     "No transcript records available (swept or not yet checkpointed)."
                 } else {
@@ -2247,7 +2502,7 @@ fn read_run(
                 },
             )]);
         }
-        (format!("Worker runs: {}\n", ids.len()), entries, ids.len())
+        (format!("Worker runs: {}\n", workers.len()), entries, workers.len())
     };
     let mut next = args.offset.min(total);
     for entry in entries {

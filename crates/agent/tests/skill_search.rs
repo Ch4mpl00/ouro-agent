@@ -65,7 +65,7 @@ fn client() -> (Arc<Api>, Arc<DecisionClient>) {
     (api, client)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires local OpenRouter credentials; uses isolated skill files"]
 async fn live_agent_discovery_scores_new_telegram_and_domain_skills_without_mcp_search() {
     let (_root, store) = store();
@@ -98,7 +98,7 @@ async fn live_agent_discovery_scores_new_telegram_and_domain_skills_without_mcp_
     println!("Agent-local live discovery: {result}");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scores_all_current_skills_then_filters_sorts_and_limits_with_hash_checked_descriptions() {
     let (_root, store) = store();
     for name in ["a", "b"] {
@@ -137,7 +137,7 @@ async fn scores_all_current_skills_then_filters_sorts_and_limits_with_hash_check
     assert_eq!(api.requests.lock().unwrap()[1]["state"]["skills"][0]["description"], "Current a.");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn batches_all_candidates_and_rejects_missing_or_invalid_decision_answers() {
     let (_root, store) = store();
     for n in 0..51 {
@@ -163,7 +163,7 @@ async fn batches_all_candidates_and_rejects_missing_or_invalid_decision_answers(
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn empty_catalog_skips_jev_and_invalid_arguments_or_cancellation_fail_before_model_calls() {
     let (_root, store) = store();
     let (api, client) = client();
@@ -198,7 +198,7 @@ impl Mcp for MemoryReply {
         Ok(self.0.to_string())
     }
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn memory_boundary_accepts_only_explicit_missing_or_valid_index_and_surfaces_failures() {
     for error in ["project_not_found", "doc_not_found"] {
         let index =
@@ -221,9 +221,9 @@ async fn memory_boundary_accepts_only_explicit_missing_or_valid_index_and_surfac
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn missing_decision_client_is_an_explicit_agent_tool_error_without_an_mcp_search_call() {
-    let mut h = Harness::new(
+    let h = Harness::configured(
         task_context("unavailable"),
         vec![
             turn(|p| {
@@ -237,8 +237,10 @@ async fn missing_decision_client_is_an_explicit_agent_tool_error_without_an_mcp_
         ],
         "unused",
         Arc::new(NullTracer),
+        |deps| {
+            deps.decisions = None;
+        },
     );
-    Arc::get_mut(&mut h.engine).unwrap().deps.decisions = None;
     assert_eq!(h.start().await.send("task".into()).await.unwrap(), "fallback");
     assert!(h.mcp.calls.lock().unwrap().is_empty());
     h.engine.shutdown().await;

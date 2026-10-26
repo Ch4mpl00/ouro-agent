@@ -1,24 +1,27 @@
 // One kind of workflow (#60): any workflow the runtime starts on a signal is
-// admitted with the model's parameters, so it may mix deterministic steps
-// with agent turns, and a recurring task can start as a copy of agent-loop.
-// The guarded round goes wherever agent_turn does; a run a workflow starts
-// itself is never admitted.
+// admitted with the model's parameters (host data), so it may mix
+// deterministic steps with agent turns, and a recurring task can start as a
+// copy of agent-loop. The guarded round goes wherever agent_turn does; a run
+// a workflow starts itself is never admitted (engine_runs.rs,
+// a_loop_a_workflow_starts_itself_is_never_admitted). Restored from
+// tests/pending on the engine (design 04): a scheduled task's saved workflow
+// is the signal's primary run (`run_saved_workflow`); the first test's dry
+// run (try_workflow on a fire of its task) came back with the sandbox step
+// (design 05, test 3).
 mod support;
 use agent::{
-    agent::AGENT_LOOP,
+    agent::{AGENT_LOOP, Engine},
     db::TraceStore,
-    durable::RunStore,
-    flows::{FlowResult, WorkflowSignal, create_durable_flows},
     mcp::Mcp,
     providers::{ToolDef, assistant},
-    schedule::{SupervisorSink, tick},
-    session::EnvDeps,
+    schedule::Task,
     supervisor::{Supervisor, create_supervisor},
     trace_model::Observation,
     tracing::{Scope, TraceStart},
 };
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use support::*;
 use tokio_util::sync::CancellationToken;
@@ -30,7 +33,7 @@ const SKILLS: &[(&str, &str)] = &[
 ];
 const READS: &[&str] = &["fetch_page", "get_timezone", "journal_tail"];
 const WRITES: &[&str] = &["send_telegram_message"];
-const LOOP_HEADER: &str = "name: agent-loop, version: '1.0.0', metadata: { loop: { description: 'General ReAct loop with guarded tools and workers.' } } }";
+const LOOP_HEADER: &str = "name: agent-loop, version: '1.0.0', metadata: { loop: { description: 'General ReAct loop with guarded tools and workers.' }, ouro: { breaker: 'off' } } }";
 
 #[derive(Default)]
 struct World {
@@ -73,65 +76,79 @@ struct Agent {
     world: Arc<World>,
     model: Arc<Scripted>,
     supervisor: Arc<Supervisor>,
+    fires: AtomicI64,
 }
 
 fn agent(script: Vec<agent::providers::Message>) -> Agent {
     let model = Arc::new(Scripted::new(script));
-    let mut f = fixture(model.clone(), &[], SKILLS);
     let world = Arc::new(World::default());
-    Arc::get_mut(&mut f.engine).unwrap().deps.mcp = world.clone();
-    let supervisor = create_supervisor(
-        f.engine.clone(),
-        EnvDeps { mcp: world.clone(), memory: f.db.clone(), user_email: None, telegram_chat_id: Some("999".into()) },
-        create_durable_flows(f.engine.clone(), (*f.db).clone()),
-    );
-    Agent { f, world, model, supervisor }
+    let f = fixture_on(model.clone(), &[], SKILLS, |deps| {
+        deps.mcp = world.clone();
+        deps.env.telegram_chat_id = Some("999".into());
+    });
+    let supervisor = create_supervisor(f.engine.clone());
+    Agent { f, world, model, supervisor, fires: AtomicI64::new(0) }
 }
 
 impl Agent {
-    fn tool(&self, name: &str, args: Value) -> anyhow::Result<Value> {
-        let reply = agent::flows::tool(&self.f.engine, name, args.as_object().unwrap())?;
+    async fn tool(&self, name: &str, args: Value) -> anyhow::Result<Value> {
+        self.f.engine.ready().await?;
+        let reply = agent::flows::tool(&self.f.engine, name, args.as_object().unwrap()).await?;
         Ok(serde_json::from_str(&reply)?)
     }
 
-    // Schedules the task as the agent would and fires it as the tick does;
-    // the run id of the fire.
+    // A fire of a task that names `workflow`, recorded as its trigger's run
+    // records one and run by the schedule's drain (design 06); the trace id
+    // of the fire.
     async fn fire(&self, workflow: &str, prompt: &str) -> String {
-        let store = &*self.f.engine.deps.schedule;
-        let args = json!({"cron_expr":"now","recurring":false,"prompt":prompt,"workflow":workflow});
-        let now = chrono::Utc::now();
-        agent::schedule::tool(
-            store,
-            &*self.f.engine.deps.workflows,
-            "UTC",
-            "schedule_task",
-            args.as_object().unwrap(),
-            now,
-        )
-        .await
-        .unwrap();
-        let before = self.fires();
-        let sink = SupervisorSink { supervisor: self.supervisor.clone(), env_context: None };
-        assert_eq!(tick(store, &sink, chrono_tz::Tz::UTC, now).await.unwrap(), 1);
-        let after = self.fires();
-        after.into_iter().find(|id| !before.contains(id)).expect("a new fire")
-    }
-
-    // The signals the supervisor ran, by trace id.
-    fn fires(&self) -> Vec<String> {
-        self.f
-            .db
-            .list_recent(50, None)
-            .unwrap()
-            .into_iter()
-            .map(|t| t.id)
-            .filter(|id| id.starts_with("scheduler:"))
-            .collect()
+        let n = self.fires.fetch_add(1, Ordering::SeqCst) + 1;
+        let task = Task {
+            id: n,
+            cron: "now".into(),
+            recurring: false,
+            prompt: prompt.into(),
+            source: None,
+            workflow: Some(workflow.into()),
+            timezone: "UTC".into(),
+            created: "2026-10-26T12:00:00.000Z".into(),
+            cancelled: false,
+        };
+        let fires = &self.f.engine.deps.schedule.fires;
+        let id = fires.record(&format!("schedule:task-{n}:at:{n}"), &task, n).await.unwrap();
+        let drained = agent::schedule::drain(&self.supervisor, None).await.unwrap();
+        assert_eq!(drained.ran, 1, "{drained:?}");
+        format!("scheduler:{id}")
     }
 
     fn trace(&self, id: &str) -> (agent::trace_model::Trace, Vec<Observation>) {
         self.f.db.get_trace(id).unwrap().unwrap()
     }
+
+    // The saved workflow's run of fire `id` (trace id `scheduler:<n>`).
+    async fn saved_run(&self, id: &str) -> ouro_runtime::durable::SavedRun {
+        let signal = format!("signal:{}", id.trim_start_matches("scheduler:"));
+        saved_child(&self.f.engine, &signal).await
+    }
+}
+
+async fn saved_child(engine: &Engine, signal: &str) -> ouro_runtime::durable::SavedRun {
+    let filter = agent::runs::Runs {
+        parent: Some(signal.into()),
+        since_ms: Some(0),
+        before_ms: Some(i64::MAX / 4),
+        ..Default::default()
+    };
+    let mut ids: Vec<String> =
+        engine.control.history(&filter, None, 50).await.unwrap().items.into_iter().map(|r| r.admission.id).collect();
+    let live = agent::runs::Runs { parent: Some(signal.into()), ..Default::default() };
+    ids.extend(engine.control.list(&live, None, 50).await.unwrap().items.into_iter().map(|r| r.admission.id));
+    for id in ids {
+        let run = engine.runtime.get(&id).await.unwrap().unwrap();
+        if run.child.as_ref().is_some_and(|l| l.key.ends_with("/saved")) {
+            return run;
+        }
+    }
+    panic!("no saved run under {signal}")
 }
 
 // The names of an observation's ancestors, nearest first; every parent must
@@ -156,7 +173,7 @@ fn system(seen: &Seen) -> &str {
 fn pages() -> String {
     let steps = r#"  - fetch:
       for: { each: url, in: '${ ["https://a.example/1", "https://b.example/2"] }' }
-      metadata: { concurrency: 4 }
+      metadata: { ouro: { concurrency: 4 } }
       do:
         - page:
             call: fetch_page
@@ -168,7 +185,13 @@ fn pages() -> String {
         system: '${ [ "Pages fetched before your first turn:\n" + ($context.pages | map(.body) | join("\n")) ] }'
       export: { as: '${ $context + { messages: .messages, memory: .memory } }' }
 "#;
-    AGENT_LOOP.replace(LOOP_HEADER, "name: pages, version: '1.0.0' }").replacen("do:\n", &format!("do:\n{steps}"), 1)
+    let pages = AGENT_LOOP.replace(LOOP_HEADER, "name: pages, version: '1.0.0' }").replacen(
+        "do:\n",
+        &format!("do:\n{steps}"),
+        1,
+    );
+    assert_ne!(pages, AGENT_LOOP);
+    pages
 }
 
 const SEND: (&str, &str) = ("send_telegram_message", "Two pages: A and B");
@@ -177,28 +200,28 @@ fn send() -> agent::providers::Message {
     calls(&[(SEND.0, json!({"chatId":"999","text":SEND.1}))])
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_semi_deterministic_workflow_saves_tries_and_runs_on_a_scheduled_signal() {
     let a = agent(vec![send(), assistant("Sent the summary."), send(), assistant("Sent the summary.")]);
     let definition = pages();
     assert!(!definition.contains("metadata: { loop"), "not a loop: a scheduled task's workflow");
-    let saved = a.tool("save_workflow", json!({"name":"pages","definition":definition})).unwrap();
+    let saved = a.tool("save_workflow", json!({"name":"pages","definition":definition})).await.unwrap();
     assert!(saved["next"].as_str().unwrap().contains("payload: {workflow: \"pages\"}"), "{saved}");
     // The scheduled form of a dry run has no admitted input for its turns.
     let trace =
         a.f.engine.deps.tracer.trace(TraceStart { id: "author".into(), name: "author".into(), ..Default::default() });
     let scope: Scope = trace.clone();
     let cancel = CancellationToken::new();
-    let env = context().env.clone();
-    let plain = json!({"name":"pages"});
-    let plain = agent::flows::try_draft(&a.f.engine, plain.as_object().unwrap(), &env, &scope, &cancel).await;
-    assert!(plain.unwrap_err().to_string().contains("takes agent turns"));
-
-    // Dry run on a fire of its task: the same admission, writes mocked.
+    // The dry signal's env is the builder session's: its chat (R-L4).
     let author = agent::session::session(
         "author",
         agent::session::EnvData { telegram_chat_id: Some("999".into()), ..context().env.clone() },
     );
+    let plain = json!({"name":"pages"});
+    let plain = agent::sandbox::try_draft(&a.f.engine, plain.as_object().unwrap(), &author, &scope, &cancel).await;
+    assert!(plain.unwrap_err().to_string().contains("takes agent turns"));
+
+    // Dry run on a fire of its task: the same admission, writes mocked.
     let args = json!({"name":"pages","signal":{"source":"scheduler","content":"Summarize the pages for me.","payload":{"workflow":"pages"}}});
     let report: Value = serde_json::from_str(
         &agent::sandbox::try_signal(&a.f.engine, args.as_object().unwrap(), &author, &scope, &cancel).await.unwrap(),
@@ -206,11 +229,14 @@ async fn a_semi_deterministic_workflow_saves_tries_and_runs_on_a_scheduled_signa
     .unwrap();
     trace.end();
     assert_eq!(report["status"], "completed", "{report:#}");
-    assert_eq!(report["drafts"], json!([{"name":"pages","version":1,"ran":true}]));
-    assert_eq!(report["writes"], json!([{"function":SEND.0,"arguments":{"chatId":"999","text":SEND.1}}]));
+    assert_eq!(report["drafts"], json!([{"name":"pages","version":1,"ran":true,"outcome":"completed"}]));
+    let writes = report["writes"].as_array().unwrap();
+    assert_eq!(writes.len(), 1, "{report:#}");
+    assert_eq!((writes[0]["function"].as_str(), writes[0]["via"].as_str()), (Some(SEND.0), Some("tool")));
+    assert_eq!(writes[0]["arguments"], json!({"chatId":"999","text":SEND.1}));
     assert_eq!((report["ended"]["by"].as_str(), report["ended"]["turns"].as_u64()), (Some("answer"), Some(2)));
     assert!(a.world.called(SEND.0).is_empty(), "the dry run sent nothing");
-    a.tool("activate_workflow", json!({"name":"pages","version":1})).unwrap();
+    a.tool("activate_workflow", json!({"name":"pages","version":1})).await.unwrap();
 
     let id = a.fire("pages", "Summarize the pages for me.").await;
     let urls: Vec<Value> = a.world.called("fetch_page").iter().skip(2).map(|args| args["url"].clone()).collect();
@@ -225,13 +251,14 @@ async fn a_semi_deterministic_workflow_saves_tries_and_runs_on_a_scheduled_signa
     assert!(first.messages[1]["content"].as_str().unwrap().contains("Summarize the pages for me."));
     assert_eq!(first.model, agent::models::default_presets().base.model, "a scheduled task's default preset");
 
-    // One trace, one tree: the steps' spans and the model's turns under the signal's primary run.
+    // One trace, one tree: the steps' calls and the model's turns under the signal's primary run.
     let (trace, observations) = a.trace(&id);
     assert_eq!(trace.output["output"], "Sent the summary.");
     assert_eq!(trace.tags, ["scheduler", "saved-workflow"]);
     let primary = observations.iter().find(|o| o.name == "agent_loop").unwrap();
     assert_eq!(primary.meta("activity"), Some(&json!("primary_loop")));
-    let pages: Vec<&Observation> = observations.iter().filter(|o| o.name == "call:page").collect();
+    let pages: Vec<&Observation> =
+        observations.iter().filter(|o| o.meta("tool") == Some(&json!("fetch_page"))).collect();
     assert_eq!(pages.len(), 2);
     for page in pages {
         let up = ancestors(&observations, page);
@@ -242,12 +269,15 @@ async fn a_semi_deterministic_workflow_saves_tries_and_runs_on_a_scheduled_signa
         assert!(ancestors(&observations, generation).contains(&"agent_loop"));
     }
     assert!(observations.iter().any(|o| o.name == "guard"), "the model's send went through the guard child");
-    let run = RunStore::new((*a.f.db).clone()).get(&id).unwrap().unwrap();
-    assert_eq!((run.name.as_str(), run.input["loop"]["preset"].as_str()), ("pages", Some("base")));
+    let run = a.saved_run(&id).await;
+    assert_eq!(
+        (run.admission.name.as_str(), run.admission.host().unwrap()["preset"].as_str()),
+        ("pages", Some("base"))
+    );
     a.supervisor.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deterministic_calls_keep_full_results_and_model_calls_are_not_duplicated() {
     for loop_metadata in [false, true] {
         let a = agent(vec![send(), assistant("Sent the summary.")]);
@@ -267,16 +297,17 @@ async fn deterministic_calls_keep_full_results_and_model_calls_are_not_duplicate
                 "name: pages, version: '1.0.0', metadata: {loop: {description: Pages with fixed steps}} }",
             );
         }
-        activate_definition(&a.f.engine, "pages", &definition);
+        activate_definition(&a.f.engine, "pages", &definition).await;
         let id = a.fire("pages", "Summarize the pages.").await;
         let (trace, observations) = a.trace(&id);
+        let run = a.saved_run(&id).await;
         let reads: Vec<_> = observations.iter().filter(|o| o.meta("tool") == Some(&json!("fetch_page"))).collect();
         assert_eq!(reads.len(), 2, "metadata.loop={loop_metadata}: each fixed call has one span");
         for read in reads {
             let url = read.input["url"].as_str().unwrap();
-            assert_eq!(read.meta("workflow_run"), Some(&json!(id)));
+            assert_eq!(read.meta("workflow_run"), Some(&json!(run.admission.id)));
             let raw: Value = serde_json::from_str(read.output.as_str().unwrap()).unwrap();
-            assert_eq!(raw, json!({"url":url,"body":format!("Body of {url}")}));
+            assert_eq!(raw, json!({"url":url,"body":format!("Body of {url}")}), "the tool's reply, whole");
             assert_eq!(read.level, "DEFAULT");
             assert!(!read.end_time.is_empty());
             assert!(ancestors(&observations, read).contains(&"runner"));
@@ -290,17 +321,11 @@ async fn deterministic_calls_keep_full_results_and_model_calls_are_not_duplicate
         assert_eq!(remembered.len(), 1);
         assert_eq!(remembered[0].input, json!({"key":"pages.checked","value":"yes"}));
         assert_eq!(remembered[0].output, json!({"ok":true,"key":"pages.checked"}));
-        let runner =
-            observations.iter().find(|o| o.name == "runner" && o.meta("workflow") == Some(&json!("pages"))).unwrap();
-        assert!(runner.input["loop"].is_object(), "fixed calls preserve the admitted input");
-        if !loop_metadata {
-            let tasks: Vec<_> = observations.iter().filter(|o| o.name == "call:page").collect();
-            assert_eq!(tasks.len(), 2);
-            for task in tasks {
-                assert!(task.output.get("url").is_none(), "task output is transformed, tool reply stays intact");
-                assert!(task.meta("tool_span").is_some());
-            }
-        }
+        let runner = observations.iter().find(|o| o.name == "runner" && o.meta("workflow") == Some(&json!("pages")));
+        assert!(runner.is_some(), "the saved run's span");
+        // Fixed calls keep the admitted input: the model's parameters stay the host's.
+        assert_eq!(run.admission.host().unwrap()["preset"], "base");
+        assert!(run.admission.input["messages"].is_array());
         let packet = agent::activity::project_trace(&trace, &observations, None, &Default::default());
         assert_eq!(packet["actions"].as_array().unwrap().iter().filter(|a| a["tool"] == "fetch_page").count(), 2);
         assert!(
@@ -311,85 +336,56 @@ async fn deterministic_calls_keep_full_results_and_model_calls_are_not_duplicate
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agent_turns_need_the_guarded_round_and_steps_alone_need_none() {
     let a = agent(vec![]);
     let bare = "document: {dsl: '1.0.4', namespace: t, name: bare, version: '1.0.0'}\ndo: [{turn: {call: agent_turn, with: {messages: '${ .messages }'}}}]\n";
-    let refused = a.tool("save_workflow", json!({"name":"bare","definition":bare})).unwrap_err().to_string();
-    assert!(refused.contains("requires a `call: start_child`") && refused.contains("copy agent-loop"), "{refused}");
-    let stored = a.f.engine.deps.workflows.save("bare", bare, None).unwrap();
-    a.f.engine.deps.workflows.mark_tried("bare", stored.version).unwrap();
-    let refused = a.tool("activate_workflow", json!({"name":"bare","version":stored.version})).unwrap_err();
-    assert!(refused.to_string().contains("requires a `call: start_child`"));
+    let refused = a.tool("save_workflow", json!({"name":"bare","definition":bare})).await.unwrap_err().to_string();
+    assert!(refused.contains("requires a `call: start_guard`") && refused.contains("copy agent-loop"), "{refused}");
+    let version = a.f.engine.runtime.save("bare", bare).await.unwrap().version;
+    agent::flows::WorkflowMeta::record(
+        &a.f.engine.deps.db,
+        "bare",
+        &ouro_runtime::durable::digest_of(bare),
+        None,
+        false,
+    )
+    .unwrap();
+    mark_tried(&a.f.engine, "bare", bare);
+    let refused = a.tool("activate_workflow", json!({"name":"bare","version":version})).await.unwrap_err();
+    assert!(refused.to_string().contains("requires a `call: start_guard`"));
     // Steps alone need no guard, a loop's included.
     for (name, metadata) in [("steps", ""), ("step-loop", ", metadata: {loop: {description: Steps}}")] {
         let definition = format!(
             "document: {{dsl: '1.0.4', namespace: t, name: {name}, version: '1.0.0'{metadata}}}\ndo: [{{page: {{call: fetch_page, with: {{url: x}}}}}}]\n"
         );
-        a.tool("save_workflow", json!({"name":name,"definition":definition})).unwrap();
+        a.tool("save_workflow", json!({"name":name,"definition":definition})).await.unwrap();
     }
-    // A run the runtime admits may declare the model's parameters; a signal
-    // route that calls primary_loop passes them there instead.
+    // A run the runtime admits may declare the model's parameters; a
+    // workflow that calls primary_loop is a signal override and declares none.
     let declared = "document: {dsl: '1.0.4', namespace: t, name: declared, version: '1.0.0', metadata: {agent: {preset: smartest, confirm: none}}}\ndo: [{page: {call: fetch_page, with: {url: x}}}]\n";
-    a.tool("save_workflow", json!({"name":"declared","definition":declared})).unwrap();
+    a.tool("save_workflow", json!({"name":"declared","definition":declared})).await.unwrap();
     let typo = declared.replace("confirm: none", "confirm: nobody");
-    assert!(a.tool("save_workflow", json!({"name":"declared","definition":typo})).is_err());
+    assert!(a.tool("save_workflow", json!({"name":"declared","definition":typo})).await.is_err());
     let legacy = "document: {dsl: '1.0.4', namespace: t, name: legacy, version: '1.0.0', metadata: {agent: {preset: base}, route: {when: {source: peer}}}}\ndo: [{p: {call: primary_loop, with: {input: x}}}]\n";
     assert!(
         a.tool("save_workflow", json!({"name":"legacy","definition":legacy}))
+            .await
             .unwrap_err()
             .to_string()
             .contains("primary_loop")
     );
 }
 
-// The model's parameters are the host's: a child a workflow starts itself is
-// never admitted, and cannot be handed a spec through its input.
-#[tokio::test]
-async fn a_child_a_workflow_starts_is_never_admitted() {
-    let a = agent(vec![]);
-    let activate = |name: &str, body: &str| {
-        let definition = format!("document: {{dsl: '1.0.4', namespace: t, name: {name}, version: '1.0.0'}}\n{body}");
-        let saved = a.f.engine.deps.workflows.save(name, &definition, None).unwrap();
-        a.f.engine.deps.workflows.activate(name, saved.version).unwrap();
-    };
-    activate("child", "do: [{turn: {call: agent_turn, with: {messages: []}}}]\n");
-    activate(
-        "forger",
-        "do: [{start: {call: start_child, with: {workflow: child, key: one, input: {loop: '${ $workflow.input.loop }'}}}}]\n",
-    );
-    activate(
-        "parent",
-        r#"do:
- - start: { call: start_child, with: { workflow: child, key: one }, export: { as: '${ . }' } }
- - wait: { listen: { to: { one: { with: { type: '${ "done:" + $context.run }' } } } }, metadata: { hold: PT5S } }
- - result: { call: child_outcome, with: { run: '${ $context.run }', key: one } }
-"#,
-    );
-    let flows = create_durable_flows(a.f.engine.clone(), (*a.f.db).clone());
-    let run = |name: &'static str, id: i64| {
-        let flows = flows.clone();
-        async move {
-            let signal = WorkflowSignal { id, source: "scheduler".into(), content: "go".into(), env_context: None };
-            let scope = agent::tracing::null_scope();
-            flows.run(name, &signal, &task_context(&format!("scheduler:{id}")), &scope, &CancellationToken::new()).await
-        }
-    };
-    let FlowResult::Faulted { error, .. } = run("forger", 1).await else { panic!("a forged spec was taken") };
-    assert!(error.to_string().contains("cannot carry `loop`"), "{error}");
-    let FlowResult::Completed(outcome) = run("parent", 2).await else { panic!("the parent did not end") };
-    assert!(outcome.to_string().contains("requires the host's admitted model input"), "{outcome}");
-    assert!(a.model.seen.lock().unwrap().is_empty(), "no turn was taken");
-}
-
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_task_copied_from_agent_loop_runs_as_the_primary_loop_and_falls_back_after_three_faults() {
     let mut script = vec![calls(&[("fetch_page", json!({"url":"https://c.example"}))]), assistant("Daily summary: C")];
     script.extend((1..=4).map(|n| assistant(&format!("handled {n}"))));
     let a = agent(script);
-    // A copy of agent-loop under the task's own name, its metadata and all.
-    let task = AGENT_LOOP.replace("name: agent-loop,", "name: daily-task,");
-    activate_definition(&a.f.engine, "daily-task", &task);
+    // A copy of agent-loop under the task's own name, its metadata and all
+    // but the breaker policy only the built-ins declare.
+    let task = variant("daily-task");
+    activate_definition(&a.f.engine, "daily-task", &task).await;
     let id = a.fire("daily-task", "Summarize https://c.example").await;
     let seen = a.model.seen.lock().unwrap().clone();
     assert_eq!(seen.len(), 2, "two turns of the task's own loop");
@@ -403,17 +399,13 @@ async fn a_task_copied_from_agent_loop_runs_as_the_primary_loop_and_falls_back_a
     let turns = observations.iter().filter(|o| o.name.starts_with("iter-")).count();
     assert_eq!(turns, 2);
     assert!(!observations.iter().any(|o| o.name == "fallback"));
-    let run = RunStore::new((*a.f.db).clone()).get(&id).unwrap().unwrap();
-    assert_eq!(run.name, "daily-task");
-    assert_eq!(run.input["loop"]["skills"], json!(["scheduler"]));
+    let run = a.saved_run(&id).await;
+    assert_eq!(run.admission.name, "daily-task");
+    assert_eq!(run.admission.host().unwrap()["skills"], json!(["scheduler"]));
 
     // Three faults of its version in a row: the agent loop takes the task.
-    let broken = task.replacen(
-        "do:\n",
-        "do:\n  - broken: { raise: { error: { type: 'https://example.com/fault', status: 500 } } }\n",
-        1,
-    );
-    activate_definition(&a.f.engine, "daily-task", &broken);
+    let broken = faulting(&task);
+    activate_definition(&a.f.engine, "daily-task", &broken).await;
     for n in 1..=4 {
         let id = a.fire("daily-task", "Summarize https://c.example").await;
         let (trace, observations) = a.trace(&id);
@@ -425,34 +417,33 @@ async fn a_task_copied_from_agent_loop_runs_as_the_primary_loop_and_falls_back_a
         let expected = if n <= 3 { "failed before changing anything" } else { "faulted 3 times in a row" };
         assert!(note.contains(expected), "fire {n}: {note}");
     }
-    let breaker: Value =
-        serde_json::from_str(&a.f.engine.deps.memory.get("daily_task.breaker").unwrap().unwrap()).unwrap();
-    assert_eq!((breaker["faults"].as_u64(), breaker["open"].as_bool()), (Some(3), Some(true)));
+    let trip = a.f.engine.runtime.definitions("daily-task").await.unwrap().tripped.unwrap();
+    assert_eq!((trip.faults, trip.breaker), (3, true));
     a.supervisor.shutdown().await;
 }
 
 // A scheduled task's admission: what its definition declares, else the
-// scheduled defaults, pinned in the run's input.
-#[tokio::test]
+// scheduled defaults, pinned in the run's host data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_workflow_declares_the_model_parameters_it_is_admitted_with() {
     let a = agent(vec![]);
     let declared = "document: {dsl: '1.0.4', namespace: t, name: declared, version: '1.0.0', metadata: {agent: {preset: smartest, confirm: none}}}\ndo: [{page: {call: fetch_page, with: {url: x}}}]\n";
-    activate_definition(&a.f.engine, "declared", declared);
+    activate_definition(&a.f.engine, "declared", declared).await;
     let plain = declared
         .replace("name: declared", "name: plain")
         .replace(", metadata: {agent: {preset: smartest, confirm: none}}", "");
-    activate_definition(&a.f.engine, "plain", &plain);
-    let runs = RunStore::new((*a.f.db).clone());
+    activate_definition(&a.f.engine, "plain", &plain).await;
     for (name, preset, confirm) in
         [("declared", "smartest", Value::Null), ("plain", "base", json!({"chatId":"999","messageThreadId":null}))]
     {
         let id = a.fire(name, "go").await;
-        let run = runs.get(&id).unwrap().unwrap();
-        assert_eq!(run.input["loop"]["preset"], preset, "{name}");
-        assert_eq!(run.input["loop"]["confirm"], confirm, "{name}");
-        assert_eq!(run.input["signal"]["payload"], json!({"workflow":name}));
-        assert!(run.input["env"]["now"].is_string(), "the env block scheduled workflows read");
-        assert_eq!(run.outcome.as_ref().map(|o| matches!(o, owf::run::Status::Completed(_))), Some(true), "{name}");
+        let run = a.saved_run(&id).await;
+        let host = run.admission.host().unwrap();
+        assert_eq!(host["preset"], preset, "{name}");
+        assert_eq!(host["confirm"], confirm, "{name}");
+        assert_eq!(run.admission.input["signal"]["payload"], json!({"workflow":name}));
+        assert!(run.admission.input["env"]["now"].is_string(), "the env block scheduled workflows read");
+        assert!(matches!(run.outcome, Some(agent::runs::Status::Completed(_))), "{name}: {:?}", run.outcome);
     }
     assert!(a.model.seen.lock().unwrap().is_empty(), "steps alone never call the model");
     a.supervisor.shutdown().await;

@@ -53,7 +53,9 @@ dependencies = [
  "dotenvy",
  "futures",
  "hex",
- "owf",
+ "ouro-durable",
+ "ouro-runtime",
+ "ows",
  "proptest",
  "rand 0.10.3",
  "regex",
@@ -62,6 +64,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "sha2 0.11.0",
  "tempfile",
  "thiserror",
@@ -1359,7 +1362,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "futures",
- "owf",
+ "ows",
  "regex",
  "reqwest",
  "rusqlite",
@@ -2753,6 +2756,7 @@ dependencies = [
  "futures",
  "grammers-client",
  "hex",
+ "ouro-runtime",
  "pdf-extract",
  "proptest",
  "rand 0.10.3",
@@ -3184,6 +3188,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "opentelemetry"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b84bcd6ae87133e903af7ef497404dda70c60d0ea14895fc8a5e6722754fc2a0"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "js-sys",
+ "pin-project-lite",
+ "thiserror",
+]
+
+[[package]]
 name = "os_info"
 version = "3.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3199,30 +3216,79 @@ dependencies = [
 ]
 
 [[package]]
+name = "ouro-durable"
+version = "0.3.0"
+source = "git+https://github.com/Ch4mpl00/ouro?tag=v0.3.0#758bd0cf74958a8b76e404770742b7e1e1f51537"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "deadpool-postgres",
+ "futures",
+ "ows",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.11.0",
+ "tokio",
+ "tokio-postgres",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "ouro-runtime"
+version = "0.3.0"
+source = "git+https://github.com/Ch4mpl00/ouro?tag=v0.3.0#758bd0cf74958a8b76e404770742b7e1e1f51537"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "chrono-tz",
+ "croner",
+ "futures",
+ "jsonschema",
+ "opentelemetry",
+ "ouro-durable",
+ "ows",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.11.0",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "outref"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
-name = "owf"
-version = "0.1.0"
+name = "ows"
+version = "0.3.0"
+source = "git+https://github.com/Ch4mpl00/ouro?tag=v0.3.0#758bd0cf74958a8b76e404770742b7e1e1f51537"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "chrono-tz",
+ "croner",
  "futures",
  "jaq-core",
  "jaq-json",
  "jaq-std",
  "jsonschema",
- "proptest",
  "serde",
  "serde_json",
  "serde_yaml_ng",
  "thiserror",
  "tokio",
  "tokio-util",
+ "uuid",
 ]
 
 [[package]]

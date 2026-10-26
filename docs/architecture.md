@@ -24,9 +24,9 @@ flowchart LR
     end
 
     subgraph agent ["crates/agent — supervisor"]
-        C[Schedule<br/>cron, 30 s tick] -->|fire| S
+        C[Schedule<br/>engine triggers, fire drain] -->|fire| S
         Q -->|get_next_signal<br/>wait_for_signal| S[Supervisor<br/>one signal at a time]
-        S -->|scheduler task<br/>naming a workflow| W[Saved workflow<br/>crates/owf]
+        S -->|scheduler task<br/>naming a workflow| W[Saved workflow<br/>ouro engine]
         S -->|all other signals| L[Agent loop<br/>skills · sub-agents]
         W -.->|faulted before any write| L
     end
@@ -60,9 +60,17 @@ Postgres, the Codex sandbox and the tunnel daemon run in Docker.
 | --- | --- | --- |
 | **`crates/mcp`** | `mcp-tools` | A stateless MCP server. It wraps Gmail, Telegram (bot and read-only userbot), Monobank, news, PDF, files and unified memory as primitive tools. It also runs the pollers that turn external events into signals. It knows nothing about the agent. |
 | **`crates/agent`** | `agent-supervisor` | The supervisor and the agent. It takes signals, preselects skills, and runs the agent loop or a saved workflow. It owns the schedule, the activity journal and the trace mirror. It knows MCP only through the protocol. |
-| **`crates/owf`** | (library) | An interpreter for the [Open Workflow Specification](https://serverlessworkflow.io) DSL 1.0, limited to the subset saved workflows use. It covers parsing against the official JSON Schema, validation, jq expressions (via jaq) and durable replay. It knows nothing about MCP or the agent. |
 | **`crates/codex`** | `codex-service` | The sandbox where the agent's `code_agent` tool and the codex judge run `codex exec`. It exposes `POST /run` and `GET /health`. |
-| **`crates/evals`** | `judge`, `judge-worker`, `improve`, … | The tooling that evaluates the agent: a per-node judge, judge-noise calibration, the improver gate and the closed-loop improver, trace replay, and the news-filter golden set. It reads the trace mirror and Langfuse, and is never in the signal path. |
+| **`crates/evals`** | `judge`, `judge-worker`, `improve`, … | The tooling that evaluates the agent: a per-node judge, judge-noise calibration, the improver gate and the closed-loop improver, trace replay, the news-filter and guard golden sets, and the workflow optimizer, whose workbench runs candidates in memory on the engine's interpreter. It reads the trace mirror and Langfuse, and is never in the signal path. |
+
+Workflows run on the **ouro engine** (`Ch4mpl00/ouro`, crates `ows`,
+`ouro-durable` and `ouro-runtime`, a git dependency pinned to a tag): an
+interpreter for the [Open Workflow Specification](https://serverlessworkflow.io)
+DSL 1.0 with durable runs, versions, a breaker, triggers and dry runs. It
+knows nothing about MCP or the agent; `crates/agent` adapts it
+(`runs.rs`, `functions.rs`, `flows.rs`). The agent's own interpreter,
+`crates/owf`, was removed when the migration finished
+(`docs/designs/07-remove-owf.md`).
 
 The server and the agent do not import each other's code. The protocol is
 the boundary. Only tests cross it: `crates/mcp/tests` drive the agent's
@@ -107,10 +115,9 @@ mcp-tools/
 └── crates/
     ├── mcp/                 src/<domain>.rs, src/bin (CLIs), migrations/pg,
     │                        specs/*.feature, tests/ (+ tests/model)
-    ├── agent/               supervisor, agent loop, schedule, flows, durable,
+    ├── agent/               supervisor, agent loop, schedule, flows, runs, sandbox,
     │                        skills, activity, tracing;
     │                        migrations/ (agent.db)
-    ├── owf/                 the workflow interpreter + schema/
     ├── codex/               codex-service
     └── evals/               judge, improver, replay, golden-set evals
 ```
@@ -126,7 +133,7 @@ mcp-tools/
 | `telegram` | Bot `getUpdates` poller in `crates/mcp` (accepts only `TELEGRAM_DEFAULT_CHAT_ID`) | long-poll |
 | `nashdom-bill` | Gmail poller in `crates/mcp`; one entry in `gmail.rs` `SUBSCRIPTIONS` per mail-driven source | 1 min |
 | `peer` | Another agent calling `ask_ouro` (see [Peer messaging](#peer-messaging)) | on demand |
-| `scheduler` (or a task's own source, e.g. `dreaming`) | The agent's own schedule (`crates/agent/src/schedule.rs`), handed straight to the supervisor without the queue | 30 s tick |
+| `scheduler` (or a task's own source) | The agent's own schedule (`crates/agent/src/schedule.rs`): engine triggers record fires, the supervisor's drain runs them without the queue | at the slot |
 
 The MCP server also runs a **news harvester**. It polls Hacker News every
 15 min, Habr every 30 min, and the user's subscribed Telegram channels (through
@@ -146,7 +153,7 @@ Telegram.
    `list_scheduled_tasks` are supervisor-only and never shown to a model.
 2. **Route by source.**
    - A `scheduler` fire whose payload names a saved workflow runs that
-     workflow's active version (`flows.rs` over `crates/owf`). No model
+     workflow's active version (an engine run, `flows.rs`). No model
      chooses the steps.
    - All other signals run the primary **agent loop** (`agent.rs`). A
      scheduler fire uses the `scheduler` skill and `base` preset. Recurring
@@ -342,8 +349,8 @@ the loop.
 writes a live skill with `write_skill`. Telegram communication rules exist
 only that way. They live in the live overlay (`skills/telegram.md`) and
 preselection brings them in. A fresh install has none until the agent is
-asked to save some. The nightly `dreaming` task reviews recent signals and
-may revise skills.
+asked to save some. The `dreaming` skill reviews recent signals and may
+revise skills; nothing schedules it unless the user asks for it.
 
 **Improver overlay.** The closed-loop improver in `crates/evals` writes
 append-only lessons to `skills/<name>.patch.md`. At runtime the patch is
@@ -371,16 +378,20 @@ export composes the skill the same way, and
 
 ### The schedule
 
-The agent owns the schedule (`crates/agent/src/schedule.rs`). Tasks are cron
-rows in agent.db, evaluated on the user's wall clock (`set_timezone`). A
-30 s tick claims each slot exactly once and hands the fire to the
-supervisor. A fire that started is never repeated, even if it failed.
-`schedule_task` takes a 5-field cron expression, `recurring: false` for a
-one-shot, `cron_expr: "now"` to run right away, and `workflow: <name>` to run
-a saved workflow instead of planning the task. On its first start the agent
-imports the tasks MCP used to hold. A fresh install instead gets the system
-task, the nightly `dreaming` review. It has no digests until the user asks the
-agent to schedule them: user-specific prompts live in agent.db, not in git.
+The agent owns the schedule (`crates/agent/src/schedule.rs`, design 06). A
+task is an engine definition `task-<id>` that `schedule_task` generates: a
+cron on the user's wall clock (`set_timezone`; a watch moves recurring tasks
+when it changes) or a one-shot instant. The engine's trigger fires each slot
+once, across restarts; its run only records the fire in agent.db, and the
+supervisor's drain runs it as a signal. A fire whose signal run started is
+never repeated, even if it failed. After downtime a task fires once, for its
+oldest missed slot. `schedule_task` takes a 5-field cron expression,
+`recurring: false` for a one-shot, `cron_expr: "now"` to run right away, and
+`workflow: <name>` to run a saved workflow instead of planning the task.
+Nothing is seeded (the system `dreaming` task was removed); the tasks MCP
+used to hold are not imported. There are no digests until the user asks
+the agent to schedule them: user-specific prompts live in the engine's store,
+not in git.
 
 ### Workflows written once, run without a model deciding
 
@@ -432,13 +443,16 @@ The workflow's input is `{ env: { timezone, now, localNow, newsLastReadAt,
 techLastReadAt, userEmail, telegramChatId }, signal: { source, content, id } }`.
 Expressions are jq, with the wall clock and environment withheld.
 
-**Durable runs.** A run's definition and input are pinned when it is
-admitted. The run executes under fenced leases on agent.db (`durable.rs`),
-and a recovery worker resumes runs that were interrupted or are waiting. On
-replay, completed steps restore their saved output, and a write that already
-completed is never sent again. Calls marked
-`metadata: { delivery: at_most_once }` commit their intent before dispatch.
-`crates/owf/README.md` documents the contract.
+**Durable runs.** A run's definition, version and input are pinned when it
+is admitted to the ouro engine's store (the `ouro_*` tables, `runs.rs`). The
+engine's worker runs it under leases and resumes runs that were interrupted
+or are waiting. On replay, completed steps restore their saved output, and a
+write that already completed is never sent again: every MCP tool without
+`readOnlyHint` is bound at most once, and a call marked
+`metadata: { ouro: { delivery: at_most_once } }` is too; their intent is
+committed before dispatch, and an outcome the engine cannot know is never
+resent. The engine's `docs/durable-invariants.md` and `docs/call-outcomes.md`
+document the contract.
 
 ## Memory
 
@@ -478,7 +492,7 @@ The rules that protect documents:
 
 | Database | Owner | Holds |
 | --- | --- | --- |
-| `mcp_state` (Postgres, same server as the news store) | MCP | OAuth tokens and the userbot session, Gmail watermarks, the Telegram cursor and chat log, the `signals` queue, peer threads, settings (time zone), and the legacy `scheduled_tasks` the agent imports once |
+| `mcp_state` (Postgres, same server as the news store) | MCP | OAuth tokens and the userbot session, Gmail watermarks, the Telegram cursor and chat log, the `signals` queue, peer threads, settings (time zone), and the legacy `scheduled_tasks` (no longer read) |
 | Postgres + pgvector (`DATABASE_URL`) | MCP | `news_items` (HN, Habr, channel posts) and unified memory (`memory_*`, `memory_index`) |
 | `agent.db` (sqlite) | agent | The `memory` KV, the trace mirror and per-node judgements, `improver_state`, activity-journal progress, the schedule, saved workflows and their durable runs |
 
@@ -508,7 +522,7 @@ group below is a **toolset** that an instance can register.
 | `knowledge` | `add_note`, `find_notes` (legacy notes) |
 | `skills` | `list_skills`, `read_skill` (an export for external clients; the agent has its own) |
 | `signals` · `dreaming` | `get_next_signal`, `wait_for_signal` · `list_signals` |
-| `scheduler` | `get_timezone`, `set_timezone`, `list_scheduled_tasks` (read once by the agent's import) |
+| `scheduler` | `get_timezone`, `set_timezone`, `list_scheduled_tasks` (MCP's legacy tasks, supervisor-only, no longer read) |
 | `peer` · `peer-reply` | `ask_ouro`, `read_replies` · `reply_to_peer`, `get_peer_thread` |
 
 **`MCP_TOOLSETS`** narrows an instance to the named groups. Narrowing works

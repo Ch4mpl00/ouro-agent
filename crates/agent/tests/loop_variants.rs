@@ -1,25 +1,32 @@
+// Loop variants (design 04, R-M9): an agent's own loops, chosen by a worker
+// (the YAML's `start_worker { loop }`, the call's `loop`, a skill's
+// preference) or started as a route; their breaker; the reference channel
+// loop (tests/fixtures/telegram-loop.yaml) and the loop's generic outcomes.
+// Restored from tests/pending on the engine: a loop runs as an engine run
+// (`AgentLoop::send`), its version chosen at its start (runs.rs §10).
 mod support;
 use agent::{
-    agent::{AGENT_LOOP, ConfirmTarget, LoopOptions},
+    agent::{AGENT_LOOP, ConfirmTarget, Engine, LoopOptions},
     db::TraceStore,
-    flows::{self, FlowResult, FlowRun},
+    flows,
     providers::assistant,
-    tracing::null_scope,
 };
+use ouro_runtime::durable::SavedRun;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use support::*;
-use tokio_util::sync::CancellationToken;
 
-fn activate(f: &Fixture, name: &str, definition: &str) -> i64 {
-    activate_definition(&f.engine, name, definition)
+const WORKER: &[(&str, &str)] = &[("worker", "---\ntools: *\n---\nworker")];
+
+async fn activate(f: &Fixture, name: &str, definition: &str) -> u64 {
+    activate_definition(&f.engine, name, definition).await
 }
-fn variant(name: &str) -> String {
-    AGENT_LOOP.replace("name: agent-loop,", &format!("name: {name},"))
-}
-async fn run(f: &Fixture, id: &str, name: &str, conversation: bool) -> FlowResult {
-    if name == "telegram-loop" && f.engine.deps.workflows.active(name).unwrap().is_none() {
-        activate_telegram_loop(&f.engine);
+
+// A loop of `name` the host runs on "reply to me": its answer, or its fault.
+async fn run(f: &Fixture, id: &str, name: &str, conversation: bool) -> anyhow::Result<String> {
+    f.engine.ready().await.unwrap();
+    if name == "telegram-loop" && f.engine.runtime.definitions(name).await.unwrap().active.is_none() {
+        activate_telegram_loop(&f.engine).await;
     }
     let mut opts = LoopOptions::new(id, context());
     opts.workflow = name.into();
@@ -29,24 +36,47 @@ async fn run(f: &Fixture, id: &str, name: &str, conversation: bool) -> FlowResul
         opts.conversation = Some(ConfirmTarget { chat_id: "42".into(), message_thread_id: Some(7) });
         opts.confirm = opts.conversation.clone();
     }
-    let input = f.engine.start_loop(opts).await.unwrap().workflow_input("reply to me").await;
-    let result = flows::create_durable_flows(f.engine.clone(), (*f.db).clone())
-        .run_loop(&format!("{id}/loop"), input, &null_scope(), &CancellationToken::new())
-        .await;
+    let result = f.engine.start_loop(opts).await.unwrap().send("reply to me".into()).await;
     f.engine.end_loop(id).await;
     result
 }
-const WORKER: &[(&str, &str)] = &[("worker", "---\ntools: *\n---\nworker")];
+
 fn sent(chat: &str, thread: Option<i64>, text: &str) -> Value {
     json!({"chatId":chat,"messageThreadId":thread,"text":text,"output":"{\"delivered\":true}"})
 }
 
-#[tokio::test]
+// The worker the loop `parent` started in round `i`, as the runtime reads it.
+async fn worker(engine: &Engine, parent: &str, i: u64) -> SavedRun {
+    let filter = agent::runs::Runs {
+        parent: Some(parent.into()),
+        since_ms: Some(0),
+        before_ms: Some(i64::MAX / 4),
+        ..Default::default()
+    };
+    let ended = engine.control.history(&filter, None, 50).await.unwrap().items;
+    let live = agent::runs::Runs { parent: Some(parent.into()), ..Default::default() };
+    let listed = engine.control.list(&live, None, 50).await.unwrap().items;
+    let key = format!("/{}", agent::agent::worker_key(i, 0));
+    let found = ended.into_iter().chain(listed).find(|r| r.child.as_ref().is_some_and(|l| l.key.ends_with(&key)));
+    engine.runtime.get(&found.expect("the worker").admission.id).await.unwrap().unwrap()
+}
+
+// agent-loop with its YAML choosing the workers' loop.
+fn choosing(name: &str) -> String {
+    let parent = without_breaker(AGENT_LOOP).replace(
+        "call: start_worker\n                    with: { call:",
+        &format!("call: start_worker\n                    with: {{ loop: {name}, call:"),
+    );
+    assert_ne!(parent, without_breaker(AGENT_LOOP));
+    parent
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reply_ends_the_telegram_variant_in_one_turn_and_is_the_trace_output() {
     let model =
         Arc::new(Scripted::new(vec![calls(&[("send_telegram_message", sent("42", Some(7), "delivered reply"))])]));
     let f = fixture(model.clone(), &["send_telegram_message"], WORKER);
-    activate_telegram_loop(&f.engine);
+    activate_telegram_loop(&f.engine).await;
     let mut opts = LoopOptions::new("reply", context());
     opts.workflow = "telegram-loop".into();
     opts.skills = vec!["worker".into()];
@@ -60,7 +90,7 @@ async fn a_reply_ends_the_telegram_variant_in_one_turn_and_is_the_trace_output()
 
 // The rule decides on what the call asked for and whether it succeeded: the
 // reply is never read, so a dry run's mock ends the loop as a real send does.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn only_successful_sends_to_the_exact_conversation_count() {
     for (name, args, delivered) in [
         ("send_telegram_message", sent("43", Some(7), "wrong chat"), false),
@@ -102,7 +132,7 @@ async fn only_successful_sends_to_the_exact_conversation_count() {
         let f = fixture(model.clone(), &["send_telegram_message", "telegram_send_status"], WORKER);
         let result = run(&f, "conversation", "telegram-loop", true).await;
         let expected = if delivered { "reply" } else { "done" };
-        assert!(matches!(result, FlowResult::Completed(ref output) if output == expected), "{name}: {result:?}");
+        assert!(matches!(result, Ok(ref output) if output == expected), "{name}: {result:?}");
         let seen = model.seen.lock().unwrap();
         assert_eq!(seen.len(), if delivered { 1 } else { 3 });
         if !delivered {
@@ -121,7 +151,7 @@ async fn only_successful_sends_to_the_exact_conversation_count() {
 
 const MOCK: &str = agent::sandbox::MOCK_REPLY;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_guard_blocked_send_does_not_end_the_loop() {
     let args = sent("42", Some(7), "sk-abcdefghijklmnopqrstuvwxyz123456");
     let model = Arc::new(Scripted::new(vec![
@@ -130,22 +160,18 @@ async fn a_guard_blocked_send_does_not_end_the_loop() {
         assistant("done"),
     ]));
     let f = fixture(model.clone(), &["send_telegram_message"], WORKER);
-    assert!(
-        matches!(run(&f,"blocked","telegram-loop",true).await, FlowResult::Completed(ref output) if output == "done")
-    );
+    assert!(matches!(run(&f, "blocked", "telegram-loop", true).await, Ok(ref output) if output == "done"));
     assert!(f.mcp.called.lock().unwrap().is_empty());
     assert_eq!(model.seen.lock().unwrap().len(), 3);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_silent_end_nudges_once_for_text_or_finish_and_workers_have_no_conversation() {
     for first in [assistant("silent"), calls(&[("finish", json!({"result":"silent"}))])] {
         let model =
             Arc::new(Scripted::new(vec![first.clone(), calls(&[("finish", json!({"result":"no reply needed"}))])]));
         let f = fixture(model.clone(), &[], WORKER);
-        assert!(
-            matches!(run(&f,"nudge","telegram-loop",true).await,FlowResult::Completed(ref v) if v=="no reply needed")
-        );
+        assert!(matches!(run(&f, "nudge", "telegram-loop", true).await, Ok(ref v) if v == "no reply needed"));
         {
             let seen = model.seen.lock().unwrap();
             assert_eq!(seen.len(), 2);
@@ -154,14 +180,15 @@ async fn a_silent_end_nudges_once_for_text_or_finish_and_workers_have_no_convers
         }
         let model = Arc::new(Scripted::new(vec![first]));
         let f = fixture(model.clone(), &[], WORKER);
-        assert!(matches!(run(&f,"worker","telegram-loop",false).await,FlowResult::Completed(ref v) if v=="silent"));
+        assert!(matches!(run(&f, "worker", "telegram-loop", false).await, Ok(ref v) if v == "silent"));
         assert_eq!(model.seen.lock().unwrap().len(), 1);
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_named_loop_requires_the_guard_at_save_and_activation() {
     let f = fixture(Arc::new(Scripted::new(vec![])), &[], WORKER);
+    f.engine.ready().await.unwrap();
     for name in ["telegram-loop", "research-loop"] {
         let def = format!(
             "document: {{dsl: '1.0.4', namespace: t, name: {name}, version: '1.0.0', metadata: {{loop: {{description: Research}}}}}}\ndo: [{{turn: {{call: agent_turn, with: {{messages: '${{ .messages }}'}}}}}}]\n"
@@ -169,40 +196,42 @@ async fn every_named_loop_requires_the_guard_at_save_and_activation() {
         let save = json!({"name":name,"definition":def});
         assert!(
             flows::tool(&f.engine, "save_workflow", save.as_object().unwrap())
+                .await
                 .unwrap_err()
                 .to_string()
-                .contains("requires a `call: start_child`")
+                .contains("requires a `call: start_guard`")
         );
-        let saved = f.engine.deps.workflows.save(name, &def, None).unwrap();
-        let args = json!({"name":name,"version":saved.version});
+        let version = f.engine.runtime.save(name, &def).await.unwrap().version;
+        let digest = ouro_runtime::durable::digest_of(&def);
+        flows::WorkflowMeta::record(&f.engine.deps.db, name, &digest, None, false).unwrap();
+        mark_tried(&f.engine, name, &def);
+        let args = json!({"name":name,"version":version});
         assert!(
             flows::tool(&f.engine, "activate_workflow", args.as_object().unwrap())
+                .await
                 .unwrap_err()
                 .to_string()
-                .contains("requires a `call: start_child`")
+                .contains("requires a `call: start_guard`")
         );
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_named_variants_breaker_falls_back_after_three_faults_and_keeps_others_closed() {
     let model = Arc::new(Scripted::new(vec![assistant("fallback"), assistant("telegram fallback")]));
     let f = fixture(model, &[], WORKER);
+    f.engine.ready().await.unwrap();
     for name in ["research-loop", "telegram-loop"] {
-        let broken = variant(name).replacen(
-            "do:\n",
-            "do:\n  - broken: { raise: { error: { type: 'https://example.com/fault', status: 500 } } }\n",
-            1,
-        );
-        activate(&f, name, &broken);
+        let broken = faulting(&variant(name));
+        activate(&f, name, &broken).await;
         for n in 0..3 {
-            assert!(matches!(run(&f, &format!("{name}-{n}"), name, false).await, FlowResult::Faulted { .. }));
+            assert!(run(&f, &format!("{name}-{n}"), name, false).await.is_err());
         }
-        assert!(matches!(run(&f, &format!("{name}-fallback"), name, false).await, FlowResult::Completed(_)));
+        assert!(run(&f, &format!("{name}-fallback"), name, false).await.is_ok());
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn workers_choose_tool_or_skill_loop_and_catalog_lists_active_versions() {
     for explicit in [false, true] {
         let args = if explicit {
@@ -220,29 +249,32 @@ async fn workers_choose_tool_or_skill_loop_and_catalog_lists_active_versions() {
             &[],
             &[("worker", "---\ntools: *\n---\nworker"), ("research", "---\ntools: *\nloop: skill-loop\n---\nresearch")],
         );
-        let catalog = flows::loop_catalog(&*f.engine.deps.workflows).unwrap();
+        f.engine.ready().await.unwrap();
+        let catalog = flows::loop_catalog(&f.engine).await.unwrap();
         assert!(catalog.contains("agent-loop:"));
         assert!(!catalog.contains("telegram-loop:"));
-        activate_telegram_loop(&f.engine);
+        activate_telegram_loop(&f.engine).await;
         for name in ["explicit-loop", "skill-loop"] {
             let def = variant(name).replace("output: .content", &format!("output: (\"{name}: \" + .content)"));
-            activate(&f, name, &def);
+            activate(&f, name, &def).await;
         }
         // A new draft must not hide an active version from the catalog.
-        f.engine.deps.workflows.save("skill-loop", &variant("skill-loop"), None).unwrap();
-        assert!(matches!(run(&f,"parent","agent-loop",false).await,FlowResult::Completed(ref v) if v=="parent answer"));
-        let runs = agent::durable::RunStore::new((*f.db).clone());
-        let child = runs.get("parent__sub1.0/loop").unwrap().unwrap();
+        let draft = variant("skill-loop").replace("General ReAct loop", "A draft loop");
+        let args = json!({"name":"skill-loop","definition":draft});
+        flows::tool(&f.engine, "save_workflow", args.as_object().unwrap()).await.unwrap();
+        assert!(matches!(run(&f, "parent", "agent-loop", false).await, Ok(ref v) if v == "parent answer"));
+        let child = worker(&f.engine, "parent", 1).await;
         let expected = if explicit { "explicit-loop" } else { "skill-loop" };
-        assert_eq!(child.name, expected);
-        assert_eq!(child.outcome, Some(owf::run::Status::Completed(json!(format!("{expected}: worker answer")))));
-        assert!(child.input["loop"]["conversation"].is_null());
+        assert_eq!(child.admission.name, expected);
+        assert_eq!(child.outcome, Some(agent::runs::Status::Completed(json!(format!("{expected}: worker answer")))));
+        assert!(child.admission.input["conversation"].is_null(), "workers have no conversation");
         let seen = model.seen.lock().unwrap();
         let description =
             seen[0].tools.iter().find(|t| t.name == "invoke_sub_agent").unwrap().description.as_ref().unwrap();
         for name in ["agent-loop:", "telegram-loop:", "explicit-loop:", "skill-loop:"] {
             assert!(description.contains(name), "{description}");
         }
+        assert!(!description.contains("A draft loop"), "{description}");
     }
 }
 
@@ -253,83 +285,95 @@ fn route_definition(name: &str, when: &str, priority: Option<i64>) -> String {
     )
 }
 
-#[test]
-fn routing_uses_source_payload_specificity_priority_and_active_overrides() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn routing_uses_source_payload_specificity_priority_and_active_overrides() {
     let f = fixture(Arc::new(Scripted::new(vec![])), &[], WORKER);
-    let pick = |source: &str, payload: &Value| flows::signal_route(&f.engine, source, payload).unwrap().map(|r| r.0);
-    assert_eq!(pick("telegram", &Value::Null), None);
-    assert_eq!(pick("telegram_button", &Value::Null), None);
+    f.engine.ready().await.unwrap();
+    let pick = async |source: &str, payload: &Value| {
+        flows::signal_routes(&f.engine, source, payload).await.unwrap().into_iter().next().map(|r| r.0)
+    };
+    assert_eq!(pick("telegram", &Value::Null).await, None);
+    assert_eq!(pick("telegram_button", &Value::Null).await, None);
     assert!(flows::built_in("telegram-loop").is_none());
-    activate_telegram_loop(&f.engine);
-    assert_eq!(pick("telegram", &Value::Null).as_deref(), Some("telegram-loop"));
-    assert_eq!(pick("telegram_button", &Value::Null).as_deref(), Some("telegram-loop"));
-    assert_eq!(pick("peer", &Value::Null), None);
-    assert_eq!(pick("scheduler", &Value::Null), None);
+    activate_telegram_loop(&f.engine).await;
+    assert_eq!(pick("telegram", &Value::Null).await.as_deref(), Some("telegram-loop"));
+    assert_eq!(pick("telegram_button", &Value::Null).await.as_deref(), Some("telegram-loop"));
+    assert_eq!(pick("peer", &Value::Null).await, None);
+    assert_eq!(pick("scheduler", &Value::Null).await, None);
     let specific = route_definition("topic-route", "source: [telegram, telegram_button], topic: research", None);
-    activate(&f, "topic-route", &specific);
-    assert_eq!(pick("telegram", &json!({"topic":"research"})).as_deref(), Some("topic-route"));
+    activate(&f, "topic-route", &specific).await;
+    assert_eq!(pick("telegram", &json!({"topic":"research"})).await.as_deref(), Some("topic-route"));
     let tie = route_definition("tied-route", "source: telegram", None);
-    let saved = f.engine.deps.workflows.save("tied-route", &tie, None).unwrap();
-    let args = json!({"name":"tied-route","version":saved.version});
-    let error = flows::tool(&f.engine, "activate_workflow", args.as_object().unwrap()).unwrap_err().to_string();
-    // A signal route and a loop route conflict by the same rules.
+    let args = json!({"name":"tied-route","definition":tie});
+    let saved = flows::tool(&f.engine, "save_workflow", args.as_object().unwrap()).await.unwrap();
+    let version = serde_json::from_str::<Value>(&saved).unwrap()["version"].clone();
+    mark_tried(&f.engine, "tied-route", &tie);
+    let args = json!({"name":"tied-route","version":version});
+    let error = flows::tool(&f.engine, "activate_workflow", args.as_object().unwrap()).await.unwrap_err().to_string();
+    // A route workflow and a loop route conflict by the same rules.
     assert!(error.contains("telegram-loop") && error.contains("priority"), "{error}");
-    activate(&f, "tied-route", &route_definition("tied-route", "source: telegram", Some(1)));
-    assert_eq!(pick("telegram", &Value::Null).as_deref(), Some("tied-route"));
-    assert_eq!(pick("telegram", &json!({"topic":"research"})).as_deref(), Some("topic-route"));
-    activate(
-        &f,
-        "telegram-loop",
-        &TELEGRAM_LOOP.replace("source: [telegram, telegram_button]", "source: [peer, scheduler]"),
-    );
-    assert_eq!(pick("peer", &Value::Null).as_deref(), Some("telegram-loop"));
-    assert_eq!(pick("telegram", &Value::Null).as_deref(), Some("tied-route"));
+    activate(&f, "tied-route", &route_definition("tied-route", "source: telegram", Some(1))).await;
+    assert_eq!(pick("telegram", &Value::Null).await.as_deref(), Some("tied-route"));
+    assert_eq!(pick("telegram", &json!({"topic":"research"})).await.as_deref(), Some("topic-route"));
+    let moved = TELEGRAM_LOOP.replace("source: [telegram, telegram_button]", "source: [peer, scheduler]");
+    activate(&f, "telegram-loop", &moved).await;
+    assert_eq!(pick("peer", &Value::Null).await.as_deref(), Some("telegram-loop"));
+    assert_eq!(pick("telegram", &Value::Null).await.as_deref(), Some("tied-route"));
 }
 
-#[tokio::test]
+// A worker's loop chosen in the YAML; a run admitted at a version keeps it
+// when another is activated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_start_child_can_choose_a_loop_and_admitted_versions_stay_pinned() {
-    let model = Arc::new(Scripted::new(vec![
-        calls(&[("invoke_sub_agent", json!({"prompt":"research"}))]),
-        assistant("worker result"),
-        assistant("parent result"),
-        assistant("pinned result"),
-    ]));
-    let f = fixture(model, &[], WORKER);
+    let release = Arc::new(tokio::sync::Notify::new());
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let (wait, hit) = (release.clone(), reached.clone());
+    let turns = Turns::new(vec![
+        turn(|_| call("invoke_sub_agent", json!({"prompt":"research"}))),
+        turn(|_| answer("worker result")),
+        turn(|_| answer("parent result")),
+        turn_async(move |_| async move {
+            hit.notify_one();
+            wait.notified().await;
+            Ok(answer("pinned result"))
+        }),
+    ]);
+    let f = fixture(turns, &[], WORKER);
+    f.engine.ready().await.unwrap();
     let old = variant("research-loop").replace("output: .content", "output: (\"old: \" + .content)");
-    let version = activate(&f, "research-loop", &old);
-    let parent = AGENT_LOOP
-        .replace("with: { workflow: agent-loop, call:", "with: { workflow: agent-loop, loop: research-loop, call:");
-    activate(&f, "agent-loop", &parent);
-    assert!(matches!(run(&f, "named-child", "agent-loop", false).await, FlowResult::Completed(_)));
-    let runs = agent::durable::RunStore::new((*f.db).clone());
-    let child = runs.get("named-child__sub1.0/loop").unwrap().unwrap();
-    assert_eq!(child.name, "research-loop");
-    assert_eq!(child.outcome, Some(owf::run::Status::Completed(json!("old: worker result"))));
-    let mut opts = LoopOptions::new("pinned", context());
-    opts.workflow = "research-loop".into();
-    opts.skills = vec!["worker".into()];
-    let mut input = f.engine.start_loop(opts).await.unwrap().workflow_input("go").await;
-    input["override_version"] = json!(version);
-    runs.admit("pinned/loop", "research-loop", &old, &input).unwrap();
-    f.engine.end_loop("pinned").await;
-    activate(&f, "research-loop", &variant("research-loop"));
-    let result = flows::create_durable_flows(f.engine.clone(), (*f.db).clone())
-        .run_loop("pinned/loop", Value::Null, &null_scope(), &CancellationToken::new())
-        .await;
-    assert!(matches!(result,FlowResult::Completed(ref v) if v=="old: pinned result"), "{result:?}");
-    let saved = runs.get("pinned/loop").unwrap().unwrap();
-    assert_eq!(saved.input["override_version"], version);
-    assert_eq!(saved.definition, old);
+    let version = activate(&f, "research-loop", &old).await;
+    activate(&f, "agent-loop", &choosing("research-loop")).await;
+    assert!(run(&f, "named-child", "agent-loop", false).await.is_ok());
+    let child = worker(&f.engine, "named-child", 1).await;
+    assert_eq!(child.admission.name, "research-loop");
+    assert_eq!(child.outcome, Some(agent::runs::Status::Completed(json!("old: worker result"))));
+
+    // Admitted at `version`; a newer version activated meanwhile is not its.
+    let pinned = {
+        let engine = f.engine.clone();
+        tokio::spawn(async move {
+            let mut opts = LoopOptions::new("pinned", context());
+            opts.workflow = "research-loop".into();
+            opts.skills = vec!["worker".into()];
+            engine.start_loop(opts).await.unwrap().send("go".into()).await
+        })
+    };
+    reached.notified().await;
+    activate(&f, "research-loop", &variant("research-loop")).await;
+    release.notify_one();
+    assert_eq!(pinned.await.unwrap().unwrap(), "old: pinned result");
+    let saved = f.engine.runtime.get("pinned").await.unwrap().unwrap();
+    assert_eq!((saved.admission.version, saved.admission.definition.as_str()), (version, old.as_str()));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_silent_end_nudge_gets_one_turn_beyond_the_iteration_limit() {
     let model = Arc::new(Scripted::new(vec![
         assistant("nothing yet"),
         calls(&[("finish", json!({"result":"no reply needed"}))]),
     ]));
     let f = fixture(model.clone(), &[], WORKER);
-    activate_telegram_loop(&f.engine);
+    activate_telegram_loop(&f.engine).await;
     let mut opts = LoopOptions::new("limit", context());
     opts.workflow = "telegram-loop".into();
     opts.skills = vec!["worker".into()];
@@ -340,7 +384,7 @@ async fn the_silent_end_nudge_gets_one_turn_beyond_the_iteration_limit() {
     assert_eq!(model.seen.lock().unwrap().len(), 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_in_process_worker_start_child_respects_the_yaml_loop_selection() {
     let model = Arc::new(Scripted::new(vec![
         calls(&[("invoke_sub_agent", json!({"prompt":"research"}))]),
@@ -348,14 +392,10 @@ async fn an_in_process_worker_start_child_respects_the_yaml_loop_selection() {
         assistant("done"),
     ]));
     let f = fixture(model.clone(), &[], WORKER);
-    activate(
-        &f,
-        "research-loop",
-        &variant("research-loop").replace("output: .content", "output: (\"research: \" + .content)"),
-    );
-    let parent = AGENT_LOOP
-        .replace("with: { workflow: agent-loop, call:", "with: { workflow: agent-loop, loop: research-loop, call:");
-    activate(&f, "agent-loop", &parent);
+    f.engine.ready().await.unwrap();
+    let research = variant("research-loop").replace("output: .content", "output: (\"research: \" + .content)");
+    activate(&f, "research-loop", &research).await;
+    activate(&f, "agent-loop", &choosing("research-loop")).await;
     let mut opts = LoopOptions::new("ephemeral", context());
     opts.skills = vec!["worker".into()];
     let live = f.engine.start_loop(opts).await.unwrap();
@@ -364,7 +404,7 @@ async fn an_in_process_worker_start_child_respects_the_yaml_loop_selection() {
     assert!(seen[2].messages.last().unwrap()["content"].as_str().unwrap().contains("research: worker answer"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_explicit_base_loop_in_yaml_overrides_a_skills_variant_preference() {
     for durable in [false, true] {
         let model = Arc::new(Scripted::new(vec![
@@ -380,20 +420,13 @@ async fn an_explicit_base_loop_in_yaml_overrides_a_skills_variant_preference() {
                 ("research", "---\ntools: *\nloop: research-loop\n---\nresearch"),
             ],
         );
-        activate(
-            &f,
-            "research-loop",
-            &variant("research-loop").replace("output: .content", "output: (\"research: \" + .content)"),
-        );
-        let parent = AGENT_LOOP
-            .replace("with: { workflow: agent-loop, call:", "with: { workflow: agent-loop, loop: agent-loop, call:");
-        activate(&f, "agent-loop", &parent);
+        f.engine.ready().await.unwrap();
+        let research = variant("research-loop").replace("output: .content", "output: (\"research: \" + .content)");
+        activate(&f, "research-loop", &research).await;
+        activate(&f, "agent-loop", &choosing("agent-loop")).await;
         if durable {
-            assert!(
-                matches!(run(&f,"explicit-base","agent-loop",false).await,FlowResult::Completed(ref v) if v=="done")
-            );
-            let runs = agent::durable::RunStore::new((*f.db).clone());
-            assert_eq!(runs.get("explicit-base__sub1.0/loop").unwrap().unwrap().name, "agent-loop");
+            assert!(matches!(run(&f, "explicit-base", "agent-loop", false).await, Ok(ref v) if v == "done"));
+            assert_eq!(worker(&f.engine, "explicit-base", 1).await.admission.name, "agent-loop");
         } else {
             let mut opts = LoopOptions::new("explicit-base", context());
             opts.skills = vec!["worker".into()];
@@ -405,12 +438,13 @@ async fn an_explicit_base_loop_in_yaml_overrides_a_skills_variant_preference() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn settle_exposes_ordered_generic_outcomes_before_model_truncation() {
     let f = fixture(Arc::new(Scripted::new(vec![])), &["t_ok", "t_err", "t_read"], WORKER);
     let mut opts = LoopOptions::new("outcomes", context());
     opts.skills = vec!["worker".into()];
-    let input = f.engine.start_loop(opts).await.unwrap().workflow_input("inspect tool facts").await;
+    let live = f.engine.start_loop(opts).await.unwrap();
+    live.admit_task("inspect tool facts").await;
     let full = json!({"answer": "evidence".repeat(1500)});
     let huge = "🦀".repeat(40_000);
     let calls = vec![
@@ -423,30 +457,15 @@ async fn settle_exposes_ordered_generic_outcomes_before_model_truncation() {
     // t_read uses the same injected MCP as any other tool, with no channel contract.
     let mut results = Vec::new();
     for call in &calls[..4] {
-        let result = agent::agent::loop_tool(
-            &f.engine,
-            &json!({"loop":input["loop"],"call":call}),
-            &null_scope(),
-            &CancellationToken::new(),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let result =
+            support::loop_tool(&f.engine, &live, &json!({"call":call}), "outcomes", "invocation", true).await.unwrap();
         results.push(result);
     }
     assert!(results[0]["presented"].as_str().unwrap().contains("\"truncated\":true"));
     // A round admitted before outcomes existed only has the full stored reply.
     results[1].as_object_mut().unwrap().remove("result");
     results.push(agent::agent::unknown_tool_outcome("t_ok"));
-    let settled = agent::agent::loop_settle(
-        &f.engine,
-        &json!({"loop":input["loop"],"calls":calls,"results":results}),
-        &null_scope(),
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    let settled = agent::agent::loop_settle(&live, &json!({"calls":calls,"results":results})).await.unwrap();
     assert!(settled.get("replied").is_none() && settled.get("reply").is_none());
     let outcomes = settled["outcomes"].as_array().unwrap();
     assert_eq!(outcomes.len(), calls.len());
@@ -465,54 +484,52 @@ async fn settle_exposes_ordered_generic_outcomes_before_model_truncation() {
     f.engine.end_loop("outcomes").await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn workflow_authors_use_maximum_effort_for_every_requested_worker_preset() {
-    for durable in [false, true] {
-        for preset in ["base", "smart", "smartest"] {
-            let model = Arc::new(Scripted::new(vec![
-                calls(&[("invoke_sub_agent", json!({"skills":["workflow-author"],"preset":preset,"prompt":"draft"}))]),
-                assistant("draft"),
-                assistant("done"),
-            ]));
-            let f = fixture(
-                model.clone(),
-                &[],
-                &[("worker", "---\ntools: *\n---\nworker"), ("workflow-author", "---\ntools: []\n---\nauthor")],
-            );
-            if durable {
-                assert!(matches!(run(&f,"author","agent-loop",false).await,FlowResult::Completed(ref v) if v=="done"));
-            } else {
-                let mut opts = LoopOptions::new("author", context());
-                opts.skills = vec!["worker".into()];
-                assert_eq!(f.engine.start_loop(opts).await.unwrap().send("draft".into()).await.unwrap(), "done");
-            }
-            let seen = model.seen.lock().unwrap();
-            assert_eq!(seen[1].model, agent::models::default_presets().smartest.model, "{preset}");
-            assert_eq!(seen[1].reasoning_effort, agent::models::ReasoningEffort::Max, "{preset}");
-        }
+    // Every loop is an engine run: the parked suite's in-process and durable
+    // paths are one.
+    for preset in ["base", "smart", "smartest"] {
+        let model = Arc::new(Scripted::new(vec![
+            calls(&[("invoke_sub_agent", json!({"skills":["workflow-author"],"preset":preset,"prompt":"draft"}))]),
+            assistant("draft"),
+            assistant("done"),
+        ]));
+        let f = fixture(
+            model.clone(),
+            &[],
+            &[("worker", "---\ntools: *\n---\nworker"), ("workflow-author", "---\ntools: []\n---\nauthor")],
+        );
+        let mut opts = LoopOptions::new("author", context());
+        opts.skills = vec!["worker".into()];
+        assert_eq!(f.engine.start_loop(opts).await.unwrap().send("draft".into()).await.unwrap(), "done");
+        let seen = model.seen.lock().unwrap();
+        assert_eq!(seen[1].model, agent::models::default_presets().smartest.model, "{preset}");
+        assert_eq!(seen[1].reasoning_effort, agent::models::ReasoningEffort::Max, "{preset}");
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn another_channels_loop_can_exit_from_generic_outcomes_without_host_changes() {
     let model = Arc::new(Scripted::new(vec![calls(&[(
         "reply_to_peer",
         json!({"threadId":9,"text":"peer answer","output":"{\"sent\":true}"}),
     )])]));
     let f = fixture(model.clone(), &["reply_to_peer"], WORKER);
+    f.engine.ready().await.unwrap();
     let definition = variant("peer-loop")
         .replace("        - finished:", "        - sent: { when: '${ any(.outcomes[]; .ok and .name == \"reply_to_peer\" and .result.sent == true) }', then: peer_reply }\n        - finished:")
         .replace("  - answer:", "  - peer_reply:\n      set: '${ { output: ([ .outcomes[] | select(.ok and .name == \"reply_to_peer\") | .arguments.text ] | last) } }'\n      then: end\n  - answer:");
-    activate(&f, "peer-loop", &definition);
-    assert!(matches!(run(&f,"peer","peer-loop",false).await,FlowResult::Completed(ref v) if v=="peer answer"));
+    assert_ne!(definition, variant("peer-loop"));
+    activate(&f, "peer-loop", &definition).await;
+    assert!(matches!(run(&f, "peer", "peer-loop", false).await, Ok(ref v) if v == "peer answer"));
     assert_eq!(model.seen.lock().unwrap().len(), 1);
 }
 
 // Fixed steps of a loop are the author's, trusted as a saved workflow's
 // calls: a direct write runs without a guard review and, recorded, is not
-// sent again when the run resumes. The model's calls still go through
-// `tool` and the guard.
-#[tokio::test]
+// sent again when the run resumes. The model's calls still go through the
+// guarded round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_loops_own_write_runs_unreviewed_and_once_while_the_models_calls_stay_guarded() {
     let (started, has_started) = tokio::sync::oneshot::channel::<()>();
     let turns = Turns::new(vec![
@@ -523,34 +540,44 @@ async fn a_loops_own_write_runs_unreviewed_and_once_while_the_models_calls_stay_
         turn(|_| calls(&[("send_telegram_message", json!({"chatId":"43","text":"elsewhere"}))])),
         turn(|_| assistant("done")),
     ]);
-    let mut f = fixture(turns.clone(), &["send_telegram_message"], WORKER);
     let api = Arc::new(GuardApi::default());
     *api.label.lock().unwrap() = Some("misaligned".into());
-    Arc::get_mut(&mut f.engine).unwrap().deps.decisions =
-        Some(agent::decisions::decision_client("guard-test".into(), api.clone()));
+    let decisions = agent::decisions::decision_client("guard-test".into(), api.clone());
+    let f = fixture_on(turns.clone(), &["send_telegram_message"], WORKER, |deps| {
+        deps.decisions = Some(decisions.clone());
+    });
+    f.engine.ready().await.unwrap();
     let direct = variant("direct-loop").replacen(
         "do:\n",
         "do:\n  - note:\n      call: send_telegram_message\n      with: { chatId: '42', text: fixed step }\n",
         1,
     );
-    activate(&f, "direct-loop", &direct);
-    let mut opts = LoopOptions::new("direct", context());
-    opts.workflow = "direct-loop".into();
-    opts.skills = vec!["worker".into()];
-    let input = f.engine.start_loop(opts).await.unwrap().workflow_input("go").await;
-    let flows = flows::create_durable_flows(f.engine.clone(), (*f.db).clone());
-    let stop = CancellationToken::new();
+    activate(&f, "direct-loop", &direct).await;
     let running = {
-        let (flows, stop) = (flows.clone(), stop.clone());
-        tokio::spawn(async move { flows.run_loop("direct/loop", input, &null_scope(), &stop).await })
+        let engine = f.engine.clone();
+        tokio::spawn(async move {
+            let mut opts = LoopOptions::new("direct", context());
+            opts.workflow = "direct-loop".into();
+            opts.skills = vec!["worker".into()];
+            engine.start_loop(opts).await.unwrap().send("go".into()).await
+        })
     };
     has_started.await.unwrap();
-    stop.cancel();
-    assert!(matches!(running.await.unwrap(), FlowResult::Interrupted { .. }));
-    f.engine.end_loop("direct").await;
-    assert_eq!(flows.recover_once(&CancellationToken::new()).await.unwrap(), 1);
-    let runs = agent::durable::RunStore::new((*f.db).clone());
-    assert_eq!(runs.get("direct/loop").unwrap().unwrap().outcome, Some(owf::run::Status::Completed(json!("done"))));
+    // A restart: this process stops in the first turn, the next resumes the run.
+    f.engine.halt().await;
+    running.abort();
+    let resumed = reopen(&f, turns.clone(), Arc::new(ouro_runtime::durable::SystemClock), |deps| {
+        deps.decisions = Some(decisions.clone());
+    });
+    resumed.ready().await.unwrap();
+    let ended = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        agent::runs::wait_end(&resumed, "direct", &tokio_util::sync::CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(ended, agent::runs::Status::Completed(json!("done")));
     let sent: Vec<_> =
         f.mcp.called.lock().unwrap().iter().filter(|(n, _)| n == "send_telegram_message").cloned().collect();
     assert_eq!(sent.len(), 1, "the direct write once, the model's blocked: {sent:?}");
@@ -559,9 +586,10 @@ async fn a_loops_own_write_runs_unreviewed_and_once_while_the_models_calls_stay_
     assert!(!api.requests.lock().unwrap().iter().any(|r| r.to_string().contains("fixed step")));
     let last = turns.requests.lock().unwrap().last().unwrap().clone();
     assert!(serde_json::to_string(&last).unwrap().contains("[guard] blocked"), "{last:?}");
+    resumed.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn loop_setup_runs_once_and_only_before_the_first_turn() {
     for (name, step, at) in [
         ("late-loop", "  - late: { call: loop_setup, with: { system: [late] } }\n  - route:\n", "  - route:\n"),
@@ -573,16 +601,17 @@ async fn loop_setup_runs_once_and_only_before_the_first_turn() {
     ] {
         let model = Arc::new(Scripted::new(vec![assistant("answer")]));
         let f = fixture(model, &[], WORKER);
-        activate(&f, name, &variant(name).replacen(at, step, 1));
-        let FlowResult::Faulted { error, .. } = run(&f, name, name, false).await else { panic!("{name} ran") };
+        f.engine.ready().await.unwrap();
+        activate(&f, name, &variant(name).replacen(at, step, 1)).await;
+        let error = run(&f, name, name, false).await.expect_err("it ran").to_string();
         let expected = if name == "late-loop" { "before the loop's first agent_turn" } else { "runs once per loop" };
-        assert!(error.to_string().contains(expected), "{name}: {error}");
+        assert!(error.contains(expected), "{name}: {error}");
     }
 }
 
 // The same loop a route starts runs as a worker: no signal, so its context
 // steps are skipped and it opens no status.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_running_the_routed_loop_skips_its_context() {
     let model = Arc::new(Scripted::new(vec![
         calls(&[("invoke_sub_agent", json!({"prompt":"research","loop":"telegram-loop"}))]),
@@ -594,15 +623,12 @@ async fn a_worker_running_the_routed_loop_skips_its_context() {
         &[],
         &[("worker", "---\ntools: *\n---\nworker"), ("telegram", "---\ntools: *\n---\nTELEGRAM")],
     );
-    activate_telegram_loop(&f.engine);
-    assert!(
-        matches!(run(&f, "parent", "agent-loop", false).await, FlowResult::Completed(ref v) if v == "parent answer")
-    );
-    let runs = agent::durable::RunStore::new((*f.db).clone());
-    let child = runs.get("parent__sub1.0/loop").unwrap().unwrap();
-    assert_eq!(child.name, "telegram-loop");
-    assert!(child.input.get("signal").is_none());
-    assert_eq!(child.outcome, Some(owf::run::Status::Completed(json!("worker answer"))));
+    activate_telegram_loop(&f.engine).await;
+    assert!(matches!(run(&f, "parent", "agent-loop", false).await, Ok(ref v) if v == "parent answer"));
+    let child = worker(&f.engine, "parent", 1).await;
+    assert_eq!(child.admission.name, "telegram-loop");
+    assert!(child.admission.input.get("signal").is_none());
+    assert_eq!(child.outcome, Some(agent::runs::Status::Completed(json!("worker answer"))));
     assert!(f.mcp.called.lock().unwrap().is_empty(), "no context reads, no status");
     let seen = model.seen.lock().unwrap();
     assert!(!seen[1].messages[0]["content"].as_str().unwrap().contains("TELEGRAM"));

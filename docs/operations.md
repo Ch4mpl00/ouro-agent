@@ -92,6 +92,82 @@ sqlite3 -json packages/agent/data/agent.db "SELECT * FROM memory"
 docker compose exec postgres psql -U mcp -d mcp_state -c "SELECT * FROM signals ORDER BY id DESC LIMIT 5"
 ```
 
+## Workflow runs on the engine
+
+Every workflow run of the agent (a signal, its primary loop, workers, guard
+rounds, a recovery report) is a run of the ouro engine, stored in
+`engine.db` beside agent.db (the same directory, so the same volume:
+`/var/lib/ouro/agent/engine.db`), `ouro_*` tables the engine creates and
+migrates (`crates/agent/src/runs.rs`; docs/designs/03-runs-on-the-engine.md).
+Back up both files (`sqlite3 <file> ".backup <copy>"`). Not inside agent.db,
+as design 01 first had it: the engine's adapter takes SQLite's write lock for
+every operation, and agent.db's writes starved behind it (docs/designs/LOG.md). The built-ins `signal`,
+`agent-loop` and `guard` are saved and activated at boot, with
+`metadata.ouro.breaker: off`.
+
+**Workflow versions** (docs/designs/04-versions-and-breaker.md): the engine
+is also the version store. Every version the agent saves, its text and
+activation history, the active version and its breaker live in `engine.db`;
+agent.db's `workflow_meta` keeps only the agent's notes on them by content
+(the note, whether a dry run tried it, whether it is a built-in text). Nothing
+copies the versions back: **back up `engine.db` together with `agent.db`**
+(both with `sqlite3 <file> ".backup <copy>"`, one after the other while the
+agent is stopped, or accept that the two copies are a few seconds apart).
+An engine store-version bump migrates `engine.db` in place.
+
+The boot activates a built-in's new text only while the active version is a
+built-in text: a version the agent activated (an override of `agent-loop` or
+`signal`) stays across restarts and upgrades. A name an operator paused is
+left alone at boot, and the agent cannot activate a version of it either,
+since an activation would lift the pause; while `agent-loop` is paused no
+loop and no failure report can start (the log names the pause). Inspect and
+operate with the engine's control API (`ouro_runtime::control::Control`):
+`definitions`/`definition` show versions, the trip and the pause; `pause`
+and `resume` act on a name.
+
+An agent version's breaker is the runtime's (3 faults in a row); a tripped
+version stays active and is set aside for each run until a version is
+activated again: the built-in runs in its place (the run's trace carries a
+`fallback` record). A name keeps at most 20 never-activated versions; pruning
+them belongs to the engine (Ch4mpl00/ouro#36).
+
+**Capacity** (`runs::config`): one run tree is a primary loop, its guard
+round and up to 16 workers with theirs, 34 drives; the signal holds none
+while it waits. Two trees can be live at once (a resumed one and the next
+signal's), so the worker drives up to **68 runs** (`max_concurrency`) with
+**136 handler slots** (`max_function_concurrency`). A child starts at the
+worker's next tick (`poll_interval`, 50 ms).
+
+**Jump budget** (`limits.max_jumps`, per run tree): a backstop, not the
+binding limit, which is each loop's `max_iterations`. One agent-loop round
+takes two jumps plus one per guarded call; the dispatcher takes at most
+three: Σ loops `max_iterations × (2 + guarded calls per round) + 3`. With
+the primary's 100 iterations and 16 workers of 50, each with up to 16
+guarded calls a round, that is 16 203; the ceiling is **20 000**. The
+recovery report runs as a root of its own (`recovery:<signal id>`), so an
+exhausted tree budget never stops it. `max_tasks` per run is 50 000.
+
+**Record sizes:** every task record of a loop carries its context, the
+transcript included, so a loop's records grow with rounds × transcript
+size; a call's checkpointed reply is clipped to 64 Ki UTF-16 units. The
+engine sweeps the records of runs that ended more than 7 days ago; the
+reconciler (every minute) sweeps the agent's own rows of those runs
+(`run_trace`, `confirmations`, `guard_verdict_uses`, `run_evidence`, and
+`evidence` no run links). Host data is at most a few KiB: large evidence
+(skill text, earlier messages) is content-addressed in `evidence`.
+
+**Latency:** a round's guard child, a worker and a signal's primary each
+start at the worker's next tick, and every commit goes through the store, so
+a signal costs a few hundred milliseconds before its first turn. A round of
+many workers is CPU-bound in the engine (its listens poll the store while
+they hold, and every task record carries the loop's context): in a debug
+build 16 one-turn workers take about 30 s; measure a release build before
+relying on wide fan-out.
+
+**Signal loss window:** `get_next_signal` takes a signal before the engine
+admits its run; a crash in between loses that signal, as before (design 03,
+decision 5).
+
 ## Tests
 
 | Command | What it runs |
@@ -149,10 +225,11 @@ server checks out exactly that commit.
 | `deploy/probe.py` | — | the native services + tunnel client |
 | tests, specs, docs, anything else | — | nothing: no build, upload or restart |
 
-Two cases need a manual step:
+Two cases worth knowing:
 
-- **`crates/owf` and `crates/evals` are not selected automatically.** After
-  a change that only touches `crates/owf`, run `scripts/deploy.sh agent`.
+- **`crates/evals` is not selected automatically**: its binaries are run
+  as CLIs and never deployed. A change of the engine's pinned tag changes
+  `Cargo.lock` and so rebuilds every service binary.
 - **Unchanged binaries are omitted by hash**, so a rebuild that produces the
   same binary uploads nothing.
 
@@ -190,7 +267,7 @@ choice. To roll back, deploy an older commit.
 | Container units | `ouro-containers` starts Postgres and Codex on boot. `ouro-tunnel-client` waits for the restricted endpoint, then runs the tunnel container and owns its retries. |
 | Executables | `/opt/ouro/bin` (`mcp-tools`, `agent-supervisor`, `codex-service`) |
 | App files | `/opt/ouro/app`: `skills.default`, `crates/mcp/gateway.config.json`, `probe.py`, and the symlinks `skills` → `/var/lib/ouro/skills` and `storage` → `/var/lib/ouro/storage` |
-| State | `/var/lib/ouro/agent` (agent.db, `AGENT_DB_PATH`), `/var/lib/ouro/skills` (live skills), `/var/lib/ouro/storage` (attachments) |
+| State | `/var/lib/ouro/agent` (agent.db, `AGENT_DB_PATH`, and the engine's `engine.db` beside it), `/var/lib/ouro/skills` (live skills), `/var/lib/ouro/storage` (attachments) |
 | Native env (root-only) | `/etc/ouro/agent.env`, `/etc/ouro/mcp.env`, `/etc/ouro/mcp-tunnel.env` |
 | Container env | The server checkout's `.env.mcp` (tunnel keys: `OPENAI_TUNNEL_ID`, `OPENAI_TUNNEL_API_KEY`) and `.env`/Compose interpolation (Postgres credentials) |
 | Docker volumes | `agent-helper_pg-data`, `agent-helper_codex-home`. Keep the compose project directory stable. |

@@ -143,7 +143,7 @@ fn final_definition(report: &str, trials: &[Trial]) -> anyhow::Result<(String, &
             .map(|t| (t.scenario.yaml.clone(), "last_trial"))
             .ok_or_else(|| anyhow::anyhow!("optimizer returned no fenced YAML definition and ran no candidate"))?,
     };
-    owf::model::parse_yaml(&yaml)?;
+    ows::model::parse_yaml(&yaml)?;
     Ok((yaml, source))
 }
 
@@ -292,11 +292,10 @@ async fn main() -> anyhow::Result<()> {
         skills.clone(),
         Arc::new(host_catalog.clone()),
     )?;
-    let adapter = agent::flows::standalone_host(
+    let adapter = agent::flows::standalone(
         &candidate_engine,
         &null_scope().span(agent::tracing::SpanStart::new("workbench", agent::tracing::SpanKind::Chain)),
-    )
-    .functions;
+    );
     let allowed = if mock_only { BTreeSet::new() } else { BTreeSet::from(["llm_compose".into()]) };
     let mut workbench = Workbench::new(
         adapter,

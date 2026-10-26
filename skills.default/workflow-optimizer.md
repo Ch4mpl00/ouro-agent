@@ -113,10 +113,11 @@ call. Preserve the guarded round, worker joins and settlement wherever
 boundary. Keep behavior in workflows/skills rather than proposing task-specific
 Rust branches.
 
-Use `fork` for independent branches and `metadata: { concurrency: N }` on a `for`
-for independent collection items. Preserve explicit concurrency bounds when
-removing model orchestration. Serialise only for ordering, dependencies or a
-known service constraint, and explain why. A concurrent `for` uses separate
+Use `fork` for independent branches and `metadata: { ouro: { concurrency: N } }`
+on a `for` for independent collection items (a flat `metadata.concurrency` is
+ignored: the `for` then runs one pass at a time). Preserve explicit concurrency
+bounds when removing model orchestration. Serialise only for ordering,
+dependencies or a known service constraint, and explain why. A concurrent `for` uses separate
 context copies and returns outputs in input order: return one outcome per item,
 then aggregate after the loop instead of mutating shared context.
 

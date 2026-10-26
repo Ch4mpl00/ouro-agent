@@ -1,5 +1,10 @@
 # The agent loop as an OWF workflow
 
+> **Superseded (2026-10-26).** The runtime this record describes (`crates/owf`,
+> `crates/agent/src/durable.rs` and their tables) was replaced by the ouro
+> engine and removed (`docs/designs/01-engine-migration.md` … `07-remove-owf.md`).
+> Kept as history; its open work is to be re-triaged against the engine.
+
 **Status:** in-progress. The loop, the `signal` workflow, durable sub-agents,
 **Open work:** #43
 cleanup and `read_run` are done (2026-10-20); two fault-handling gaps remain

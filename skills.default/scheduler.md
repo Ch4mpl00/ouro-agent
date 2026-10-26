@@ -24,6 +24,9 @@ Recurring: yes | no (one-shot)
 <the user's prompt verbatim from when they scheduled the task>
 ```
 
+After the agent was down over several slots, a recurring task fires once,
+for the oldest slot it missed (the `Slot` line), not once per missed slot.
+
 ## Protocol
 
 1. **Read the body** (everything after the blank line). It is the user's

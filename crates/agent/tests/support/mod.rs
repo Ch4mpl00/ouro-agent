@@ -13,7 +13,7 @@ use agent::{
 };
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -88,7 +88,15 @@ impl Mcp for FakeMcp {
         self.called.lock().unwrap().push((name.into(), args.clone()));
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(active, Ordering::SeqCst);
-        let result = agent::errors::or_cancel(cancel, async {
+        // A call the engine drops (a cancelled run) is no longer active.
+        struct Leaving<'a>(&'a AtomicUsize);
+        impl Drop for Leaving<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _leaving = Leaving(&self.active);
+        agent::errors::or_cancel(cancel, async {
             tokio::time::sleep(std::time::Duration::from_millis(
                 args.get("delay").and_then(Value::as_u64).unwrap_or(0),
             ))
@@ -100,9 +108,7 @@ impl Mcp for FakeMcp {
                 _ => Ok(args.get("output").and_then(Value::as_str).unwrap_or("ok").to_owned()),
             }
         })
-        .await;
-        self.active.fetch_sub(1, Ordering::SeqCst);
-        result
+        .await
     }
     async fn close(&self) {
         self.closed.fetch_add(1, Ordering::SeqCst);
@@ -123,13 +129,46 @@ pub struct Fixture {
     pub engine: Arc<Engine>,
 }
 pub fn fixture(provider: Arc<dyn ChatProvider>, definitions: &[&str], skills: &[(&str, &str)]) -> Fixture {
+    fixture_on(provider, definitions, skills, |_| {})
+}
+/// A fixture whose engine dependencies `configure` changes before the engine
+/// is built (its registry is built from them, and handlers hold it weakly, so
+/// it cannot be changed after).
+pub fn fixture_on(
+    provider: Arc<dyn ChatProvider>,
+    definitions: &[&str],
+    skills: &[(&str, &str)],
+    configure: impl FnOnce(&mut EngineDeps),
+) -> Fixture {
+    fixture_clocked(provider, definitions, skills, Arc::new(ouro_runtime::durable::SystemClock), configure)
+}
+
+/// A fixture whose engine keeps time by `clock` (a confirmation's 24 hours).
+pub fn fixture_clocked(
+    provider: Arc<dyn ChatProvider>,
+    definitions: &[&str],
+    skills: &[(&str, &str)],
+    clock: Arc<dyn ouro_runtime::durable::Clock>,
+    configure: impl FnOnce(&mut EngineDeps),
+) -> Fixture {
+    fixture_configured(provider, definitions, skills, clock, agent::runs::config(), configure)
+}
+
+/// `fixture_clocked` with the runtime configured as `config` (a short
+/// heartbeat, so a test can move the clock while a run holds its lease).
+pub fn fixture_configured(
+    provider: Arc<dyn ChatProvider>,
+    definitions: &[&str],
+    skills: &[(&str, &str)],
+    clock: Arc<dyn ouro_runtime::durable::Clock>,
+    config: ouro_runtime::Config,
+    configure: impl FnOnce(&mut EngineDeps),
+) -> Fixture {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("skills.default")).unwrap();
     for (name, body) in skills {
         std::fs::write(root.path().join("skills.default").join(format!("{name}.md")), body).unwrap();
     }
-    let db = Arc::new(AgentDb::open(root.path().join("agent.db")).unwrap());
-    let store = Arc::new(FsSkillStore::new(root.path()));
     // The reference Telegram loop calls its status tool directly, so every
     // fixture knows it (activation checks a definition's calls).
     let mcp = Arc::new(FakeMcp {
@@ -141,14 +180,39 @@ pub fn fixture(provider: Arc<dyn ChatProvider>, definitions: &[&str], skills: &[
             .collect(),
         ..Default::default()
     });
-    let engine = create_engine(EngineDeps {
+    let (db, skills, engine) = open_engine(root.path(), provider, mcp.clone(), clock, config, configure);
+    Fixture { root, db, skills, mcp, engine }
+}
+
+/// Another engine on `f`'s files (agent.db and the engine's store): the
+/// next process after a restart.
+pub fn reopen(
+    f: &Fixture,
+    provider: Arc<dyn ChatProvider>,
+    clock: Arc<dyn ouro_runtime::durable::Clock>,
+    configure: impl FnOnce(&mut EngineDeps),
+) -> Arc<Engine> {
+    open_engine(f.root.path(), provider, f.mcp.clone(), clock, agent::runs::config(), configure).2
+}
+
+fn open_engine(
+    root: &std::path::Path,
+    provider: Arc<dyn ChatProvider>,
+    mcp: Arc<FakeMcp>,
+    clock: Arc<dyn ouro_runtime::durable::Clock>,
+    config: ouro_runtime::Config,
+    configure: impl FnOnce(&mut EngineDeps),
+) -> (Arc<AgentDb>, Arc<FsSkillStore>, Arc<Engine>) {
+    let db = Arc::new(AgentDb::open(root.join("agent.db")).unwrap());
+    let store = Arc::new(FsSkillStore::new(root));
+    let mut deps = EngineDeps {
         providers: Providers {
             openai: provider.clone(),
             gemini: provider.clone(),
             deepseek: provider.clone(),
             openrouter: Some(provider),
         },
-        mcp: mcp.clone(),
+        mcp,
         presets: default_presets(),
         skills: Vec::new(),
         skill_store: store.clone(),
@@ -156,10 +220,15 @@ pub fn fixture(provider: Arc<dyn ChatProvider>, definitions: &[&str], skills: &[
         tracer: Arc::new(local_recorder_tracer(db.clone())),
         codex: Arc::new(NoCodex),
         decisions: Some(allow_guard()),
-        workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
-        schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
-    });
-    Fixture { root, db, skills: store, mcp, engine }
+        schedule: Arc::new(agent::schedule::Schedules::new(db.clone())),
+        env: Default::default(),
+        db: (*db).clone(),
+        store: agent::runs::open_store(&root.join("agent.db")).unwrap(),
+        dry_store: agent::runs::open_store_view(&root.join("agent.db")).unwrap(),
+    };
+    configure(&mut deps);
+    let engine = agent::agent::create_engine_on(deps, config, clock);
+    (db, store, engine)
 }
 
 // ── The TS agent-loop harness ───────────────────────────────────────────────
@@ -269,7 +338,10 @@ pub fn tool_replies(messages: &[Message]) -> Vec<Value> {
     messages
         .iter()
         .filter(|m| m["role"] == "tool")
-        .map(|m| serde_json::from_str(m["content"].as_str().unwrap()).unwrap())
+        .map(|m| {
+            let text = m["content"].as_str().unwrap();
+            serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_owned()))
+        })
         .collect()
 }
 
@@ -349,16 +421,22 @@ impl Mcp for ToolMcp {
     }
 }
 
-// The agent's persistent KV: nothing stored, writes recorded.
+// The memory KV's writes of the agent, in order; the keys the runtime keeps
+// for itself (`engine.`: built-in digests, the reconciler's watermarks) are
+// kept apart, readable, and out of the log.
 #[derive(Default)]
-pub struct PersistLog(pub Mutex<Vec<(String, String)>>);
+pub struct PersistLog(pub Mutex<Vec<(String, String)>>, pub Mutex<HashMap<String, String>>);
 
 impl MemoryStore for PersistLog {
-    fn get(&self, _: &str) -> anyhow::Result<Option<String>> {
-        Ok(None)
+    fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.1.lock().unwrap().get(key).cloned())
     }
     fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        self.0.lock().unwrap().push((key.into(), value.into()));
+        if key.starts_with(agent::runs::RESERVED_MEMORY_PREFIX) {
+            self.1.lock().unwrap().insert(key.into(), value.into());
+        } else {
+            self.0.lock().unwrap().push((key.into(), value.into()));
+        }
         Ok(())
     }
 }
@@ -444,12 +522,25 @@ pub struct Harness {
 
 impl Harness {
     pub fn new(session: Session, turns: Vec<Turn>, tool_result: &str, tracer: Arc<dyn Tracer>) -> Harness {
+        Self::configured(session, turns, tool_result, tracer, |_| {})
+    }
+
+    /// A harness whose engine dependencies `configure` changes before the
+    /// engine is built (handlers hold it weakly: it cannot change after).
+    pub fn configured(
+        session: Session,
+        turns: Vec<Turn>,
+        tool_result: &str,
+        tracer: Arc<dyn Tracer>,
+        configure: impl FnOnce(&mut EngineDeps),
+    ) -> Harness {
         let model = Turns::new(turns);
         let status = ToolDef::new(STATUS_TOOL, STATUS_TOOL, json!({"type":"object"}));
         let mcp = ToolMcp::returning(vec![search_tool(), status], tool_result);
         let persist = Arc::new(PersistLog::default());
         let provider: Arc<dyn ChatProvider> = model.clone();
-        let engine = create_engine(EngineDeps {
+        let (store, dry_store) = agent::runs::memory_store_with_view();
+        let mut deps = EngineDeps {
             providers: Providers {
                 openai: provider.clone(),
                 gemini: provider.clone(),
@@ -464,9 +555,14 @@ impl Harness {
             tracer,
             codex: Arc::new(NoCodex),
             decisions: Some(allow_guard()),
-            workflows: std::sync::Arc::new(agent::flows::MemoryWorkflows::default()),
-            schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
-        });
+            schedule: std::sync::Arc::new(agent::schedule::Schedules::in_memory()),
+            env: Default::default(),
+            db: agent::db::AgentDb::open(":memory:").unwrap(),
+            store,
+            dry_store,
+        };
+        configure(&mut deps);
+        let engine = create_engine(deps);
         Harness { engine, session, mcp, persist, model }
     }
 
@@ -540,21 +636,76 @@ pub fn allow_guard() -> Arc<agent::decisions::DecisionClient> {
 }
 
 // Reference workflows are agent-authored examples, never runtime built-ins.
-// Exercise both authoring checks, including guard references and route conflicts.
-pub fn activate_definition(engine: &Arc<Engine>, name: &str, definition: &str) -> i64 {
+// The agent saves a version through its gate, a dry run marks its content
+// tried (the sandbox step's `try_workflow`; here directly), and the agent
+// activates it: what the user confirmed.
+pub async fn activate_definition(engine: &Arc<Engine>, name: &str, definition: &str) -> u64 {
+    engine.ready().await.unwrap();
     let args = json!({"name": name, "definition": definition});
-    let saved: Value =
-        serde_json::from_str(&agent::flows::tool(engine, "save_workflow", args.as_object().unwrap()).unwrap()).unwrap();
-    let version = saved["version"].as_i64().unwrap();
-    // Stands in for the dry run activation requires (sandbox tests try them).
-    engine.deps.workflows.mark_tried(name, version).unwrap();
+    let saved = agent::flows::tool(engine, "save_workflow", args.as_object().unwrap())
+        .await
+        .unwrap_or_else(|e| panic!("saving {name}: {e:#}"));
+    let version = serde_json::from_str::<Value>(&saved).unwrap()["version"].as_u64().unwrap();
+    mark_tried(engine, name, definition);
     let args = json!({"name": name, "version": version});
-    agent::flows::tool(engine, "activate_workflow", args.as_object().unwrap()).unwrap();
+    agent::flows::tool(engine, "activate_workflow", args.as_object().unwrap())
+        .await
+        .unwrap_or_else(|e| panic!("activating {name} v{version}: {e:#}"));
+    version
+}
+/// Marks `definition`'s content as tried, as a completed dry run would.
+pub fn mark_tried(engine: &Engine, name: &str, definition: &str) {
+    let digest = ouro_runtime::durable::digest_of(definition);
+    agent::flows::WorkflowMeta::mark_tried(&engine.deps.db, name, &digest).unwrap();
+}
+/// Stores and activates a version past the agent's gate: one an operator
+/// put there, or one older rules allowed. The engine still validates it.
+pub async fn store_definition(engine: &Arc<Engine>, name: &str, definition: &str) -> u64 {
+    engine.ready().await.unwrap();
+    let digest = ouro_runtime::durable::digest_of(definition);
+    agent::flows::WorkflowMeta::record(&engine.deps.db, name, &digest, None, false).unwrap();
+    let version = engine.runtime.save(name, definition).await.unwrap_or_else(|e| panic!("{name}: {e:#}")).version;
+    engine.runtime.activate_as(name, version, "operator", None).await.unwrap();
     version
 }
 // The reference flow of a channel: one loop that declares its route.
 pub const TELEGRAM_LOOP: &str = include_str!("../fixtures/telegram-loop.yaml");
 pub const STATUS_TOOL: &str = "telegram_send_status";
-pub fn activate_telegram_loop(engine: &Arc<Engine>) -> i64 {
-    activate_definition(engine, "telegram-loop", TELEGRAM_LOOP)
+pub async fn activate_telegram_loop(engine: &Arc<Engine>) -> u64 {
+    activate_definition(engine, "telegram-loop", TELEGRAM_LOOP).await
+}
+/// A built-in definition as the agent may save it: without the breaker
+/// policy only the built-ins declare (design 04, decision 3).
+pub fn without_breaker(definition: &str) -> String {
+    definition.replace(", ouro: { breaker: 'off' }", "").replace(", metadata: { ouro: { breaker: 'off' } }", "")
+}
+/// A loop of the agent's own: a copy of agent-loop under `name`.
+pub fn variant(name: &str) -> String {
+    without_breaker(agent::agent::AGENT_LOOP).replace("name: agent-loop,", &format!("name: {name},"))
+}
+/// `definition` faulting before anything else (its top-level `do`, a block
+/// list or a flow list).
+pub fn faulting(definition: &str) -> String {
+    const BOOM: &str = "boom: { raise: { error: { type: 'https://example.com/boom', status: 500, detail: boom } } }";
+    let faulting = if definition.contains("\ndo:\n") {
+        definition.replacen("\ndo:\n", &format!("\ndo:\n  - {BOOM}\n"), 1)
+    } else {
+        definition.replacen("\ndo: [ ", &format!("\ndo: [ {{ {BOOM} }}, "), 1)
+    };
+    assert_ne!(faulting, definition, "a top-level do list");
+    faulting
+}
+
+/// `agent::loop_tool` as a test calls it from outside a run's function: the
+/// host's own store is the run tree it reads (a handler reads its call's).
+pub async fn loop_tool(
+    engine: &Arc<Engine>,
+    live: &Arc<agent::agent::AgentLoop>,
+    args: &Value,
+    run: &str,
+    invocation: &str,
+    once: bool,
+) -> anyhow::Result<Value> {
+    let at = agent::agent::CallSite { runs: &**engine, run, task: "test", invocation };
+    agent::agent::loop_tool(engine, live, args, &at, once).await
 }

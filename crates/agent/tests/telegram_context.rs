@@ -56,7 +56,7 @@ impl Setup {
 
 // ── Telegram signal context ─────────────────────────────────────────────────
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn does_not_load_history_for_other_sources_even_with_a_telegram_target_and_content() {
     for source in ["scheduler", "news-digest", "nashdom-bill"] {
         let h = Setup::new(Vec::new());
@@ -68,7 +68,7 @@ async fn does_not_load_history_for_other_sources_even_with_a_telegram_target_and
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supplies_chronological_history_and_a_memory_reference_without_duplicating_the_current_message() {
     let previous =
         vec![message(1, "make a summary", json!({"role":"user"})), message(2, "Collect for the week?", json!({}))];
@@ -98,7 +98,7 @@ async fn supplies_chronological_history_and_a_memory_reference_without_duplicati
     assert_eq!(serde_json::from_str::<Value>(&h.history()).unwrap(), json!({"messages":previous}));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn isolates_the_originating_chat_and_topic() {
     for thread_id in [Some(7), None] {
         let h = Setup::new(vec![
@@ -119,7 +119,7 @@ async fn isolates_the_originating_chat_and_topic() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn preserves_an_older_identical_user_message_when_the_current_one_is_absent_from_the_log() {
     let h = Setup::new(vec![message(1, "go ahead", json!({"role":"user"})), message(2, "Which period?", json!({}))]);
     let input = h.run(&signal()).await;
@@ -127,7 +127,7 @@ async fn preserves_an_older_identical_user_message_when_the_current_one_is_absen
     assert_eq!(serde_json::from_str::<Value>(&h.history()).unwrap()["messages"].as_array().unwrap().len(), 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn leaves_out_messages_logged_after_the_signal_when_the_current_one_is_absent_from_the_log() {
     let h = Setup::new(vec![
         message(1, "Which period?", json!({})),
@@ -139,7 +139,7 @@ async fn leaves_out_messages_logged_after_the_signal_when_the_current_one_is_abs
     assert!(!h.history().contains("Future reply"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keeps_the_latest_complete_messages_inline_and_preserves_omitted_history_in_memory() {
     let h = Setup::new(vec![
         message(1, &format!("OLD {}", "x".repeat(20_000)), json!({})),
@@ -154,7 +154,7 @@ async fn keeps_the_latest_complete_messages_inline_and_preserves_omitted_history
     assert!(h.history().contains("OLD"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bounds_an_oversized_latest_message_in_utf8_marks_clipping_and_preserves_its_tail() {
     let text = "📰 Headline \"quoted\" — naïve café\n".repeat(2_000) + "Collect for the week?";
     let h = Setup::new(vec![message(1, &text, json!({}))]);
@@ -169,14 +169,14 @@ async fn bounds_an_oversized_latest_message_in_utf8_marks_clipping_and_preserves
     assert_eq!(serde_json::from_str::<Value>(&h.history()).unwrap()["messages"][0]["text"], text);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn represents_an_empty_history_without_hiding_the_current_request() {
     let h = Setup::new(Vec::new());
     assert!(h.run(&signal()).await.contains("Shown 0 of 0 prior messages; truncated=false"));
     assert_eq!(h.history(), "{\"messages\":[]}");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn continues_with_the_current_signal_if_history_is_unavailable() {
     for result in ["[tool error] offline", "not JSON", "{\"messages\":null}"] {
         let h = Setup { context: task_context("telegram:1"), mcp: ToolMcp::returning(Vec::new(), result) };
@@ -187,7 +187,7 @@ async fn continues_with_the_current_signal_if_history_is_unavailable() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn continues_when_the_mcp_request_throws() {
     let h = Setup::new(Vec::new());
     h.mcp.always(Arc::new(|_, _, _| Box::pin(async { Err(anyhow::anyhow!("connection lost")) })));
@@ -195,7 +195,7 @@ async fn continues_when_the_mcp_request_throws() {
     assert!(h.context.memory.list().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn never_guesses_a_chat_from_user_text_or_the_default_delivery_target() {
     let h = Setup::new(Vec::new());
     let mut s = signal();
@@ -216,7 +216,7 @@ async fn load(mcp: &ToolMcp) -> Option<String> {
     load_recent_activity(mcp, &null_scope(), &CancellationToken::new()).await.unwrap()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn loads_the_last_10_notes_oldest_first_and_says_how_to_load_more() {
     let mcp = tail(&["newest note".into(), "older note".into()]);
     let block = load(&mcp).await.unwrap();
@@ -229,7 +229,7 @@ async fn loads_the_last_10_notes_oldest_first_and_says_how_to_load_more() {
     assert!(block.find("older note").unwrap() < block.find("newest note").unwrap());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keeps_the_newest_whole_notes_within_the_byte_budget() {
     let notes: Vec<String> = (0..10).map(|i| format!("note {i} {}", "ж".repeat(1_500))).collect();
     let block = load(&tail(&notes)).await.unwrap();
@@ -238,7 +238,7 @@ async fn keeps_the_newest_whole_notes_within_the_byte_budget() {
     assert!(!block.contains("note 9 "));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn is_absent_when_the_journal_is_empty_or_unreadable() {
     assert_eq!(load(&tail(&[])).await, None);
     assert_eq!(load(&ToolMcp::returning(Vec::new(), "[tool error] journal_tail: down")).await, None);

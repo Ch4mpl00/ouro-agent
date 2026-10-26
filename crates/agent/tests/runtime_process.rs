@@ -105,23 +105,45 @@ impl Drop for Fixture {
         self.task.abort();
     }
 }
+// The reference Telegram loop, activated through the authoring checks in the
+// files the child process opens at startup (agent.db and the engine's store
+// beside it).
+async fn activate_reference_loop(root: &std::path::Path) {
+    let db = AgentDb::open(root.join("agent.db")).unwrap();
+    let provider: Arc<dyn agent::providers::ChatProvider> = Arc::new(support::Scripted::new(vec![]));
+    let status = agent::providers::ToolDef::new(support::STATUS_TOOL, support::STATUS_TOOL, json!({"type":"object"}));
+    let mcp = Arc::new(support::FakeMcp { defs: vec![status], ..Default::default() });
+    let author = agent::agent::create_engine(agent::agent::EngineDeps {
+        providers: agent::agent::Providers {
+            openai: provider.clone(),
+            gemini: provider.clone(),
+            deepseek: provider.clone(),
+            openrouter: Some(provider),
+        },
+        mcp,
+        presets: agent::models::default_presets(),
+        skills: Vec::new(),
+        skill_store: Arc::new(support::AnySkill),
+        memory: Arc::new(db.clone()),
+        tracer: Arc::new(agent::tracing::NullTracer),
+        codex: Arc::new(support::NoCodex),
+        decisions: None,
+        schedule: Arc::new(agent::schedule::Schedules::in_memory()),
+        env: Default::default(),
+        db,
+        store: agent::runs::open_store(&root.join("agent.db")).unwrap(),
+        dry_store: agent::runs::open_store_view(&root.join("agent.db")).unwrap(),
+    });
+    support::activate_telegram_loop(&author).await;
+    author.shutdown().await;
+}
+
 impl Fixture {
     async fn new(source: &str, fail_send: bool, wait_model: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_owned();
-        // These fixtures exercise one supplied signal, not system maintenance.
-        AgentDb::open(root.join("agent.db"))
-            .unwrap()
-            .conn()
-            .execute("DELETE FROM scheduled_tasks WHERE workflow = 'skill-index'", [])
-            .unwrap();
         if source == "telegram" {
-            // Install the reference policy through the authoring checks, in
-            // the database that the real child process opens on startup.
-            let mut author = support::fixture(Arc::new(support::Scripted::new(vec![])), &[], &[]);
-            Arc::get_mut(&mut author.engine).unwrap().deps.workflows =
-                Arc::new(AgentDb::open(root.join("agent.db")).unwrap());
-            support::activate_telegram_loop(&author.engine);
+            activate_reference_loop(&root).await;
         }
         std::fs::create_dir(root.join("skills.default")).unwrap();
         for (name, tools, body) in [
@@ -213,7 +235,7 @@ impl Fixture {
 async fn binary_runs_scheduler_and_agent_sources_and_flushes_matching_otel_ids() {
     for source in ["scheduler", "telegram", "domain"] {
         let f = Fixture::new(source, false, false).await;
-        let output = tokio::time::timeout(Duration::from_secs(10), f.child(true).output()).await.unwrap().unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(20), f.child(true).output()).await.unwrap().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         assert_eq!(f.state.sends.load(Ordering::SeqCst), 1);
         // A plain reply to the conversation the request came from skips Jev;
@@ -241,7 +263,7 @@ async fn binary_runs_scheduler_and_agent_sources_and_flushes_matching_otel_ids()
 #[tokio::test]
 async fn binary_tool_failure_returns_to_the_scheduler_loop_without_recovery() {
     let f = Fixture::new("scheduler", true, false).await;
-    let output = tokio::time::timeout(Duration::from_secs(10), f.child(true).output()).await.unwrap().unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(20), f.child(true).output()).await.unwrap().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(f.state.sends.load(Ordering::SeqCst), 1);
     let (trace, obs) = f.trace();
@@ -255,7 +277,8 @@ async fn binary_tool_failure_returns_to_the_scheduler_loop_without_recovery() {
 async fn sigterm_cancels_an_active_signal_and_flushes_trace_before_process_exit() {
     let f = Fixture::new("telegram", false, true).await;
     let child = f.child(false).spawn().unwrap();
-    tokio::time::timeout(Duration::from_secs(5), f.state.model_started.notified()).await.unwrap();
+    // The binary boots first: MCP, the engine's store and its built-ins.
+    tokio::time::timeout(Duration::from_secs(15), f.state.model_started.notified()).await.unwrap();
     let pid = child.id().unwrap();
     assert!(std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status().unwrap().success());
     let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output()).await.unwrap().unwrap();
@@ -318,6 +341,7 @@ async fn binary_journal_records_one_completed_run_without_creating_recursive_tra
     assert_eq!(entries[0]["metadata"]["trace_id"], trace.id);
     assert_eq!(entries[0]["metadata"]["source"], "telegram");
     assert!(entries[0]["body"].as_str().unwrap().contains("Sent a message"));
+    // The Telegram loop ends on its reply: no closing turn.
     assert_eq!(f.state.requests.lock().unwrap().len(), 2, "one reply turn and one journal composition");
     for export in f.state.exports.lock().unwrap().iter() {
         for span in export["resourceSpans"][0]["scopeSpans"][0]["spans"].as_array().unwrap() {

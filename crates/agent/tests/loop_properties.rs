@@ -224,16 +224,29 @@ async fn exercise(
         }
     }
 
-    // MCP sees exactly the allowed calls with object arguments, in order,
-    // with the arguments the model sent. Every reply's calls ran: the loop
-    // only stops after replying to them.
+    // MCP sees exactly the allowed calls with object arguments, with the
+    // arguments the model sent, round after round. Every reply's calls ran:
+    // the loop only stops after replying to them. Within a round the calls
+    // run at once (each an engine call of its own), so their start order is
+    // not the model's: a round is compared as a multiset.
     let sent: Vec<_> = replies.iter().take(requests.len()).flat_map(tool_calls).collect();
-    let want_dispatch: Vec<_> = sent
-        .iter()
-        .filter(|c| ALLOWED.contains(&c.name.as_str()))
-        .filter_map(|c| parsed_args(&c.arguments).map(|a| (c.name.clone(), a)))
-        .collect();
-    prop_assert_eq!(dispatched, want_dispatch, "{}: dispatched calls", at);
+    let mut rest = dispatched.as_slice();
+    for (k, reply) in replies.iter().take(requests.len()).enumerate() {
+        let mut want: Vec<_> = tool_calls(reply)
+            .iter()
+            .filter(|c| ALLOWED.contains(&c.name.as_str()))
+            .filter_map(|c| parsed_args(&c.arguments).map(|a| (c.name.clone(), a)))
+            .collect();
+        prop_assert!(rest.len() >= want.len(), "{}: round {}: dispatched {:?}", at, k, dispatched);
+        let (round, later) = rest.split_at(want.len());
+        let mut got = round.to_vec();
+        let key = |c: &(String, Map<String, Value>)| format!("{}{}", c.0, Value::Object(c.1.clone()));
+        got.sort_by_key(key);
+        want.sort_by_key(key);
+        prop_assert_eq!(got, want, "{}: round {}: dispatched calls", at, k);
+        rest = later;
+    }
+    prop_assert!(rest.is_empty(), "{}: calls past the last round: {:?}", at, rest);
     if sent.iter().any(|c| !ALLOWED.contains(&c.name.as_str())) {
         witnessed.lock().unwrap().insert("refuses a tool outside the loop");
     }

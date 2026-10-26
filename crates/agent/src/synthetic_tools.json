@@ -82,7 +82,7 @@
     "type": "function",
     "function": {
       "name": "set_memory",
-      "description": "Persist a small piece of agent-side state to the local memory KV. Use for watermarks, last-seen markers, counters, or any note the agent wants to recall in a future session. Well-known keys (e.g. `news_digest.last_read_at`) are auto-injected into the `Current context` block of future system prompts. Values are stored as strings \u2014 JSON-stringify complex payloads yourself.",
+      "description": "Persist a small piece of agent-side state to the local memory KV. Use for watermarks, last-seen markers, counters, or any note the agent wants to recall in a future session. Well-known keys (e.g. `news_digest.last_read_at`) are auto-injected into the `Current context` block of future system prompts. Values are stored as strings — JSON-stringify complex payloads yourself.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -123,7 +123,7 @@
     "type": "function",
     "function": {
       "name": "code_agent",
-      "description": "Delegate a computational / coding task to a sandboxed code agent (Codex). It writes AND runs code (Python with pandas/openpyxl, or Node) and returns ONLY the final result. Use it for anything that must be COMPUTED rather than recalled or written by an LLM: exact arithmetic, counting, date/time math, statistics, parsing or aggregating CSV/Excel/JSON data, string/data transformations, regex extraction, unit conversions. Do NOT use it for web access, reasoning, or composing prose \u2014 only code/computation. State the task precisely and say exactly what the output should be (e.g. 'return just the number'). Put any data the code needs in `data` \u2014 it is delivered to the program on stdin (for a binary file like .xlsx, base64-encode it and say so in the task).",
+      "description": "Delegate a computational / coding task to a sandboxed code agent (Codex). It writes AND runs code (Python with pandas/openpyxl, or Node) and returns ONLY the final result. Use it for anything that must be COMPUTED rather than recalled or written by an LLM: exact arithmetic, counting, date/time math, statistics, parsing or aggregating CSV/Excel/JSON data, string/data transformations, regex extraction, unit conversions. Do NOT use it for web access, reasoning, or composing prose — only code/computation. State the task precisely and say exactly what the output should be (e.g. 'return just the number'). Put any data the code needs in `data` — it is delivered to the program on stdin (for a binary file like .xlsx, base64-encode it and say so in the task).",
       "parameters": {
         "type": "object",
         "properties": {
@@ -221,7 +221,7 @@
           },
           "prompt": {
             "type": "string",
-            "description": "Task / user-facing request to hand to the sub-agent \u2014 goes in as a user message and shows up as the sub-agent's trace input. Use the user's verbatim wording when possible. For self-initiated tasks (no user message) put the trigger description here."
+            "description": "Task / user-facing request to hand to the sub-agent — goes in as a user message and shows up as the sub-agent's trace input. Use the user's verbatim wording when possible. For self-initiated tasks (no user message) put the trigger description here."
           },
           "input_refs": {
             "type": "array",
@@ -242,7 +242,7 @@
               "smart",
               "smartest"
             ],
-            "description": "Model preset for the sub-agent. `base` \u2014 cheap chat model, no thinking (default; use for simple one-offs and lookups). `smart` \u2014 DeepSeek with thinking on (use for real editorial / parsing work: digests, semantic dedup, PDF amount extraction). Default `base`."
+            "description": "Model preset for the sub-agent. `base` — cheap chat model, no thinking (default; use for simple one-offs and lookups). `smart` — DeepSeek with thinking on (use for real editorial / parsing work: digests, semantic dedup, PDF amount extraction). Default `base`."
           },
           "loop": {
             "type": "string",
@@ -259,7 +259,7 @@
     "type": "function",
     "function": {
       "name": "save_workflow",
-      "description": "Validate a saved-workflow definition (Open Workflow Specification DSL 1.0, YAML) and store it as a new draft version of `name`. Problems come back with the path of the task and property to fix; fix them all and save again. The reply lists every call the workflow makes with its effect (read/write) \u2014 show the user the write calls before asking them to confirm. A draft never runs; see activate_workflow.",
+      "description": "Validate a workflow definition (Open Workflow Specification DSL 1.0, YAML) and store it as a new draft version of `name`; saving the same text again returns its existing version. Problems come back with the path of the task and property to fix; fix them all and save again. The reply lists every call the workflow makes with its delivery (at_least_once / at_most_once) — show the user the at-most-once calls (the writes) before asking them to confirm. A draft never runs; see activate_workflow.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -289,7 +289,7 @@
     "type": "function",
     "function": {
       "name": "activate_workflow",
-      "description": "Make a saved version of a workflow the one that runs; the version active before retires. Call it ONLY after the user explicitly confirmed this version in the chat. A task scheduled with schedule_task(workflow: name) then runs it without the agent.",
+      "description": "Make a saved version of a workflow the one that runs; the version active before retires. Call it ONLY after the user explicitly confirmed this version in the chat. A version needs a completed dry run (try_workflow), except the current built-in text of agent-loop or signal, which is how an override is undone. Activating clears a tripped breaker and starts a fresh count. A name an operator paused cannot be activated. A task scheduled with schedule_task(workflow: name) then runs it without the agent.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -300,6 +300,10 @@
           "version": {
             "type": "integer",
             "minimum": 1
+          },
+          "note": {
+            "type": "string",
+            "description": "Why this version is activated, for the history; the save's note by default."
           }
         },
         "required": [
@@ -313,7 +317,7 @@
     "type": "function",
     "function": {
       "name": "list_workflows",
-      "description": "List saved workflows: the newest version of each, its status, and which version is active.",
+      "description": "List the workflows: the built-ins and every name you saved, each with its newest version and that version's status (active, retired, draft), whether it is a built-in text, whether a dry run tried it, the active version, and whether its breaker tripped or an operator paused it.",
       "parameters": {
         "type": "object",
         "properties": {},
@@ -325,7 +329,7 @@
     "type": "function",
     "function": {
       "name": "read_workflow",
-      "description": "Read a saved workflow's definition: the newest version, or `version`.",
+      "description": "Read a workflow's definition: `version`, else the active one, else the newest; with its status, note and whether it is set aside.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -348,7 +352,7 @@
     "type": "function",
     "function": {
       "name": "schedule_task",
-      "description": "Register a cron-driven task. When the cron matches, the agent gets a `scheduler` signal with the given prompt and acts on it (send a Telegram message, run a check, etc). Cron is standard 5-field (minute hour day-of-month month day-of-week) evaluated in the user's configured timezone. For one-shot reminders set `recurring: false` and use a specific cron like '30 14 12 5 *' (14:30 on May 12); the task auto-deactivates after the first fire. For repeating tasks use a generic cron like '0 9 * * *' (every day 9:00). Convert natural-language times into cron syntax before calling this tool. To run something once right away (\"run it now\"), set `cron_expr: \"now\"`: it fires within half a minute, after the current conversation turn ends. With `workflow`, each fire runs that saved workflow's active version instead of planning the task.",
+      "description": "Register a cron-driven task. When the cron matches, the agent gets a `scheduler` signal with the given prompt and acts on it (send a Telegram message, run a check, etc). Cron is standard 5-field (minute hour day-of-month month day-of-week) evaluated in the user's configured timezone; a recurring task follows the user's timezone when it changes. For one-shot reminders set `recurring: false` and use a specific cron like '30 14 12 5 *' (14:30 on May 12): it fires once, at that cron's next match. For repeating tasks use a generic cron like '0 9 * * *' (every day 9:00). Convert natural-language times into cron syntax before calling this tool. To run something once right away (\"run it now\"), set `cron_expr: \"now\"`: it fires at once, after the signal running now ends. With `workflow`, each fire runs that saved workflow's active version instead of planning the task. At most 100 tasks may be scheduled at a time. Returns { ok, task: { id, cron_expr, recurring, prompt, workflow, timezone }, next_fire } (next_fire in UTC), or { ok: false, error }.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -384,7 +388,7 @@
     "type": "function",
     "function": {
       "name": "list_scheduled_tasks",
-      "description": "Show every task that may still fire \u2014 recurring tasks (always) and one-shots that haven't been triggered yet. Each row includes the cron expression, prompt, the saved workflow it runs (if any), last fire time, and the next 1-3 upcoming fire timestamps in the user's timezone for sanity-checking.",
+      "description": "Show every task that may still fire: recurring tasks, and one-shots that have not fired yet (a one-shot whose fire is waiting to run is shown with consumed: true; it leaves the list once it ran). Each row has id, cron_expr, recurring, prompt, source, the saved workflow it runs (if any), timezone, created_at, next_fire (the next due time) and last_fire (the slot it last fired for), both UTC; a task whose recording failed shows faults and last_error, and one an operator paused shows paused.",
       "parameters": {
         "type": "object",
         "properties": {},
@@ -396,7 +400,7 @@
     "type": "function",
     "function": {
       "name": "cancel_scheduled_task",
-      "description": "Permanently remove a task by id. Use this when the user says 'forget about that reminder' or 'stop the daily X'. Returns { ok: true, id } on success, { ok: false, id } if no such task.",
+      "description": "Cancel a task by id: it never fires again (a fire already due still runs). Use this when the user says 'forget about that reminder' or 'stop the daily X'. Returns { ok: true, id } on success, { ok: false, id, error } for an unknown id, a task already cancelled or a one-shot that already fired. Ids are never reused.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -456,7 +460,7 @@
     "type": "function",
     "function": {
       "name": "try_workflow",
-      "description": "Dry-run a saved workflow once, now. Without `signal`: as a scheduled fire would run it. With `signal`: as if that signal had just arrived, through the whole chain (the signal dispatcher, the route it picks, the loop, the guard, workers), with this workflow and each of `drafts` at its latest saved version in place of the active one. Model turns, reads (the internet's and MCP's) and the guard run for real; every write is only recorded and answered with {\"mock\": true, \"note\": \"dry run: not executed\", \"delivered\": true}, a confirmation is answered automatically (`confirm`), and nothing is kept. Returns the trace: the path of every workflow with each switch's case, each model turn's reasoning, text and calls, each call's verdict and reply, the writes, how each loop ended and the output. A signal with an unknown or missing source runs nothing and lists the signal types, each with its latest real signal.",
+      "description": "Dry-run a saved workflow once, now. Without `signal`: as a scheduled fire would run it. With `signal`: as if that signal had just arrived, through the whole chain (the signal dispatcher, the route it picks, the loop, the guard, workers), with this workflow and each of `drafts` at its latest saved version in place of the active one. Model turns, reads (the internet's and MCP's) and the guard run for real; every write is only recorded and answered with {\"mock\": true, \"note\": \"dry run: not executed\", \"delivered\": true} (without `signal`: {\"ok\": true, \"dryRun\": true}), a confirmation is answered automatically (`confirm`), and nothing is kept. Returns the trace: the path of every workflow with each switch's case, each model turn's reasoning, text and calls, each call's verdict and reply, the writes, how each loop ended and the output. A signal with an unknown or missing source runs nothing and lists the signal types, each with its latest real signal.",
       "parameters": {
         "type": "object",
         "properties": {

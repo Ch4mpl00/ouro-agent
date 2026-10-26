@@ -113,12 +113,12 @@ impl State {
         }
         entry
     }
-    pub fn restore_chain(&mut self, records: &[owf::durable::Record]) {
-        use owf::durable::{CallState, Record};
+    pub fn restore_chain(&mut self, records: &crate::agent::Records) {
+        use ouro_runtime::ows::durable::{CallState, Record};
         let mut entries = Vec::new();
-        for record in records {
+        for record in records.values() {
             if let Record::Call { function, arguments, state, logical, .. } = record
-                && function == "tool"
+                && (function == "tool_once" || function == "tool_repeat")
                 && !matches!(state, CallState::NotExecuted(_))
             {
                 let saved = match state {
@@ -126,8 +126,8 @@ impl State {
                     _ => None,
                 };
                 let entry = saved.or_else(|| {
-                    // Pending intent or legacy record: preserve the attempted
-                    // call, without interpreting or serializing its result.
+                    // Pending intent or an unknown outcome: preserve the
+                    // attempted call, without interpreting its result.
                     let value = &arguments["call"];
                     let call = ToolCall {
                         id: value["id"].as_str()?.into(),
@@ -176,7 +176,7 @@ pub fn key(call: &ToolCall) -> String {
 }
 pub fn needs_guard(engine: &Engine, call: &ToolCall) -> bool {
     call.name != "invoke_sub_agent"
-        && (tool_effect(engine, &call.name) == owf::run::Effect::Write || tool_open_world(engine, &call.name))
+        && (tool_effect(engine, &call.name) == crate::agent::Effect::Write || tool_open_world(engine, &call.name))
 }
 
 // ── 2. deterministic rules ──────────────────────────────────────────────────
@@ -357,7 +357,8 @@ pub async fn judge(
                 Ok(decision) => Verdict::new(settle(&decision.answer(&format!("call_{i}"), &questions[i])?)),
                 Err(error) => {
                     let mut verdict = Verdict::new(
-                        if tool_effect(engine, &call.name) == owf::run::Effect::Read || current_reply(context, call) {
+                        if tool_effect(engine, &call.name) == crate::agent::Effect::Read || current_reply(context, call)
+                        {
                             "allow"
                         } else {
                             "guard_unavailable"
@@ -369,7 +370,7 @@ pub async fn judge(
             };
             // Preserve the unavailable evidence even on a permitted reply.
             if verdict.allowed() && verdict.unavailable.is_some() {
-                verdict.guidance = if tool_effect(engine, &call.name) == owf::run::Effect::Read {
+                verdict.guidance = if tool_effect(engine, &call.name) == crate::agent::Effect::Read {
                     "Decision service unavailable; open-world read passed deterministic checks."
                 } else {
                     "Decision service unavailable; reply to the current conversation permitted."
@@ -516,29 +517,32 @@ mod tests {
 
     #[test]
     fn restore_keeps_pending_calls_in_round_order_without_result_bodies() {
-        use owf::{
-            durable::{CallState, Delivery, Record},
-            run::Effect,
-        };
+        use ouro_runtime::ows::durable::{CallState, Delivery, Record};
         let record = |index: u64, name: &str, state| Record::Call {
             logical: format!("call-{index}"),
-            function: "tool".into(),
+            function: "tool_once".into(),
             arguments: json!({"i":1,"index":index,"call":{"id":name,"name":name,"arguments":"{}"}}),
-            effect: Effect::Write,
             delivery: Delivery::AtMostOnce,
             state,
+            annotations: Default::default(),
         };
         let mut state = State::default();
-        state.restore_chain(&[
-            record(
-                1,
-                "send",
-                CallState::Done(Ok(json!({"guard_call":{
-                "id":"send","name":"send","arguments":"{}","blocked":true,"sequence":1},
-                "presented":"RESULT_MUST_STAY_OUT"}))),
+        let records: crate::agent::Records = [
+            (
+                "a".to_owned(),
+                record(
+                    1,
+                    "send",
+                    CallState::Done(Ok(json!({"guard_call":{
+                    "id":"send","name":"send","arguments":"{}","blocked":true,"sequence":1},
+                    "presented":"RESULT_MUST_STAY_OUT"}))),
+                ),
             ),
-            record(0, "search", CallState::Pending),
-        ]);
+            ("b".to_owned(), record(0, "search", CallState::Pending)),
+        ]
+        .into_iter()
+        .collect();
+        state.restore_chain(&records);
         assert_eq!(state.chain[0]["name"], "search");
         assert_eq!(state.chain[1]["name"], "send");
         assert_eq!(state.chain[1]["blocked"], true);

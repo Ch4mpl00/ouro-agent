@@ -237,7 +237,7 @@ impl agent::db::MemoryStore for BrokenMemory {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn environment_does_not_replace_storage_failures_with_bootstrap_watermarks() {
     let deps = agent::session::EnvDeps {
         mcp: std::sync::Arc::new(support::FakeMcp::default()),

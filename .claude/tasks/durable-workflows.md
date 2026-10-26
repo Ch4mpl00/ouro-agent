@@ -1,5 +1,10 @@
 # Durable workflows: run state, waits and user input
 
+> **Superseded (2026-10-26).** The runtime this record describes (`crates/owf`,
+> `crates/agent/src/durable.rs` and their tables) was replaced by the ouro
+> engine and removed (`docs/designs/01-engine-migration.md` … `07-remove-owf.md`).
+> Kept as history; its open work is to be re-triaged against the engine.
+
 **Status:** in-progress. The durable core is built and used by saved workflows
 **Open work:** #44
 and the agent loop (see "Done"). Open: external events and user replies as

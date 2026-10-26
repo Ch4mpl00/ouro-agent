@@ -28,8 +28,9 @@ skills and workflows.
 
 - **The agent loop is a workflow.** Turn, review, tools, settle: the loop is
   [`agent-loop.yaml`](crates/agent/workflows/agent-loop.yaml), run by
-  Ouro's own [Open Workflow Specification](https://open-workflow-specification.org/)
-  interpreter ([`crates/owf`](crates/owf)). With your approval Ouro
+  the [ouro engine](https://github.com/Ch4mpl00/ouro), a durable
+  [Open Workflow Specification](https://open-workflow-specification.org/)
+  runtime. With your approval Ouro
   activates its own version of the loop, or of how a signal is handled,
   without a rebuild;
   three faults in a row restore the built-in one.
@@ -100,9 +101,11 @@ flowchart LR
 |---|---|
 | [`crates/mcp`](crates/mcp) | MCP server: Gmail, Telegram, news, memory and other tools, plus the pollers that emit signals. Knows nothing about the agent. |
 | [`crates/agent`](crates/agent) | The supervisor: signals, loops, guard, schedule, durable runs. Reaches tools only over MCP. |
-| [`crates/owf`](crates/owf) | Open Workflow Specification interpreter with a [durability contract](crates/owf/README.md). Independent of the rest. |
-| [`crates/evals`](crates/evals) | Judges, golden sets (news filter, guard) and trace replay. |
+| [`crates/evals`](crates/evals) | Judges, golden sets (news filter, guard), trace replay and the workflow optimizer. |
 | [`crates/codex`](crates/codex) | The sandbox for the agent's `code_agent` tool. |
+
+Workflows run on the [ouro engine](https://github.com/Ch4mpl00/ouro) (crates
+`ows`, `ouro-durable`, `ouro-runtime`), a git dependency pinned to a tag.
 
 ## Docs
 

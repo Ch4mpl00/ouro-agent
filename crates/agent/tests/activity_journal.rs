@@ -582,7 +582,7 @@ async fn the_background_worker_stops_during_its_idle_wait() {
 
 #[tokio::test]
 async fn an_anchored_request_is_projected_once_after_its_last_terminal_segment_is_recorded() {
-    use agent::{durable::RunStore, local_recorder::local_recorder_tracer, tracing::*};
+    use agent::{local_recorder::local_recorder_tracer, runs::RunTrace, tracing::*};
     let h = Harness::new();
     let tracer = local_recorder_tracer(h.db.clone());
     let first = tracer.trace(TraceStart {
@@ -594,24 +594,29 @@ async fn an_anchored_request_is_projected_once_after_its_last_terminal_segment_i
     });
     first.update(ContextUpdate::input("save this"));
     let anchor = first.anchor().unwrap();
-    let runs = RunStore::new((*h.db).clone());
-    let lease = runs.start_anchored("run", "agent-loop", "definition", &json!({}), Some(&anchor)).unwrap().unwrap();
+    h.db.insert_run_trace(&RunTrace {
+        run_id: "run".into(),
+        trace_id: anchor.trace_id.clone(),
+        session_id: anchor.session_id.clone(),
+        parent_span_id: Some(anchor.parent_span_id.clone()),
+        recorded: false,
+        created_ms: 0,
+    })
+    .unwrap();
     first.update(ContextUpdate::output(json!({"resumes":true})));
     first.end();
     assert_eq!(h.tick().await, 0);
     assert!(h.db.list_recent(20, Some(("judge", "v1"))).unwrap().is_empty());
-    lease.finish(&owf::run::Status::Completed(json!("saved"))).unwrap();
-    // A committed run outcome alone is not enough: its final spans must land.
+    // A run that ended is not enough: its end must be recorded in the trace.
     assert_eq!(h.tick().await, 0);
     let resumed =
         tracer.trace(TraceStart { name: "resume:agent-loop".into(), continuation: Some(anchor), ..Default::default() });
-    let runner = resumed.span(
-        SpanStart::new("runner", SpanKind::Chain)
-            .metadata(json!({"durable_run":"run","durable_terminal":true}).as_object().unwrap().clone()),
-    );
+    let runner = resumed.span(SpanStart::new("runner", SpanKind::Chain));
     runner.end(SpanEnd::output("saved"));
     resumed.update(ContextUpdate::output("saved"));
     resumed.end();
+    assert_eq!(h.tick().await, 0);
+    h.db.mark_recorded("run").unwrap();
     assert_eq!(h.tick().await, 1);
     assert_eq!(h.db.list_recent(20, Some(("judge", "v1"))).unwrap().len(), 1);
     assert_eq!(h.tick().await, 0);

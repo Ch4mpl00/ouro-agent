@@ -117,7 +117,7 @@ impl SpanSink for Sink {
         self.0.lock().unwrap().push(span);
     }
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tee_forces_primary_ids_and_records_nested_spans_usage_and_merged_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(AgentDb::open(dir.path().join("agent.db")).unwrap());
@@ -182,7 +182,7 @@ async fn tee_forces_primary_ids_and_records_nested_spans_usage_and_merged_metada
     drop(wire);
     tracer.shutdown().await;
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn error_and_retry_event_attributes_match_local_records() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(AgentDb::open(dir.path().join("agent.db")).unwrap());
