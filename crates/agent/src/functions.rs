@@ -2,7 +2,7 @@
 // 1. the registry and typed outcomes; 2. MCP tools from the snapshot;
 // 3. loop functions; 4. context functions; 5. child starters and their
 // settlement; 6. guard functions; 7. dispatcher functions; 8. workflow steps;
-// 9. the catalog authors see.
+// 8b. scheduled tasks; 9. the catalog authors see.
 //
 // A handler reads its run tree (its own run, its ancestors, its descendants
 // and their records) through the call's run access (`FunctionContext::run`,
@@ -75,6 +75,7 @@ pub fn registry(engine: Weak<Engine>, deps: &EngineDeps) -> Registry {
     add(&mut registry, &engine, "signal_session", repeat, signal_session);
     add(&mut registry, &engine, "signal_transcript", repeat, signal_transcript);
     add(&mut registry, &engine, "set_memory", once, set_memory);
+    add(&mut registry, &engine, "fire_scheduled", repeat, fire_scheduled);
     for name in ["llm_compose", "filter_relevant", "choose", "hash_value", "skill_catalog_snapshot"] {
         add(&mut registry, &engine, name, repeat, move |e, a, c| step(e, a, c, name));
     }
@@ -1542,6 +1543,22 @@ pub async fn run_step(
     }
 }
 
+// ── 8b. scheduled tasks ─────────────────────────────────────────────────────
+
+/// `fire_scheduled { slot }`: a task's trigger run records its fire
+/// (schedule.rs §5) and ends at once; the supervisor's drain runs it. A
+/// storage error is no answer (`interrupted`: the engine resends it).
+async fn fire_scheduled(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
+    let run = RunReads::run(&ctx, &ctx.run_id)
+        .await
+        .map_err(failed)?
+        .ok_or_else(|| FunctionError::interrupted("the call lost its run"))?;
+    crate::schedule::fire(&engine, &run, &args["slot"]).await.map_err(|failure| match failure {
+        crate::schedule::FireFailure::Storage(error) => FunctionError::interrupted(format!("{error:#}")),
+        crate::schedule::FireFailure::Invalid(detail) => FunctionError::runtime(detail),
+    })
+}
+
 // ── 9. the catalog authors see ──────────────────────────────────────────────
 
 /// A function of the runtime as a workflow's author sees it (`workflow_functions`).
@@ -1553,7 +1570,8 @@ pub struct HostFunction {
     pub needs: &'static [&'static str],
     pub description: &'static str,
     // Which runs may call it: "workflow" (any), "agent-loop", "signal",
-    // "signal|agent-loop", "guard".
+    // "signal|agent-loop", or a reserved context no version of the agent's
+    // may call: "guard", "task" (`RESERVED_CONTEXTS`).
     pub context: &'static str,
 }
 
@@ -1735,6 +1753,7 @@ pub const HOST_FUNCTIONS: &[HostFunction] = &[
     f("confirm_request", Write, &["call"], &["call"], "guard", "The guard round's confirmation card."),
     f("resolve_review", Read, &["call", "outcome"], &["call"], "guard", "The guard round's verdict for a call."),
     f("set_memory", Write, &["key", "value"], &["key", "value"], "workflow", "Store a value in the memory KV."),
+    f("fire_scheduled", Write, &["slot"], &["slot"], "task", "A scheduled task's trigger records its fire."),
     f(
         "llm_compose",
         Read,
@@ -1783,6 +1802,10 @@ pub const ENGINE_FUNCTIONS: &[HostFunction] = &[
     ),
     f("child_outcome", Read, &["id", "key"], &["id", "key"], "workflow", "The engine's own: an owned child's outcome."),
 ];
+
+/// The contexts whose functions belong to the runtime alone: no version of
+/// the agent's may call them, and the author's catalog leaves them out.
+pub const RESERVED_CONTEXTS: &[&str] = &["guard", "task"];
 
 pub fn host_function(name: &str) -> Option<&'static HostFunction> {
     HOST_FUNCTIONS.iter().chain(ENGINE_FUNCTIONS).find(|f| f.name == name)

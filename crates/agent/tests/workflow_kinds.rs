@@ -14,7 +14,7 @@ use agent::{
     db::TraceStore,
     mcp::Mcp,
     providers::{ToolDef, assistant},
-    schedule::{FIRST_FIRE_ID, Fire, FireSink, SupervisorSink},
+    schedule::Task,
     supervisor::{Supervisor, create_supervisor},
     trace_model::Observation,
     tracing::{Scope, TraceStart},
@@ -97,22 +97,27 @@ impl Agent {
         Ok(serde_json::from_str(&reply)?)
     }
 
-    // A fire of a task that names `workflow`, as the schedule's tick hands
-    // it to the supervisor (scheduling one with `schedule_task(workflow:)`
-    // returns with the schedules step); the trace id of the fire.
+    // A fire of a task that names `workflow`, recorded as its trigger's run
+    // records one and run by the schedule's drain (design 06); the trace id
+    // of the fire.
     async fn fire(&self, workflow: &str, prompt: &str) -> String {
         let n = self.fires.fetch_add(1, Ordering::SeqCst) + 1;
-        let sink = SupervisorSink { supervisor: self.supervisor.clone(), env_context: None };
-        let fire = Fire {
-            id: FIRST_FIRE_ID + n,
-            task_id: n,
-            source: "scheduler".into(),
-            content: prompt.into(),
+        let task = Task {
+            id: n,
+            cron: "now".into(),
+            recurring: false,
+            prompt: prompt.into(),
+            source: None,
             workflow: Some(workflow.into()),
-            slot: chrono::Utc::now(),
+            timezone: "UTC".into(),
+            created: "2026-10-26T12:00:00.000Z".into(),
+            cancelled: false,
         };
-        assert_eq!(sink.fire(fire).await, agent::schedule::Fired::Started);
-        format!("scheduler:{}", FIRST_FIRE_ID + n)
+        let fires = &self.f.engine.deps.schedule.fires;
+        let id = fires.record(&format!("schedule:task-{n}:at:{n}"), &task, n).await.unwrap();
+        let drained = agent::schedule::drain(&self.supervisor, None).await.unwrap();
+        assert_eq!(drained.ran, 1, "{drained:?}");
+        format!("scheduler:{id}")
     }
 
     fn trace(&self, id: &str) -> (agent::trace_model::Trace, Vec<Observation>) {

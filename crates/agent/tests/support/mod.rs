@@ -151,6 +151,19 @@ pub fn fixture_clocked(
     clock: Arc<dyn ouro_runtime::durable::Clock>,
     configure: impl FnOnce(&mut EngineDeps),
 ) -> Fixture {
+    fixture_configured(provider, definitions, skills, clock, agent::runs::config(), configure)
+}
+
+/// `fixture_clocked` with the runtime configured as `config` (a short
+/// heartbeat, so a test can move the clock while a run holds its lease).
+pub fn fixture_configured(
+    provider: Arc<dyn ChatProvider>,
+    definitions: &[&str],
+    skills: &[(&str, &str)],
+    clock: Arc<dyn ouro_runtime::durable::Clock>,
+    config: ouro_runtime::Config,
+    configure: impl FnOnce(&mut EngineDeps),
+) -> Fixture {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("skills.default")).unwrap();
     for (name, body) in skills {
@@ -167,7 +180,7 @@ pub fn fixture_clocked(
             .collect(),
         ..Default::default()
     });
-    let (db, skills, engine) = open_engine(root.path(), provider, mcp.clone(), clock, configure);
+    let (db, skills, engine) = open_engine(root.path(), provider, mcp.clone(), clock, config, configure);
     Fixture { root, db, skills, mcp, engine }
 }
 
@@ -179,7 +192,7 @@ pub fn reopen(
     clock: Arc<dyn ouro_runtime::durable::Clock>,
     configure: impl FnOnce(&mut EngineDeps),
 ) -> Arc<Engine> {
-    open_engine(f.root.path(), provider, f.mcp.clone(), clock, configure).2
+    open_engine(f.root.path(), provider, f.mcp.clone(), clock, agent::runs::config(), configure).2
 }
 
 fn open_engine(
@@ -187,6 +200,7 @@ fn open_engine(
     provider: Arc<dyn ChatProvider>,
     mcp: Arc<FakeMcp>,
     clock: Arc<dyn ouro_runtime::durable::Clock>,
+    config: ouro_runtime::Config,
     configure: impl FnOnce(&mut EngineDeps),
 ) -> (Arc<AgentDb>, Arc<FsSkillStore>, Arc<Engine>) {
     let db = Arc::new(AgentDb::open(root.join("agent.db")).unwrap());
@@ -206,14 +220,14 @@ fn open_engine(
         tracer: Arc::new(local_recorder_tracer(db.clone())),
         codex: Arc::new(NoCodex),
         decisions: Some(allow_guard()),
-        schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
+        schedule: Arc::new(agent::schedule::Schedules::new(db.clone())),
         env: Default::default(),
         db: (*db).clone(),
         store: agent::runs::open_store(&root.join("agent.db")).unwrap(),
         dry_store: agent::runs::open_store_view(&root.join("agent.db")).unwrap(),
     };
     configure(&mut deps);
-    let engine = agent::agent::create_engine_on(deps, agent::runs::config(), clock);
+    let engine = agent::agent::create_engine_on(deps, config, clock);
     (db, store, engine)
 }
 
@@ -541,7 +555,7 @@ impl Harness {
             tracer,
             codex: Arc::new(NoCodex),
             decisions: Some(allow_guard()),
-            schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
+            schedule: std::sync::Arc::new(agent::schedule::Schedules::in_memory()),
             env: Default::default(),
             db: agent::db::AgentDb::open(":memory:").unwrap(),
             store,

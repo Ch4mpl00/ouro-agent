@@ -108,7 +108,7 @@ fn engine_on(
         db: stores.db.clone(),
         store: stores.store.clone(),
         dry_store: stores.dry_store.clone(),
-        schedule: Arc::new(agent::schedule::MemorySchedule::default()),
+        schedule: Arc::new(agent::schedule::Schedules::in_memory()),
     })
 }
 

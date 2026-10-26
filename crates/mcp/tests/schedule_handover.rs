@@ -1,17 +1,14 @@
 // What MCP still serves the agent's schedule (crates/agent/src/schedule.rs)
-// now that the agent owns it: the user's time zone, read on every tick; the
-// environment note a fire carries; and its old task table, which the agent's
-// first start imports. The import runs the agent's own client and code
-// against the real server, so the two sides cannot drift apart.
+// now that scheduled tasks are engine definitions: the user's time zone,
+// which the agent's zone watch reads, and the environment note a fire
+// carries. MCP's old task table is no longer imported (design 06): the
+// maintainer recreates the tasks it held.
 
 mod support;
 
-use agent::mcp::{ConnectOptions, Mcp, McpClient, open_http};
-use agent::schedule::{self, MemorySchedule, ScheduleStore};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use support::{Outcome, call, connect, start_test_server};
-use tokio_util::sync::CancellationToken;
 
 fn value(outcome: Outcome, tool: &str) -> Value {
     match outcome {
@@ -22,44 +19,6 @@ fn value(outcome: Outcome, tool: &str) -> Value {
 
 fn keys(v: &Value) -> BTreeSet<&str> {
     v.as_object().map(|m| m.keys().map(String::as_str).collect()).unwrap_or_default()
-}
-
-#[test]
-fn the_agents_first_start_imports_the_tasks_mcp_still_holds() {
-    support::runtime().block_on(async {
-        let db = support::test_database().await;
-        let server = start_test_server(&db, None).await.unwrap();
-        let digest = server.scheduler.insert("0 9 * * *", true, "digest", None).await.unwrap();
-        let dreaming = server.scheduler.insert("0 4 * * *", true, "dream", Some("dreaming")).await.unwrap();
-        let fired = server.scheduler.insert("30 14 2 10 *", false, "pills", None).await.unwrap();
-        let client = server.db.client().await.unwrap();
-        for (id, slot) in [(digest.id, 1_782_896_400_i64), (fired.id, 1_791_037_800)] {
-            client.execute("UPDATE scheduled_tasks SET last_run_at = $1 WHERE id = $2", &[&slot, &id]).await.unwrap();
-        }
-
-        let mcp = McpClient::connect(open_http(server.url.clone()), ConnectOptions::default()).await.unwrap();
-        let store = MemorySchedule::default();
-        assert_eq!(schedule::initialize(&store, &mcp, &CancellationToken::new()).await.unwrap(), 2);
-        // cron, recurring, prompt, source, last fire, created (unix seconds)
-        type Imported = (String, bool, String, Option<String>, Option<i64>, i64);
-        let imported: Vec<Imported> = store
-            .list_active()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|t| (t.cron_expr, t.recurring == 1, t.prompt, t.source, t.last_run_at, t.created.timestamp()))
-            .collect();
-        // The one-shot that already fired may never fire again, so it stays behind.
-        assert_eq!(
-            imported,
-            [
-                ("0 9 * * *".into(), true, "digest".into(), None, Some(1_782_896_400), digest.created.timestamp()),
-                ("0 4 * * *".into(), true, "dream".into(), Some("dreaming".into()), None, dreaming.created.timestamp()),
-            ]
-        );
-        mcp.close().await;
-        db.drop_all().await;
-    });
 }
 
 #[test]

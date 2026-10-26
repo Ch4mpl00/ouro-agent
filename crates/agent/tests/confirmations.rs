@@ -150,7 +150,7 @@ fn engine(p: &Parts) -> Arc<Engine> {
             tracer: Arc::new(agent::tracing::NullTracer),
             codex: Arc::new(NoCodex),
             decisions: Some(agent::decisions::decision_client("test".into(), p.api.clone())),
-            schedule: Arc::new(agent::schedule::MemorySchedule::default()),
+            schedule: Arc::new(agent::schedule::Schedules::in_memory()),
             env: agent::session::EnvConfig { user_email: None, telegram_chat_id: Some("42".into()) },
             db: p.db.clone(),
             store: p.store.clone(),

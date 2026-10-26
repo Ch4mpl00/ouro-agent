@@ -26,7 +26,7 @@ use crate::{
     mcp::{Mcp, SharedMcp, ToolCallFailure},
     providers::{self, Message, ToolCall, ToolDef},
     runs::{Choice, Fallback, Site, Status},
-    schedule::{NewTask, ScheduleStore, TaskRow},
+    schedule::{Fire, FireStore, Schedules, Task},
     session::{EnvConfig, Session},
     skills::{SkillEntry, SkillFile, SkillStore, Written},
     supervisor::PendingSignal,
@@ -317,8 +317,9 @@ fn cut(value: &Value, max: usize) -> Value {
 }
 
 // The engine's mock (decision 6): an MCP tool of the registry not marked
-// read-only, `set_memory`, and `deliver_event` (it delivers into a real run)
-// are answered by the sandbox; every other function dispatches.
+// read-only, `set_memory`, `deliver_event` (it delivers into a real run) and
+// `fire_scheduled` (a try never records a fire, design 06 decision 5) are
+// answered by the sandbox; every other function dispatches.
 struct DryMock {
     sandbox: Arc<Sandbox>,
     writes: BTreeSet<String>,
@@ -326,7 +327,7 @@ struct DryMock {
 
 impl Mock for DryMock {
     fn mocks(&self, function: &str, _arguments: &Value) -> bool {
-        self.writes.contains(function) || matches!(function, "set_memory" | "deliver_event")
+        self.writes.contains(function) || matches!(function, "set_memory" | "deliver_event" | "fire_scheduled")
     }
     fn response(&self, function: &str, arguments: &Value, ctx: &FunctionContext) -> Result<Output, FunctionError> {
         let reply = self.sandbox.mock(Via::Yaml, Some(&ctx.run_id), Some(&ctx.task_path), function, arguments.clone());
@@ -420,26 +421,30 @@ impl SkillStore for DrySkills {
     }
 }
 
-struct DrySchedule(Arc<dyn ScheduleStore>);
+// The fire table as a dry run sees it (R2-L8): the real one read through
+// (`list_scheduled_tasks` shows the real last fires), every write refused.
+// A try never records a fire: `fire_scheduled` is mocked (`DryMock`), and a
+// model's `schedule_task` is a mocked write.
+struct DryFires(Arc<dyn FireStore>);
 
 #[async_trait]
-impl ScheduleStore for DrySchedule {
-    async fn insert(&self, _: &NewTask) -> anyhow::Result<TaskRow> {
+impl FireStore for DryFires {
+    async fn record(&self, _: &str, _: &Task, _: i64) -> anyhow::Result<i64> {
         anyhow::bail!(NO_WRITES)
     }
-    async fn list_active(&self) -> anyhow::Result<Vec<TaskRow>> {
-        self.0.list_active().await
+    async fn next_pending(&self) -> anyhow::Result<Option<Fire>> {
+        self.0.next_pending().await
     }
-    async fn swap_last_run(&self, _: i64, _: Option<i64>, _: Option<i64>) -> anyhow::Result<bool> {
+    async fn done(&self, _: i64) -> anyhow::Result<()> {
         anyhow::bail!(NO_WRITES)
     }
-    async fn delete(&self, _: i64) -> anyhow::Result<bool> {
+    async fn latest(&self, task_id: i64) -> anyhow::Result<Option<Fire>> {
+        self.0.latest(task_id).await
+    }
+    async fn next_task_id(&self) -> anyhow::Result<i64> {
         anyhow::bail!(NO_WRITES)
     }
-    async fn record_fire(&self, _: i64, _: i64) -> anyhow::Result<i64> {
-        anyhow::bail!(NO_WRITES)
-    }
-    async fn initialize(&self, _: &[NewTask]) -> anyhow::Result<bool> {
+    async fn seed_id(&self) -> anyhow::Result<i64> {
         anyhow::bail!(NO_WRITES)
     }
 }
@@ -522,7 +527,7 @@ fn sandbox_engine(
         tracer: Arc::new(Nested(root)),
         codex: deps.codex.clone(),
         decisions: deps.decisions.clone(),
-        schedule: Arc::new(DrySchedule(deps.schedule.clone())),
+        schedule: Arc::new(Schedules::new(Arc::new(DryFires(deps.schedule.fires.clone())))),
         env,
         db,
         store,

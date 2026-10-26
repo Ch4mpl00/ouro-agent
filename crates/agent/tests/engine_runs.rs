@@ -151,7 +151,7 @@ fn engine_with(parts: &Parts, config: ouro_runtime::Config) -> Arc<Engine> {
             tracer: Arc::new(agent::local_recorder::local_recorder_tracer(Arc::new(parts.db.clone()))),
             codex: Arc::new(NoCodex),
             decisions: Some(agent::decisions::decision_client("guard-test".into(), parts.guard.clone())),
-            schedule: Arc::new(agent::schedule::MemorySchedule::default()),
+            schedule: Arc::new(agent::schedule::Schedules::in_memory()),
             env: agent::session::EnvConfig { user_email: None, telegram_chat_id: Some(CHAT.into()) },
             db: parts.db.clone(),
             store: parts.store.clone(),

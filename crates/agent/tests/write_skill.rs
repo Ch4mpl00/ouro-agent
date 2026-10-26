@@ -92,7 +92,7 @@ fn engine(model: Model, tools: &[&str], store: Arc<FsSkillStore>) -> Arc<agent::
         db: agent::db::AgentDb::open(":memory:").unwrap(),
         store: runs,
         dry_store,
-        schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
+        schedule: std::sync::Arc::new(agent::schedule::Schedules::in_memory()),
     })
 }
 

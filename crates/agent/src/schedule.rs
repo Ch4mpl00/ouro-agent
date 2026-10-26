@@ -1,28 +1,30 @@
-// Scheduled tasks: the agent's own clock. Cron rows in agent.db, fired by a
-// 30 s tick inside the supervisor process; a fire runs as a `scheduler` (or
-// the task's own source) signal, and a task naming a saved workflow runs it.
+// Scheduled tasks on the engine's triggers (docs/designs/06-schedules.md).
+// A task is the definition `task-<id>`, written by the host, never by the
+// model: its trigger (a cron on the user's wall clock, or a one-shot `at`)
+// starts a run whose one call, `fire_scheduled`, records a fire in agent.db
+// and ends. The supervisor's drain runs each fire as a `scheduler` (or the
+// task's own source) signal, one at a time with every other signal, so no
+// handler ever waits on the supervisor (design 06, decision 2).
 //
 // Sections:
-//   1. storage — task rows and fires, on agent.db and in memory
-//   2. cron    — parse + next-slot math on the user's wall clock
-//   3. tick    — due tasks → fires, claimed once per slot; the loop
-//   4. tools   — schedule_task / list_scheduled_tasks / cancel_scheduled_task
-//   5. boot    — first start: import MCP's tasks, or seed the system ones
-//
-// A slot is claimed (compare-and-swap on `last_run_at`) before its fire runs:
-// at most once. A fire that never started (the supervisor was stopping) gives
-// its slot back; one that started is never repeated, even if it failed or the
-// process died under it — a run may already have sent something.
+//   1. the fire table — `scheduled_fires`, the task id sequence, the seam
+//   2. task definitions — their YAML, the cron rule, reading a task back
+//   3. the drain and the zone watch
+//   4. tools — schedule_task / list_scheduled_tasks / cancel_scheduled_task
+//   5. fire_scheduled — what a trigger's run records
+//   6. boot — the system task, seeded once
 use crate::{
+    agent::Engine,
     db::AgentDb,
-    mcp::Mcp,
     session::iso,
     supervisor::{PendingSignal, Supervisor},
 };
 use async_trait::async_trait;
-use chrono::{DateTime, Offset, TimeZone, Utc};
+use chrono::{DateTime, FixedOffset, TimeZone, Utc};
 use chrono_tz::Tz;
 use croner::Cron;
+use ouro_runtime::durable::SavedRun;
+use ouro_runtime::durable::control::{DefinitionSummary, ScheduleKind};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -30,462 +32,618 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-// ── 1. storage ─────────────────────────────────────────────────────────────
+// ── 1. the fire table ──────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct TaskRow {
+/// What a task is, as its definition carries it (`document.metadata.task`):
+/// the host's own block, never an expression, so a prompt that looks like
+/// `${ … }` arrives verbatim (decision 4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Task {
     pub id: i64,
-    pub cron_expr: String,
-    // 0 | 1 — schedule_task has always returned the raw row.
-    pub recurring: i64,
+    pub cron: String,
+    pub recurring: bool,
     pub prompt: String,
-    // None → signal source 'scheduler' (user-created).
+    // None → the signal's source is `scheduler`.
     pub source: Option<String>,
-    // A saved workflow the fire runs instead of the primary agent loop.
+    // A saved workflow each fire runs instead of the primary agent loop.
     pub workflow: Option<String>,
-    // Unix seconds of the slot last fired for.
-    pub last_run_at: Option<i64>,
-    // "YYYY-MM-DD HH:MM:SS", UTC.
-    pub created_at: String,
-    #[serde(skip)]
-    pub created: DateTime<Utc>,
+    // The zone the task was saved with (a recurring task's trigger zone).
+    pub timezone: String,
+    // When it was scheduled, ISO 8601 UTC.
+    pub created: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
 }
 
-#[derive(Debug, Clone)]
-pub struct NewTask {
-    pub cron_expr: String,
+/// A recorded fire: the task's parts at its slot, the previous slot it
+/// fired for, and whether its signal run exists yet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fire {
+    pub id: i64,
+    pub task_id: i64,
+    pub run_id: String,
+    pub slot: DateTime<Utc>,
+    pub previous: Option<DateTime<Utc>>,
+    pub cron: String,
     pub recurring: bool,
     pub prompt: String,
     pub source: Option<String>,
     pub workflow: Option<String>,
-    pub last_run_at: Option<i64>,
-    pub created: DateTime<Utc>,
+    pub pending: bool,
 }
 
+/// The agent's side of the schedule: fires and task ids (agent.db, or
+/// memory for tools that keep nothing).
 #[async_trait]
-pub trait ScheduleStore: Send + Sync {
-    async fn insert(&self, task: &NewTask) -> anyhow::Result<TaskRow>;
-    // Tasks that may still fire: every recurring task, plus one-shots that
-    // have not fired yet.
-    async fn list_active(&self) -> anyhow::Result<Vec<TaskRow>>;
-    // Moves last_run_at from `expected` to `next` only while it still is
-    // `expected` and the task still exists. Stamping a one-shot retires it.
-    async fn swap_last_run(&self, id: i64, expected: Option<i64>, next: Option<i64>) -> anyhow::Result<bool>;
-    async fn delete(&self, id: i64) -> anyhow::Result<bool>;
-    // Logs a claimed slot; the id names the fire's signal and trace.
-    async fn record_fire(&self, task_id: i64, slot: i64) -> anyhow::Result<i64>;
-    // Stores the first boot's tasks, once: false (and nothing stored) when
-    // the schedule was initialized before.
-    async fn initialize(&self, tasks: &[NewTask]) -> anyhow::Result<bool>;
+pub trait FireStore: Send + Sync {
+    /// The fire of trigger run `run_id`: inserted once, `pending`, with the
+    /// slot of the task's latest earlier fire as `previous` (decision 6);
+    /// the row already there for a run recorded before (decision 3).
+    async fn record(&self, run_id: &str, task: &Task, slot_ms: i64) -> anyhow::Result<i64>;
+    /// The oldest fire whose signal has not run yet.
+    async fn next_pending(&self) -> anyhow::Result<Option<Fire>>;
+    async fn done(&self, id: i64) -> anyhow::Result<()>;
+    /// The task's latest fire (by slot).
+    async fn latest(&self, task_id: i64) -> anyhow::Result<Option<Fire>>;
+    /// A new task id, never one used before.
+    async fn next_task_id(&self) -> anyhow::Result<i64>;
+    /// The system task's id: allocated and stored under `SEEDED` the first
+    /// time, the same id ever after (decision 14).
+    async fn seed_id(&self) -> anyhow::Result<i64>;
 }
 
-fn sql_time(t: DateTime<Utc>) -> String {
-    t.format("%Y-%m-%d %H:%M:%S").to_string()
-}
+/// The memory key holding the system task's id.
+pub const SEEDED: &str = "schedule.engine_seeded";
+
+/// Fire ids continue above any signal id MCP handed out (migration 0005), so
+/// a fire's trace and run (`scheduler:<id>`, `signal:<id>`) never land on an
+/// older signal's; the in-memory store starts there too.
+pub const FIRST_FIRE_ID: i64 = 1_000_000_000;
 
 fn from_ms(ms: i64) -> DateTime<Utc> {
     Utc.timestamp_millis_opt(ms).single().unwrap_or_default()
 }
 
-const COLUMNS: &str = "id, cron_expr, recurring, prompt, source, workflow, last_run_at, created_ms";
-const INITIALIZED: &str = "schedule.initialized";
+const FIRE_COLUMNS: &str = "id, task_id, run_id, slot, previous, cron, recurring, prompt, source, workflow, state";
 
-fn task_row(r: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
-    let created = from_ms(r.get(7)?);
-    Ok(TaskRow {
+fn fire_row(r: &rusqlite::Row) -> rusqlite::Result<Fire> {
+    let state: String = r.get(10)?;
+    Ok(Fire {
         id: r.get(0)?,
-        cron_expr: r.get(1)?,
-        recurring: r.get(2)?,
-        prompt: r.get(3)?,
-        source: r.get(4)?,
-        workflow: r.get(5)?,
-        last_run_at: r.get(6)?,
-        created_at: sql_time(created),
-        created,
+        task_id: r.get(1)?,
+        run_id: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+        slot: from_ms(r.get(3)?),
+        previous: r.get::<_, Option<i64>>(4)?.map(from_ms),
+        cron: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+        recurring: r.get::<_, Option<bool>>(6)?.unwrap_or_default(),
+        prompt: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+        source: r.get(8)?,
+        workflow: r.get(9)?,
+        pending: state == "pending",
     })
 }
 
-fn insert_task(conn: &rusqlite::Connection, t: &NewTask) -> rusqlite::Result<TaskRow> {
-    conn.query_row(
-        &format!(
-            "INSERT INTO scheduled_tasks (cron_expr, recurring, prompt, source, workflow, last_run_at, created_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) RETURNING {COLUMNS}"
-        ),
-        params![
-            t.cron_expr,
-            i64::from(t.recurring),
-            t.prompt,
-            t.source,
-            t.workflow,
-            t.last_run_at,
-            t.created.timestamp_millis()
-        ],
-        task_row,
-    )
-}
-
+// Writes go through `AgentDb::write`: `fire_scheduled` runs inside the
+// engine's drive, and a write may wait for SQLite's lock (runs.rs §2).
 #[async_trait]
-impl ScheduleStore for AgentDb {
-    // The schedule tools run inside a loop's call: a write may wait for the
-    // engine's lock on agent.db, so it waits on the blocking pool (runs.rs §2).
-    async fn insert(&self, task: &NewTask) -> anyhow::Result<TaskRow> {
-        let task = task.clone();
-        self.write(move |db| Ok(insert_task(&db.conn(), &task)?)).await
+impl FireStore for AgentDb {
+    async fn record(&self, run_id: &str, task: &Task, slot_ms: i64) -> anyhow::Result<i64> {
+        let (run_id, task) = (run_id.to_owned(), task.clone());
+        self.write(move |db| {
+            let mut conn = db.conn();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let existing: Option<i64> =
+                tx.query_row("SELECT id FROM scheduled_fires WHERE run_id = ?1", [&run_id], |r| r.get(0)).optional()?;
+            if let Some(id) = existing {
+                return Ok(id);
+            }
+            let previous: Option<i64> = tx.query_row(
+                "SELECT max(slot) FROM scheduled_fires WHERE task_id = ?1 AND slot < ?2",
+                params![task.id, slot_ms],
+                |r| r.get(0),
+            )?;
+            let id = tx.query_row(
+                "INSERT INTO scheduled_fires
+                   (task_id, slot, run_id, previous, cron, recurring, prompt, source, workflow, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending') RETURNING id",
+                params![
+                    task.id,
+                    slot_ms,
+                    run_id,
+                    previous,
+                    task.cron,
+                    task.recurring,
+                    task.prompt,
+                    task.source,
+                    task.workflow
+                ],
+                |r| r.get(0),
+            )?;
+            tx.commit()?;
+            Ok(id)
+        })
+        .await
     }
 
-    async fn list_active(&self) -> anyhow::Result<Vec<TaskRow>> {
-        let conn = self.conn();
-        let mut statement = conn.prepare(&format!(
-            "SELECT {COLUMNS} FROM scheduled_tasks WHERE recurring = 1 OR last_run_at IS NULL ORDER BY id"
-        ))?;
-        Ok(statement.query_map([], task_row)?.collect::<rusqlite::Result<_>>()?)
+    async fn next_pending(&self) -> anyhow::Result<Option<Fire>> {
+        Ok(self
+            .read()
+            .query_row(
+                &format!("SELECT {FIRE_COLUMNS} FROM scheduled_fires WHERE state = 'pending' ORDER BY id LIMIT 1"),
+                [],
+                fire_row,
+            )
+            .optional()?)
     }
 
-    async fn swap_last_run(&self, id: i64, expected: Option<i64>, next: Option<i64>) -> anyhow::Result<bool> {
-        let changed = self.conn().execute(
-            "UPDATE scheduled_tasks SET last_run_at = ?1 WHERE id = ?2 AND last_run_at IS ?3",
-            params![next, id, expected],
-        )?;
-        Ok(changed > 0)
+    async fn done(&self, id: i64) -> anyhow::Result<()> {
+        self.write(move |db| {
+            db.conn().execute("UPDATE scheduled_fires SET state = 'done' WHERE id = ?1", [id])?;
+            Ok(())
+        })
+        .await
     }
 
-    async fn delete(&self, id: i64) -> anyhow::Result<bool> {
-        self.write(move |db| Ok(db.conn().execute("DELETE FROM scheduled_tasks WHERE id = ?1", params![id])? > 0)).await
+    async fn latest(&self, task_id: i64) -> anyhow::Result<Option<Fire>> {
+        Ok(self
+            .read()
+            .query_row(
+                &format!(
+                    "SELECT {FIRE_COLUMNS} FROM scheduled_fires WHERE task_id = ?1 ORDER BY slot DESC, id DESC LIMIT 1"
+                ),
+                [task_id],
+                fire_row,
+            )
+            .optional()?)
     }
 
-    async fn record_fire(&self, task_id: i64, slot: i64) -> anyhow::Result<i64> {
-        Ok(self.conn().query_row(
-            "INSERT INTO scheduled_fires (task_id, slot) VALUES (?1, ?2) RETURNING id",
-            params![task_id, slot],
-            |r| r.get(0),
-        )?)
+    async fn next_task_id(&self) -> anyhow::Result<i64> {
+        self.write(|db| {
+            Ok(db.conn().query_row("INSERT INTO task_ids DEFAULT VALUES RETURNING id", [], |r| r.get(0))?)
+        })
+        .await
     }
 
-    async fn initialize(&self, tasks: &[NewTask]) -> anyhow::Result<bool> {
-        let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let done = tx.query_row("SELECT 1 FROM memory WHERE key = ?1", params![INITIALIZED], |_| Ok(())).optional()?;
-        if done.is_some() {
-            return Ok(false);
-        }
-        for task in tasks {
-            insert_task(&tx, task)?;
-        }
-        tx.execute("INSERT INTO memory (key, value) VALUES (?1, '1')", params![INITIALIZED])?;
-        tx.commit()?;
-        Ok(true)
+    async fn seed_id(&self) -> anyhow::Result<i64> {
+        self.write(|db| {
+            let mut conn = db.conn();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let stored: Option<String> =
+                tx.query_row("SELECT value FROM memory WHERE key = ?1", [SEEDED], |r| r.get(0)).optional()?;
+            if let Some(id) = stored.and_then(|v| v.parse().ok()) {
+                return Ok(id);
+            }
+            let id: i64 = tx.query_row("INSERT INTO task_ids DEFAULT VALUES RETURNING id", [], |r| r.get(0))?;
+            tx.execute(
+                "INSERT INTO memory (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                params![SEEDED, id.to_string()],
+            )?;
+            tx.commit()?;
+            Ok(id)
+        })
+        .await
     }
 }
 
-// The same contract without a database, for tests and tools that need none.
+/// The same contract without a database.
 #[derive(Default)]
-pub struct MemorySchedule(Mutex<MemoryState>);
+pub struct MemoryFires(Mutex<MemoryState>);
 
 #[derive(Default)]
 struct MemoryState {
-    tasks: Vec<TaskRow>,
-    next_id: i64,
-    fires: i64,
-    initialized: bool,
-}
-
-impl MemoryState {
-    fn insert(&mut self, t: &NewTask) -> TaskRow {
-        self.next_id += 1;
-        let row = TaskRow {
-            id: self.next_id,
-            cron_expr: t.cron_expr.clone(),
-            recurring: i64::from(t.recurring),
-            prompt: t.prompt.clone(),
-            source: t.source.clone(),
-            workflow: t.workflow.clone(),
-            last_run_at: t.last_run_at,
-            created_at: sql_time(t.created),
-            created: t.created,
-        };
-        self.tasks.push(row.clone());
-        row
-    }
+    fires: Vec<Fire>,
+    tasks: i64,
+    seeded: Option<i64>,
 }
 
 #[async_trait]
-impl ScheduleStore for MemorySchedule {
-    async fn insert(&self, task: &NewTask) -> anyhow::Result<TaskRow> {
-        Ok(self.0.lock().unwrap_or_else(|e| e.into_inner()).insert(task))
+impl FireStore for MemoryFires {
+    async fn record(&self, run_id: &str, task: &Task, slot_ms: i64) -> anyhow::Result<i64> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(fire) = state.fires.iter().find(|f| f.run_id == run_id) {
+            return Ok(fire.id);
+        }
+        let slot = from_ms(slot_ms);
+        let previous = state.fires.iter().filter(|f| f.task_id == task.id && f.slot < slot).map(|f| f.slot).max();
+        let id = FIRST_FIRE_ID + state.fires.len() as i64 + 1;
+        state.fires.push(Fire {
+            id,
+            task_id: task.id,
+            run_id: run_id.into(),
+            slot,
+            previous,
+            cron: task.cron.clone(),
+            recurring: task.recurring,
+            prompt: task.prompt.clone(),
+            source: task.source.clone(),
+            workflow: task.workflow.clone(),
+            pending: true,
+        });
+        Ok(id)
     }
-
-    async fn list_active(&self) -> anyhow::Result<Vec<TaskRow>> {
+    async fn next_pending(&self) -> anyhow::Result<Option<Fire>> {
+        Ok(self.0.lock().unwrap_or_else(|e| e.into_inner()).fires.iter().find(|f| f.pending).cloned())
+    }
+    async fn done(&self, id: i64) -> anyhow::Result<()> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(fire) = state.fires.iter_mut().find(|f| f.id == id) {
+            fire.pending = false;
+        }
+        Ok(())
+    }
+    async fn latest(&self, task_id: i64) -> anyhow::Result<Option<Fire>> {
         let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state.tasks.iter().filter(|t| t.recurring == 1 || t.last_run_at.is_none()).cloned().collect())
+        Ok(state.fires.iter().filter(|f| f.task_id == task_id).max_by_key(|f| (f.slot, f.id)).cloned())
     }
-
-    async fn swap_last_run(&self, id: i64, expected: Option<i64>, next: Option<i64>) -> anyhow::Result<bool> {
+    async fn next_task_id(&self) -> anyhow::Result<i64> {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        match state.tasks.iter_mut().find(|t| t.id == id && t.last_run_at == expected) {
-            Some(task) => {
-                task.last_run_at = next;
-                Ok(true)
-            }
-            None => Ok(false),
+        state.tasks += 1;
+        Ok(state.tasks)
+    }
+    async fn seed_id(&self) -> anyhow::Result<i64> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(id) = state.seeded {
+            return Ok(id);
         }
-    }
-
-    async fn delete(&self, id: i64) -> anyhow::Result<bool> {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let before = state.tasks.len();
-        state.tasks.retain(|t| t.id != id);
-        Ok(state.tasks.len() < before)
-    }
-
-    async fn record_fire(&self, _: i64, _: i64) -> anyhow::Result<i64> {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        state.fires += 1;
-        Ok(FIRST_FIRE_ID + state.fires)
-    }
-
-    async fn initialize(&self, tasks: &[NewTask]) -> anyhow::Result<bool> {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if state.initialized {
-            return Ok(false);
-        }
-        for task in tasks {
-            state.insert(task);
-        }
-        state.initialized = true;
-        Ok(true)
+        state.tasks += 1;
+        state.seeded = Some(state.tasks);
+        Ok(state.tasks)
     }
 }
 
-// Fire ids continue above any signal id MCP handed out, so a fire's trace
-// (`scheduler:<id>`) never lands on an older signal's (see the migration).
-pub const FIRST_FIRE_ID: i64 = 1_000_000_000;
-
-// ── 2. cron ────────────────────────────────────────────────────────────────
-
-// croner's defaults match cron-parser's: 5 fields (an optional leading
-// seconds field), and day-of-month OR day-of-week when both are restricted.
-pub fn parse_cron(expr: &str) -> Result<Cron, croner::errors::CronError> {
-    expr.parse()
+/// The schedule's seam (`EngineDeps::schedule`, R2-L3): the fire table, the
+/// one mutex every `task-` write holds (a cancel and a re-save never
+/// interleave, decision 9) and the drain's wake-up. The runtime is the
+/// engine's: the tools, the drain and the watch take `&Engine`.
+pub struct Schedules {
+    pub fires: Arc<dyn FireStore>,
+    writes: tokio::sync::Mutex<()>,
+    wake: tokio::sync::Notify,
 }
 
-// First slot strictly after `after`, evaluated on the wall clock of `tz`.
-//
-// The match is searched on the wall clock as if it never changed, then the
-// wall time is placed on the timeline: a time the clock skipped (going
-// forward) fires shifted by the size of the jump — 03:30 on a 03:00→04:00
-// night fires at 04:30, as the TS server's cron-parser does (croner alone
-// fires at 04:00) — and a time the clock shows twice (going back) fires the
-// first time only.
-fn next_slot(cron: &Cron, tz: Tz, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    let mut cursor = after.with_timezone(&tz).naive_local();
-    // A wall match whose instant is not after `after` (the first pass of a
-    // repeated hour already behind us) moves the search on; a handful of
-    // steps always reaches the next real one.
-    for _ in 0..8 {
-        let wall = cron.find_next_occurrence(&Utc.from_utc_datetime(&cursor), false).ok()?.naive_utc();
-        let instant = match tz.from_local_datetime(&wall) {
-            chrono::LocalResult::Single(t) => t.with_timezone(&Utc),
-            chrono::LocalResult::Ambiguous(first, _) => first.with_timezone(&Utc),
-            chrono::LocalResult::None => {
-                // Skipped: read the wall time with the offset in force before
-                // the jump.
-                let before = tz.from_local_datetime(&(wall - chrono::Duration::hours(24))).earliest()?;
-                Utc.from_utc_datetime(&(wall - before.offset().fix()))
-            }
-        };
-        if instant > after {
-            return Some(instant);
-        }
-        cursor = wall;
+impl Schedules {
+    pub fn new(fires: Arc<dyn FireStore>) -> Self {
+        Self { fires, writes: Default::default(), wake: Default::default() }
     }
-    None
-}
-
-fn preview_next_fires(cron: &Cron, tz: Tz, count: usize, now: DateTime<Utc>) -> Vec<String> {
-    let mut out = Vec::with_capacity(count);
-    let mut cursor = now;
-    while out.len() < count {
-        let Some(next) = next_slot(cron, tz, cursor) else { break };
-        out.push(iso(next));
-        cursor = next;
+    pub fn in_memory() -> Self {
+        Self::new(Arc::new(MemoryFires::default()))
     }
-    out
+    /// Wakes the drain: `notify_one` keeps the permit when nobody waits, so
+    /// a fire recorded mid-round is never missed (R2-L6).
+    pub fn wake(&self) {
+        self.wake.notify_one();
+    }
+    async fn woken(&self) {
+        self.wake.notified().await
+    }
 }
 
-// `cron_expr: "now"`: a one-shot due at once, fired by the first tick that
-// finds it (after the signal running at the time, like every fire).
+// ── 2. task definitions ────────────────────────────────────────────────────
+
+pub const TASK_PREFIX: &str = "task-";
+
+pub fn task_name(id: i64) -> String {
+    format!("{TASK_PREFIX}{id}")
+}
+
+/// `cron_expr: "now"`: a one-shot due at once.
 pub const NOW: &str = "now";
 
-// The slot a task's next fire is computed from: the slot it last fired for,
-// or — never fired — its creation time.
-fn anchor(task: &TaskRow) -> DateTime<Utc> {
-    match task.last_run_at {
-        Some(secs) => Utc.timestamp_opt(secs, 0).single().unwrap_or_default(),
-        None => task.created,
+const DEFAULT_SOURCE: &str = "scheduler";
+
+/// How a task's definition fires.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Trigger {
+    /// Its cron on `zone`'s wall clock.
+    Cron(Tz),
+    /// Once, at this instant.
+    At(DateTime<FixedOffset>),
+    /// Never again: a version without a schedule removes the triggers.
+    Cancelled,
+}
+
+/// The definition of `task`, built as a value and serialized (JSON text is
+/// YAML), never formatted: a cron like `0 9 * * 1,3` or a prompt with quotes
+/// and newlines round-trips (R2-L4). `breaker: off`: a passing agent.db
+/// fault never stops a task for good (decision 7).
+pub fn definition(task: &Task, trigger: &Trigger) -> String {
+    let mut ouro = Map::new();
+    let mut root = Map::new();
+    let fire = json!([{"fire": {"call": "fire_scheduled", "with": {"slot": "${ $run.schedule.slot.iso8601 }"}}}]);
+    let tasks = match trigger {
+        Trigger::Cron(zone) => {
+            ouro.insert("timezone".into(), json!(zone.name()));
+            ouro.insert("breaker".into(), json!("off"));
+            root.insert("schedule".into(), json!({"cron": task.cron}));
+            fire
+        }
+        Trigger::At(at) => {
+            ouro.insert("at".into(), json!(at.to_rfc3339()));
+            ouro.insert("breaker".into(), json!("off"));
+            fire
+        }
+        Trigger::Cancelled => json!([{"cancelled": {"set": {"cancelled": true}}}]),
+    };
+    let mut metadata = Map::new();
+    if !ouro.is_empty() {
+        metadata.insert("ouro".into(), Value::Object(ouro));
+    }
+    metadata.insert("task".into(), json!(task));
+    let mut document = Map::new();
+    document.insert(
+        "document".into(),
+        json!({"dsl": "1.0.4", "namespace": "agent", "name": task_name(task.id), "version": "1.0.0",
+               "metadata": metadata}),
+    );
+    document.extend(root);
+    document.insert("do".into(), tasks);
+    serde_json::to_string_pretty(&Value::Object(document)).unwrap_or_default()
+}
+
+fn metadata_of(yaml: &str) -> Option<Value> {
+    let wf = ouro_runtime::ows::model::parse_yaml(yaml).ok()?;
+    Some(crate::flows::workflow_metadata(&wf).clone())
+}
+
+/// The task block of a task's definition.
+pub fn task_of(yaml: &str) -> Option<Task> {
+    serde_json::from_value(metadata_of(yaml)?.get("task")?.clone()).ok()
+}
+
+// The zone a definition's cron runs on.
+fn zone_of(yaml: &str) -> Option<String> {
+    metadata_of(yaml)?["ouro"]["timezone"].as_str().map(str::to_owned)
+}
+
+// croner also reads 6-field expressions, as ones with a seconds field, so a
+// "with seconds" cron would fire on a schedule nobody wrote. Only the
+// documented 5 fields.
+fn field_count_error(cron_expr: &str) -> Option<String> {
+    let fields = cron_expr.split_whitespace().count();
+    (fields != 5).then(|| format!("expected 5 fields (minute hour day-of-month month day-of-week), got {fields}"))
+}
+
+/// The engine's rule (ouro `schedule.rs`, `next_cron`): croner on `zone`'s
+/// wall clock, the same crate and version, so a one-shot and the same
+/// recurring task agree (decision 11).
+pub fn next_slot(cron: &Cron, zone: Tz, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    cron.find_next_occurrence(&after.with_timezone(&zone), false).ok().map(|t| t.with_timezone(&Utc))
+}
+
+/// A cron as a task takes it: 5 fields, parsed, and matching a date that
+/// exists after `now`.
+pub fn parse_cron(cron_expr: &str, zone: Tz, now: DateTime<Utc>) -> Result<(Cron, DateTime<Utc>), String> {
+    if let Some(error) = field_count_error(cron_expr) {
+        return Err(format!("Invalid cron expression: {error}"));
+    }
+    let cron: Cron = cron_expr.parse().map_err(|e| format!("Invalid cron expression: {e}"))?;
+    // croner accepts a day that never comes (Nov 31); such a task would
+    // never fire.
+    let next = next_slot(&cron, zone, now)
+        .ok_or_else(|| "Invalid cron expression: it never matches a date that exists".to_owned())?;
+    Ok((cron, next))
+}
+
+/// A non-recurring cron's instant: its next slot after `now` on `zone`'s
+/// wall clock, with the zone's offset then.
+pub fn one_shot_at(cron_expr: &str, zone: Tz, now: DateTime<Utc>) -> Result<DateTime<FixedOffset>, String> {
+    let (_, next) = parse_cron(cron_expr, zone, now)?;
+    Ok(next.with_timezone(&zone).fixed_offset())
+}
+
+// Saves `yaml` as a version of `name` (the version with the same content
+// when there is one) and activates it.
+async fn put(engine: &Engine, name: &str, yaml: &str, note: &str) -> anyhow::Result<u64> {
+    let digest = ouro_runtime::durable::digest_of(yaml);
+    let definitions = engine.runtime.definitions(name).await?;
+    let version = match definitions.versions.values().find(|d| d.digest == digest) {
+        Some(d) => d.version,
+        None => engine.runtime.save(name, yaml).await?.version,
+    };
+    engine.runtime.activate_as(name, version, "agent", Some(note)).await?;
+    Ok(version)
+}
+
+// A one-shot whose `at` slot was taken: its trigger has no due time left
+// (one definition for the list, cancel and the cap, R2-L7).
+fn consumed(summary: &DefinitionSummary) -> bool {
+    summary.schedules.iter().any(|s| s.kind == ScheduleKind::At && s.next_due_ms.is_none() && s.queued.is_none())
+}
+
+// A task the engine still holds triggers for: its active version, its task
+// block and the control summary.
+struct Held {
+    task: Task,
+    yaml: String,
+    summary: DefinitionSummary,
+}
+
+// Every `task-` definition with a schedule (a cancelled one has none), by id.
+async fn held(engine: &Engine) -> anyhow::Result<Vec<Held>> {
+    let mut summaries = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = engine.control.definitions(cursor.as_ref(), 1_000).await.map_err(anyhow::Error::from)?;
+        summaries.extend(page.items.into_iter().filter(|d| d.name.starts_with(TASK_PREFIX) && !d.schedules.is_empty()));
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    let mut out = Vec::new();
+    for summary in summaries {
+        let definitions = engine.runtime.definitions(&summary.name).await?;
+        let Some(d) = definitions.active.and_then(|v| definitions.versions.get(&v)) else { continue };
+        let Some(task) = task_of(&d.yaml) else { continue };
+        out.push(Held { task, yaml: d.yaml.clone(), summary });
+    }
+    out.sort_by_key(|h| h.task.id);
+    Ok(out)
+}
+
+fn now(engine: &Engine) -> DateTime<Utc> {
+    from_ms(engine.clock.now_ms())
+}
+
+// ── 3. the drain and the zone watch ────────────────────────────────────────
+
+/// A fire as the signal it runs as (decisions 2 and 4): the header source
+/// skills parse, then the prompt verbatim; `Now` is the drain's clock.
+pub fn signal_of(fire: &Fire, env_context: Option<&str>, now: DateTime<Utc>) -> PendingSignal {
+    let never = "never (this is the first run)".to_owned();
+    let content = [
+        format!("Scheduled task #{} fired.", fire.task_id),
+        format!("Cron: {}", fire.cron),
+        format!("Slot: {}", iso(fire.slot)),
+        format!("Now: {}", iso(now)),
+        format!("Previous fire: {}", fire.previous.map(iso).unwrap_or(never)),
+        format!("Recurring: {}", if fire.recurring { "yes" } else { "no (one-shot)" }),
+        String::new(),
+        fire.prompt.clone(),
+    ]
+    .join("\n");
+    PendingSignal {
+        id: fire.id,
+        source: fire.source.clone().unwrap_or_else(|| DEFAULT_SOURCE.into()),
+        content,
+        env_context: env_context.map(str::to_owned),
+        created_at: now.format("%Y-%m-%d %H:%M:%S").to_string(),
+        payload: fire.workflow.as_ref().map(|workflow| json!({ "workflow": workflow })),
     }
 }
 
-// ── 3. tick ────────────────────────────────────────────────────────────────
-
-const TICK_INTERVAL: Duration = Duration::from_secs(30);
-const DEFAULT_SIGNAL_SOURCE: &str = "scheduler";
-
-// One claimed slot, ready to run.
-#[derive(Debug, Clone)]
-pub struct Fire {
-    pub id: i64,
-    pub task_id: i64,
-    pub source: String,
-    pub content: String,
-    pub workflow: Option<String>,
-    pub slot: DateTime<Utc>,
+/// How a drain round ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoundEnd {
+    /// No fire is pending.
+    Empty,
+    /// The supervisor is stopping: nothing of the fire ran.
+    Stopping,
+    /// Fire `id`'s signal run was not admitted; it stays pending.
+    Pending(i64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Fired {
-    Started,
-    // Nothing ran (the runner was stopping): the slot goes back.
-    NotStarted,
+pub struct Drained {
+    /// Fires whose signal ran in this round.
+    pub ran: usize,
+    pub end: RoundEnd,
 }
 
-// What runs a fire: the supervisor, or a test's recorder.
-#[async_trait]
-pub trait FireSink: Send + Sync {
-    async fn fire(&self, fire: Fire) -> Fired;
-}
-
-// Fires every task whose next slot (after its anchor) has passed. Restart-safe
-// and never double-fires a slot: the anchor is the *slot* fired for, not the
-// wall clock, so a late tick still advances to the following slot.
-pub async fn tick(store: &dyn ScheduleStore, sink: &dyn FireSink, tz: Tz, now: DateTime<Utc>) -> anyhow::Result<usize> {
-    let mut fired = 0;
-    for task in store.list_active().await? {
-        let slot = if task.cron_expr == NOW {
-            // Its slot is its creation: a claimed one retires it.
-            task.created
-        } else {
-            let cron = match parse_cron(&task.cron_expr) {
-                Ok(cron) => cron,
-                Err(err) => {
-                    eprintln!("[schedule] task {} has an invalid cron {:?}, skipping: {err}", task.id, task.cron_expr);
-                    continue;
-                }
-            };
-            let Some(slot) = next_slot(&cron, tz, anchor(&task)) else { continue };
-            slot
-        };
-        if slot > now {
+/// One round of the drain: each pending fire, oldest first, by decision 3's
+/// one rule. A fire whose signal run `signal:<id>` exists is done (the
+/// engine resumes that run: `run_active` never enters twice for one trace);
+/// otherwise the supervisor starts it, and it is done once its run exists (a
+/// faulted signal too: its catch reported it). No run after the start
+/// (stopping, an admission error) leaves it pending and ends the round.
+pub async fn drain(supervisor: &Arc<Supervisor>, env_context: Option<&str>) -> anyhow::Result<Drained> {
+    let engine = &supervisor.engine;
+    let fires = &engine.deps.schedule.fires;
+    let mut ran = 0;
+    loop {
+        let Some(fire) = fires.next_pending().await? else { return Ok(Drained { ran, end: RoundEnd::Empty }) };
+        let run = crate::functions::signal_run(fire.id);
+        if engine.runtime.get(&run).await?.is_some() {
+            fires.done(fire.id).await?;
             continue;
         }
-        // Snapshot before stamping, so skills can scope `since=<previous
-        // fire>` from the signal header.
-        let previous = task.last_run_at.and_then(|s| Utc.timestamp_opt(s, 0).single()).map(iso);
-        // Claimed with a compare-and-set: an overlapping tick that got there
-        // first, or a cancel since list_active, means this tick doesn't fire it.
-        let slot_unix = slot.timestamp();
-        if !store.swap_last_run(task.id, task.last_run_at, Some(slot_unix)).await? {
-            continue;
-        }
-        let id = match store.record_fire(task.id, slot_unix).await {
-            Ok(id) => id,
-            Err(err) => {
-                store.swap_last_run(task.id, Some(slot_unix), task.last_run_at).await?;
-                return Err(err);
-            }
+        let signal = signal_of(&fire, env_context, now(engine));
+        let Some(result) = supervisor.start(&signal).await else {
+            return Ok(Drained { ran, end: RoundEnd::Stopping });
         };
-        let fire = Fire {
-            id,
-            task_id: task.id,
-            source: task.source.clone().unwrap_or_else(|| DEFAULT_SIGNAL_SOURCE.into()),
-            content: render_content(&task, previous.as_deref(), slot, now),
-            workflow: task.workflow.clone(),
-            slot,
-        };
-        if sink.fire(fire).await == Fired::NotStarted {
-            // Give the slot back so a later tick fires it, rather than
-            // leaving it marked as done with nothing run.
-            store.swap_last_run(task.id, Some(slot_unix), task.last_run_at).await?;
-            return Ok(fired);
+        if let Err(error) = &result {
+            eprintln!("[schedule] fire {} of task {}: {error:#}", fire.id, fire.task_id);
         }
-        fired += 1;
+        if engine.runtime.get(&run).await?.is_none() {
+            return Ok(Drained { ran, end: RoundEnd::Pending(fire.id) });
+        }
+        fires.done(fire.id).await?;
+        ran += 1;
     }
-    Ok(fired)
 }
 
-// A header with the cron metadata (source skills parse the lines they need),
-// then the task's prompt verbatim.
-fn render_content(task: &TaskRow, previous: Option<&str>, slot: DateTime<Utc>, now: DateTime<Utc>) -> String {
-    [
-        format!("Scheduled task #{} fired.", task.id),
-        format!("Cron: {}", task.cron_expr),
-        format!("Slot: {}", iso(slot)),
-        format!("Now: {}", iso(now)),
-        format!("Previous fire: {}", previous.unwrap_or("never (this is the first run)")),
-        format!("Recurring: {}", if task.recurring == 1 { "yes" } else { "no (one-shot)" }),
-        String::new(),
-        task.prompt.clone(),
-    ]
-    .join("\n")
-}
+const DRAIN_ROUND: Duration = Duration::from_secs(30);
+const BACKOFF_MIN: Duration = Duration::from_secs(1);
+const BACKOFF_MAX: Duration = Duration::from_secs(300);
 
-// The user's zone, from MCP's settings: read on every tick, so a change takes
-// effect on the next one. UTC when unset or unreadable.
-async fn timezone(mcp: &dyn Mcp, cancel: &CancellationToken) -> Tz {
-    let raw = mcp.call_tool("get_timezone", Map::new(), cancel).await.unwrap_or_default();
-    serde_json::from_str::<Value>(&raw)
-        .ok()
-        .and_then(|v| v["timezone"].as_str().and_then(|z| z.parse().ok()))
-        .unwrap_or(Tz::UTC)
-}
-
-// Fires run as signals on the supervisor, one at a time with every other
-// signal, carrying the environment note a queued signal carries
-// (`session::telegram_env_note`).
-pub struct SupervisorSink {
-    pub supervisor: Arc<Supervisor>,
-    pub env_context: Option<String>,
-}
-
-#[async_trait]
-impl FireSink for SupervisorSink {
-    async fn fire(&self, fire: Fire) -> Fired {
-        let signal = PendingSignal {
-            id: fire.id,
-            source: fire.source,
-            content: fire.content,
-            env_context: self.env_context.clone(),
-            created_at: sql_time(Utc::now()),
-            payload: fire.workflow.map(|workflow| json!({ "workflow": workflow })),
-        };
-        match self.supervisor.start(&signal).await {
-            None => Fired::NotStarted,
-            Some(result) => {
-                if let Err(err) = result {
-                    eprintln!("[schedule] fire {} of task {}: {err:#}", signal.id, fire.task_id);
-                }
-                Fired::Started
+/// The drain (spawned by main.rs unless `--once`): a round at once, then on
+/// every recorded fire or every 30 s; a fire left pending is retried after a
+/// backoff of 1 s doubling to five minutes (in memory).
+pub async fn run_drain(supervisor: Arc<Supervisor>, env_context: Option<String>, cancel: CancellationToken) {
+    let schedules = supervisor.engine.deps.schedule.clone();
+    let mut backoff = BACKOFF_MIN;
+    loop {
+        let failed = match drain(&supervisor, env_context.as_deref()).await {
+            Ok(Drained { end: RoundEnd::Stopping, .. }) => return,
+            Ok(Drained { end: RoundEnd::Pending(id), .. }) => {
+                eprintln!("[schedule] fire {id} was not admitted; retried in {backoff:?}");
+                true
             }
+            Ok(_) => false,
+            Err(error) => {
+                eprintln!("[schedule] drain failed, retried in {backoff:?}: {error:#}");
+                true
+            }
+        };
+        if failed {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(BACKOFF_MAX);
+            continue;
+        }
+        backoff = BACKOFF_MIN;
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = schedules.woken() => {}
+            _ = tokio::time::sleep(DRAIN_ROUND) => {}
         }
     }
 }
 
-pub async fn run_ticks(
-    store: Arc<dyn ScheduleStore>,
-    sink: Arc<dyn FireSink>,
-    mcp: Arc<dyn Mcp>,
-    cancel: CancellationToken,
-) {
-    let mut interval = tokio::time::interval(TICK_INTERVAL);
-    // A tick that overran (a long fire) should not be followed by a burst.
+/// One round of the zone watch (decision 9): every live recurring task
+/// (active, not cancelled, not set aside) whose stored zone is not `zone`
+/// gets a version on `zone`, activated. Idempotent by construction: an
+/// unchanged zone saves nothing. Returns how many it moved.
+pub async fn zone_round(engine: &Engine, zone: Tz) -> anyhow::Result<usize> {
+    let _writing = engine.deps.schedule.writes.lock().await;
+    let mut moved = 0;
+    for held in held(engine).await? {
+        let Held { task, yaml, summary } = held;
+        if !task.recurring || task.cancelled || summary.tripped.is_some() {
+            continue;
+        }
+        let Some(old) = zone_of(&yaml).filter(|z| z != zone.name()) else { continue };
+        let task = Task { timezone: zone.name().into(), ..task };
+        let yaml = definition(&task, &Trigger::Cron(zone));
+        put(engine, &summary.name, &yaml, &format!("time zone {old} → {}", zone.name())).await?;
+        moved += 1;
+    }
+    Ok(moved)
+}
+
+/// The user's zone from MCP's settings; `None` when unreadable.
+pub async fn user_zone(engine: &Engine, cancel: &CancellationToken) -> Option<Tz> {
+    let raw = engine.deps.mcp.call_tool("get_timezone", Map::new(), cancel).await.ok()?;
+    serde_json::from_str::<Value>(&raw).ok()?["timezone"].as_str()?.parse().ok()
+}
+
+const ZONE_WATCH: Duration = Duration::from_secs(60);
+
+/// The zone watch (spawned by main.rs unless `--once`): every 60 s; an
+/// unreadable zone skips the round.
+pub async fn run_zone_watch(engine: Arc<Engine>, cancel: CancellationToken) {
+    let mut interval = tokio::time::interval(ZONE_WATCH);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return,
             _ = interval.tick() => {}
         }
-        let tz = timezone(&*mcp, &cancel).await;
-        if let Err(err) = tick(&*store, &*sink, tz, Utc::now()).await {
-            eprintln!("[schedule] tick failed: {err:#}");
+        let Some(zone) = user_zone(&engine, &cancel).await else { continue };
+        if let Err(error) = zone_round(&engine, zone).await {
+            eprintln!("[schedule] zone watch: {error:#}");
         }
     }
 }
@@ -495,237 +653,262 @@ pub async fn run_ticks(
 // Synthetic tools of the agent loop.
 pub const TOOLS: &[&str] = &["schedule_task", "list_scheduled_tasks", "cancel_scheduled_task"];
 
-#[derive(Serialize)]
-struct Failure {
-    ok: bool,
-    error: String,
+/// The most live tasks (not cancelled, not consumed) the agent keeps
+/// (decision 15, raised to 100 by the maintainer): the list and the zone
+/// watch stay small. Reversible.
+pub const MAX_LIVE_TASKS: usize = 100;
+
+fn failure(error: impl Into<String>) -> anyhow::Result<String> {
+    Ok(json!({"ok": false, "error": error.into()}).to_string())
 }
 
-fn failure(error: String) -> anyhow::Result<String> {
-    Ok(serde_json::to_string(&Failure { ok: false, error })?)
+// The ISO time of a task's next due slot, from the engine's summary.
+fn next_due(summary: &DefinitionSummary) -> Option<String> {
+    summary.schedules.iter().filter_map(|s| s.next_due_ms).min().map(|ms| iso(from_ms(ms)))
 }
 
-#[derive(Serialize)]
-struct Scheduled {
-    ok: bool,
-    task: TaskRow,
-    timezone: String,
-    upcoming_fires: Vec<String>,
+// The error of the latest faulted run of `name` (`None` in a dry run: its
+// store reads no runs).
+async fn last_error(engine: &Engine, name: &str) -> Option<String> {
+    if engine.sandbox.is_some() {
+        return None;
+    }
+    let filter = ouro_runtime::durable::control::Runs {
+        definition: Some(name.into()),
+        state: Some(ouro_runtime::durable::RunState::Failed),
+        ..Default::default()
+    };
+    let page = engine.control.list(&filter, None, 1_000).await.ok()?;
+    let run = page.items.into_iter().max_by_key(|r| r.ended_ms)?;
+    match run.outcome? {
+        crate::runs::Status::Faulted(error) => Some(error.detail.clone().unwrap_or_else(|| error.to_string())),
+        _ => None,
+    }
 }
 
-#[derive(Serialize)]
-struct ListedTask {
-    id: i64,
-    cron_expr: String,
-    recurring: bool,
-    prompt: String,
-    source: Option<String>,
-    workflow: Option<String>,
-    last_run_at: Option<i64>,
-    created_at: String,
-    last_run_at_iso: Option<String>,
-    upcoming_fires: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct Listed {
-    timezone: String,
-    count: usize,
-    tasks: Vec<ListedTask>,
-}
-
-// croner also reads 6-field expressions — as ones with a seconds field — so a
-// "with seconds" cron would fire on a schedule nobody wrote. Only the
-// documented 5 fields.
-fn field_count_error(cron_expr: &str) -> Option<String> {
-    let fields = cron_expr.split_whitespace().count();
-    (fields != 5).then(|| format!("expected 5 fields (minute hour day-of-month month day-of-week), got {fields}"))
-}
-
-fn upcoming_count(recurring: bool) -> usize {
-    if recurring { 3 } else { 1 }
-}
-
-// `tz` is the session's zone (the user's, from MCP).
-pub async fn tool(
-    store: &dyn ScheduleStore,
-    tz: &str,
-    name: &str,
-    args: &Map<String, Value>,
-    now: DateTime<Utc>,
-) -> anyhow::Result<String> {
-    let tz: Tz = tz.parse().unwrap_or(Tz::UTC);
+/// The schedule's synthetic tools; `tz` is the session's zone (the user's).
+pub async fn tool(engine: &Engine, tz: &str, name: &str, args: &Map<String, Value>) -> anyhow::Result<String> {
+    let zone: Tz = tz.parse().unwrap_or(Tz::UTC);
+    let now = now(engine);
+    let schedules = &engine.deps.schedule;
     match name {
         "schedule_task" => {
             let text = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default().to_owned();
-            let (cron_expr, prompt) = (text("cron_expr"), text("prompt"));
+            let (cron, prompt) = (text("cron_expr"), text("prompt"));
             let recurring =
                 args.get("recurring").and_then(Value::as_bool).ok_or_else(|| anyhow::anyhow!("recurring: Required"))?;
-            anyhow::ensure!(!cron_expr.is_empty() && !prompt.is_empty(), "cron_expr and prompt must be non-empty");
+            anyhow::ensure!(!cron.is_empty() && !prompt.is_empty(), "cron_expr and prompt must be non-empty");
             let workflow = args.get("workflow").and_then(Value::as_str).filter(|w| !w.is_empty()).map(str::to_owned);
-            // `now` runs once, whatever `recurring` says.
-            let (recurring, upcoming_fires) = if cron_expr == NOW {
-                (false, vec![iso(now)])
-            } else {
-                if let Some(error) = field_count_error(&cron_expr) {
-                    return failure(format!("Invalid cron expression: {error}"));
+            if let Some(workflow) = &workflow {
+                if crate::flows::reserved(workflow) {
+                    return failure(format!("`{workflow}` is a reserved name, not a saved workflow a task can run"));
                 }
-                let cron = match parse_cron(&cron_expr) {
-                    Ok(cron) => cron,
-                    Err(err) => return failure(format!("Invalid cron expression: {err}")),
-                };
-                // croner accepts a day that never comes (Nov 31) and would store a
-                // task that never fires; the TS server's parser refuses it.
-                if next_slot(&cron, tz, now).is_none() {
-                    return failure("Invalid cron expression: it never matches a date that exists".into());
+                if engine.runtime.definitions(workflow).await?.active.is_none() {
+                    return failure(format!(
+                        "workflow `{workflow}` has no active version; save, try and activate it first"
+                    ));
                 }
-                (recurring, preview_next_fires(&cron, tz, upcoming_count(recurring), now))
-            };
-            // Saved workflows run again with the versions and schedules steps
-            // of the engine migration (design 03, R2-M5).
-            if workflow.is_some() {
-                return Ok(crate::flows::unavailable("schedule_task(workflow: …)", "schedules"));
             }
-            let task = store
-                .insert(&NewTask {
-                    cron_expr,
-                    recurring,
-                    prompt,
-                    source: None,
-                    workflow,
-                    last_run_at: None,
-                    created: now,
-                })
-                .await?;
-            Ok(serde_json::to_string(&Scheduled { ok: true, task, timezone: tz.name().to_owned(), upcoming_fires })?)
+            // `now` runs once, whatever `recurring` says.
+            let (recurring, trigger) = if cron == NOW {
+                (false, Trigger::At(now.fixed_offset()))
+            } else {
+                let next = match parse_cron(&cron, zone, now) {
+                    Ok((_, next)) => next,
+                    Err(error) => return failure(error),
+                };
+                let trigger =
+                    if recurring { Trigger::Cron(zone) } else { Trigger::At(next.with_timezone(&zone).fixed_offset()) };
+                (recurring, trigger)
+            };
+            let _writing = schedules.writes.lock().await;
+            let live = held(engine).await?.iter().filter(|h| !consumed(&h.summary)).count();
+            if live >= MAX_LIVE_TASKS {
+                return failure(format!(
+                    "{live} tasks are scheduled, the most the agent keeps; cancel one first (list_scheduled_tasks)"
+                ));
+            }
+            let id = schedules.fires.next_task_id().await?;
+            let task = Task {
+                id,
+                cron: cron.clone(),
+                recurring,
+                prompt: prompt.clone(),
+                source: None,
+                workflow: workflow.clone(),
+                timezone: zone.name().into(),
+                created: iso(now),
+                cancelled: false,
+            };
+            let name = task_name(id);
+            if let Err(error) = put(engine, &name, &definition(&task, &trigger), "scheduled").await {
+                return failure(format!("{error:#}"));
+            }
+            let summary = engine.control.definition(&name).await.map_err(anyhow::Error::from)?;
+            Ok(json!({
+                "ok": true,
+                "task": {"id": id, "cron_expr": cron, "recurring": recurring, "prompt": prompt,
+                         "workflow": workflow, "timezone": zone.name()},
+                "next_fire": summary.as_ref().and_then(next_due),
+            })
+            .to_string())
         }
         "list_scheduled_tasks" => {
-            let tasks: Vec<ListedTask> = store
-                .list_active()
-                .await?
-                .into_iter()
-                .map(|t| {
-                    let recurring = t.recurring == 1;
-                    // An invalid cron surfaces as an empty `upcoming_fires`.
-                    let upcoming_fires = if t.cron_expr == NOW {
-                        vec![iso(now)]
-                    } else {
-                        parse_cron(&t.cron_expr)
-                            .map(|cron| preview_next_fires(&cron, tz, upcoming_count(recurring), now))
-                            .unwrap_or_default()
-                    };
-                    ListedTask {
-                        last_run_at_iso: t.last_run_at.and_then(|s| Utc.timestamp_opt(s, 0).single()).map(iso),
-                        id: t.id,
-                        cron_expr: t.cron_expr,
-                        recurring,
-                        prompt: t.prompt,
-                        source: t.source,
-                        workflow: t.workflow,
-                        last_run_at: t.last_run_at,
-                        created_at: t.created_at,
-                        upcoming_fires,
-                    }
-                })
-                .collect();
-            Ok(serde_json::to_string(&Listed { timezone: tz.name().to_owned(), count: tasks.len(), tasks })?)
+            let mut tasks = Vec::new();
+            for Held { task, summary, .. } in held(engine).await? {
+                let latest = schedules.fires.latest(task.id).await?;
+                let consumed = consumed(&summary);
+                // A one-shot that fired is listed until its signal ran.
+                if consumed && !latest.as_ref().is_some_and(|f| f.pending) {
+                    continue;
+                }
+                let mut listed = json!({
+                    "id": task.id, "cron_expr": task.cron, "recurring": task.recurring, "prompt": task.prompt,
+                    "source": task.source, "workflow": task.workflow, "timezone": task.timezone,
+                    "created_at": task.created, "next_fire": next_due(&summary),
+                    "last_fire": latest.as_ref().map(|f| iso(f.slot)),
+                });
+                if consumed {
+                    listed["consumed"] = json!(true);
+                }
+                if summary.consecutive_faults > 0 {
+                    listed["faults"] = json!(summary.consecutive_faults);
+                    listed["last_error"] = json!(last_error(engine, &summary.name).await);
+                }
+                if let Some(trip) = &summary.tripped {
+                    listed["paused"] = json!(trip.manual.as_ref().map(|m| m.note.clone()).unwrap_or_default());
+                }
+                tasks.push(listed);
+            }
+            Ok(json!({"timezone": zone.name(), "count": tasks.len(), "tasks": tasks}).to_string())
         }
         "cancel_scheduled_task" => {
             let id = args.get("id").and_then(Value::as_i64).filter(|id| *id >= 1);
             let id = id.ok_or_else(|| anyhow::anyhow!("id must be a positive integer"))?;
-            Ok(json!({"ok": store.delete(id).await?, "id": id}).to_string())
+            let refused = |error: &str| Ok(json!({"ok": false, "id": id, "error": error}).to_string());
+            let _writing = schedules.writes.lock().await;
+            let name = task_name(id);
+            let definitions = engine.runtime.definitions(&name).await?;
+            let Some(d) = definitions.active.and_then(|v| definitions.versions.get(&v)) else {
+                return refused("no such task");
+            };
+            let Some(task) = task_of(&d.yaml) else { return refused("no such task") };
+            if task.cancelled {
+                return refused("the task is already cancelled");
+            }
+            let summary = engine.control.definition(&name).await.map_err(anyhow::Error::from)?;
+            if summary.as_ref().is_some_and(consumed) {
+                return refused("the one-shot task already fired");
+            }
+            let task = Task { cancelled: true, ..task };
+            put(engine, &name, &definition(&task, &Trigger::Cancelled), "cancelled").await?;
+            Ok(json!({"ok": true, "id": id}).to_string())
         }
         _ => anyhow::bail!("unknown schedule tool {name}"),
     }
 }
 
-// ── 5. boot ────────────────────────────────────────────────────────────────
+// ── 5. fire_scheduled ──────────────────────────────────────────────────────
 
-struct SystemTask {
-    cron: &'static str,
-    // None → fires as a generic `scheduler` signal; the scheduler skill maps
-    // the prompt body to the right composer sub-agent.
-    source: Option<&'static str>,
-    prompt: &'static str,
+/// Why `fire_scheduled` recorded nothing.
+#[derive(Debug)]
+pub enum FireFailure {
+    /// agent.db failed: the call is interrupted and resent (decision 7).
+    Storage(anyhow::Error),
+    /// The run's definition is not a task's: a definite failure.
+    Invalid(String),
 }
 
-const SYSTEM_TASKS: &[SystemTask] = &[SystemTask {
-    cron: "0 4 * * *",
-    source: Some("dreaming"),
-    prompt: "Daily dreaming tick. Review the signals processed since the \
+/// What a trigger's run of a task records (decisions 2–5): one fire per run
+/// id, read from the run's admitted definition, never from an expression.
+/// Only a trigger's root run of a `task-` definition records; anything else
+/// (a child a workflow started) completes refused, and a run of a task
+/// cancelled since its admission records nothing.
+pub async fn fire(engine: &Engine, run: &SavedRun, slot: &Value) -> Result<Value, FireFailure> {
+    let name = &run.admission.name;
+    let trigger_root = run.child.is_none()
+        && name.starts_with(TASK_PREFIX)
+        && run.admission.id.starts_with(&format!("schedule:{TASK_PREFIX}"));
+    if !trigger_root {
+        return Ok(json!({"fire": null, "refused": "not a trigger's run"}));
+    }
+    let definitions = engine.runtime.definitions(name).await.map_err(FireFailure::Storage)?;
+    let active = definitions.active.and_then(|v| definitions.versions.get(&v)).and_then(|d| task_of(&d.yaml));
+    if active.is_none_or(|t| t.cancelled) {
+        return Ok(json!({"fire": null, "cancelled": true}));
+    }
+    let task = task_of(&run.admission.definition)
+        .ok_or_else(|| FireFailure::Invalid(format!("{name} carries no task block")))?;
+    let slot = slot
+        .as_str()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .ok_or_else(|| FireFailure::Invalid(format!("slot must be an RFC 3339 time, got {slot}")))?;
+    let schedules = &engine.deps.schedule;
+    let id = schedules
+        .fires
+        .record(&run.admission.id, &task, slot.timestamp_millis())
+        .await
+        .map_err(FireFailure::Storage)?;
+    schedules.wake();
+    Ok(json!({"fire": id}))
+}
+
+// ── 6. boot ────────────────────────────────────────────────────────────────
+
+const DREAMING_CRON: &str = "0 4 * * *";
+const DREAMING_SOURCE: &str = "dreaming";
+const DREAMING_PROMPT: &str = "Daily dreaming tick. Review the signals processed since the \
              previous dreaming fire (see 'Previous fire' header above) and \
              consider whether any skill files deserve an edit based on \
              patterns, recurring user feedback, or failure modes you \
              observed. Use list_signals(since=<previous fire>) to scope \
-             the review. Edit skills via write_skill when warranted.",
-}];
+             the review. Edit skills via write_skill when warranted.";
 
-// MCP's `list_scheduled_tasks` reply, as far as the import reads it.
-#[derive(Deserialize)]
-struct McpListed {
-    tasks: Vec<McpTask>,
-}
-
-#[derive(Deserialize)]
-struct McpTask {
-    cron_expr: String,
-    recurring: bool,
-    prompt: String,
-    source: Option<String>,
-    last_run_at: Option<i64>,
-    created_at: String,
-}
-
-// The schedule MCP kept until the agent owned it.
-async fn mcp_tasks(mcp: &dyn Mcp, cancel: &CancellationToken) -> anyhow::Result<Vec<NewTask>> {
-    if !mcp.tools().iter().any(|t| t.name == "list_scheduled_tasks") {
-        return Ok(Vec::new());
+/// The first start under `SEEDED` (decision 14) creates the system task,
+/// the generic dreaming tick, on `zone`; never again, so a cancelled one
+/// stays cancelled. Crash-safe: the id is allocated and stored first, and a
+/// stored id whose definition has no active version is completed. User
+/// tasks (the digests) are never shipped. Returns the task's id when this
+/// start created or completed it.
+pub async fn seed(engine: &Engine, zone: Tz) -> anyhow::Result<Option<i64>> {
+    let schedules = &engine.deps.schedule;
+    let _writing = schedules.writes.lock().await;
+    let id = schedules.fires.seed_id().await?;
+    let name = task_name(id);
+    let definitions = engine.runtime.definitions(&name).await?;
+    if definitions.active.is_some() {
+        return Ok(None);
     }
-    let raw = mcp.call_tool("list_scheduled_tasks", Map::new(), cancel).await?;
-    let listed: McpListed = serde_json::from_str(&raw)
-        .map_err(|e| anyhow::anyhow!("list_scheduled_tasks: unexpected reply ({e}): {raw}"))?;
-    listed
-        .tasks
-        .into_iter()
-        .map(|t| {
-            let created = chrono::NaiveDateTime::parse_from_str(&t.created_at, "%Y-%m-%d %H:%M:%S")
-                .map_err(|e| anyhow::anyhow!("created_at {:?}: {e}", t.created_at))?
-                .and_utc();
-            Ok(NewTask {
-                cron_expr: t.cron_expr,
-                recurring: t.recurring,
-                prompt: t.prompt,
-                source: t.source,
-                workflow: None,
-                last_run_at: t.last_run_at,
-                created,
-            })
-        })
-        .collect()
+    if let Some(&version) = definitions.versions.keys().next_back() {
+        engine.runtime.activate_as(&name, version, "agent", Some("seeded")).await?;
+        return Ok(Some(id));
+    }
+    let task = Task {
+        id,
+        cron: DREAMING_CRON.into(),
+        recurring: true,
+        prompt: DREAMING_PROMPT.into(),
+        source: Some(DREAMING_SOURCE.into()),
+        workflow: None,
+        timezone: zone.name().into(),
+        created: iso(now(engine)),
+        cancelled: false,
+    };
+    put(engine, &name, &definition(&task, &Trigger::Cron(zone)), "seeded").await?;
+    Ok(Some(id))
 }
 
-// On the first start, the tasks MCP held move here with their last fire, so
-// nothing owed is lost and nothing fired is fired again; with none to move
-// (a fresh install), the system tasks are seeded: only the generic dreaming
-// tick. User-specific tasks (the digests and their prompts) are not shipped;
-// they live in agent.db once the user asks the agent to schedule them. Never
-// again after that: a task the user cancelled stays cancelled. A failed import changes nothing
-// and is retried on the next start.
-pub async fn initialize(store: &dyn ScheduleStore, mcp: &dyn Mcp, cancel: &CancellationToken) -> anyhow::Result<usize> {
-    let mut tasks = mcp_tasks(mcp, cancel).await?;
-    if tasks.is_empty() {
-        tasks = SYSTEM_TASKS
-            .iter()
-            .map(|t| NewTask {
-                cron_expr: t.cron.into(),
-                recurring: true,
-                prompt: t.prompt.into(),
-                source: t.source.map(str::to_owned),
-                workflow: None,
-                last_run_at: None,
-                created: Utc::now(),
-            })
-            .collect();
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test 14 (DST): a non-recurring `30 2 * * *` in Berlin created the day
+    // before the 2027 spring-forward fires at the first instant after the
+    // gap, 03:00 CEST, by the engine's rule (the tick's old rule gave 03:30).
+    #[test]
+    fn a_one_shot_in_a_skipped_hour_takes_the_engines_rule() {
+        let now = DateTime::parse_from_rfc3339("2027-03-27T12:00:00Z").unwrap().with_timezone(&Utc);
+        let at = one_shot_at("30 2 * * *", chrono_tz::Europe::Berlin, now).unwrap();
+        assert_eq!(at.to_rfc3339(), "2027-03-28T03:00:00+02:00");
     }
-    Ok(if store.initialize(&tasks).await? { tasks.len() } else { 0 })
 }

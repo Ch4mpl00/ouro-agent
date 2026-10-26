@@ -173,41 +173,53 @@ async fn signals_without_saved_workflows_run_the_primary_loop_with_the_source_co
         supervisor.shutdown().await;
     }
 }
-// A scheduled fire runs on the supervisor like a queued signal: with the
-// environment note one carries, and its saved workflow when the task names
-// one. A supervisor that is stopping starts nothing: the slot goes back.
+// A scheduled fire runs on the supervisor like a queued signal, through the
+// schedule's drain: with the environment note one carries, and its saved
+// workflow when the task names one. A supervisor that is stopping starts
+// nothing: the fire stays pending (design 06, decision 3).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_scheduled_fire_runs_as_a_signal_with_mcps_note_and_its_workflow() {
-    use agent::schedule::{FIRST_FIRE_ID, Fire, FireSink, Fired, SupervisorSink};
+    use agent::schedule::{RoundEnd, Task, drain};
     let model = Arc::new(Scripted::new(vec![assistant("done"), assistant("done")]));
     let (f, _, supervisor) = setup(model.clone());
     let env_context = agent::session::telegram_env_note(Some("4242"), &[]);
-    let sink = SupervisorSink { supervisor: supervisor.clone(), env_context };
-    let fire = |n: i64, source: &str, workflow: Option<&str>| Fire {
-        id: FIRST_FIRE_ID + n,
-        task_id: n,
-        source: source.into(),
-        content: format!("Scheduled task #{n} fired.\n\nDaily dreaming tick."),
-        workflow: workflow.map(str::to_owned),
-        slot: chrono::Utc::now(),
+    let fires = f.engine.deps.schedule.fires.clone();
+    let record = |n: i64, source: Option<&str>, workflow: Option<&str>| {
+        let task = Task {
+            id: n,
+            cron: "now".into(),
+            recurring: false,
+            prompt: "Daily dreaming tick.".into(),
+            source: source.map(str::to_owned),
+            workflow: workflow.map(str::to_owned),
+            timezone: "UTC".into(),
+            created: "2026-09-06T12:00:00.000Z".into(),
+            cancelled: false,
+        };
+        let fires = fires.clone();
+        async move { fires.record(&format!("schedule:task-{n}:at:{n}"), &task, n).await.unwrap() }
     };
 
-    assert_eq!(sink.fire(fire(1, "dreaming", None)).await, Fired::Started);
+    let first = record(1, Some("dreaming"), None).await;
+    assert_eq!(drain(&supervisor, env_context.as_deref()).await.unwrap().ran, 1);
     let system = model.seen.lock().unwrap()[0].messages[0]["content"].as_str().unwrap().to_owned();
     assert!(system.contains("Default Telegram chat id: 4242."), "the note reaches the prompt: {system}");
-    assert!(f.db.get_trace(&format!("dreaming:{}", FIRST_FIRE_ID + 1)).unwrap().is_some());
+    assert!(f.db.get_trace(&format!("dreaming:{first}")).unwrap().is_some());
 
     // A task naming a workflow with no active version goes to the agent
     // loop, told so.
-    assert_eq!(sink.fire(fire(2, "scheduler", Some("w"))).await, Fired::Started);
-    let (_, obs) = f.db.get_trace(&format!("scheduler:{}", FIRST_FIRE_ID + 2)).unwrap().unwrap();
+    let second = record(2, None, Some("w")).await;
+    assert_eq!(drain(&supervisor, env_context.as_deref()).await.unwrap().ran, 1);
+    let (_, obs) = f.db.get_trace(&format!("scheduler:{second}")).unwrap().unwrap();
     assert!(obs.iter().any(|o| o.name == "fallback"), "the task is handed over");
     let system = model.seen.lock().unwrap()[1].messages[0]["content"].as_str().unwrap().to_owned();
     assert!(system.contains("saved workflow `w`") && system.contains("it has no active version"), "{system}");
 
     supervisor.shutdown().await;
-    assert_eq!(sink.fire(fire(3, "scheduler", None)).await, Fired::NotStarted);
-    assert!(f.db.get_trace(&format!("scheduler:{}", FIRST_FIRE_ID + 3)).unwrap().is_none());
+    let third = record(3, None, None).await;
+    assert_eq!(drain(&supervisor, None).await.unwrap().end, RoundEnd::Stopping);
+    assert!(fires.next_pending().await.unwrap().is_some_and(|f| f.id == third), "still pending");
+    assert!(f.db.get_trace(&format!("scheduler:{third}")).unwrap().is_none());
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn history_scopes_chat_topic_and_time_excludes_current_and_keeps_memory() {

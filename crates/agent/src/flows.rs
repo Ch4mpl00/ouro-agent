@@ -55,6 +55,28 @@ pub fn built_in(name: &str) -> Option<&'static str> {
 /// agent's to override (#55).
 pub const RESERVED: &[&str] = &[GUARD_NAME];
 
+/// Whether `name` is the runtime's alone: a reserved built-in, or a
+/// scheduled task's definition (`task-<id>`, which only the schedule tools
+/// write, design 06 decision 1).
+pub fn reserved(name: &str) -> bool {
+    RESERVED.contains(&name) || name.starts_with(crate::schedule::TASK_PREFIX)
+}
+
+/// The one reserved-name check: `save_workflow`, `activate_workflow`, a
+/// named start (`runs::start_named_child`, so `launch` too) and
+/// `schedule_task(workflow:)` refuse what `reserved` names.
+pub fn refuse_reserved(name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !name.starts_with(crate::schedule::TASK_PREFIX),
+        "`{name}` is a scheduled task's definition: only schedule_task and cancel_scheduled_task write it"
+    );
+    anyhow::ensure!(
+        !RESERVED.contains(&name),
+        "{name} is a reserved built-in workflow and cannot be saved or activated"
+    );
+    Ok(())
+}
+
 /// The stored version of `name` whose content is the compiled built-in text
 /// (`None`: no built-in, or not saved yet).
 pub async fn builtin_version(runtime: &ouro_runtime::Runtime, name: &str) -> anyhow::Result<Option<u64>> {
@@ -524,10 +546,12 @@ fn each_task(wf: &Workflow, visit: &mut dyn FnMut(&Task, &str)) {
 
 /// What an agent version may not contain (design 04, the gate, R2-M4): a
 /// schedule (activation would arm engine triggers that fire outside the
-/// supervisor, with no host data: the schedules step brings them), its own
-/// breaker policy (decision 3), `emit` (design 01, 17), `run: workflow` (its
-/// version resolution picks versions the agent never named), and the guard
-/// round's private functions. The engine's `call: start_child { name, input }`
+/// supervisor, with no host data: a task's definition is the host's,
+/// written by `schedule_task`, design 06), its own breaker policy
+/// (decision 3), `emit` (design 01, 17), `run: workflow` (its version
+/// resolution picks versions the agent never named), the reserved contexts'
+/// functions (the guard round's, `fire_scheduled`) and a `start_child` of a
+/// task's definition by a literal name. The engine's `call: start_child { name, input }`
 /// stays allowed: it starts the active version of a name the YAML names,
 /// with no host data, so only its own trusted steps run.
 fn denied(wf: &Workflow) -> Vec<String> {
@@ -553,6 +577,17 @@ fn denied(wf: &Workflow) -> Vec<String> {
         Kind::Call { function, .. } if crate::functions::host_function(function).is_some_and(|f| f.context == "guard") => {
             problems.push(format!("{at}/call: `{function}` belongs to the reserved guard round"))
         }
+        Kind::Call { function, .. } if crate::functions::host_function(function).is_some_and(|f| crate::functions::RESERVED_CONTEXTS.contains(&f.context)) => {
+            problems.push(format!("{at}/call: `{function}` belongs to the runtime's scheduled tasks"))
+        }
+        // A literal task name only: one built by an expression is refused at
+        // run time, by `fire_scheduled`'s root check (design 06, decision 5).
+        Kind::Call { function, with: Some(with) }
+            if function == "start_child"
+                && with.get("name").and_then(Value::as_str).is_some_and(|n| n.starts_with(crate::schedule::TASK_PREFIX)) =>
+        {
+            problems.push(format!("{at}/call: `start_child` cannot start a scheduled task's definition"))
+        }
         _ => {}
     }
     });
@@ -573,10 +608,7 @@ pub struct Gated {
 /// reads. Flows that are legal but usually a mistake come back as warnings,
 /// never refused (R2-L4).
 pub fn gate(engine: &Engine, name: &str, definition: &str) -> anyhow::Result<Gated> {
-    anyhow::ensure!(
-        !RESERVED.contains(&name),
-        "{name} is a reserved built-in workflow and cannot be saved or activated"
-    );
+    refuse_reserved(name)?;
     let wf = engine.runtime.validate(definition).map_err(|e| anyhow::anyhow!("invalid workflow: {e:#}"))?;
     anyhow::ensure!(
         wf.document.name == name,
@@ -1103,10 +1135,7 @@ pub async fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> any
         }
         "activate_workflow" => {
             let name = text("name")?;
-            anyhow::ensure!(
-                !RESERVED.contains(&name),
-                "{name} is a reserved built-in workflow and cannot be saved or activated"
-            );
+            refuse_reserved(name)?;
             let version = version()?.ok_or_else(|| anyhow::anyhow!("version: Required"))?;
             let definitions = engine.runtime.definitions(name).await?;
             let d = definitions
@@ -1268,7 +1297,7 @@ pub fn functions(engine: &Engine, args: &Map<String, Value>) -> anyhow::Result<S
         crate::functions::HOST_FUNCTIONS
             .iter()
             .chain(crate::functions::ENGINE_FUNCTIONS)
-            .filter(|f| f.context != "guard")
+            .filter(|f| !crate::functions::RESERVED_CONTEXTS.contains(&f.context))
             .map(|f| (*f, f.context))
     };
     if let Some(name) = args.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()) {

@@ -9,13 +9,13 @@ use agent::{
     errors::{is_aborted, or_cancel},
     langfuse::LangfuseTracer,
     local_recorder::local_recorder_tracer,
-    mcp::{ConnectOptions, Mcp, McpClient, RETRY_UNTIL_UP, SharedMcp, open_from_env},
+    mcp::{ConnectOptions, Mcp, McpClient, RETRY_UNTIL_UP, open_from_env},
     models::{DEFAULT_DECISION_MODEL, Presets, default_presets},
     providers::{
         DEEPSEEK_BASE_URL, GEMINI_BASE_URL, HttpApi, OPENAI_BASE_URL, ProviderKind, RetryOpts, SharedProvider,
         openrouter_api, provider, with_retry,
     },
-    schedule::{ScheduleStore, SupervisorSink, run_ticks},
+    schedule::{Schedules, run_drain, run_zone_watch},
     session::{EnvConfig, parse_telegram_topics, telegram_env_note},
     skills::FsSkillStore,
     supervisor::{ERROR_BACKOFF, NextSignal, create_supervisor_with_cancel, run_poll_loop},
@@ -202,7 +202,7 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
             skills: vec!["orchestrator".into()],
             skill_store: skills.clone(),
             memory: db.clone(),
-            schedule: db.clone(),
+            schedule: Arc::new(Schedules::new(db.clone())),
             env: EnvConfig {
                 user_email: std::env::var("USER_EMAIL").ok(),
                 telegram_chat_id: config.telegram_chat_id.clone(),
@@ -246,25 +246,34 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
             eprintln!(
                 "[supervisor] entering main loop (scheduler → saved workflow when named, otherwise → agent-loop)"
             );
-            // The agent owns the schedule: its first start imports the tasks
-            // MCP held (or seeds the system ones), and a 30 s tick fires them
-            // through the supervisor, one signal at a time with the queue's.
-            let tick_cancel = stopping.child_token();
-            let ticks = if !once {
-                match agent::schedule::initialize(&*db, &*mcp, &stopping).await {
-                    Ok(0) => {}
-                    Ok(n) => eprintln!("[schedule] first start: {n} tasks"),
-                    Err(error) => eprintln!("[schedule] first start failed, retried on the next: {error:#}"),
+            // Scheduled tasks are engine definitions (`task-<id>`): their
+            // triggers record fires, and the drain runs each one through the
+            // supervisor, one signal at a time with the queue's. The first
+            // start seeds the system task; the zone watch keeps recurring
+            // tasks on the user's zone (schedule.rs, design 06). Not in
+            // `--once`: fires recorded then wait for the next normal start.
+            let schedule_cancel = stopping.child_token();
+            let mut scheduled = Vec::new();
+            if !once {
+                let zone = agent::schedule::user_zone(&engine, &stopping).await.unwrap_or(chrono_tz::Tz::UTC);
+                match agent::schedule::seed(&engine, zone).await {
+                    Ok(Some(id)) => eprintln!("[schedule] system task #{id} seeded"),
+                    Ok(None) => {}
+                    Err(error) => eprintln!("[schedule] seeding failed, retried on the next start: {error:#}"),
                 }
-                let store: Arc<dyn ScheduleStore> = db.clone();
-                let sink = Arc::new(SupervisorSink {
-                    supervisor: supervisor.clone(),
-                    env_context: config.env_context.clone(),
-                });
-                let shared: SharedMcp = mcp.clone();
-                Some(tokio::spawn(run_ticks(store, sink, shared, tick_cancel.clone())))
-            } else {
-                None
+                scheduled.push(tokio::spawn(run_drain(
+                    supervisor.clone(),
+                    config.env_context.clone(),
+                    schedule_cancel.clone(),
+                )));
+                scheduled.push(tokio::spawn(run_zone_watch(engine.clone(), schedule_cancel.clone())));
+            }
+            // The drain and the watch end before the supervisor shuts down.
+            let stop_scheduled = async |scheduled: &mut Vec<tokio::task::JoinHandle<()>>| {
+                schedule_cancel.cancel();
+                for task in scheduled.drain(..) {
+                    let _ = task.await;
+                }
             };
             let outcome = if once {
                 let raw = mcp.call_tool("get_next_signal", serde_json::Map::new(), &stopping).await;
@@ -292,15 +301,13 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
                     _ = stopping.cancelled() => {
                         journal_cancel.cancel();
                         if let Some(task) = journal.take() { log_journal_result(task.await); }
+                        stop_scheduled(&mut scheduled).await;
                         supervisor.shutdown().await;
                         poll.await.map_err(anyhow::Error::from).and_then(|result| result)
                     }
                 }
             };
-            tick_cancel.cancel();
-            if let Some(ticks) = ticks {
-                let _ = ticks.await;
-            }
+            stop_scheduled(&mut scheduled).await;
             journal_cancel.cancel();
             if let Some(task) = journal {
                 log_journal_result(task.await);

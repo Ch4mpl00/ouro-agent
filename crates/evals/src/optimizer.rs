@@ -824,7 +824,7 @@ pub fn isolated_engine(
         db: agent::db::AgentDb::open(":memory:")?,
         store,
         dry_store,
-        schedule: Arc::new(agent::schedule::MemorySchedule::default()),
+        schedule: Arc::new(agent::schedule::Schedules::in_memory()),
     }))
 }
 

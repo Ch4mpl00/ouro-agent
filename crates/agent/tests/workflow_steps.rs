@@ -127,7 +127,7 @@ impl World {
             db: self.db.clone(),
             store: self.store.clone(),
             dry_store: self.dry_store.clone(),
-            schedule: Arc::new(agent::schedule::MemorySchedule::default()),
+            schedule: Arc::new(agent::schedule::Schedules::in_memory()),
         })
     }
 

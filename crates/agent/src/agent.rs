@@ -42,7 +42,9 @@ pub struct EngineDeps {
     pub tracer: Arc<dyn Tracer>,
     pub codex: SharedCodex,
     pub decisions: Option<Arc<crate::decisions::DecisionClient>>,
-    pub schedule: Arc<dyn crate::schedule::ScheduleStore>,
+    // The schedule's seam: the fire table, the task-write mutex, the
+    // drain's wake-up (schedule.rs §1).
+    pub schedule: Arc<crate::schedule::Schedules>,
     // The user's email and default chat, for a signal's session.
     pub env: crate::session::EnvConfig,
     // The agent's tables beside the engine's: evidence, run anchors, the MCP
@@ -1106,8 +1108,7 @@ impl AgentLoop {
                 crate::sandbox::try_workflow(engine, args, &self.opts.session, &scope, &self.cancel).await
             }
             name if crate::schedule::TOOLS.contains(&name) => {
-                let tz = &self.opts.session.env.timezone;
-                crate::schedule::tool(&*engine.deps.schedule, tz, name, args, chrono::Utc::now()).await
+                crate::schedule::tool(engine, &self.opts.session.env.timezone, name, args).await
             }
             _ => anyhow::bail!("unknown synthetic tool {name}"),
         }

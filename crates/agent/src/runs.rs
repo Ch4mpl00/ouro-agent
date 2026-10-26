@@ -1423,6 +1423,12 @@ pub async fn start_named_child(
     site: Site,
     build: impl Fn(Choice) -> futures::future::BoxFuture<'static, anyhow::Result<(Value, Value)>>,
 ) -> anyhow::Result<Named<ouro_runtime::ChildRef>> {
+    // A scheduled task's definition is never a child the host starts (a
+    // forged `{workflow: "task-…"}` payload reaching `launch`, design 06).
+    anyhow::ensure!(
+        !name.starts_with(crate::schedule::TASK_PREFIX),
+        "`{name}` is a scheduled task's definition and is not started as a workflow"
+    );
     let start = async |name: &str, version: Option<u64>, input: Value, host: Value| {
         ctx.start_child(ouro_runtime::ChildStart { key: key.into(), name: name.into(), version, input, host }).await
     };

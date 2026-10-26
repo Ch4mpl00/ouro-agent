@@ -153,7 +153,7 @@ fn world_on(
         db: agent::db::AgentDb::open(":memory:").unwrap(),
         store: store.0.clone(),
         dry_store: store.1.clone(),
-        schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
+        schedule: std::sync::Arc::new(agent::schedule::Schedules::in_memory()),
     });
     World { engine, mcp, written, persist, store }
 }

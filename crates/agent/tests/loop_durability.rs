@@ -271,7 +271,7 @@ fn engine(p: &Parts) -> Arc<Engine> {
         db: p.db.clone(),
         store: p.store.clone(),
         dry_store: p.dry_store.clone(),
-        schedule: Arc::new(agent::schedule::MemorySchedule::default()),
+        schedule: Arc::new(agent::schedule::Schedules::in_memory()),
     })
 }
 

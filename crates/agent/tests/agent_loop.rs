@@ -1089,7 +1089,7 @@ fn engine_with(openrouter: Option<Arc<dyn ChatProvider>>) -> Arc<agent::agent::E
         db: agent::db::AgentDb::open(":memory:").unwrap(),
         store,
         dry_store,
-        schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
+        schedule: std::sync::Arc::new(agent::schedule::Schedules::in_memory()),
     })
 }
 

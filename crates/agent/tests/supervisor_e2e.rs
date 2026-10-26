@@ -388,7 +388,7 @@ async fn run(plans: &[(i64, Plan)]) -> Run {
         db: (*db).clone(),
         store,
         dry_store,
-        schedule: std::sync::Arc::new(agent::schedule::MemorySchedule::default()),
+        schedule: std::sync::Arc::new(agent::schedule::Schedules::in_memory()),
     });
     let supervisor = create_supervisor(engine.clone());
     run_poll_loop(mcp, supervisor.clone(), world.drained.clone(), std::time::Duration::ZERO).await.unwrap();
