@@ -271,3 +271,26 @@ ambiguous, each reversible:
   tools, launches, built-ins, loop selection, meta, gate, pinning,
   handover, re-dispatch join, cap and reuse, catalog, route priority,
   transcript). The executor's report lists which mutant fails which test.
+
+## 2026-10-26 (step 4: design 05, the sandbox)
+
+- **The engine first:** the sandbox needs the engine to give handlers the
+  store that drives them (a dry run's runs live in a private store), to
+  report a dry run's whole tree, to take an observer of its own, to cut
+  holds in a dry run and to let the host name the root. That is ouro design
+  07 (ouro#39), approved after two goldfish rounds; it is a breaking release
+  (0.3.0). Run access reads the call's lineage (a loop reads the signal run
+  above it) and delivers only to the call's run and its descendants,
+  lease-checked, never with the engine's reserved event types (whether
+  `Runtime::deliver` should refuse them too: ouro#40).
+- **Design 05 revises design 01, decision 16** (decision 12): drafts are not
+  activated in a second runtime but overlaid as "active" inside the sandbox's
+  guard store, which both the agent and the engine read; and a small named
+  set of `Engine::sandbox` branches stays (confirmation press, card edit,
+  `tool`'s write answer, turn/call records, recovery) instead of a parallel
+  dry registry, because the handlers are shared and the differences few.
+- **Reversible choices:** recovery in a try is a second dry run after the
+  signal's (decision 13); a draft of a tripped name is tried unless the name
+  is paused or the draft is the tripped content (decision 4, so a fix can
+  become tried); `tried` needs every run of the draft to complete
+  (decision 10); the no-signal mode's input follows step 5's fire input.

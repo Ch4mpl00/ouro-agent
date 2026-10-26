@@ -1,6 +1,6 @@
 # 05. Step 4: dry runs on the engine (`try_workflow`)
 
-Status: revised after goldfish round 1 (resolutions marked R-n) ·
+Status: approved after goldfish rounds 1 and 2 (resolutions marked R-n, R2-n) ·
 Overview: [01](01-engine-migration.md) step 4, decision 16 (revised here,
 decision 12) · Epic: #62 · Engine prerequisite: ouro design 07 (ouro#39,
 release 0.3.0) · Decisions log: [LOG.md](LOG.md)
@@ -72,38 +72,50 @@ Elephant (logged in LOG.md, reversible):
    (`max_hold = 0`, ouro 07 decision 8), so a loop joining its guard or a
    worker suspends at once and the child is driven (R-H2). The root is
    admitted under the live id and name (`DryRunOptions::{id, name}`, ouro 07
-   decision 9): `signal:0` named `signal` with a signal, the draft's own id
-   and name without one (R-H3).
+   decision 9): `signal:0` named `signal` with a signal; `try:<name>` named
+   after the draft without one (R-H3, R2-L). The report takes each run's
+   version from the sandbox's own choice (`Choice`), not from the root's
+   `DryRunRun::version`, which is the private store's save (R2-L).
 3. **Handlers reach their run tree through `FunctionContext` run access**
    (ouro 07: `cx.run`, `records`, `children`, `cx.deliver`), never through
    `engine.runtime`/`engine.control`, wherever they read their own run, its
    records, a descendant or its children, or deliver to one (R-H1). The
-   complete list of call sites is below (Handler refactor). The sandbox
+   complete list of call sites is below (Handler refactor). Run access
+   reads the call's lineage (ouro 07 R2-H1), so a loop reads the signal run
+   that started it, an ancestor. The sandbox
    engine's run store is a **guard store**: a `RunStore` that answers the
    definition reads a dry run needs (from a read-only view of the real store)
    and refuses every run read and every write with "sandbox: use the call's
    run access", so a missed call site fails a try loudly instead of reading
-   the wrong store (R-M3). If `RunStore`'s surface makes the wrapper
+   the wrong store (R-M3). Several sites swallow store errors
+   (`effects_started`, `read_run`, `unanchor`, `signal_transcript`,
+   `end_tree_loops`), so the guard store also **counts** its refusals; the
+   report carries `sandbox_refusals` when nonzero, and every sandbox test
+   asserts zero (R2-M2). If `RunStore`'s surface makes the wrapper
    impractical, the executor uses the read-only view directly and records
    the deviation; the restored suites then carry the burden.
-4. **Drafts are an overlay of "active", not activations (R-H4, R-H5).** A
-   `Drafts` map (name → {version, digest, yaml}) in the sandbox engine's deps.
-   Every place that asks "the active version of X" asks the overlay first:
-   `flows::active_versions` (so `signal_routes` matches a draft's own
-   `metadata.route.when`, and `loop_catalog` lists draft loops) and
-   `runs::decide`. Nothing is saved or activated anywhere. For a listed draft,
-   `decide` sets aside only when the name is paused by an operator
-   (`trip.manual`, design 04 decision 5) or the draft's digest is the tripped
-   one; any other trip is ignored for the draft (the engine admits other
-   content, and the try is how a fix becomes tried).
+4. **Drafts are an overlay of "active", not activations (R-H4, R-H5,
+   R2-M3).** A `Drafts` map (name → {version, digest, yaml}) lives **in the
+   guard store**: its `definitions(name)` and its definition queries answer a
+   listed draft as the active version, so the agent (`flows::active_versions`
+   → `signal_routes` matches a draft's own `metadata.route.when`,
+   `loop_catalog` lists draft loops; `runs::decide`) and the engine itself
+   (`call: start_child {name}` in a draft's YAML, `run: workflow` children)
+   all see the same thing, with no agent-side branch. Nothing is saved or
+   activated anywhere. For a listed draft the overlay reports the name's trip
+   only when the name is paused by an operator (`trip.manual`, design 04
+   decision 5) or the draft's digest is the tripped one; any other trip is
+   hidden for the draft (the engine admits other content, and the try is how
+   a fix becomes tried).
 5. **The root goes through the live start rule (R-M5).** The sandbox
    chooses the root's YAML with the same `decide` (drafts included) and builds
    its input with the same `build(Choice)` the supervisor uses, so a tripped
    or paused active `signal` override, not listed as a draft, runs the
    built-in with `signal.fallback`, as live.
 6. **The mock rule (R-M1).** The engine `Mock` marks a registered function
-   when it is an MCP tool of the registry snapshot not marked read-only, or
-   `set_memory`; every other registered function dispatches (host functions
+   when it is an MCP tool of the registry snapshot not marked read-only,
+   `set_memory`, or `deliver_event` (it delivers into a real run, R2-L);
+   every other registered function dispatches (host functions
    included). The answer is `MOCK_REPLY`, and `Mock::response` appends to the
    sandbox's ordered write log with its run id and task path (`via: yaml`)
    (R-M6). Separately, in a sandbox, `tool` answers a model's call that
@@ -134,11 +146,14 @@ Elephant (logged in LOG.md, reversible):
    from `DryRun::runs`. Turns (reasoning, text, calls), verdicts and card
    answers come from the sandbox's records (`main`'s `Sandbox::turn/call/press`
    hooks).
-9. **The sandbox's observer also does the lifecycle work (R-M7).** A never
-   started engine has no drain, so the sandbox's observer composes `Path`
-   with the engine's own run-end handling: on `RunEnded`/`RunSuspended` it
-   ends the run's scope with the outcome and closes the run's live loop, as
-   the drain does. The sandbox borrows the root span under the root id
+9. **The sandbox's observer also does the lifecycle work (R-M7, R2-M1).** A
+   never started engine has no drain. `Observer` is synchronous, so the
+   sandbox's observer composes `Path` with a buffer: it pushes each
+   `RunEnded` (with its outcome) onto a channel, and a sandbox task, running
+   for the length of the dry run, ends that run's scope with the event's
+   outcome and closes its live loop, with no store read. `RunSuspended` is
+   ignored (with `max_hold = 0` every join suspends; a loop stays open
+   across it). The sandbox borrows the root span under the root id
    (`scopes.borrow`), writes the root's evidence and `run_trace` anchor under
    it in the sandbox db, and after the dry run closes any loop and scope still
    open with "dry run ended" before it ends the root span. It never calls
@@ -163,14 +178,21 @@ Elephant (logged in LOG.md, reversible):
     This design keeps drafts unactivated (an overlay) and keeps a small,
     named set of branches on `Engine::sandbox`: `confirm_request`,
     `resolve_review`'s card edit, `tool`'s write answer, the turn/call
-    records, `recovery_loop` (decision 13), and the overlay reads. Reason: the
+    records, `recovery_loop` (decision 13). `Engine::sandbox` is added by
+    this step (the branch has none; R2-L); the overlay is in the guard store,
+    not a branch. Reason: the
     handlers are shared, the differences are few, and a parallel registry
     would duplicate the handlers it wraps. Logged in LOG.md.
-13. **Recovery runs dry as a host child (R-M2).** Live, `recovery_loop`
-    starts the root `recovery:<id>`. In a sandbox it starts the same
-    definition, same builder, as a host child of the signal run
-    (`cx.start_child`, key `recovery`), so it runs dry and shows in the tree.
-    Its error is reported in the tree, not only logged.
+13. **Recovery runs as a second dry run (R-M2, R2-H2).** Live,
+    `recovery_loop` starts the root `recovery:<id>` and returns; the signal's
+    catch then raises, and the signal's terminal commit would cancel any
+    owned child, so a host child cannot carry it. In a sandbox
+    `recovery_loop` records the start it would make (the chosen definition,
+    its input and host data from the same builder) and returns as live.
+    After the signal's dry run ends, the sandbox runs that recorded start as
+    a second `dry_run_opts` on the same sandbox engine (id `recovery:0`),
+    under the same timeout budget; its tree is reported under `recovery`
+    with its writes (mocked). A try whose signal did not fault runs none.
 14. **Bounds.** `DRY_RUN_TIMEOUT` (300 s, ported from `main:flows.rs`)
     cancels the dry run's stop token; the engine's `max_tasks`, `max_depth`
     and the jump budget bound it too.
@@ -271,21 +293,28 @@ cancellation → an `Err` (as `main`); an engine `Err` (no `DryRun`) →
 ### Handler refactor (decision 3; R-H1)
 
 Every call site below moves to the call's run access. An executor greps
-`rg "engine\.(runtime|control)\." crates/agent/src/{functions,agent,confirmation,runs}.rs`
-and classifies each hit; the known ones:
+`rg "\b(self|engine)\.(runtime|control)\." crates/agent/src/{functions,agent,confirmation,runs}.rs`
+and classifies each hit (R2-M2); the known ones:
 
 - `functions.rs`: `loop_setup` (records), `context` on the signal run (get,
   records), `primary_loop` (records), `recovery_loop` (records; start per
   decision 13), `start_guard`'s joined-child read, `launch` (records),
   `settle_child` (records, child get), `reviewed` (records: consumed
   events), `confirm_request`/`resolve_review`, `effects_started` (children
-  list), `signal_transcript` (records), `unanchor`, the child checks by
-  parent.
+  list, and each child's call records from `records`: run access has no
+  call journal, the `Record::Call` entries are the journal; R2-L),
+  `signal_transcript` (records), `unanchor`, the child checks by parent,
+  `guard_context_of` (R2-L).
 - `agent.rs`: `loop_of` (records: the guard chain), the guard's own-run check,
-  the worker reads, `worker_runs` and `read_run` (records, children list).
-- `runs.rs`: `start_named_child` step 0 (child get), `decide` (definitions:
-  stays on the engine's runtime, served by the guard store from the real
-  store, with the overlay).
+  the worker reads, `worker_runs` and `read_run` (records, children list),
+  and the `self.runtime`/`self.control` reads among them (R2-M2).
+- `runs.rs`: `start_named_child` step 0 (child get: the `ChildStarts` seam
+  gains `run(id)`, R2-L), `decide` (definitions: stays on the engine's
+  runtime, served by the guard store from the real store, with the overlay).
+- Stay on `engine.runtime`, by design: `deliver_event` (delivers into another
+  signal's run; mocked in a sandbox, decision 6) and `confirmation::pending`
+  (other signals' cards; in a sandbox it reads only the sandbox db's cards,
+  so it makes no run read) (R2-L).
 - `flows::builtin_version(&Runtime, ..)` used by `start_guard` and fallbacks:
   definitions only, unchanged.
 
@@ -367,13 +396,19 @@ New:
     activates; a draft of a paused name is set aside with the reason.
 13. R-H6/D4: the verdict per answer (the call ran; declined; expired) and no
     `edit_telegram_message` in the writes.
-14. R-M2: a draft chain whose loop faults: the tree shows the recovery child
-    and its writes (mocked).
+14. R-M2/R2-H2: a draft chain whose loop faults: the report's `recovery`
+    tree shows the recovery loop's run and its writes (mocked); a try whose
+    signal completes has no `recovery`.
 15. R-M5: an active tripped `signal` override not listed as a draft: the try
     runs the built-in with the fallback line.
 16. R-M6: writes in order across YAML, model and handler sources.
 17. R-L5: `try_workflow` called by a model inside a try answers "not
     available inside a dry run".
+18. R2-M3: a draft whose YAML has `call: start_child {name: <other draft>}`
+    starts the other draft, not its active version.
+19. R2-M2: every sandbox test asserts `sandbox_refusals` is absent (zero);
+    one test leaves a deliberate site on `engine.runtime` behind a test-only
+    hook and sees the count.
 
 Mutants the suite must catch (run by the executor once, with
 `cargo mutants --in-diff` where it fits, by hand otherwise): the overlay
