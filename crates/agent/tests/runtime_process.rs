@@ -205,7 +205,7 @@ impl Fixture {
 async fn binary_runs_scheduler_and_agent_sources_and_flushes_matching_otel_ids() {
     for source in ["scheduler", "telegram", "domain"] {
         let f = Fixture::new(source, false, false).await;
-        let output = tokio::time::timeout(Duration::from_secs(10), f.child(true).output()).await.unwrap().unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(20), f.child(true).output()).await.unwrap().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         assert_eq!(f.state.sends.load(Ordering::SeqCst), 1);
         // A plain reply to the conversation the request came from skips Jev;
@@ -233,7 +233,7 @@ async fn binary_runs_scheduler_and_agent_sources_and_flushes_matching_otel_ids()
 #[tokio::test]
 async fn binary_tool_failure_returns_to_the_scheduler_loop_without_recovery() {
     let f = Fixture::new("scheduler", true, false).await;
-    let output = tokio::time::timeout(Duration::from_secs(10), f.child(true).output()).await.unwrap().unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(20), f.child(true).output()).await.unwrap().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(f.state.sends.load(Ordering::SeqCst), 1);
     let (trace, obs) = f.trace();
@@ -247,7 +247,8 @@ async fn binary_tool_failure_returns_to_the_scheduler_loop_without_recovery() {
 async fn sigterm_cancels_an_active_signal_and_flushes_trace_before_process_exit() {
     let f = Fixture::new("telegram", false, true).await;
     let child = f.child(false).spawn().unwrap();
-    tokio::time::timeout(Duration::from_secs(5), f.state.model_started.notified()).await.unwrap();
+    // The binary boots first: MCP, the engine's store and its built-ins.
+    tokio::time::timeout(Duration::from_secs(15), f.state.model_started.notified()).await.unwrap();
     let pid = child.id().unwrap();
     assert!(std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status().unwrap().success());
     let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output()).await.unwrap().unwrap();

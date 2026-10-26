@@ -206,7 +206,9 @@ async fn passes_references_directly_to_a_child_and_shares_memory_without_copying
     // Two loops: the parent and one worker, which ran on the parent's session.
     let observations = &written.all()[0].observations;
     let worker = find(observations, "invoke_sub_agent");
-    assert_eq!(worker.meta("agent_id"), Some(&json!("parent__sub1")));
+    // A worker is a host child of the parent's run (design 03): its own id.
+    let agent_id = worker.meta("agent_id").and_then(Value::as_str).unwrap();
+    assert!(agent_id.starts_with("hostchild:"), "{agent_id}");
     assert_eq!(
         observations
             .iter()
@@ -468,11 +470,12 @@ async fn cancels_a_child_loop_and_closes_its_observations_before_the_parent_trac
     let loop_ = h.start().await;
     let sent = tokio::spawn(loop_.send("delegate".into()));
     let child_signal = signal.await.unwrap();
-    assert!(h.engine.loop_ids().await.contains(&"parent__sub1".to_owned()));
+    // The worker's loop: a host child of the parent's run.
+    let worker = h.engine.loop_ids().await.into_iter().find(|id| id.starts_with("hostchild:")).unwrap();
     loop_.close().await;
     assert!(is_aborted(&sent.await.unwrap().unwrap_err()));
     assert!(child_signal.is_cancelled());
-    assert!(!h.engine.loop_ids().await.contains(&"parent__sub1".to_owned()));
+    assert!(!h.engine.loop_ids().await.contains(&worker));
     assert_eq!(h.requests(), 2);
     let traces = written.all();
     assert_eq!(traces.len(), 1);
@@ -682,14 +685,15 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
                 let mcp = seen.lock().unwrap().clone().unwrap();
                 assert_eq!(
                     *mcp.calls.lock().unwrap(),
+                    // The session's clock, the history, the activity and the
+                    // skill index, all before the first turn. (The default
+                    // path: a Telegram loop's status bubble returns with the
+                    // versions step, design 03 decision 9.)
                     [
+                        ("get_timezone".to_owned(), obj(json!({}))),
                         ("get_telegram_chat_history".to_owned(), obj(json!({"chatId":"42","limit":20}))),
                         ("journal_tail".to_owned(), obj(json!({"stream":"ouro/activity","n":10}))),
                         ("read_doc".to_owned(), obj(json!({"project":"agent-system","doc":"skill-index.md"}))),
-                        (
-                            "telegram_send_status".to_owned(),
-                            obj(json!({"id":"status:1","text":"👀","chatId":"42","messageThreadId":null}))
-                        ),
                     ]
                 );
                 assert!(mentions(&p.messages, "Put together a weekly summary?"));
@@ -700,7 +704,6 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
                 answer("summary")
             }),
             turn(|_| answer("done")),
-            turn(|_| answer("done")),
         ],
         &history.to_string(),
         tracer,
@@ -709,16 +712,17 @@ async fn loads_telegram_history_before_the_first_generation_and_shares_its_refer
     let runner = supervisor(&h);
     let content = "Telegram message in chat 42.\nText: \"go ahead\"";
     assert_eq!(runner.run_signal(&signal("telegram", content)).await.unwrap(), "done");
-    // History, activity, skill-index lookup and the loop's status bubble,
-    // opened and cleared; no worker fetch or extra LLM retrieval turn.
-    assert_eq!(h.mcp.calls.lock().unwrap().len(), 5);
+    // Clock, history, activity and skill-index lookup; no worker fetch or
+    // extra LLM retrieval turn.
+    assert_eq!(h.mcp.calls.lock().unwrap().len(), 4);
     let trace = &written.all()[0];
     assert_eq!(trace.input, Some(json!(content)));
     let fetch = find(&trace.observations, "get_telegram_chat_history");
     assert_eq!(fetch.kind, ObservationType::Tool);
     assert_eq!(fetch.meta("automatic"), Some(&json!(true)));
     assert_eq!(fetch.meta("memory_key"), Some(&json!("telegram.history")));
-    assert_eq!(trace.observations.iter().filter(|o| o.kind == ObservationType::Generation).count(), 4);
+    // The parent's two turns and the worker's.
+    assert_eq!(trace.observations.iter().filter(|o| o.kind == ObservationType::Generation).count(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -741,8 +745,7 @@ async fn guard_gets_only_preloaded_user_messages_and_raw_signal_for_parent_and_w
         &history.to_string(),
         null(),
         |deps| {
-        deps.decisions =
-            Some(agent::decisions::decision_client("guard-test".into(), api.clone()));
+            deps.decisions = Some(agent::decisions::decision_client("guard-test".into(), api.clone()));
         },
     );
     let content = "Telegram message in chat 42.\nText: \"do what I asked yesterday\"";
@@ -781,7 +784,7 @@ async fn runs_a_signal_directly_and_records_parent_worker_tool_io_memory_referen
         &payload,
         Arc::new(tee_tracer(primary, mirror)),
         |deps| {
-        deps.skills = vec!["orchestrator".into()];
+            deps.skills = vec!["orchestrator".into()];
         },
     );
     let runner = supervisor(&h);
@@ -795,7 +798,9 @@ async fn runs_a_signal_directly_and_records_parent_worker_tool_io_memory_referen
     assert_eq!(trace.tags, ["telegram", "agent-loop"]);
     let agent = find(&trace.observations, "agent_loop");
     assert_eq!(agent.meta("preset"), Some(&json!("smart")));
-    assert_eq!(agent.meta("skills"), Some(&json!(["orchestrator", "telegram"])));
+    // The default path (no Telegram loop is active in step 2, design 03
+    // decision 9): the engine's skills; Telegram rules come by preselection.
+    assert_eq!(agent.meta("skills"), Some(&json!(["orchestrator"])));
     let worker = find(&trace.observations, "invoke_sub_agent");
     let search = find(&trace.observations, "search_news");
     let generations: Vec<_> = trace
@@ -849,7 +854,9 @@ async fn records_tool_and_child_failures_as_errors_then_lets_the_parent_continue
         tracer,
     );
     h.start().await.send("do work".into()).await.unwrap();
-    let observations = &written.all()[0].observations;
+    let traces = written.all();
+    assert_eq!(traces.len(), 1, "{:?}", traces.iter().map(|t| (&t.name, t.observations.len())).collect::<Vec<_>>());
+    let observations = &traces[0].observations;
     assert_eq!(find(observations, "search_news").level, "ERROR");
     assert_eq!(find(observations, "invoke_sub_agent").level, "ERROR");
     let failed = observations.iter().find(|o| o.status_message.as_deref() == Some("model offline")).unwrap();
@@ -884,7 +891,7 @@ async fn recovers_a_failed_primary_loop_in_the_same_trace_and_releases_both_loop
     assert_eq!(recovery.meta("skills"), Some(&json!(["recovery"])));
     assert_eq!(recovery.meta("max_iterations"), Some(&json!(5)));
     // The recovery loop runs on the primary loop's session.
-    assert_eq!(recovery.meta("agent_id"), Some(&json!("telegram:1__recovery")));
+    assert_eq!(recovery.meta("agent_id"), Some(&json!("recovery:1")));
     assert_eq!(recovery.meta("parent_id"), Some(&json!("telegram:1")));
 }
 
@@ -946,7 +953,7 @@ async fn exports_the_primary_loop_and_nested_worker_through_the_langfuse_adapter
         &"large result ".repeat(1_000),
         tracer.clone(),
         |deps| {
-        deps.skills = vec!["orchestrator".into()];
+            deps.skills = vec!["orchestrator".into()];
         },
     );
     supervisor(&h).run_signal(&signal("telegram", SIGNAL_CONTENT)).await.unwrap();
@@ -1249,7 +1256,9 @@ async fn skill_write_authorization_cannot_be_created_by_model_arguments() {
         assert_eq!(model.seen.lock().unwrap()[1].tools.iter().any(|t| t.name == "write_skill"), authorized);
         assert_eq!(
             f.skills.read_skill("telegram").await.unwrap().unwrap().body,
-            if authorized { "revised\n" } else { "original\n" }
+            if authorized { "revised\n" } else { "original\n" },
+            "{:?}",
+            model.seen.lock().unwrap().get(2).and_then(|s| s.messages.last().cloned())
         );
         f.engine.shutdown().await;
     }
@@ -1323,7 +1332,9 @@ async fn close_cancels_active_round_joins_tools_and_closes_trace_once() {
     opts.skills = vec!["worker".into()];
     let loop_ = f.engine.start_loop(opts).await.unwrap();
     let running = tokio::spawn(loop_.send("go".into()));
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    // The round's guard child and the calls start on the engine worker's
+    // ticks, every commit in the SQLite store.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while f.mcp.active.load(Ordering::SeqCst) < 2 {
             tokio::task::yield_now().await;
         }

@@ -238,7 +238,7 @@ async fn missing_decision_client_is_an_explicit_agent_tool_error_without_an_mcp_
         "unused",
         Arc::new(NullTracer),
         |deps| {
-        deps.decisions = None;
+            deps.decisions = None;
         },
     );
     assert_eq!(h.start().await.send("task".into()).await.unwrap(), "fallback");

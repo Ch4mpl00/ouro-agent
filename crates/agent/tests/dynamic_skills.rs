@@ -99,10 +99,10 @@ async fn primary_saves_live_rules_then_a_new_session_discovers_them_alongside_do
         "unused",
         Arc::new(NullTracer),
         |deps| {
-        deps.skills = vec!["orchestrator".into()];
-        deps.skill_store = Arc::new(FsSkillStore::new(root.path()));
-        deps.mcp = Arc::new(MemoryOnly);
-        deps.decisions = Some(decision_client("jev-test".into(), Arc::new(Scorer)));
+            deps.skills = vec!["orchestrator".into()];
+            deps.skill_store = Arc::new(FsSkillStore::new(root.path()));
+            deps.mcp = Arc::new(MemoryOnly);
+            deps.decisions = Some(decision_client("jev-test".into(), Arc::new(Scorer)));
         },
     );
     let mut opts = h.options();

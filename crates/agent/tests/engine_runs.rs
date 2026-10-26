@@ -100,7 +100,7 @@ fn tools() -> Vec<agent::providers::ToolDef> {
     let open = json!({"type":"object"});
     ["send_telegram_message", "edit_telegram_message", "append_doc", "search_news", "get_telegram_chat_history"]
         .iter()
-        .map(|name| agent::providers::ToolDef::new(*name, *name, open.clone()))
+        .map(|name| agent::providers::ToolDef::new(name, name, open.clone()))
         .collect()
 }
 
@@ -141,7 +141,8 @@ fn engine_with(parts: &Parts, config: ouro_runtime::Config) -> Arc<Engine> {
             },
             mcp: parts.mcp.clone(),
             presets: agent::models::default_presets(),
-            skills: Vec::new(),
+            // The orchestrator's skill allows every tool, as the shipped one.
+            skills: vec!["orchestrator".into()],
             skill_store: Arc::new(AnySkill),
             memory: Arc::new(parts.db.clone()),
             tracer: Arc::new(agent::local_recorder::local_recorder_tracer(Arc::new(parts.db.clone()))),
@@ -234,7 +235,7 @@ async fn a_press_arriving_as_the_next_signal_is_honoured_within_seconds() {
     let ended = until_ended(&engine, "signal:1").await;
     assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
     assert!(matches!(ended, agent::runs::Status::Completed(ref v) if v.as_str().unwrap().starts_with("done")));
-    assert_eq!(count(&parts.mcp, "append_doc"), 1, "the confirmed write, once");
+    assert_eq!(count(&parts.mcp, "append_doc"), 1, "the confirmed write, once: {ended:?}");
     supervisor.shutdown().await;
 }
 
@@ -258,7 +259,7 @@ async fn a_press_from_another_chat_or_message_is_not_honoured() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_press_of_an_unknown_card_falls_through_to_the_agent_with_its_reason() {
-    let parts = parts(vec![turn(|p| answer(&p.messages[0]["content"].as_str().unwrap().to_owned()))]);
+    let parts = parts(vec![turn(|p| answer(p.messages[0]["content"].as_str().unwrap()))]);
     let engine = engine(&parts);
     let supervisor = create_supervisor(engine.clone());
     let out = supervisor.run_signal(&press(3, CHAT, 100, "cf:forged")).await.unwrap();
@@ -404,6 +405,26 @@ async fn a_worker_confirms_where_its_parent_does() {
     assert_eq!(host["parent_id"], "loop-5");
 }
 
+// What a stuck tree looks like: each run's state and its calls (a test's
+// diagnostics on a timeout).
+async fn dump(engine: &Engine, root: &str) -> String {
+    let mut out = String::new();
+    let mut pending = vec![root.to_owned()];
+    while let Some(id) = pending.pop() {
+        if let Some(run) = engine.runtime.get(&id).await.unwrap() {
+            out += &format!(
+                "{id} {} {:?} wake={} outcome={:?}\n",
+                run.admission.name, run.state, run.wake_at_ms, run.outcome
+            );
+            for call in engine.runtime.calls(&id).await.unwrap_or_default() {
+                out += &format!("  {call:?}\n");
+            }
+        }
+        pending.extend(children(engine, &id).await);
+    }
+    out
+}
+
 async fn children(engine: &Engine, run: &str) -> Vec<String> {
     let filter = agent::runs::Runs { parent: Some(run.into()), ..Default::default() };
     engine.control.list(&filter, None, 100).await.unwrap().items.into_iter().map(|r| r.admission.id).collect()
@@ -432,7 +453,9 @@ async fn a_card_whose_send_is_unknown_is_not_resent_and_the_round_goes_on() {
     }));
     let engine = engine(&parts);
     let live = loop_of(&parts, &engine, "loop-6", &format!("{ASKED}; reply in chat {CHAT}")).await;
-    let out = live.send(format!("{ASKED}; reply in chat {CHAT}")).await.unwrap();
+    let sent = tokio::time::timeout(Duration::from_secs(30), live.send(format!("{ASKED}; reply in chat {CHAT}"))).await;
+    let Ok(out) = sent else { panic!("the round never settled:\n{}", dump(&engine, "loop-6").await) };
+    let out = out.unwrap();
     let cards = parts
         .mcp
         .calls
@@ -656,31 +679,71 @@ async fn a_signal_settles_its_primary_by_how_it_ended() {
 
 // ── 14. an exhausted budget still gets its report ───────────────────────────
 
+fn mentions(messages: &[agent::providers::Message], text: &str) -> bool {
+    agent::generation::messages_json(messages).to_string().contains(text)
+}
+
+// A model that keeps working (a local read every turn) until it is asked
+// for the failure report, which it sends once and ends.
+fn busy_until_reporting(n: usize) -> Vec<Turn> {
+    (0..n)
+        .map(|_| {
+            turn(|p| {
+                if !mentions(&p.messages, "Report the failure only") {
+                    call("working_memory_list", json!({}))
+                } else if p.messages.last().is_some_and(|m| m["role"] == "tool") {
+                    answer("reported")
+                } else {
+                    call("send_telegram_message", json!({"chatId":CHAT,"text":"report: it failed"}))
+                }
+            })
+        })
+        .collect()
+}
+
+fn reported(parts: &Parts) -> bool {
+    parts
+        .mcp
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(n, a)| n == "send_telegram_message" && a["text"] == "report: it failed")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_primary_exhausting_its_iterations_still_gets_the_failure_reported() {
+    // The primary's limit is 100 rounds; the report runs outside its tree.
+    let parts = parts(busy_until_reporting(110));
+    let engine = engine(&parts);
+    let supervisor = create_supervisor(engine.clone());
+    let error = tokio::time::timeout(Duration::from_secs(120), supervisor.run_signal(&telegram(15, "work")))
+        .await
+        .expect("the signal ends")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("exceeded maxIterations=100"), "{error}");
+    let report = engine.runtime.get("recovery:15").await.unwrap().expect("the report runs");
+    assert!(matches!(report.outcome, Some(agent::runs::Status::Completed(_))), "{:?}", report.outcome);
+    assert!(reported(&parts), "the user got the report");
+    supervisor.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_exhausting_the_trees_budget_still_gets_the_failure_reported() {
     let mut turns = vec![turn(|_| call("invoke_sub_agent", json!({"prompt":"loop forever"})))];
-    for _ in 0..8 {
-        turns.push(turn(|_| call("search_news", json!({"query":"x"}))));
-    }
-    turns.push(turn(|_| call("send_telegram_message", json!({"chatId":CHAT,"text":"report: it failed"}))));
-    turns.push(turn(|_| answer("reported")));
+    turns.extend(busy_until_reporting(20));
     let parts = parts(turns);
     let mut config = agent::runs::config();
     config.limits.max_jumps = 6;
     let engine = engine_with(&parts, config);
     let supervisor = create_supervisor(engine.clone());
     let error = supervisor.run_signal(&telegram(14, "work")).await.unwrap_err().to_string();
-    assert!(error.contains("budget"), "{error}");
+    // The engine's jump budget ended the tree.
+    assert!(error.contains("jumps in this run tree"), "{error}");
     let report = engine.runtime.get("recovery:14").await.unwrap().expect("the report runs outside the tree");
     assert!(report.outcome.is_some(), "the report ran to its end");
-    let reported = parts
-        .mcp
-        .calls
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|(n, a)| n == "send_telegram_message" && a["text"] == "report: it failed");
-    assert!(reported, "the user got the report");
+    assert!(reported(&parts), "the user got the report");
     supervisor.shutdown().await;
 }
 

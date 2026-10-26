@@ -13,7 +13,7 @@ use agent::{
 };
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -284,7 +284,10 @@ pub fn tool_replies(messages: &[Message]) -> Vec<Value> {
     messages
         .iter()
         .filter(|m| m["role"] == "tool")
-        .map(|m| serde_json::from_str(m["content"].as_str().unwrap()).unwrap())
+        .map(|m| {
+            let text = m["content"].as_str().unwrap();
+            serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_owned()))
+        })
         .collect()
 }
 
@@ -364,16 +367,22 @@ impl Mcp for ToolMcp {
     }
 }
 
-// The agent's persistent KV: nothing stored, writes recorded.
+// The memory KV's writes of the agent, in order; the keys the runtime keeps
+// for itself (`engine.`: built-in digests, the reconciler's watermarks) are
+// kept apart, readable, and out of the log.
 #[derive(Default)]
-pub struct PersistLog(pub Mutex<Vec<(String, String)>>);
+pub struct PersistLog(pub Mutex<Vec<(String, String)>>, pub Mutex<HashMap<String, String>>);
 
 impl MemoryStore for PersistLog {
-    fn get(&self, _: &str) -> anyhow::Result<Option<String>> {
-        Ok(None)
+    fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.1.lock().unwrap().get(key).cloned())
     }
     fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        self.0.lock().unwrap().push((key.into(), value.into()));
+        if key.starts_with(agent::runs::RESERVED_MEMORY_PREFIX) {
+            self.1.lock().unwrap().insert(key.into(), value.into());
+        } else {
+            self.0.lock().unwrap().push((key.into(), value.into()));
+        }
         Ok(())
     }
 }
