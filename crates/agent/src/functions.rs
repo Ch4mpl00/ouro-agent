@@ -975,15 +975,19 @@ async fn settle_child(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
             (Some(Status::Completed(output)), _) => {
                 let text = output.as_str().map(str::to_owned).unwrap_or_else(|| output.to_string());
                 // A route's run is the signal's primary run: its answer is
-                // the signal's; its skills are its own (no primary_loop record).
+                // the signal's; a route's skills are its own loop's, read
+                // from its run (no primary_loop record).
                 if kind == PRIMARY || kind == ROUTE {
                     let records = RunReads::records(&ctx, &ctx.run_id).await?;
-                    let loaded = if kind == PRIMARY { primary_loaded(&records) } else { Vec::new() };
-                    scope.update(ContextUpdate {
-                        output: Some(json!(text)),
-                        metadata: Some(metadata(json!({"skills": loaded}))),
-                        ..Default::default()
-                    });
+                    let loaded = if kind == PRIMARY {
+                        primary_loaded(&records)
+                    } else {
+                        let records = RunReads::records(&ctx, id).await?;
+                        let host = crate::agent::loop_host_of(child.admission.host(), "settle_child")?;
+                        crate::agent::loop_skill_names(&engine, &host, &records)
+                    };
+                    let metadata = Some(metadata(json!({"skills": loaded})));
+                    scope.update(ContextUpdate { output: Some(json!(text)), metadata, ..Default::default() });
                 }
                 json!({"action": "done", "output": text})
             }
