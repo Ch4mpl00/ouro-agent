@@ -462,3 +462,16 @@ each reversible:
 - **Hand mutants** (once each, scratch worktree): all seven the design
   names are caught; "the prompt written into `with`" is caught at save (the
   engine refuses `${` embedded in text, so the first prompt never fires).
+
+## 2026-10-26 (maintainer: design 04 calls; step 5 verified)
+
+- **Maintainer confirmed** design 04 decisions 2 (the engine is the only
+  version store, no YAML copy, no re-seeding), 5 (an operator pause is never
+  lifted by the agent) and 8 (at most 20 never-activated versions per name).
+- **Maintainer:** a routed signal's trace carries the routed loop's skills
+  again (the activity journal lists them, as on `main`); the load-sensitive
+  wall-clock tests are rewritten to assert what they mean, not elapsed time.
+- **Step 5 verified** (design 06): the drain's one rule and `fire_scheduled`
+  read against the design; 106/107 binaries in the executor's full run, the
+  one failure the sandbox confirmation test's wall-clock bound under load
+  (24/24 alone), covered by the item above.

@@ -471,6 +471,4 @@ Nothing deploys.
 
 ## Open questions
 
-For the maintainer, reversible, not blocking: decision 5 (pause semantics),
-decision 8 (the cap counts only never-activated versions) and decision 2 (no
-re-seeding, no YAML copy).
+None. Decisions 2, 5 and 8 confirmed by the maintainer on 2026-10-26 (LOG).
