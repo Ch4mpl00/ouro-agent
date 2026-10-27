@@ -188,6 +188,31 @@ async fn a_plain_answer_ends_the_run() {
     assert_eq!(engine.runtime.get("peer:2").await.unwrap().unwrap().outcome, Some(Status::Completed(json!("hello"))));
 }
 
+// The workflow's model steps are the loop's tools too: data too large for the
+// model's context goes to them by a working-memory reference (`refs`), as a
+// saved workflow passes it, and a reference to nothing is an error the model
+// reads, never an empty input.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_loop_composes_from_working_memory_through_refs() {
+    let posts = json!({"items": [{"body": "POST-ONE"}, {"body": "POST-TWO"}]}).to_string();
+    let llm = Arc::new(Scripted::new(vec![
+        calls(&[("working_memory_put", json!({"key": "posts", "value": posts, "format": "json"}))]),
+        calls(&[
+            ("llm_compose", json!({"prompt": "Write the digest.", "refs": {"input.posts": "posts#items"}})),
+            ("llm_compose", json!({"prompt": "Nothing here.", "refs": {"input.posts": "missing"}})),
+        ]),
+        support::answer("DIGEST-TEXT"),
+        calls(&[("finish", json!({"result": "done"}))]),
+    ]));
+    let engine = engine(llm.clone(), Arc::new(World::default()));
+    assert_eq!(start(&engine, "peer:steps").await.send("go".into()).await.unwrap(), "done");
+    let composed = seen(&llm, 2);
+    assert!(composed.contains("POST-ONE") && composed.contains("POST-TWO"), "{composed}");
+    let replies = seen(&llm, 3);
+    assert!(replies.contains("DIGEST-TEXT"), "{replies}");
+    assert!(replies.contains("missing") && replies.contains("not found"), "{replies}");
+}
+
 // ── restarts ────────────────────────────────────────────────────────────────
 
 // The process dies inside a round's write. The next one resumes the run from

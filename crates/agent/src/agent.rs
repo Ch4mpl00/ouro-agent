@@ -1023,6 +1023,17 @@ impl AgentLoop {
                 optional_string(args, "result")?;
                 Ok(json!({"ok": true}).to_string())
             }
+            // The workflow's model steps, the same functions a saved workflow
+            // calls: data too large for the model's context reaches them by
+            // a working-memory reference (`refs`).
+            "llm_compose" | "filter_relevant" | "choose" => {
+                let args = with_refs(&self.opts.session.memory, args)?;
+                let scope: Scope = span;
+                crate::functions::run_step(engine, name, &args, &scope, name, &self.cancel)
+                    .await
+                    .map(|reply| reply.to_string())
+                    .map_err(|error| anyhow::anyhow!("{error}"))
+            }
             "hash_value" => {
                 let value = args.get("value").ok_or_else(|| anyhow::anyhow!("value is required"))?;
                 Ok(json!({"hash":crate::skills::hash_value(value)}).to_string())
@@ -1275,6 +1286,43 @@ static SYNTHETIC: LazyLock<Vec<ToolDef>> = LazyLock::new(|| {
 
 pub fn synthetic_definitions() -> &'static [ToolDef] {
     &SYNTHETIC
+}
+
+// A model step's arguments with its `refs` resolved: each argument path
+// (`items`, `input.posts`) takes the working-memory value under a key, as
+// JSON when it parses, or a field of it after `#` (`tool.ab#items`).
+fn with_refs(memory: &crate::session::WorkingMemory, args: &Map<String, Value>) -> anyhow::Result<Value> {
+    let mut args = args.clone();
+    let refs = match args.remove("refs") {
+        None | Some(Value::Null) => return Ok(Value::Object(args)),
+        Some(Value::Object(refs)) => refs,
+        Some(_) => anyhow::bail!("refs: expected an object of argument path: working-memory key"),
+    };
+    for (path, reference) in refs {
+        let reference = reference.as_str().ok_or_else(|| anyhow::anyhow!("refs.{path}: expected a key"))?;
+        let (key, field) = match reference.split_once('#') {
+            Some((key, field)) => (key, Some(field)),
+            None => (reference, None),
+        };
+        let raw = memory.get(key).map_err(|e| anyhow::anyhow!("refs.{path}: {e}"))?;
+        let mut value = serde_json::from_str(&raw).unwrap_or(Value::String(raw));
+        for part in field.into_iter().flat_map(|f| f.split('.')) {
+            value =
+                value.get(part).cloned().ok_or_else(|| anyhow::anyhow!("refs.{path}: {key} has no field `{part}`"))?;
+        }
+        let mut target = &mut args;
+        let mut parts: Vec<&str> = path.split('.').collect();
+        let last = parts.pop().filter(|p| !p.is_empty()).ok_or_else(|| anyhow::anyhow!("refs: empty argument path"))?;
+        for part in parts {
+            target = target
+                .entry(part)
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("refs.{path}: `{part}` is not an object"))?;
+        }
+        target.insert(last.to_owned(), value);
+    }
+    Ok(Value::Object(args))
 }
 
 fn string_arg<'a>(args: &'a Map<String, Value>, name: &str, nonempty: bool) -> anyhow::Result<&'a str> {
