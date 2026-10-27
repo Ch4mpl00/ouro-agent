@@ -753,10 +753,10 @@ impl agent::providers::JsonApi for Chooser {
     }
 }
 
-// Past a few reflexes, the loop's instructions list only those Jev chose for
-// its request, and find_reflexes searches them all.
+// The loop's instructions hold the reflexes Jev chose for its request, each
+// with its YAML; find_reflexes searches them all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn past_a_few_reflexes_the_instructions_list_the_ones_chosen_for_the_request() {
+async fn the_instructions_hold_the_yaml_of_the_reflexes_chosen_for_the_request() {
     let s = stores();
     let jev = Arc::new(Chooser::default());
     let model = Arc::new(Scripted::new(vec![
@@ -778,7 +778,8 @@ async fn past_a_few_reflexes_the_instructions_list_the_ones_chosen_for_the_reque
         admitted.contains("Chosen for this request, 1 of 6; find_reflexes(query) searches the others"),
         "{admitted}"
     );
-    assert!(admitted.contains("- news-window(since*, query) [reads]"), "{admitted}");
+    assert!(admitted.contains("### news-window(since*, query) [reads]"), "{admitted}");
+    assert!(admitted.contains("```yaml\ndocument:") && admitted.contains("call: news_list"), "its YAML: {admitted}");
     assert!(!admitted.contains("news-a("), "an unchosen reflex is not listed: {admitted}");
     let asked = jev.requests.lock().unwrap().clone();
     assert_eq!(asked.len(), 2, "the block, chosen once, and the search");
@@ -792,6 +793,7 @@ async fn past_a_few_reflexes_the_instructions_list_the_ones_chosen_for_the_reque
         "{reply}"
     );
     assert!(!reply.contains("news-a("), "{reply}");
+    assert!(reply.contains("call: news_list"), "find_reflexes gives the YAML: {reply}");
     engine.shutdown().await;
 }
 
