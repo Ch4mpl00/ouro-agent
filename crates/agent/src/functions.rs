@@ -636,6 +636,9 @@ async fn loop_admission(
     memory: Value,
     fallback: Option<&Fallback>,
 ) -> anyhow::Result<(Value, crate::runs::LoopHost)> {
+    let mut opts = opts.clone();
+    opts.reflex_request = Some(prompt.to_owned());
+    let opts = &opts;
     let prepared = crate::agent::prepare(engine, opts).await?;
     let messages = json!([providers::system(&prepared.system), providers::user(prompt)]);
     let input = crate::agent::loop_input(messages, memory, opts);
@@ -1094,6 +1097,7 @@ async fn prepare_inherited(
     opts.system_prompt = Some(parts.join("\n\n"));
     narrow(engine, &json!({"exclude_tools": request.exclude_tools, "on_step": request.on_step}), &mut opts)?;
     opts.skills = request.skills;
+    opts.reflex_request = Some(request.input.clone());
     let skills = crate::agent::prepare(engine, &opts).await?;
     let messages = json!([providers::system(&skills.system), providers::user(&request.input)]);
     let memory = engine.memory_out(&id, &session.memory).await?;

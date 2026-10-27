@@ -259,7 +259,7 @@
     "type": "function",
     "function": {
       "name": "run_reflex",
-      "description": "Run a reflex: a saved workflow that does one finished thing (the Reflexes block of your instructions lists them; list_workflows gives each one's declaration). Its output is this call's reply. One that changes something, or reads the internet, is reviewed like any such call.",
+      "description": "Run a reflex: a saved workflow that does one finished thing (the Reflexes block of your instructions lists the ones chosen for this request; find_reflexes searches the others). Its output is this call's reply. One that changes something, or reads the internet, is reviewed like any such call.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -277,6 +277,26 @@
           "name"
         ],
         "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "find_reflexes",
+      "description": "Search your reflexes (saved workflows that each do one finished thing) for ones useful for a task: each match with how to call it with run_reflex, its parameters, whether it writes, and a relevance score. Use it when the Reflexes block does not list one that fits.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The task, in words."
+          }
+        },
+        "required": [
+          "query"
+        ]
       }
     }
   },
