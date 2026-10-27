@@ -1,7 +1,8 @@
 # 09. Loops as workflow children (ouro 0.4 host inheritance)
 
 Status: v2, after the maintainer's decision of 2026-10-27 (LOG: an
-activated workflow is trusted code) · Issues: ouro#43 (done in ouro 0.4.0)
+activated workflow is trusted code); implemented, with the deviations in
+LOG "2026-10-27 (design 09: executor)" · Issues: ouro#43 (done in ouro 0.4.0)
 
 v1 kept a trust boundary between YAML and the runtime; its Codex Sol review
 (five high findings, all at that boundary) led the maintainer to drop it
