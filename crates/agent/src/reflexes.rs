@@ -518,13 +518,28 @@ pub fn round_reflexes(db: &AgentDb, entries: &Value) -> anyhow::Result<crate::gu
             Some(digest) => db.evidence(digest)?.unwrap_or_default(),
             None => String::new(),
         };
-        let evidence = json!({
-            "note": "run_reflex runs this saved workflow with the call's input: judge what its calls will do with it",
-            "name": entry["name"], "version": entry["version"],
-            "writes": summary.writes, "open_world": summary.open_world,
-            "yaml": crate::activity::clip(&yaml, YAML_CHARS),
-        });
+        let evidence = evidence(&entry["name"], &entry["version"], summary, &yaml);
         reflexes.0.insert(key.clone(), (summary, evidence));
     }
     Ok(reflexes)
+}
+
+/// `call`'s reflex as a review without a guard child sees it (the inline
+/// review of a round that started none): its resolution's YAML now.
+pub async fn call_reflexes(engine: &Engine, call: &ToolCall, resolution: &Resolution) -> crate::guard::Reflexes {
+    let definitions = engine.runtime.definitions(&resolution.name).await.ok();
+    let yaml = definitions.and_then(|d| d.versions.get(&resolution.version).map(|d| d.yaml.clone()));
+    let evidence =
+        evidence(&json!(resolution.name), &json!(resolution.version), resolution.summary, &yaml.unwrap_or_default());
+    let mut reflexes = crate::guard::Reflexes::default();
+    reflexes.0.insert(crate::guard::key(call), (resolution.summary, evidence));
+    reflexes
+}
+
+fn evidence(name: &Value, version: &Value, summary: Summary, yaml: &str) -> Value {
+    json!({
+        "note": "run_reflex runs this saved workflow with the call's input: judge what its calls will do with it",
+        "name": name, "version": version, "writes": summary.writes, "open_world": summary.open_world,
+        "yaml": crate::activity::clip(yaml, YAML_CHARS),
+    })
 }

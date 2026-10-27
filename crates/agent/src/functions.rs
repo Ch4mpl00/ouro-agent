@@ -767,8 +767,7 @@ async fn start_reflex(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
             task: &ctx.task_path,
             invocation: &ctx.idempotency_key,
         };
-        let mut reflexes = crate::guard::Reflexes::default();
-        reflexes.0.insert(crate::guard::key(&call), (resolution.summary, Value::Null));
+        let reflexes = crate::reflexes::call_reflexes(&engine, &call, &resolution).await;
         let verdict = match reviewed {
             false => None,
             true => crate::agent::call_verdict(&engine, &live, &at, &args, &call, &reflexes).await?,
