@@ -1,9 +1,14 @@
 // Design 08: the built-in `telegram` wrapper around a loop. A Telegram
 // signal routes to the wrapper, which opens the 👀 bubble, starts the loop
-// as its owned child (`start_loop`, the delivery tools excluded, a status
-// observer on every step), joins it, composes the reply from what the loop
-// did and sends it through the guard, then clears the bubble. The loop does
-// not know it runs inside a Telegram flow.
+// as its owned child (the delivery tools excluded, a status observer on
+// every step), joins it, composes the reply from what the loop did and sends
+// it through the guard, then clears the bubble. The loop does not know it
+// runs inside a Telegram flow.
+//
+// Design 09: the wrapper starts its loop with the engine's `start_child {
+// name, host: inherit, input: { request } }` (ouro 0.4): the child's host
+// data is the wrapper's, byte-equal, and its parameters are its request,
+// prepared once by the first host function that serves it and stored.
 mod support;
 use agent::{
     db::TraceStore,
@@ -195,6 +200,7 @@ const SKILLS: &[(&str, &str)] = &[
     ("wide", "---\ntools: *\n---\nWIDE"),
     ("worker", "---\ntools: *\n---\nWORKER"),
     ("scheduler", "---\ntools: *\n---\nSCHEDULER"),
+    ("child", "---\ntools: [t1]\n---\nCHILD V1"),
 ];
 
 const MESSAGE: &str = "Telegram message in chat -10042 (forum topic thread_id=7).\nText: \"go ahead\"";
@@ -215,6 +221,15 @@ fn configure(
     api: &Arc<GuardApi>,
     engine_skills: &[&str],
 ) -> impl FnOnce(&mut agent::agent::EngineDeps) + use<> {
+    configure_gated(mcp, api, engine_skills, None)
+}
+
+fn configure_gated(
+    mcp: &Arc<Tg>,
+    api: &Arc<GuardApi>,
+    engine_skills: &[&str],
+    gate: Option<Arc<SkillGate>>,
+) -> impl FnOnce(&mut agent::agent::EngineDeps) + use<> {
     let (mcp, api) = (mcp.clone(), api.clone());
     let skills: Vec<String> = engine_skills.iter().map(|s| (*s).to_owned()).collect();
     move |deps| {
@@ -222,6 +237,52 @@ fn configure(
         deps.skills = skills;
         deps.decisions = Some(agent::decisions::decision_client("guard-test".into(), api));
         deps.env = agent::session::EnvConfig { user_email: None, telegram_chat_id: Some("999".into()) };
+        if let Some(gate) = gate {
+            deps.skill_store = Arc::new(GatedSkills { inner: deps.skill_store.clone(), gate });
+        }
+    }
+}
+
+// The skill store, with a crash in the first read of one skill: the process
+// dies while a loop's preparation reads its skills, before it is stored.
+struct SkillGate {
+    name: &'static str,
+    crash: Mutex<Option<CancellationToken>>,
+    // The engine whose shutdown ends the hanging read.
+    engine: Mutex<Option<Arc<agent::agent::Engine>>>,
+}
+
+impl SkillGate {
+    fn new(name: &'static str, crash: CancellationToken) -> Arc<SkillGate> {
+        Arc::new(SkillGate { name, crash: Mutex::new(Some(crash)), engine: Mutex::new(None) })
+    }
+}
+
+struct GatedSkills {
+    inner: Arc<dyn agent::skills::SkillStore>,
+    gate: Arc<SkillGate>,
+}
+
+#[async_trait]
+impl agent::skills::SkillStore for GatedSkills {
+    async fn read_skill(&self, name: &str) -> anyhow::Result<Option<agent::skills::SkillFile>> {
+        let crash = if name == self.gate.name { self.gate.crash.lock().unwrap().take() } else { None };
+        if let Some(stop) = crash {
+            let engine = self.gate.engine.lock().unwrap().clone().expect("the gated engine");
+            stop.cancel();
+            engine.stopping().cancelled().await;
+            return Err(agent::errors::aborted());
+        }
+        self.inner.read_skill(name).await
+    }
+    async fn read_patch(&self, name: &str) -> anyhow::Result<Option<String>> {
+        self.inner.read_patch(name).await
+    }
+    async fn save_skill(&self, name: &str, content: &str) -> anyhow::Result<agent::skills::Written> {
+        self.inner.save_skill(name, content).await
+    }
+    async fn list_skills(&self) -> anyhow::Result<Vec<agent::skills::SkillEntry>> {
+        self.inner.list_skills().await
     }
 }
 
@@ -238,12 +299,25 @@ fn setup(turns: Vec<Message>, reply: Value) -> Setup {
 }
 
 fn setup_with(turns: Vec<Message>, reply: Value, label: &str, engine_skills: &[&str]) -> Setup {
+    setup_gated(turns, reply, label, engine_skills, None)
+}
+
+fn setup_gated(
+    turns: Vec<Message>,
+    reply: Value,
+    label: &str,
+    engine_skills: &[&str],
+    gate: Option<Arc<SkillGate>>,
+) -> Setup {
     let events: Events = Default::default();
     let model = Model::new(turns, reply, events.clone());
     let mcp = Arc::new(Tg { events, ..Default::default() });
     let api = Arc::new(GuardApi::default());
     *api.label.lock().unwrap() = Some(label.into());
-    let f = fixture_on(model.clone(), &[], SKILLS, configure(&mcp, &api, engine_skills));
+    let f = fixture_on(model.clone(), &[], SKILLS, configure_gated(&mcp, &api, engine_skills, gate.clone()));
+    if let Some(gate) = gate {
+        *gate.engine.lock().unwrap() = Some(f.engine.clone());
+    }
     let supervisor = create_supervisor(f.engine.clone());
     Setup { f, mcp, api, model, supervisor }
 }
@@ -359,9 +433,15 @@ async fn a_telegram_signal_runs_the_wrapper_its_loop_and_sends_the_composed_repl
     let (wrapper, inner) = wrapper_and_loop(&s.f.engine, 42).await;
     assert_eq!(inner.admission.name, "agent-loop");
     assert_eq!(wrapper.outcome, Some(agent::runs::Status::Completed(json!("Готово: t1"))));
-    let host = inner.admission.host().unwrap();
+    // Its host data is the wrapper's, unchanged; its parameters are its
+    // request, prepared once by its first host function and stored (design 09).
+    assert_eq!(inner.admission.host(), wrapper.admission.host(), "inherited unchanged");
+    assert!(inner.admission.input["request"].is_object(), "{}", inner.admission.input);
+    let prepared = s.f.db.prepared_loop(&inner.admission.id).unwrap().expect("its stored preparation");
+    assert!(prepared.loaded.contains(&"telegram".to_owned()), "{:?}", prepared.loaded);
+    let host = serde_json::to_value(&prepared.host).unwrap();
     let conversation = json!({"chatId":"-10042","messageThreadId":7});
-    assert_eq!(host["conversation"], conversation, "inherited from the wrapper's host data");
+    assert_eq!(host["conversation"], conversation, "from the wrapper's host data");
     assert_eq!(host["confirm"], conversation);
     assert_eq!(host["signal_id"], 42);
     assert_eq!(host["preset"], "smart");
@@ -476,13 +556,16 @@ async fn an_excluded_tool_never_runs_and_workers_inherit_the_exclusion() {
     s.supervisor.shutdown().await;
 }
 
-fn probe_route(name: &str, source: &str, with: &str) -> String {
+// A wrapper of the agent's: it starts `child` with `request` as its child
+// (`start_child`, the wrapper's host data inherited), joins it and answers
+// `status|output or error|transcript`.
+fn probe_route(name: &str, source: &str, child: &str, request: &str) -> String {
     format!(
         r#"document: {{dsl: '1.0.4', namespace: agent, name: {name}, version: '1.0.0', metadata: {{route: {{when: {{source: {source}}}}}}}}}
 do:
   - loop:
-      call: start_loop
-      with: {with}
+      call: start_child
+      with: {{ name: {child}, host: inherit, input: {{ request: {request} }} }}
       export: {{ as: '${{ $context + {{ loop: . }} }}' }}
   - wait:
       listen: {{ to: {{ one: {{ with: {{ type: '${{ $context.loop.done }}' }} }} }} }}
@@ -495,7 +578,7 @@ do:
       with: {{ ref: '${{ $context.loop }}' }}
       export: {{ as: '${{ $context + {{ work: . }} }}' }}
   - answer:
-      set: '${{ {{ output: ($context.outcome.status + "|" + ($context.outcome.output // "") + "|" + $context.work) }} }}'
+      set: '${{ {{ output: ($context.outcome.status + "|" + ($context.outcome.output // $context.outcome.error.detail // $context.outcome.error.title // "") + "|" + $context.work) }} }}'
 output: {{ as: '${{ .output }}' }}
 "#
     )
@@ -512,15 +595,28 @@ fn probe_signal(source: &str, id: i64) -> PendingSignal {
     }
 }
 
+// `status|output or error|transcript`, split.
+fn probed(output: &str) -> (String, String, String) {
+    let (status, rest) = output.split_once('|').unwrap_or_else(|| panic!("{output}"));
+    let (answer, work) = rest.split_once('|').unwrap_or_else(|| panic!("{output}"));
+    (status.into(), answer.into(), work.into())
+}
+
 // The maintainer's requirement: a wrapper starts any named loop, an agent's
 // own (a copy of agent-loop) included, and reads its outcome and transcript
 // back. The exclusion narrows, never widens: a skill that allows only t1
 // keeps edit_telegram_message out without naming it, and a `tools: *` skill
 // loaded by the loop's setup brings everything back but the excluded name.
+// Design 09, test 2: the wrapper passes the gate and a dry run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_wrapper_starts_a_custom_loop_and_reads_its_outcome_and_transcript() {
     let s = setup_with(
-        vec![calls(&[("t1", json!({"n":7}))]), assistant("custom done"), assistant("setup done")],
+        vec![
+            calls(&[("t1", json!({"n":7}))]),
+            assistant("custom done"),
+            assistant("setup done"),
+            assistant("dry done"),
+        ],
         reply("unused"),
         "allow",
         &[],
@@ -532,20 +628,25 @@ async fn a_wrapper_starts_a_custom_loop_and_reads_its_outcome_and_transcript() {
         1,
     );
     activate_definition(&s.f.engine, "setup-loop", &setup_loop).await;
-    let narrow = r#"{ input: '${ $context.signal.content }', loop: research-loop, skills: [narrow], preset: base, exclude_tools: [send_telegram_message], system: [PROBE LINE] }"#;
-    activate_definition(&s.f.engine, "probe-a", &probe_route("probe-a", "probe-a", narrow)).await;
-    let wide = r#"{ input: '${ $context.signal.content }', loop: setup-loop, skills: [narrow], exclude_tools: [edit_telegram_message] }"#;
-    activate_definition(&s.f.engine, "probe-b", &probe_route("probe-b", "probe-b", wide)).await;
+    let narrow = r#"{ input: '${ $context.signal.content }', skills: [narrow], preset: base, exclude_tools: [send_telegram_message], system: [PROBE LINE] }"#;
+    let probe_a = probe_route("probe-a", "probe-a", "research-loop", narrow);
+    agent::flows::gate(&s.f.engine, "probe-a", &probe_a).unwrap_or_else(|e| panic!("{e:#}"));
+    activate_definition(&s.f.engine, "probe-a", &probe_a).await;
+    let wide = r#"{ input: '${ $context.signal.content }', skills: [narrow], exclude_tools: [edit_telegram_message] }"#;
+    activate_definition(&s.f.engine, "probe-b", &probe_route("probe-b", "probe-b", "setup-loop", wide)).await;
 
     let output = s.supervisor.run_signal(&probe_signal("probe-a", 50)).await.unwrap();
-    let (status, rest) = output.split_once('|').unwrap();
-    let (answer, work) = rest.split_once('|').unwrap();
-    assert_eq!((status, answer), ("completed", "custom done"));
+    let (status, answer, work) = probed(&output);
+    assert_eq!((status.as_str(), answer.as_str()), ("completed", "custom done"));
     assert!(work.contains("t1") && work.contains("probe the loop"), "{work}");
     assert!(!work.contains("NARROW") && !work.contains("PROBE LINE"), "no instructions in the transcript: {work}");
     let route = named(&s.f.engine, "signal:50", "probe-a").await.pop().unwrap();
     let inner = children(&s.f.engine, &route.admission.id).await;
     assert_eq!(inner.iter().map(|c| c.admission.name.as_str()).collect::<Vec<_>>(), ["research-loop"]);
+    assert_eq!(inner[0].admission.host(), route.admission.host(), "the wrapper's host data, unchanged");
+    let prepared = s.f.db.prepared_loop(&inner[0].admission.id).unwrap().expect("its stored preparation");
+    assert_eq!(prepared.host.workflow, "research-loop");
+    assert_eq!(prepared.host.preset, "base");
     assert!(s.model.loop_system(0).contains("PROBE LINE"));
     let tools = s.model.loop_tools(0);
     assert!(tools.contains(&"t1".to_owned()));
@@ -556,18 +657,84 @@ async fn a_wrapper_starts_a_custom_loop_and_reads_its_outcome_and_transcript() {
     let tools = s.model.loop_tools(2);
     assert!(tools.contains(&"send_telegram_message".to_owned()), "the tools: * skill widened: {tools:?}");
     assert!(!tools.contains(&"edit_telegram_message".to_owned()), "the exclusion survived the setup: {tools:?}");
+
+    // A draft of the wrapper dry-runs: its child inherits in the dry run's store.
+    let draft = probe_route("probe-d", "probe-d", "research-loop", narrow);
+    let args = json!({"name":"probe-d","definition":draft});
+    agent::flows::tool(&s.f.engine, "save_workflow", args.as_object().unwrap()).await.unwrap();
+    let trace = s.f.engine.deps.tracer.trace(agent::tracing::TraceStart {
+        id: "author".into(),
+        name: "author".into(),
+        ..Default::default()
+    });
+    let scope: agent::tracing::Scope = trace.clone();
+    let args = json!({"name":"probe-d","signal":{"source":"probe-d","content":"probe the loop"}});
+    let report =
+        agent::sandbox::try_signal(&s.f.engine, args.as_object().unwrap(), &context(), &scope, &CancellationToken::new())
+            .await
+            .unwrap();
+    let report: Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(report["status"], "completed", "{report:#}");
+    assert!(report["output"].as_str().unwrap().starts_with("completed|dry done|"), "{report:#}");
     s.supervisor.shutdown().await;
 }
 
-// A name that is no tool fails the start: a typo must not leave the tool in.
+// Design 09, test 4: a bad request is a mistake the child reports, not a
+// refused start: the child faults with the reason, the wrapper's
+// loop_outcome reads it, and no loop turn runs. A name that is no tool fails
+// it too: a typo must not leave the tool in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_unknown_excluded_name_fails_the_start() {
+async fn a_bad_request_faults_the_child_and_the_wrapper_reads_why() {
     let s = setup_with(vec![], reply("unused"), "allow", &[]);
-    let typo = r#"{ input: x, exclude_tools: [send_telegram_mesage] }"#;
-    activate_definition(&s.f.engine, "probe-c", &probe_route("probe-c", "probe-c", typo)).await;
-    let error = s.supervisor.run_signal(&probe_signal("probe-c", 52)).await.unwrap_err();
-    assert!(format!("{error:#}").contains("send_telegram_mesage"), "{error:#}");
+    let cases = [
+        ("probe-c", r#"{ input: x, exclude_tools: [send_telegram_mesage] }"#, "send_telegram_mesage"),
+        ("probe-e", r#"{ input: x, preset: no-such-preset }"#, "no-such-preset"),
+        ("probe-f", r#"{ input: x, skills: [no-such-skill] }"#, "no-such-skill"),
+        ("probe-g", r#"{ input: x, exclude_tool: [t1] }"#, "exclude_tool"),
+        ("probe-h", r#"{ skills: [narrow] }"#, "input"),
+    ];
+    for (i, (name, request, reason)) in cases.into_iter().enumerate() {
+        activate_definition(&s.f.engine, name, &probe_route(name, name, "agent-loop", request)).await;
+        let output = s.supervisor.run_signal(&probe_signal(name, 52 + i as i64)).await.unwrap();
+        let (status, error, _) = probed(&output);
+        assert_eq!(status, "faulted", "{name}: {output}");
+        assert!(error.contains(reason), "{name}: {error}");
+    }
     assert!(s.model.loop_seen.lock().unwrap().is_empty(), "no loop ran");
+    s.supervisor.shutdown().await;
+}
+
+// Design 09, the deny set: a loop's exclusions are its parent's plus its
+// request's, so a wrapper started under a narrowed one cannot hand its own
+// loop the tool back by leaving it out of the request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_nested_loop_keeps_its_parents_exclusions() {
+    let s = setup_with(vec![assistant("nested done")], reply("unused"), "allow", &["orchestrator"]);
+    let nest = r#"document: {dsl: '1.0.4', namespace: agent, name: nest, version: '1.0.0'}
+do:
+  - loop:
+      call: start_child
+      with: { name: agent-loop, host: inherit, input: { request: { input: '${ $context.request.input }', exclude_tools: [edit_telegram_message] } } }
+      export: { as: '${ $context + { loop: . } }' }
+  - wait:
+      listen: { to: { one: { with: { type: '${ $context.loop.done }' } } } }
+  - outcome:
+      call: loop_outcome
+      with: { ref: '${ $context.loop }' }
+  - answer:
+      set: '${ { output: .output } }'
+output: { as: '${ .output }' }
+"#;
+    activate_definition(&s.f.engine, "nest", nest).await;
+    let request = r#"{ input: '${ $context.signal.content }', exclude_tools: [send_telegram_message] }"#;
+    activate_definition(&s.f.engine, "probe-n", &probe_route("probe-n", "probe-n", "nest", request)).await;
+    let output = s.supervisor.run_signal(&probe_signal("probe-n", 70)).await.unwrap();
+    assert!(output.starts_with("completed|nested done|"), "{output}");
+    let tools = s.model.loop_tools(0);
+    assert!(tools.contains(&"t1".to_owned()), "{tools:?}");
+    for name in ["send_telegram_message", "edit_telegram_message"] {
+        assert!(!tools.contains(&name.to_owned()), "{name} offered to the nested loop: {tools:?}");
+    }
     s.supervisor.shutdown().await;
 }
 
@@ -853,5 +1020,179 @@ async fn an_agent_copy_of_the_wrapper_passes_the_gate_and_a_dry_run() {
     assert_eq!(report["status"], "completed", "{report:#}");
     assert_eq!(report["output"], "dry reply", "{report:#}");
     assert!(replies(&s.mcp).is_empty(), "a dry run's writes are mocked");
+    s.supervisor.shutdown().await;
+}
+
+// ── design 09: preparation, tracing, a refused start ────────────────────────
+
+const CHILD_REQUEST: &str =
+    r#"{ input: '${ $context.signal.content }', skills: [child], exclude_tools: [send_telegram_message] }"#;
+
+fn write_skill(f: &Fixture, name: &str, body: &str) {
+    std::fs::write(f.root.path().join("skills.default").join(format!("{name}.md")), body).unwrap();
+}
+
+// The guard's questions so far, as text.
+fn guard_questions(api: &GuardApi) -> Vec<String> {
+    api.requests.lock().unwrap().iter().map(|r| r.to_string()).collect()
+}
+
+// Test 3: the process dies while the child's preparation reads its skill
+// (nothing stored), and again in the middle of the loop, with the skill
+// changed in between. The loop keeps the first stored preparation: the same
+// instructions, tools and exclusions, and the guard judges by the child's
+// skill as it was prepared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restarts_never_change_a_prepared_loop() {
+    let crash = CancellationToken::new();
+    let gate = SkillGate::new("child", crash.clone());
+    let s = setup_gated(
+        vec![calls(&[("t1", json!({"n":1}))]), calls(&[("t1", json!({"n":2}))]), assistant("child done")],
+        reply("unused"),
+        "allow",
+        &[],
+        Some(gate.clone()),
+    );
+    activate_definition(&s.f.engine, "probe-r", &probe_route("probe-r", "probe-r", "agent-loop", CHILD_REQUEST)).await;
+    let supervisor = s.supervisor.clone();
+    let first = tokio::spawn(async move { supervisor.run_signal(&probe_signal("probe-r", 80)).await });
+    crash.cancelled().await;
+    s.supervisor.shutdown().await;
+    let _ = first.await;
+    let route = named(&s.f.engine, "signal:80", "probe-r").await.pop().expect("the wrapper");
+    let child = children(&s.f.engine, &route.admission.id).await.pop().expect("its loop");
+    assert!(s.f.db.prepared_loop(&child.admission.id).unwrap().is_none(), "died before it was stored");
+    assert!(s.model.loop_seen.lock().unwrap().is_empty());
+
+    // The second process prepares it and dies in the loop's first call.
+    let stop = CancellationToken::new();
+    *s.mcp.crash_on_t1.lock().unwrap() = Some(stop.clone());
+    let second = reopen(
+        &s.f,
+        s.model.clone(),
+        Arc::new(ouro_runtime::durable::SystemClock),
+        configure_gated(&s.mcp, &s.api, &[], Some(gate.clone())),
+    );
+    second.ready().await.unwrap();
+    stop.cancelled().await;
+    let stored = s.f.db.prepared_loop(&child.admission.id).unwrap().expect("stored by the second process");
+    second.shutdown().await;
+    assert_eq!(s.model.loop_seen.lock().unwrap().len(), 1);
+    let questions = guard_questions(&s.api);
+    assert!(questions.iter().any(|q| q.contains("CHILD V1")), "the guard judges by the child's skill: {questions:?}");
+
+    // The skill changes; the third process finishes the loop as prepared.
+    write_skill(&s.f, "child", "---\ntools: *\n---\nCHILD V2");
+    let asked = guard_questions(&s.api).len();
+    let third = reopen(
+        &s.f,
+        s.model.clone(),
+        Arc::new(ouro_runtime::durable::SystemClock),
+        configure_gated(&s.mcp, &s.api, &[], Some(gate)),
+    );
+    third.ready().await.unwrap();
+    let (status, answer, _) = match ended(&third, "signal:80").await {
+        agent::runs::Status::Completed(output) => probed(output.as_str().unwrap()),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!((status.as_str(), answer.as_str()), ("completed", "child done"));
+    assert_eq!(s.f.db.prepared_loop(&child.admission.id).unwrap(), Some(stored.clone()), "the first one stays");
+    assert_eq!(s.model.loop_system(1), s.model.loop_system(0));
+    assert!(s.model.loop_system(1).contains("CHILD V1") && !s.model.loop_system(1).contains("CHILD V2"));
+    assert_eq!(s.model.loop_tools(1), s.model.loop_tools(0), "the same tools after the skill changed");
+    assert!(!s.model.loop_tools(1).contains(&"edit_telegram_message".to_owned()));
+    let later = guard_questions(&s.api)[asked..].to_vec();
+    assert!(!later.is_empty(), "the second t1 was reviewed");
+    for question in &later {
+        assert!(question.contains("CHILD V1") && !question.contains("CHILD V2"), "{question}");
+    }
+    let mut excluded = stored.host.exclude_tools.clone();
+    excluded.sort();
+    assert_eq!(excluded, ["send_telegram_message"]);
+    third.shutdown().await;
+}
+
+// Test 5: the child's trace nests under the wrapper's span, its work under
+// its own span, and a re-dispatch of its preparation (the process died in
+// it) opens no second span.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_childs_trace_nests_under_its_wrapper_once() {
+    let crash = CancellationToken::new();
+    let gate = SkillGate::new("child", crash.clone());
+    let s = setup_gated(
+        vec![calls(&[("t1", json!({"n":1}))]), assistant("traced done")],
+        reply("unused"),
+        "allow",
+        &[],
+        Some(gate.clone()),
+    );
+    activate_definition(&s.f.engine, "probe-t", &probe_route("probe-t", "probe-t", "agent-loop", CHILD_REQUEST)).await;
+    let supervisor = s.supervisor.clone();
+    let first = tokio::spawn(async move { supervisor.run_signal(&probe_signal("probe-t", 81)).await });
+    crash.cancelled().await;
+    s.supervisor.shutdown().await;
+    let _ = first.await;
+    let restarted = reopen(
+        &s.f,
+        s.model.clone(),
+        Arc::new(ouro_runtime::durable::SystemClock),
+        configure_gated(&s.mcp, &s.api, &[], Some(gate)),
+    );
+    restarted.ready().await.unwrap();
+    assert!(matches!(ended(&restarted, "signal:81").await, agent::runs::Status::Completed(_)));
+    restarted.shutdown().await;
+
+    let (_, observations) = s.f.db.get_trace("probe-t:81").unwrap().expect("the signal's trace");
+    let loops: Vec<_> = observations
+        .iter()
+        .filter(|o| o.name == "agent_loop" && o.meta("activity") == Some(&json!("loop")))
+        .collect();
+    assert_eq!(loops.len(), 1, "one span for the child: {:#?}", observations.iter().map(|o| &o.name).collect::<Vec<_>>());
+    let by_id: std::collections::HashMap<&str, &agent::trace_model::Observation> =
+        observations.iter().map(|o| (o.id.as_str(), o)).collect();
+    let ancestors = |id: &str| {
+        let mut chain = Vec::new();
+        let mut at = by_id.get(id).and_then(|o| o.parent_observation_id.clone());
+        while let Some(parent) = at {
+            let Some(o) = by_id.get(parent.as_str()) else { break };
+            chain.push(*o);
+            at = o.parent_observation_id.clone();
+        }
+        chain
+    };
+    let wrapper = ancestors(&loops[0].id)
+        .into_iter()
+        .find(|o| o.meta("activity") == Some(&json!("primary_loop")))
+        .expect("the wrapper's span above the child's");
+    assert_eq!(wrapper.meta("kind"), Some(&json!("route")));
+    assert_eq!(wrapper.meta("workflow"), Some(&json!("probe-t")));
+    let t1 = observations.iter().find(|o| o.name == "t1").expect("the loop's call");
+    assert!(ancestors(&t1.id).iter().any(|o| o.id == loops[0].id), "the loop's work nests under its span");
+}
+
+// Test 6: an operator paused agent-loop. The wrapper's start is refused, its
+// catch answers the user through the same reply (the refusal is the work it
+// composes from), and nothing starts in its place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paused_loop_is_refused_and_the_wrapper_answers_the_user() {
+    let s = setup(vec![], reply("Сейчас не могу: агент приостановлен"));
+    s.f.engine.ready().await.unwrap();
+    let request =
+        ouro_runtime::control::Request { id: "pause-loop".into(), actor: "operator".into(), reason: "test".into() };
+    s.f.engine.control.pause(&request, "agent-loop", "maintenance window").await.unwrap();
+    assert_eq!(s.supervisor.run_signal(&signal(42)).await.unwrap(), "Сейчас не могу: агент приостановлен");
+    let wrapper = named(&s.f.engine, "signal:42", "telegram").await.pop().expect("the wrapper");
+    let started = children(&s.f.engine, &wrapper.admission.id).await;
+    assert!(
+        started.iter().all(|c| c.admission.name == "guard"),
+        "only the reply's guard: {:?}",
+        started.iter().map(|c| &c.admission.name).collect::<Vec<_>>()
+    );
+    assert!(s.model.loop_seen.lock().unwrap().is_empty(), "no loop ran");
+    let composes = s.model.composes.lock().unwrap().clone();
+    assert_eq!(composes.len(), 1);
+    assert!(composes[0].contains("maintenance window"), "the refusal is in the work: {}", composes[0]);
+    assert_eq!(replies(&s.mcp).len(), 1);
+    assert_eq!(statuses(&s.mcp).last().unwrap()["text"], "");
     s.supervisor.shutdown().await;
 }
