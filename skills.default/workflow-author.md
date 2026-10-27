@@ -20,6 +20,9 @@ Specification definitions. You can author:
   change (rare).
 - **Scheduled pipelines**: fixed steps run when their scheduled task fires;
   model adapters such as `llm_compose` and `filter_relevant` provide judgement.
+- **Reflexes** (`document.metadata.reflex`): a small workflow that does one
+  finished thing, which every loop sees in a catalog and runs with
+  `run_reflex(name, input)`, and which other workflows compose ("Reflexes").
 
 The user can describe the desired behavior without naming workflows or OWF.
 "Fix the Telegram cycle", "show a status before the first model turn", and
@@ -269,8 +272,8 @@ minimum:
 1. Rename `document.name`, drop `metadata.ouro` (the breaker policy is the
    built-in's alone) and add `metadata.loop.description` and
    `metadata.route.when` (below). Keep the guarded round as it is: `turn`,
-   `start_guard`, the `round` (worker joins, `classify` → `tool_once` |
-   `tool_repeat`), `settle`.
+   `start_guard`, the `round` (worker and reflex joins, `classify` →
+   `tool_once` | `tool_repeat`), `settle`.
 2. Before the first turn, gather context with the steps you need, under one
    `if: '${ $context.signal != null }'`: a worker running the same loop has
    no signal and skips them (the route's input carries the signal). `signal_input` (the message with its source's
@@ -456,6 +459,69 @@ route to check that it still takes the default path.
 
 A completed try marks every draft whose runs all completed as tried;
 activation needs it.
+
+## Reflexes
+
+A reflex is a saved workflow that does one finished thing ("the news about
+X since a time"): the loops list the active ones in their instructions and
+run one with `run_reflex(name, input)`, and workflows compose them. It is an
+ordinary workflow with a declaration:
+
+- **The declaration.** `metadata.reflex`: `description` (what it does and
+  when to use it, one or two sentences: the catalog shows it), `input` (each
+  parameter and what it means; the YAML reads it as
+  `$workflow.input.<param>`) and `required`. Its output is the workflow's
+  output. Parameter names are identifiers (`env` and `request` are taken).
+  A reflex gets everything through its parameters: it never reads
+  `$workflow.input.env` (make the time or the chat a parameter). It is no
+  loop and no route.
+- **Its review follows what it does.** The runtime reads the YAML. MCP reads
+  of the agent's own stores, `llm_compose`, `filter_relevant`, `choose`,
+  `hash_value`, `child_outcome` and reflexes doing only that make a
+  closed-world read, which runs with no review. A read of the internet or
+  any write (an MCP write, `set_memory`, any other host function, a child
+  whose name is an expression) goes through the guard like the same call
+  made by the model, with your YAML and the call's input as its evidence:
+  keep it plain. The catalog marks a reflex that writes `[writes]`.
+- **Calling one from YAML.** `start_child { name, host: inherit, input }`
+  with its parameters as `input`, `listen` on its `done`, then
+  `child_outcome { id, key }`: `Completed` holds its output, `Faulted` its
+  error. Name it literally, so what it does stays known.
+- **Trying it.** `try_workflow(name, input: {…})` runs a reflex draft on its
+  parameters, checked against its declaration (`drafts` for reflexes it
+  starts). Only a completed try on accepted input marks it tried. Activate
+  it after the user confirms, as any workflow; only an active, tried reflex
+  is listed, and a loop keeps the catalog it started with.
+- **How it runs.** A call runs the active version of that moment, and the
+  start is its effect: a restart joins the run, never starts another. A
+  paused or tripped reflex is an error reply; nothing runs in its place.
+
+A read reflex calling another (`news-window` lists the news of a window):
+
+```yaml
+document:
+  dsl: '1.0.4'
+  namespace: agent
+  name: news-about
+  version: '1.0.0'
+  metadata:
+    reflex:
+      description: The news about a topic since a time. Use it before searching the news by hand.
+      input: { topic: what the news is about, since: the window's start (ISO 8601) }
+      required: [topic, since]
+do:
+  - window:
+      call: start_child
+      with: { name: news-window, host: inherit, input: { since: '${ $workflow.input.since }', query: '${ $workflow.input.topic }' } }
+      export: { as: '${ $context + { child: . } }' }
+  - wait:
+      listen: { to: { one: { with: { type: '${ $context.child.done }' } } } }
+  - outcome:
+      call: child_outcome
+      with: { id: '${ $context.child.id }', key: '${ $context.child.key }' }
+output:
+  as: '${ .Completed }'
+```
 
 ## The language
 
