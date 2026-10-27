@@ -25,8 +25,9 @@ Specification definitions. You can author:
   `run_reflex(name, input)`, and which other workflows compose ("Reflexes").
 
 The user can describe the desired behavior without naming workflows or OWF.
-"Fix the Telegram cycle", "show a status before the first model turn", and
-"use another cycle for peer signals" are workflow-authoring requests.
+"Change how messages from a channel are handled", "show a status before the
+first model turn" and "use another cycle for one source's signals" are
+workflow-authoring requests.
 Skills provide model instructions; explicit workflow steps and switches
 establish execution order and exit conditions. Loops and dispatcher
 overrides need no cron task. For a runtime change follow the procedure and
@@ -181,9 +182,8 @@ judge. Build the pipeline the task needs from these parts, no more:
   into its prompt in full, and pass the data in `input`. Leave `preset`
   out for what the user reads (the default `compose`, the writing model);
   `base` for mechanical reshaping.
-- **Delivery.** `send_telegram_message` to
-  `$workflow.input.env.telegramChatId` unless the user named another chat;
-  never write a chat id into the definition.
+- **Delivery.** To the user's default chat, which the input's `env` carries,
+  unless the user named another; never write a chat id into the definition.
 - **Bookkeeping last.** Stamp a watermark or append to a journal only after
   the delivery it stands for succeeded, so a failure cannot mark unsent
   data as handled. Data a run read and judged not worth sending is handled
@@ -291,15 +291,18 @@ minimum:
    only for the model's calls: they carry the guard's verdict.
 5. Exit rules decide on `agent_settle`'s `outcomes` (below).
 
+Its function and skill names (`channel-rules`, `show_status`, `send_reply`)
+stand for real ones; it shows the shape of a routed loop, not one to copy.
+
 ```yaml
 document:
   dsl: '1.0.4'
   namespace: agent
-  name: chat-loop
+  name: channel-loop
   version: '1.0.0'
   metadata:
-    loop: { description: Telegram conversations; ends on a reply to the chat. }
-    route: { when: { source: [telegram, telegram_button] } }
+    loop: { description: One channel's conversations; ends on a reply to the conversation. }
+    route: { when: { source: [channel] } }
 input:
   from: '${ . + { i: 0 } }'
 do:
@@ -311,13 +314,13 @@ do:
         - setup:
             call: loop_setup
             with:
-              skills: [telegram]
+              skills: [channel-rules]
               input: '${ $context.input }'
-              system: '${ [ $context.activity, "Delivery: reply with send_telegram_message to the current chat." ] }'
+              system: '${ [ $context.activity, "Delivery: reply with send_reply to the current conversation." ] }'
             export: { as: '${ $context + { messages: .messages, memory: .memory } }' }
         - status:
             if: '${ $context.conversation != null }'
-            call: telegram_send_status
+            call: show_status
             with: { id: '${ "status:" + ($context.signal.id | tostring) }', text: 👀, chatId: '${ $context.conversation.chatId }' }
   - turn:
       call: agent_turn
@@ -331,7 +334,7 @@ do:
       call: start_guard
       with: { calls: '${ $context.calls }', i: '${ $context.i }' }
       export: { as: '${ $context + { guard_run: .run, guarded: (.guarded // []) } }' }
-  # round: as in agent-loop, unchanged (workers, classify, tool_once / tool_repeat)
+  # round: as in agent-loop, unchanged (workers, reflexes, classify, tool_once / tool_repeat)
   - settle:
       call: agent_settle
       with: { calls: '${ $context.calls }', results: '${ . }', memory: '${ $context.memory }' }
@@ -339,13 +342,13 @@ do:
   - next:
       switch:
         - replied:
-            when: '${ $context.conversation as $c | $c != null and any(.outcomes[]; .ok and .name == "send_telegram_message" and (.arguments.chatId | tostring) == ($c.chatId | tostring)) }'
+            when: '${ $context.conversation as $c | $c != null and any(.outcomes[]; .ok and .name == "send_reply" and (.arguments.chatId | tostring) == ($c.chatId | tostring)) }'
             then: clear
         - finished: { when: '${ .finished }', then: clear }
         - more: { then: turn }
   - clear:
       if: '${ $context.signal != null and $context.conversation != null }'
-      call: telegram_send_status
+      call: show_status
       with: { id: '${ "status:" + ($context.signal.id | tostring) }', text: '', chatId: '${ $context.conversation.chatId }' }
 ```
 
@@ -360,7 +363,7 @@ conversation (else the default chat) as its confirmation target;
 session context, the signal's source and its env addendum; its input carries
 `signal` (`id`, `source`, `content`, `env_context`, `payload`, `button`,
 `created_at`) besides `messages`, `memory`, `env`, `conversation` and
-`confirm`. Telegram uses the default path until a matching loop is active.
+`confirm`. A signal no active route matches takes the default path.
 A route set aside (its breaker, an operator's pause, a tool it calls gone)
 gives way to the next matching route, then to the default path, which is
 told why. A workflow that calls the dispatcher's own functions
@@ -420,9 +423,8 @@ route to check that it still takes the default path.
 - **The signal.** Model it on a real one; never invent its shape.
   `try_workflow(name: "signal", signal: {})` succeeds without a draft or a
   run: `status: "signal_types"`, with the types and latest real examples in
-  `signal_types`. Copy a matching example's form (a
-  Telegram signal's header line with the chat and thread, a peer's
-  "Message from …, thread N"), change only the text. A source that is not
+  `signal_types`. Copy a matching example's form (its
+  header lines as they are), change only the text. A source that is not
   one of them is refused.
 - **What is real.** Model turns (they cost what a real signal costs), reads,
   the internet and MCP's reads included, and the guard (its rules and its
@@ -462,20 +464,21 @@ activation needs it.
 
 ## Reflexes
 
-A reflex is a saved workflow that does one finished thing ("the news about
-X since a time"): the loops list the active ones in their instructions and
+A reflex is a saved workflow that does one finished thing ("the records of a
+window that pass given criteria"): the loops list the active ones in their instructions and
 run one with `run_reflex(name, input)`, and workflows compose them. It is an
 ordinary workflow with a declaration:
 
 - **One step, not a scenario.** A reflex is one meaningful, reusable step
-  ("find the news on a topic since a time and keep the relevant ones"), not
-  a whole task ("the twice-daily digest"). A scenario is a workflow that
+  ("read a window of records and keep the ones that pass given criteria"),
+  not a whole task ("the morning report"). A scenario is a workflow that
   composes reflexes and adds its own constants and order. Before saving a
   reflex, ask whether a different task could call it as it is; if it only
   fits one task, split it or make it a plain workflow.
   - **Everything specific is a parameter.** The filter's criteria, the
     window, the source, the query, the chat: the caller passes them, so one
-    reflex serves the digest, a question in chat and a research task. Bake
+    reflex serves a scheduled report, a question in a conversation and a
+    research task. Bake
     in no stream name, memory key, chat id or task's rules; the scenario
     that calls it supplies them from its own YAML.
   - **It returns data and leaves the rest to its caller.** A reflex that
@@ -515,31 +518,33 @@ ordinary workflow with a declaration:
   start is its effect: a restart joins the run, never starts another. A
   paused or tripped reflex is an error reply; nothing runs in its place.
 
-A read reflex calling another (`news-window` lists the news of a window):
+A read reflex calling another; `records-window` stands for a reflex that
+reads the records of a window:
 
 ```yaml
 document:
   dsl: '1.0.4'
   namespace: agent
-  name: news-about
+  name: relevant-records
   version: '1.0.0'
   metadata:
     reflex:
-      description: The news about a topic since a time. Use it before searching the news by hand.
-      input: { topic: what the news is about, since: the window's start (ISO 8601) }
-      required: [topic, since]
+      description: The records of a time window that pass the given criteria. Use it instead of reading and filtering them by hand.
+      input: { since: the window's start (ISO 8601), criteria: what to keep (rules an item passes or fails) }
+      required: [since, criteria]
 do:
   - window:
       call: start_child
-      with: { name: news-window, host: inherit, input: { since: '${ $workflow.input.since }', query: '${ $workflow.input.topic }' } }
+      with: { name: records-window, host: inherit, input: { since: '${ $workflow.input.since }' } }
       export: { as: '${ $context + { child: . } }' }
   - wait:
       listen: { to: { one: { with: { type: '${ $context.child.done }' } } } }
   - outcome:
       call: child_outcome
       with: { id: '${ $context.child.id }', key: '${ $context.child.key }' }
-output:
-  as: '${ .Completed }'
+  - keep:
+      call: filter_relevant
+      with: { items: '${ .Completed.items }', prompt: '${ $workflow.input.criteria }' }
 ```
 
 ## The language
@@ -692,24 +697,24 @@ Functions besides the ones `workflow_functions` lists from the tools:
   document: { dsl: '1.0.4', namespace: agent, name: example, version: '1.0.0' }
   do:
     - gather:
-        call: search_news
-        with: { query: rust }
+        call: read_records
+        with: { since: '${ $workflow.input.env.now }' }
         export: { as: '${ $context + { items: .items } }' }
     - worth_sending:
         call: choose
         with:
-          question: Is there anything in input.items that is worth a digest?
-          options: { digest: Something new and significant, quiet: Nothing new or nothing significant }
+          question: Is there anything in input.items that is worth reporting?
+          options: { report: Something new and significant, quiet: Nothing new or nothing significant }
           input: { items: '${ $context.items }' }
           min_confidence: 0.6
-          default: digest
+          default: report
     - route:
         switch:
           - quiet: { when: '${ .choice == "quiet" }', then: end }
-          - digest: { then: compose }
+          - report: { then: compose }
     - compose:
         call: llm_compose
-        with: { prompt: Write the digest., input: { items: '${ $context.items }' } }
+        with: { prompt: Write the report., input: { items: '${ $context.items }' } }
   ```
 - `set_memory { key, value }` — stamps one of the two watermarks above.
 - `hash_value { value }` — SHA-256 of canonical JSON (object key order does
@@ -730,7 +735,7 @@ reply: always check `ok` before treating a write as successful.
 ## Reference
 
 Every construct of the table in one definition. Its function names stand
-for real ones (`read_records`, `read_sent`, `remember_sent`); it shows the
+for real ones (`read_records`, `read_sent`, `deliver`, `remember_sent`); it shows the
 shape of each construct, not a pipeline to copy.
 
 ```yaml
@@ -773,8 +778,8 @@ do:
       export: { as: '${ $context + { text: . } }' }
   - send:
       if: '${ $context.text != "" }'
-      call: send_telegram_message
-      with: { chatId: '${ $workflow.input.env.telegramChatId }', text: '${ $context.text }' }
+      call: deliver
+      with: { text: '${ $context.text }' }
   - remember:
       if: '${ $context.text != "" }'
       call: remember_sent
