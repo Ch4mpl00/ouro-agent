@@ -1023,7 +1023,7 @@ struct SearchParams {
     k: Option<usize>,
     /// Restrict results to one source.
     source: Option<KnownSource>,
-    /// Only items with posted_at > this ISO timestamp.
+    /// Only items with posted_at > this ISO timestamp. Default: 24 hours before untilISO (or now), so the search covers the last day; pass an earlier one to search further back.
     #[serde(rename = "sinceISO")]
     since_iso: Option<String>,
     /// Only items with posted_at <= this ISO timestamp.
@@ -1086,6 +1086,18 @@ fn build_filter(
     })
 }
 
+/// How far back search_news looks when the caller names no start.
+pub const SEARCH_DEFAULT_WINDOW: chrono::TimeDelta = chrono::TimeDelta::hours(24);
+
+// A search always has a start, so it reads only the window asked for: the
+// exact ordering a source filter keeps (`search_ordering`) compares the
+// query with every row the filter leaves, and over the whole store that is
+// every embedding (minutes on prod). Without `sinceISO` the window is the
+// day before `untilISO` (or `now`).
+pub fn search_since(filter: &Filter, now: DateTime<Utc>) -> DateTime<Utc> {
+    filter.since.unwrap_or_else(|| filter.until.unwrap_or(now) - SEARCH_DEFAULT_WINDOW)
+}
+
 fn chunks_in_range(chunks: Option<usize>) -> bool {
     chunks.is_none_or(|c| (2..=8).contains(&c))
 }
@@ -1104,13 +1116,14 @@ async fn search_news_response(news: &NewsRepository, params: SearchParams) -> an
         (None, Some(queries)) => (queries, true),
         _ => return Ok(json!({ "error": "Pass exactly one of `query` or `queries`." })),
     };
-    let filter = build_filter(
+    let mut filter = build_filter(
         params.source,
         params.since_iso.as_deref(),
         params.until_iso.as_deref(),
         params.as_of_iso.as_deref(),
         params.channel,
     )?;
+    filter.since = Some(search_since(&filter, Utc::now()));
     let results = news.search(&queries, params.k.unwrap_or(10), &filter, annotate_matches).await?;
     Ok(match params.chunks {
         Some(count) => json!({ "count": results.len(), "chunks": split_chunks(&results, count) }),
@@ -1191,7 +1204,9 @@ async fn fetch_article_response(news: &NewsRepository, fetcher: &ArticleFetcher,
         url: Some(url.to_owned()),
         body: article.text.clone(),
         metadata,
-        posted_at: article.published_at,
+        // An undated article is dated when it was fetched: a search covers a
+        // window of posted_at (`search_since`), which an undated row is never in.
+        posted_at: article.published_at.or_else(|| Some(Utc::now())),
     };
     let mut response = fetched_article_json(&article, source);
     // The read succeeded, so the text still comes back; the reply says the
@@ -1225,7 +1240,11 @@ impl McpTools {
             and already de-duplicated across the batch (an item's `distance` \
             is its best match across the facets, `matchedQueries` lists which \
             facets surfaced it), so do NOT re-query per facet or re-dedup. \
-            Pass exactly one of `query` or `queries`."
+            Pass exactly one of `query` or `queries`.\n\n\
+            It searches one time window: from `sinceISO` (default: the 24 \
+            hours before `untilISO`, or before now) to `untilISO`. To search \
+            further back, pass an earlier `sinceISO`; a wider window is \
+            slower."
     )]
     async fn search_news(&self, Parameters(params): Parameters<SearchParams>) -> ToolResult {
         let invalid_query = params.query.as_deref().is_some_and(str::is_empty);
