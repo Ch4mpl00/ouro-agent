@@ -1,7 +1,7 @@
 // Judge an agent run per node from the terminal.
 //
-//   judge [--provider openai|codex] [--dump] <traceId>
-//   judge [--provider openai|codex] [--dump] --recent [N]
+//   judge [--provider openai] [--dump] <traceId>
+//   judge [--provider openai] [--dump] --recent [N]
 //
 // --dump writes the per-node judge materials (no LLM call) for the in-session
 // judge-trace skill to /tmp/judge-dump-<traceId>.md.
@@ -131,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let Some(trace_id) = cli.args.first().filter(|a| !a.starts_with("--")) else {
         eprintln!(
-            "usage: judge [--provider openai|codex] [--dump] <traceId>  |  judge [--provider openai|codex] [--dump] --recent [N]"
+            "usage: judge [--provider openai] [--dump] <traceId>  |  judge [--provider openai] [--dump] --recent [N]"
         );
         std::process::exit(1);
     };

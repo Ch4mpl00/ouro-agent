@@ -12,7 +12,6 @@ Group=ouro
 WorkingDirectory=/opt/ouro/app
 EnvironmentFile=/etc/ouro/agent.env
 ExecStartPre=/usr/bin/python3 /opt/ouro/app/probe.py mcp
-ExecStartPre=/usr/bin/python3 /opt/ouro/app/probe.py codex
 ExecStart=/opt/ouro/bin/agent-supervisor
 Restart=always
 RestartSec=3

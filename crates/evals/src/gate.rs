@@ -217,9 +217,9 @@ async fn judge_outputs(
     Ok(acc)
 }
 
-// Run the gate for ONE node. Sequential by design — codex is the bottleneck and
+// Run the gate for ONE node. Sequential by design — the judge is the bottleneck and
 // shares the user's ChatGPT quota. `stored` are the node's existing corpus
-// scores (the free "before"); only REGENERATION + after-judging cost codex calls.
+// scores (the free "before"); only REGENERATION + after-judging cost judge calls.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_node_gate(
     backend: &dyn JudgeBackend,

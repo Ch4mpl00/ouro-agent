@@ -1,11 +1,6 @@
 // The actual reqwest adapter against loopback HTTP: one retry layer, exact
 // request headers/body and cancellation. No credentials or external services.
-use agent::{
-    codex::{Codex, code_agent},
-    models::ReasoningEffort,
-    providers::*,
-};
-use async_trait::async_trait;
+use agent::{models::ReasoningEffort, providers::*};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -79,24 +74,4 @@ async fn actual_http_wait_is_cancelled() {
     cancel.cancel();
     assert!(tokio::time::timeout(std::time::Duration::from_secs(2), task).await.unwrap().unwrap().is_err());
     assert_eq!(server.seen.lock().unwrap().len(), 1);
-}
-struct RecordingCodex(Mutex<Vec<Value>>);
-#[async_trait]
-impl Codex for RecordingCodex {
-    async fn run(&self, request: Value, _: &CancellationToken) -> anyhow::Result<String> {
-        self.0.lock().unwrap().push(request);
-        Ok("  42\n".into())
-    }
-}
-#[tokio::test]
-async fn code_agent_uses_the_verbatim_framing_and_sandbox() {
-    let recorder = Arc::new(RecordingCodex(Default::default()));
-    let codex: agent::codex::SharedCodex = recorder.clone();
-    assert_eq!(code_agent(&codex, "sum", Some("input"), &CancellationToken::new()).await.unwrap(), "42");
-    let seen = recorder.0.lock().unwrap();
-    assert_eq!(seen[0]["sandbox"], "workspace-write");
-    assert_eq!(seen[0]["approvalPolicy"], "never");
-    assert_eq!(seen[0]["timeoutMs"], 120000);
-    assert_eq!(seen[0]["input"], "input");
-    assert!(seen[0]["prompt"].as_str().unwrap().ends_with("Task:\nsum"));
 }

@@ -10,8 +10,6 @@ workspace:
   signal at a time from MCP, loads the matching skill, runs one session, and
   stops. Knows nothing about MCP internals — only the actions exposed by the
   MCP protocol.
-- **`crates/codex`** (`codex-service`) — the sandbox the agent's `code_agent`
-  tool and the codex judge run `codex exec` in, behind a small HTTP front.
 - **`crates/evals`** — the evaluation tooling around the agent: the per-node
   judge (CLI + `judge-worker`), judge-noise calibration, the improver gate and
   the closed-loop improver (`improve-worker`), trace replay, the news-filter
@@ -30,7 +28,7 @@ and runs it durably: runs, versions, the breaker, triggers, dry runs.
 The server and the agent communicate strictly through the MCP protocol;
 neither depends on the other's crate (only tests do: `crates/mcp/tests` drive
 the agent's client and skill loader against the real server). Deployed as
-three native systemd services; Postgres, Codex and tunnel-client stay in
+three native systemd services; Postgres and tunnel-client stay in
 Docker (`docker-compose.yml`). See `docs/operations.md`, Deploy, for the current layout.
 
 ## The main principle: the agent's freedom and generality
@@ -233,8 +231,8 @@ mcp-tools/
 ├── .env.mcp                MCP container env (integration creds)
 ├── .env.agent              agent container env (model keys, presets)
 ├── .env.example, .env.mcp.example, .env.agent.example
-├── docker-compose.yml      postgres, codex, tunnel-client (native app: systemd)
-├── Dockerfile              cached cross-builder + explicit Codex runtime image
+├── docker-compose.yml      postgres, tunnel-client (native app: systemd)
+├── Dockerfile              cached cross-builder for the native binaries
 ├── scripts/deploy.sh       changed binaries via rsync; tests/docs skip deploy
 ├── deploy/systemd/         native services and container startup ordering
 ├── skills.default/         shipped skills (git-tracked, read-only fallback)
@@ -291,7 +289,6 @@ mcp-tools/
     │   ├── src/{tracing,langfuse,local_recorder,trace_model}.rs  Tracer, Langfuse, mirror
     │   ├── src/db.rs                       agent.db: memory KV, trace mirror, judgements
     │   └── migrations/                     agent.db migrations (drizzle journal, unchanged)
-    ├── codex/                              codex-service (POST /run, GET /health)
     └── evals/
         ├── src/                            judge, noise, gate, improver, optimizer, scores, Langfuse API
         ├── src/bin/                        judge, judge-worker, judge-noise, judge-gate, improve,
@@ -655,7 +652,6 @@ image they are on `PATH`.
   before the session starts (memory, news, skills, `ask_ouro`).
 - `agent-supervisor` — the supervisor (long-running loop);
   `agent-supervisor --check-config` validates env and exits.
-- `codex-service` — the codex sandbox service.
 - `mcp-setup` — create/migrate `mcp_state` without starting the server.
 - `gmail-auth` — one-time OAuth bootstrap. Writes to `mcp_state` (needs
   `DATABASE_URL`). `gmail-list-unread` — debug helper.
@@ -674,7 +670,7 @@ image they are on `PATH`.
   inline embed).
 - `eval-snapshot`, `eval-rag`, `eval-inspect` — the RAG eval harness over
   `crates/mcp/eval/fixtures`.
-- `judge <traceId>` / `judge --recent N` (`--provider openai|codex`,
+- `judge <traceId>` / `judge --recent N` (`--provider openai`,
   `--dump` writes the materials for the judge-trace skill) — judge a run per
   node. `judge-noise` measures the judge's σ into `noise-baseline.json`;
   `judge-gate` A/Bs a candidate patch; `improve` runs one improver cycle;
@@ -729,20 +725,17 @@ container environment at migration. They are authoritative afterwards;
 local env files are never uploaded. `AGENT_DB_PATH` points at the migrated
 sqlite database; its TS-era default path is still used locally.
 
-Postgres and Codex remain containerized, with the existing `pg-data` and
-`codex-home` volumes. Codex uses a stable runtime image and the deployed
-`codex-service` executable through a read-only bind mount. Use
-`scripts/deploy.sh --runtime-image` only for runtime dependencies; ordinary
-Rust deployments never send the whole image. Evaluation workers remain off;
+Postgres remains containerized, with the existing `pg-data` volume. Rust
+deployments never send a Docker image. Evaluation workers remain off;
 evaluation binaries can still be run explicitly as CLIs.
 
-`ouro-containers` starts Postgres and Codex on boot. `ouro-tunnel-client`
+`ouro-containers` starts Postgres on boot. `ouro-tunnel-client`
 waits for the restricted native endpoint before starting the tunnel
 container, and retries if the daemon exits. The daemon still uses the
 server checkout's `.env.mcp`; it uses host networking to reach
 `http://127.0.0.1:3001/mcp`. Credentials are mapped inside its entrypoint
 as before. Native MCP binds loopback with `MCP_HOST=127.0.0.1`; Postgres
-and Codex publish only on loopback. Neither MCP endpoint is public.
+publishes only on loopback. Neither MCP endpoint is public.
 
 The restricted endpoint keeps `MCP_NO_POLLERS=1`,
 `MCP_TOOLSETS=news-read,telegram-send,skills,memory,peer`, actor `chatgpt`,

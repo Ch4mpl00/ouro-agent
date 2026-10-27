@@ -9,7 +9,7 @@
 //   improve --skill news-digest --axis coverage [--cluster 3] [--holdout 3]
 //           [--samples 2] [--absMax 0.6] [--bar 0.75] [--holdoutMin 0.85]
 //           [--recentDays 14] [--k 2] [--budget 8] [--maxAttempts 1]
-//           [--guard-faithfulness] [--provider codex] [--apply]
+//           [--guard-faithfulness] [--provider openai] [--apply]
 use agent::db::AgentDb;
 use agent::skills::FsSkillStore;
 use evals::backend::{JudgeProvider, judge_backend};
@@ -21,7 +21,7 @@ use evals::schema::JUDGE_PROMPT_VERSION;
 use evals::sigma::load_sigma_baseline;
 use evals::source::local_with_langfuse;
 
-const USAGE: &str = "usage: improve --skill <skill> --axis <axis> [--cluster N] [--holdout M] [--samples K] [--absMax 0.6] [--bar 0.75] [--holdoutMin 0.85] [--recentDays 14] [--k 2] [--budget 8] [--maxAttempts 1] [--guard-faithfulness] [--provider codex|openai] [--apply]";
+const USAGE: &str = "usage: improve --skill <skill> --axis <axis> [--cluster N] [--holdout M] [--samples K] [--absMax 0.6] [--bar 0.75] [--holdoutMin 0.85] [--recentDays 14] [--k 2] [--budget 8] [--maxAttempts 1] [--guard-faithfulness] [--provider openai] [--apply]";
 
 // JS `Number(v) || fallback`: unparsable or zero falls back.
 fn or(v: &str, fallback: f64) -> f64 {
@@ -32,7 +32,7 @@ fn parse_args(argv: &[String]) -> anyhow::Result<ImproveCycleOpts> {
     let mut o = ImproveCycleOpts {
         skill: String::new(),
         axis: NoiseAxis::Coverage,
-        provider: JudgeProvider::Codex,
+        provider: JudgeProvider::OpenAi,
         cluster: 3,
         holdout: 3,
         samples: 2,
@@ -101,7 +101,6 @@ async fn main() -> anyhow::Result<()> {
     let backend = judge_backend(opts.provider)?;
     let judge_model = match opts.provider {
         JudgeProvider::OpenAi => "openai".to_owned(),
-        JudgeProvider::Codex => std::env::var("CODEX_JUDGE_MODEL").unwrap_or_else(|_| "codex".into()),
     };
     let (sigma, _) = load_sigma_baseline(&root, &judge_model, JUDGE_PROMPT_VERSION);
     let axis_sigma = sigma.get(&opts.axis).copied();

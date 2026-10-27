@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use support::{NoCodex, PersistLog};
+use support::PersistLog;
 use tokio_util::sync::CancellationToken;
 
 const MCP_TOOLS: [&str; 3] = ["send_telegram_message", "recall", "list_news"];
@@ -86,7 +86,6 @@ fn engine(model: Model, tools: &[&str], store: Arc<FsSkillStore>) -> Arc<agent::
         skill_store: store,
         memory: Arc::new(PersistLog::default()),
         tracer: Arc::new(NullTracer),
-        codex: Arc::new(NoCodex),
         decisions: Some(support::allow_guard()),
         env: Default::default(),
         db: agent::db::AgentDb::open(":memory:").unwrap(),

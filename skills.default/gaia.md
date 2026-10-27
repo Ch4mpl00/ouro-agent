@@ -18,8 +18,8 @@ fully, then emit only the answer.
 - Most tasks are **search → read → reason**. Use `tavily__tavily_search` to
   find sources and `tavily__tavily_extract` to read a specific URL. Many
   facts are URL-addressable directly (e.g. a Wikipedia revision by date).
-- For any exact calculation, counting, or data-table work, delegate to a
-  `code_agent` step — do not do arithmetic in your head.
+- For any exact calculation, counting, or data-table work, go step by step
+  with the extracted data and re-check the result before answering.
 - Chase the *specific* fact the question asks for. GAIA answers are precise
   (a number, a name, a short list), never a paragraph.
 

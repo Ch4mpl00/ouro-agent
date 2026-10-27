@@ -499,7 +499,7 @@ impl Trace for NestedTrace {
 }
 
 // The engine of one try (decision 1): the real engine's providers, presets,
-// skills, codex and decisions; the dry stores; a tracer nested under `root`;
+// skills and decisions; the dry stores; a tracer nested under `root`;
 // the builder session's env (R-L4); an in-memory agent.db holding the MCP
 // tool snapshot and `workflow_meta`; and the guard store with the drafts.
 fn sandbox_engine(
@@ -530,7 +530,6 @@ fn sandbox_engine(
         skill_store: Arc::new(DrySkills(deps.skill_store.clone())),
         memory: Arc::new(DryMemory { real: deps.memory.clone(), kept: Mutex::default() }),
         tracer: Arc::new(Nested(root)),
-        codex: deps.codex.clone(),
         decisions: deps.decisions.clone(),
         schedule: Arc::new(Schedules::new(Arc::new(DryFires(deps.schedule.fires.clone())))),
         env,

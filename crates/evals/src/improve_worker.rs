@@ -45,17 +45,17 @@ pub struct ImproveWorkerOpts {
     pub holdout_min: f64,
     pub max_attempts: usize,
     pub guard_faithfulness: bool,
-    // Cost ceiling: at most this many improve cycles (the codex-heavy step) per
+    // Cost ceiling: at most this many improve cycles (the judge-heavy step) per
     // tick. Monitoring/auto-revert is free and runs for ALL pairs every tick;
     // only AUTHORING is capped. Pairs are picked least-recently-attempted first
-    // (round-robin), so an unattended tick can't blow the shared codex quota.
+    // (round-robin), so an unattended tick can't blow the judge budget.
     pub max_cycles_per_tick: usize,
 }
 
 impl ImproveWorkerOpts {
     pub fn from_env() -> ImproveWorkerOpts {
         ImproveWorkerOpts {
-            provider: JudgeProvider::from_env(),
+            provider: JudgeProvider::OpenAi,
             apply: bool_env("IMPROVE_APPLY", false),
             // Daily; the cap below bounds per-tick cost.
             poll_interval_ms: num_env("IMPROVE_POLL_INTERVAL_MS", 86_400_000.0) as u64,
@@ -70,7 +70,7 @@ impl ImproveWorkerOpts {
             abs_max: num_env("IMPROVE_ABS_MAX", 0.6),
             bar: num_env("IMPROVE_BAR", 0.75),
             holdout_min: num_env("IMPROVE_HOLDOUT_MIN", 0.85),
-            // 1 = no informed retry (retry doubles codex).
+            // 1 = no informed retry (retry doubles judge calls).
             max_attempts: num_env("IMPROVE_MAX_ATTEMPTS", 1.0) as usize,
             guard_faithfulness: bool_env("IMPROVE_GUARD_FAITHFULNESS", false),
             max_cycles_per_tick: num_env("IMPROVE_MAX_CYCLES_PER_TICK", 1.0) as usize,
@@ -233,7 +233,7 @@ async fn tick(deps: &WorkerDeps<'_>, opts: &ImproveWorkerOpts) -> anyhow::Result
         }
     }
 
-    // Monitor every pair first — free (no codex): auto-revert a ship whose live
+    // Monitor every pair first — free (no judge calls): auto-revert a ship whose live
     // trend fell, settle a held one. Watching/Reverted pairs skip authoring.
     let mut eligible = Vec::new();
     for p in pairs {
@@ -243,7 +243,7 @@ async fn tick(deps: &WorkerDeps<'_>, opts: &ImproveWorkerOpts) -> anyhow::Result
         }
     }
 
-    // Author for at most max_cycles_per_tick pairs — the codex-heavy step —
+    // Author for at most max_cycles_per_tick pairs — the judge-heavy step —
     // picking the least-recently-attempted first so coverage rotates and no
     // single tick can spike the shared quota.
     eligible.sort_by(|a, b| a.last_attempt_at.cmp(&b.last_attempt_at));

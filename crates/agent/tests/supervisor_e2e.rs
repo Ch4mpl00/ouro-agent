@@ -32,7 +32,6 @@ use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
-use support::NoCodex;
 use tokio_util::sync::CancellationToken;
 
 const CHAT: i64 = 42;
@@ -378,7 +377,6 @@ async fn run(plans: &[(i64, Plan)]) -> Run {
         skill_store: skill_store.clone(),
         memory: db.clone(),
         tracer: Arc::new(local_recorder_tracer(db.clone())),
-        codex: Arc::new(NoCodex),
         decisions: Some(support::allow_guard()),
         env: agent::session::EnvConfig { user_email: None, telegram_chat_id: Some(CHAT.to_string()) },
         db: (*db).clone(),

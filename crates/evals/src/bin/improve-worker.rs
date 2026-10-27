@@ -28,7 +28,6 @@ async fn main() -> anyhow::Result<()> {
     let backend = judge_backend(opts.provider)?;
     let judge_model = match opts.provider {
         JudgeProvider::OpenAi => "openai".to_owned(),
-        JudgeProvider::Codex => std::env::var("CODEX_JUDGE_MODEL").unwrap_or_else(|_| "codex".into()),
     };
     let (sigma, found) = load_sigma_baseline(&root, &judge_model, JUDGE_PROMPT_VERSION);
     if !found {

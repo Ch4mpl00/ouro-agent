@@ -1,13 +1,12 @@
 // A judge backend runs ONE structured-output completion: a system instruction
 // + user content + a strict JSON schema → the raw parsed JSON object, which the
 // caller validates. This is the SINGLE primitive that differs between judge
-// providers (OpenAI chat vs the codex service). Everything provider-agnostic —
+// providers (today only OpenAI chat). Everything provider-agnostic —
 // rubric selection, prompt building, the scorecard+faithfulness split — lives
 // in node_judge.rs and depends only on this trait.
 
 use std::sync::Arc;
 
-use agent::codex::{SharedCodex, codex_client};
 use agent::providers::{HttpApi, JsonApi, OPENAI_BASE_URL, RetryOpts, retry_on_transient};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -34,31 +33,19 @@ pub type SharedBackend = Arc<dyn JudgeBackend>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JudgeProvider {
     OpenAi,
-    Codex,
 }
 
 impl JudgeProvider {
     pub fn as_str(self) -> &'static str {
         match self {
             JudgeProvider::OpenAi => "openai",
-            JudgeProvider::Codex => "codex",
         }
     }
 
     pub fn parse(value: &str) -> anyhow::Result<JudgeProvider> {
         match value {
             "openai" => Ok(JudgeProvider::OpenAi),
-            "codex" => Ok(JudgeProvider::Codex),
-            _ => anyhow::bail!("--provider must be openai or codex"),
-        }
-    }
-
-    // JUDGE_PROVIDER: "openai" picks OpenAI, anything else codex.
-    pub fn from_env() -> JudgeProvider {
-        if std::env::var("JUDGE_PROVIDER").as_deref() == Ok("openai") {
-            JudgeProvider::OpenAi
-        } else {
-            JudgeProvider::Codex
+            _ => anyhow::bail!("--provider must be openai"),
         }
     }
 }
@@ -114,48 +101,9 @@ impl JudgeBackend for OpenAiBackend {
     }
 }
 
-pub struct CodexBackend {
-    codex: SharedCodex,
-    timeout_ms: u64,
-}
-
-impl CodexBackend {
-    pub fn new(codex: SharedCodex) -> CodexBackend {
-        let timeout_ms =
-            std::env::var("CODEX_JUDGE_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(10 * 60_000);
-        CodexBackend { codex, timeout_ms }
-    }
-}
-
-#[async_trait]
-impl JudgeBackend for CodexBackend {
-    async fn complete(&self, req: &JudgeCompletion<'_>) -> anyhow::Result<Value> {
-        let request = json!({
-            "prompt": format!("{}\n\nReturn only the final JSON object matching the provided schema.", req.system),
-            "input": req.user,
-            "schema": req.schema,
-            "sandbox": "read-only",
-            "approvalPolicy": "never",
-            "timeoutMs": self.timeout_ms,
-            "config": {
-                "web_search": "disabled",
-                "features.shell_tool": false,
-                "features.multi_agent": false,
-            },
-        });
-        let content = self.codex.run(request, &CancellationToken::new()).await?;
-        Ok(serde_json::from_str(content.trim())?)
-    }
-}
-
-pub fn codex_from_env() -> SharedCodex {
-    codex_client(&std::env::var("CODEX_URL").unwrap_or_else(|_| "http://localhost:3010".into()))
-}
-
 // Resolve a provider name to its backend.
 pub fn judge_backend(provider: JudgeProvider) -> anyhow::Result<SharedBackend> {
     Ok(match provider {
-        JudgeProvider::Codex => Arc::new(CodexBackend::new(codex_from_env())),
         JudgeProvider::OpenAi => Arc::new(OpenAiBackend::from_env()?),
     })
 }

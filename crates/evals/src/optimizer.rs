@@ -813,14 +813,6 @@ use agent::models::{PresetName, Presets};
 use agent::providers::{ChatProvider, ProviderKind};
 use agent::skills::SkillStore;
 
-struct NoCode;
-#[async_trait]
-impl agent::codex::Codex for NoCode {
-    async fn run(&self, _: Value, _: &CancellationToken) -> anyhow::Result<String> {
-        anyhow::bail!("code execution is not a workbench capability")
-    }
-}
-
 /// Disposable runtime stores. No MCP connection, persistent agent.db or saved
 /// production workflow is opened. Uses the normal function/compose/loop code.
 pub fn isolated_engine(
@@ -838,7 +830,6 @@ pub fn isolated_engine(
         mcp,
         memory: Arc::new(agent::db::AgentDb::open(":memory:")?),
         tracer: Arc::new(agent::tracing::NullTracer),
-        codex: Arc::new(NoCode),
         decisions: None,
         env: Default::default(),
         db: agent::db::AgentDb::open(":memory:")?,

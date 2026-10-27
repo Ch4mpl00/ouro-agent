@@ -5,7 +5,6 @@
 // .claude/tasks/done/rust-agent.md and docs/designs.
 
 pub mod agent;
-pub mod codex;
 pub mod db;
 pub mod decisions;
 pub mod errors;

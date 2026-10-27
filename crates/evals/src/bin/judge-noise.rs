@@ -6,7 +6,7 @@
 //
 //   judge-noise <traceId...>            # nodes from these traces
 //   judge-noise --recent 5              # nodes from 5 latest Langfuse traces
-//   judge-noise --provider codex --runs 5 <traceId>
+//   judge-noise --provider openai --runs 5 <traceId>
 //   judge-noise --model gpt-5.4 --out path.json <traceId>
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,10 +41,8 @@ fn or(v: &str, fallback: f64) -> f64 {
 }
 
 fn parse_args(argv: &[String]) -> anyhow::Result<Cli> {
-    // codex is the PROD judge and the cheap one (shared ChatGPT quota, not the
-    // expensive gpt-5.4 API) — default to it; --provider openai to override.
     let mut cli = Cli {
-        provider: JudgeProvider::Codex,
+        provider: JudgeProvider::OpenAi,
         runs: 5,
         concurrency: 1,
         model: None,
@@ -135,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
     };
     if trace_ids.is_empty() {
         eprintln!(
-            "usage: judge-noise [--provider openai|codex] [--runs K] [--concurrency C] [--model label] [--out file] (<traceId...> | --recent N)"
+            "usage: judge-noise [--provider openai] [--runs K] [--concurrency C] [--model label] [--out file] (<traceId...> | --recent N)"
         );
         std::process::exit(1);
     }
@@ -165,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
         cli.concurrency
     );
     // Re-judge each node K times. One flat task list keeps the concurrency cap
-    // honest across nodes; codex callers leave concurrency=1 to respect the quota.
+    // honest across nodes; callers leave concurrency=1 to respect rate limits.
     let tasks: Vec<&NodeMaterial> = nodes.iter().flat_map(|n| std::iter::repeat_n(n, cli.runs)).collect();
     let total = tasks.len();
     let done = AtomicUsize::new(0);
@@ -206,7 +204,6 @@ async fn main() -> anyhow::Result<()> {
         .collect();
     let model = cli.model.clone().unwrap_or_else(|| match cli.provider {
         JudgeProvider::OpenAi => JUDGE_MODEL.into(),
-        JudgeProvider::Codex => std::env::var("CODEX_JUDGE_MODEL").unwrap_or_else(|_| "codex".into()),
     });
     let report = summarize_noise(
         NoiseContext {

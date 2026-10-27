@@ -8,7 +8,6 @@ tools: *
 Complete the task in the parent's brief. Use the supplied working-memory
 inputs first and fetch missing evidence with the available tools. Explicitly
 read full stored results when a preview is insufficient for your own work.
-Use `code_agent` for computations that require exact arithmetic or parsing.
 
 Return the complete result as your final assistant answer. The runtime
 saves it and gives the parent a short answer or a memory reference according

@@ -1,5 +1,5 @@
 // fetch_url: GET a page and return its RAW body (HTML / JSON / text) — for
-// parsing a <table> in a code_agent step, or a URL the search provider can't
+// parsing a <table>, or a URL the search provider can't
 // retrieve. Complements tavily_extract, which returns cleaned prose.
 //
 // Sections:
@@ -285,7 +285,7 @@ impl McpTools {
         title = "Fetch a URL's raw content",
         description = "GET a URL and return its RAW body (HTML / JSON / text). Use when you \
             already have a link and need the raw content — e.g. the raw HTML to \
-            parse a <table> in a code_agent step, or a page the search/extract \
+            parse a <table>, or a page the search/extract \
             provider can't retrieve. Complements tavily_extract (which returns \
             cleaned prose). Follows redirects; binary content (PDF/image/zip) is \
             not returned — use read_pdf for PDFs."

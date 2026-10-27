@@ -122,29 +122,6 @@
   {
     "type": "function",
     "function": {
-      "name": "code_agent",
-      "description": "Delegate a computational / coding task to a sandboxed code agent (Codex). It writes AND runs code (Python with pandas/openpyxl, or Node) and returns ONLY the final result. Use it for anything that must be COMPUTED rather than recalled or written by an LLM: exact arithmetic, counting, date/time math, statistics, parsing or aggregating CSV/Excel/JSON data, string/data transformations, regex extraction, unit conversions. Do NOT use it for web access, reasoning, or composing prose — only code/computation. State the task precisely and say exactly what the output should be (e.g. 'return just the number'). Put any data the code needs in `data` — it is delivered to the program on stdin (for a binary file like .xlsx, base64-encode it and say so in the task).",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "task": {
-            "type": "string",
-            "description": "Precise description of the computation to perform and the exact output expected. E.g. 'Sum the `total` column of the CSV on stdin; return only the rounded integer.'"
-          },
-          "data": {
-            "type": "string",
-            "description": "Optional input data delivered to the program on stdin (CSV/JSON/numbers/text, or base64 for a binary file). Omit if the task is self-contained."
-          }
-        },
-        "required": [
-          "task"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
       "name": "read_skill",
       "description": "Read a skill to use its instructions in this session. Returns effective live/default text with improver patches, tools and content_hash. Does not execute the skill or grant additional tool permissions. Pass expected_hash from find_skills to reject a changed version. If required tools are unavailable here, delegate to a worker with that named skill. Follow effectiveInstructions; editableBody is the unpatched body for revisions and tools/routable are its metadata.",
       "parameters": {

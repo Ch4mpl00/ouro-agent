@@ -16,7 +16,7 @@ Environment files:
 | File | For | Notes |
 | --- | --- | --- |
 | `.env.mcp` (from `.env.mcp.example`) | `mcp-tools` and the CLIs | Integration credentials, `OPENAI_API_KEY` (embeddings, required), `DATABASE_URL`, `TAVILY_API_KEY`, tunnel keys |
-| `.env.agent` (from `.env.agent.example`) | `agent-supervisor` | Required: `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPEN_ROUTER_API_KEY`. Optional: `AGENT_*_MODEL`, `AGENT_DECISION_MODEL`, `LANGFUSE_*`, `CODEX_URL`, `TELEGRAM_DEFAULT_CHAT_ID` / `TELEGRAM_TOPICS_JSON` |
+| `.env.agent` (from `.env.agent.example`) | `agent-supervisor` | Required: `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPEN_ROUTER_API_KEY`. Optional: `AGENT_*_MODEL`, `AGENT_DECISION_MODEL`, `LANGFUSE_*`, `TELEGRAM_DEFAULT_CHAT_ID` / `TELEGRAM_TOPICS_JSON` |
 
 The server and the supervisor load only `./.env` from the working directory
 (they never search parent directories), plus the process environment. The
@@ -45,8 +45,6 @@ docker compose up -d postgres          # pgvector on 127.0.0.1:5432
   supervisor spawns `mcp-tools` itself (`MCP_STDIO_COMMAND`).
 - `MCP_PORT` defaults to 3000, and `MCP_ALLOWED_HOSTS` to
   `localhost,127.0.0.1,::1`.
-- `code_agent` needs a `codex-service` at `CODEX_URL` (default
-  `http://localhost:3010`).
 
 ### One-time credentials and CLIs
 
@@ -198,9 +196,8 @@ a cached Docker builder and sends the changed files with rsync.
 
 ```bash
 scripts/deploy.sh                    # deploy whatever the runtime changes since the server's revision need
-scripts/deploy.sh agent              # also force a service: mcp, mcp-tunnel, agent, codex, tunnel-client
+scripts/deploy.sh agent              # also force a service: mcp, mcp-tunnel, agent, tunnel-client
 scripts/deploy.sh mcp                # both MCP instances (one shared binary) + reconnect the agent
-scripts/deploy.sh --runtime-image    # rebuild and ship the Codex runtime image (Node/Python/Codex CLI)
 python3 scripts/test_deploy.py       # deployment regression checks, no Docker/SSH
 ```
 
@@ -215,10 +212,9 @@ server checks out exactly that commit.
 
 | Changed path | Builds | Restarts |
 | --- | --- | --- |
-| `Cargo.toml`, `Cargo.lock` | all three service binaries | everything |
+| `Cargo.toml`, `Cargo.lock` | both service binaries | everything |
 | `crates/mcp/{src,migrations,Cargo.toml}` | `mcp-tools` | `mcp`, `mcp-tunnel`, `agent` |
 | `crates/agent/{src,migrations,Cargo.toml}` | `agent-supervisor` | `agent` |
-| `crates/codex/…` | `codex-service` | `codex` |
 | `skills.default/` | — | the native services |
 | `crates/mcp/gateway.config.json` | — | `mcp`, `agent` |
 | `docker-compose.yml`, `deploy/systemd/` | — | containers + every service |
@@ -250,7 +246,7 @@ On the server, `deploy.py --apply`:
 7. Runs `agent-supervisor --check-config` as `ouro` with the real
    `/etc/ouro/agent.env`.
 8. Starts or restarts the containers and units.
-9. Probes MCP (`:3000`), restricted MCP (`:3001`) and Codex (`:3010`). The
+9. Probes MCP (`:3000`) and restricted MCP (`:3001`). The
    MCP probe is a sessionless `ping` answered with HTTP 422, so it can never
    evict the agent's session.
 10. Waits for the supervisor to log `mcp connected; skill validation passed`.
@@ -264,13 +260,13 @@ choice. To roll back, deploy an older commit.
 | What | Where |
 | --- | --- |
 | Native units (user `ouro`) | `ouro-mcp` (full MCP + the only Telegram poller), `ouro-mcp-tunnel` (restricted MCP), `ouro-agent` (supervisor) |
-| Container units | `ouro-containers` starts Postgres and Codex on boot. `ouro-tunnel-client` waits for the restricted endpoint, then runs the tunnel container and owns its retries. |
-| Executables | `/opt/ouro/bin` (`mcp-tools`, `agent-supervisor`, `codex-service`) |
+| Container units | `ouro-containers` starts Postgres on boot. `ouro-tunnel-client` waits for the restricted endpoint, then runs the tunnel container and owns its retries. |
+| Executables | `/opt/ouro/bin` (`mcp-tools`, `agent-supervisor`) |
 | App files | `/opt/ouro/app`: `skills.default`, `crates/mcp/gateway.config.json`, `probe.py`, and the symlinks `skills` → `/var/lib/ouro/skills` and `storage` → `/var/lib/ouro/storage` |
 | State | `/var/lib/ouro/agent` (agent.db, `AGENT_DB_PATH`, and the engine's `engine.db` beside it), `/var/lib/ouro/skills` (live skills), `/var/lib/ouro/storage` (attachments) |
 | Native env (root-only) | `/etc/ouro/agent.env`, `/etc/ouro/mcp.env`, `/etc/ouro/mcp-tunnel.env` |
 | Container env | The server checkout's `.env.mcp` (tunnel keys: `OPENAI_TUNNEL_ID`, `OPENAI_TUNNEL_API_KEY`) and `.env`/Compose interpolation (Postgres credentials) |
-| Docker volumes | `agent-helper_pg-data`, `agent-helper_codex-home`. Keep the compose project directory stable. |
+| Docker volumes | `agent-helper_pg-data`. Keep the compose project directory stable. |
 
 **Native env files are authoritative.** They were imported from the
 containers' effective environment at migration. Edit them on the server and
@@ -282,7 +278,6 @@ restart the affected unit. Local `.env.*` files are never uploaded.
 | --- | --- |
 | `127.0.0.1:3000` | MCP (`MCP_TOOLSETS` unset, actor `supervisor`, pollers on) |
 | `127.0.0.1:3001` | Restricted MCP (`MCP_NO_POLLERS=1`, `MCP_TOOLSETS=news-read,telegram-send,skills,memory,peer`, actor `chatgpt`, multi-session) |
-| `127.0.0.1:3010` | Codex service |
 | `127.0.0.1:5432` | Postgres |
 
 The tunnel container uses host networking to reach
@@ -298,15 +293,12 @@ live skills through the state symlink.
   `/etc/ouro/agent.env`. Restart the unit after editing.
 - **Gmail OAuth and the userbot session** live in `mcp_state`, not in env.
   `gmail-auth` and `userbot-auth` are not installed on the server (a deploy
-  ships only the three service binaries). Run them with a `DATABASE_URL`
+  ships only the two service binaries). Run them with a `DATABASE_URL`
   that reaches production Postgres, which listens on loopback only. One way
   is from the laptop through an SSH forward:
   `ssh -N -L 15432:127.0.0.1:5432 ouro`, then
   `DATABASE_URL=postgres://<user>:<password>@127.0.0.1:15432/<db> cargo run -p mcp-tools --bin gmail-auth`.
   The credentials are the ones in `/etc/ouro/mcp.env`.
-- **Codex** keeps its login in the `codex-home` volume. Bootstrap it once
-  from the server checkout:
-  `docker compose run --rm codex codex login --device-auth`.
 - **The tunnel** needs `OPENAI_TUNNEL_ID` and a restricted
   `OPENAI_TUNNEL_API_KEY` (Tunnels Read + Use) in the server checkout's
   `.env.mcp`.
@@ -320,14 +312,12 @@ migrates from the old all-Docker layout:
   containers' effective environment. The tunnel's file gets
   `MCP_TOOLSETS=news-read,telegram-send,skills,memory`; `peer` was added to
   it by hand later.
-- It tags the installed image as `ouro-codex-runtime:current`, so no image
-  is transferred.
 - It stops the legacy agent and MCP containers gracefully (closing sqlite
   and stopping the second poller). It copies `agent-data`, `agent-skills` and
   `mcp-storage` into `/var/lib/ouro`, checks agent.db with `PRAGMA
   quick_check`, and removes the old containers.
 
-Postgres and Codex keep their existing data volumes.
+Postgres keeps its existing data volume.
 
 ### On the server
 

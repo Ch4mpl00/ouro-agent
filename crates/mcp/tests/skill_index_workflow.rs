@@ -16,7 +16,7 @@ use agent::{
     skills::FsSkillStore,
     tracing::{Scope, TraceStart},
 };
-use agent_support::{NoCodex, Scripted, activate_definition, recording, task_context};
+use agent_support::{Scripted, activate_definition, recording, task_context};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -67,7 +67,6 @@ async fn sandbox(live: bool) {
         memory: db.clone(),
         schedule: Arc::new(agent::schedule::Schedules::new(db.clone())),
         tracer: tracer.clone(),
-        codex: Arc::new(NoCodex),
         decisions: None,
         env: Default::default(),
         db: (*db).clone(),
