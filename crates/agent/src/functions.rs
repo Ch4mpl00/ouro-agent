@@ -1,8 +1,9 @@
 // The functions the engine's runs call (docs/designs/03-runs-on-the-engine.md, A):
 // 1. the registry and typed outcomes; 2. MCP tools from the snapshot;
 // 3. loop functions; 4. context functions; 5. child starters and their
-// settlement, 5b. loops a workflow starts; 6. guard functions; 7. dispatcher functions; 8. workflow steps;
-// 8b. scheduled tasks; 9. the catalog authors see.
+// settlement; 5b. loops a workflow starts; 6. guard functions; 7. dispatcher
+// functions; 8. workflow steps; 8b. scheduled tasks; 9. the catalog authors
+// see.
 //
 // A handler reads its run tree (its own run, its ancestors, its descendants
 // and their records) through the call's run access (`FunctionContext::run`,
