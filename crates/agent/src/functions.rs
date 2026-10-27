@@ -66,6 +66,7 @@ pub fn registry(engine: Weak<Engine>, deps: &EngineDeps) -> Registry {
     }
     add(&mut registry, &engine, "start_guard", repeat, start_guard);
     add(&mut registry, &engine, "start_worker", repeat, start_worker);
+    add(&mut registry, &engine, "start_reflex", repeat, start_reflex);
     add(&mut registry, &engine, "primary_loop", repeat, primary_loop);
     add(&mut registry, &engine, "loop_outcome", repeat, loop_outcome);
     add(&mut registry, &engine, "loop_transcript", repeat, loop_transcript);
@@ -113,9 +114,19 @@ where
     F: Fn(Arc<Engine>, Value, FunctionContext) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<Value, FunctionError>> + Send + 'static,
 {
-    let engine = engine.clone();
+    let (engine, handler) = (engine.clone(), Arc::new(handler));
     let function = Function::new(name, json!({}), json!({}), move |args: Value, ctx: FunctionContext| {
-        let call = engine.upgrade().map(|engine| handler(engine, args, ctx));
+        let handler = handler.clone();
+        let call = engine.upgrade().map(|engine| async move {
+            // A run a workflow started with its parent's host data is
+            // anchored by the first agent function that serves it (R7).
+            if ctx.host().is_some()
+                && let Err(error) = anchor_inherited(&engine, &ctx, &ctx.run_id).await
+            {
+                eprintln!("[{}] anchoring its trace: {error:#}", ctx.run_id);
+            }
+            handler(engine, args, ctx).await
+        });
         async move {
             let Some(call) = call else { return Err(FunctionError::interrupted("the agent engine is closed")) };
             // A handler's panic is its call's failure: the engine worker
@@ -302,6 +313,15 @@ async fn classify(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Res
     let classified = async {
         live_loop(&engine, &ctx).await?;
         let call = tool_call(&args["call"])?;
+        // A reflex call's resolution, pinned (design 10, R1): recorded here
+        // too, where the journal keeps it beside the call.
+        if call.name == crate::reflexes::TOOL {
+            let reflex = match args["i"].as_u64().zip(args["index"].as_u64()) {
+                Some((i, index)) => Some(crate::reflexes::resolution(&engine, &ctx.run_id, i, index, &call).await?),
+                None => None,
+            };
+            return Ok(json!({"once": false, "reflex": reflex}));
+        }
         let once =
             crate::agent::runs_once(&engine, &call, args["guard_run"].as_str(), args["worker_run"].as_str().is_some())?;
         Ok(json!({"once": once}))
@@ -435,6 +455,48 @@ async fn unanchor(engine: &Engine, ctx: &FunctionContext, child: &str, error: &s
     }
 }
 
+/// Anchors run `run`'s trace if a workflow started it with its parent's host
+/// data (`start_child { host: inherit }`) and nothing anchored it yet
+/// (design 10, R7): a span named after its workflow under its parent's
+/// current span, insert-or-get, so a restart opens no second one. Its
+/// missing ancestors are anchored first, up to the first that has an
+/// anchor: a workflow between them that calls no agent function (only
+/// `start_child`, `listen`, `child_outcome`) is never served itself. A loop
+/// a workflow started is anchored by its preparation (§5b); a run that
+/// inherits nothing is left alone, and remembered as such.
+pub(crate) async fn anchor_inherited(engine: &Arc<Engine>, runs: &dyn RunReads, run: &str) -> anyhow::Result<()> {
+    if engine.scopes.current(run).is_some()
+        || engine.scopes.not_inherited(run)
+        || engine.deps.db.run_trace(run)?.is_some()
+    {
+        return Ok(());
+    }
+    let inherited = async {
+        let Some(saved) = runs.run(run).await? else { return anyhow::Ok(None) };
+        let Some(link) = saved.child.clone() else { return Ok(None) };
+        let Some(parent) = runs.run(&link.parent).await? else { return Ok(None) };
+        let inherits = saved.admission.host().is_some() && parent.admission.host() == saved.admission.host();
+        Ok(inherits.then_some((saved, parent)))
+    };
+    let Some((saved, parent)) = inherited.await? else {
+        engine.scopes.mark_not_inherited(run);
+        return Ok(());
+    };
+    if saved.admission.input.get("request").is_some_and(|r| !r.is_null()) {
+        engine.scopes.mark_not_inherited(run);
+        return Ok(());
+    }
+    Box::pin(anchor_inherited(engine, runs, &parent.admission.id)).await?;
+    let span = engine.scope_for(&parent.admission.id, &parent.admission.name).span(
+        SpanStart::new(saved.admission.name.clone(), SpanKind::Chain)
+            .input(saved.admission.input.clone())
+            .metadata(metadata(json!({"activity": "workflow", "workflow": saved.admission.name,
+                "workflow_version": saved.admission.version, "workflow_run": run}))),
+    );
+    let session = saved.admission.host().and_then(|h| h["session_id"].as_str()).map(str::to_owned);
+    anchor_child(engine, run, span, None, session).await
+}
+
 /// `start_guard { calls, i }`: the round's guard, a host child named guard
 /// whose host data names this loop, the round, the confirmation target and
 /// the guard context it judges by; `{run: null}` for a round with only local
@@ -448,14 +510,36 @@ async fn start_guard(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> 
             .iter()
             .map(tool_call)
             .collect::<anyhow::Result<Vec<_>>>()?;
-        if !calls.iter().any(|c| crate::guard::needs_guard(&engine, c)) {
+        let id = ctx.child_id("guard");
+        // The round's reflex calls, resolved and pinned here, the first step
+        // that meets them (design 10, R1): what each does decides whether it
+        // is reviewed, and its review sees the pinned version's YAML.
+        let mut entries = Map::new();
+        if let Some(round) = args["i"].as_u64() {
+            for (index, call) in calls.iter().enumerate().filter(|(_, c)| c.name == crate::reflexes::TOOL) {
+                let resolved = crate::reflexes::resolution(&engine, &ctx.run_id, round, index as u64, call).await?;
+                let Some(resolution) = resolved.reflex() else { continue };
+                let digest = match resolution.summary.needs_guard() {
+                    false => None,
+                    true => {
+                        let definitions = engine.runtime.definitions(&resolution.name).await?;
+                        let version = definitions.versions.get(&resolution.version);
+                        let (run, body) = (id.clone(), version.map(|d| d.yaml.clone()).unwrap_or_default());
+                        Some(engine.deps.db.write(move |db| db.put_evidence(&run, &body)).await?)
+                    }
+                };
+                entries.insert(crate::guard::key(call), crate::reflexes::round_entry(resolution, digest.as_deref()));
+            }
+        }
+        let entries = Value::Object(entries);
+        let reflexes = crate::reflexes::round_reflexes(&engine.deps.db, &entries)?;
+        if !calls.iter().any(|c| crate::guard::needs_guard_in(&engine, c, &reflexes)) {
             return Ok(json!({"run": null}));
         }
         let round = args["i"].as_u64().ok_or_else(|| refuse("start_guard: a round `i` is required"))?;
-        let id = ctx.child_id("guard");
         // Freeze history before independent calls in this round can run.
         let (chain, count) = live.guard_history().await;
-        let input = json!({"calls": args["calls"], "round": round, "history": [chain, count]});
+        let input = json!({"calls": args["calls"], "round": round, "history": [chain, count], "reflexes": entries});
         let context = live.guard_snapshot().await?;
         let host = GuardHost {
             kind: GUARD.into(),
@@ -485,14 +569,18 @@ async fn start_guard(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> 
             .await
             .map_err(anyhow::Error::from)?;
         // The calls the joined child reviews: its own stored input.
-        let joined = RunReads::run(&ctx, &child.id).await?.map(|r| r.admission.input["calls"].clone());
+        let joined = RunReads::run(&ctx, &child.id).await?.map(|r| r.admission.input);
+        let reflexes = crate::reflexes::round_reflexes(
+            &engine.deps.db,
+            joined.as_ref().map_or(&Value::Null, |input| &input["reflexes"]),
+        )?;
         let guarded: Vec<usize> = joined
             .as_ref()
-            .and_then(Value::as_array)
+            .and_then(|input| input["calls"].as_array())
             .into_iter()
             .flatten()
             .enumerate()
-            .filter(|(_, c)| tool_call(c).is_ok_and(|c| crate::guard::needs_guard(&engine, &c)))
+            .filter(|(_, c)| tool_call(c).is_ok_and(|c| crate::guard::needs_guard_in(&engine, &c, &reflexes)))
             .map(|(i, _)| i)
             .collect();
         Ok(json!({"run": child.id, "key": child.key, "done": child.done, "waiting": child.waiting, "guarded": guarded}))
@@ -617,6 +705,132 @@ async fn start_worker(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
                 Ok(serde_json::to_value(child)?)
             }
             Named::SetAside(_) => Ok(json!({"id": null})),
+        }
+    };
+    start.await.map_err(failed)
+}
+
+/// `start_reflex { call, guard_run, i, index }`: the model's `run_reflex`
+/// call (design 10, R3) as a host child of the loop, keyed by the call's
+/// place in its round (`reflex:<i>.<index>`), so a redispatch joins it
+/// before it reads anything else. It starts the version the call resolved
+/// (R1), with the input that validated, under the loop's own host data plus
+/// a note of the call and its verdict (R4): its MCP tools and model steps
+/// are served, its confirmations go where the loop's go. A reflex that
+/// needs a review starts only under an allowing verdict, which this call
+/// spends (one owner: the join only checks the note). `{id: null, error}`
+/// when nothing starts (a bad call, a block, a refused start): a recorded
+/// answer `tool_repeat` presents.
+async fn start_reflex(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
+    let start = async {
+        let (live, _) = engine.loop_of(&ctx, &ctx.run_id, ctx.host(), &ctx.function).await?;
+        let call = tool_call(&args["call"])?;
+        let (i, index) = args["i"]
+            .as_u64()
+            .zip(args["index"].as_u64())
+            .ok_or_else(|| refuse("start_reflex: i and index are required"))?;
+        let key = crate::reflexes::child_key(i, index);
+        let id = ctx.child_id(&key);
+        let not_started = |error: String| json!({"id": null, "error": error});
+        // A start the call made before is joined first (R1).
+        if let Some(saved) = RunReads::run(&ctx, &id).await? {
+            let child = ctx
+                .start_child(ChildStart {
+                    key,
+                    name: saved.admission.name,
+                    version: None,
+                    input: Value::Null,
+                    host: Value::Null,
+                })
+                .await
+                .map_err(anyhow::Error::from)?;
+            return Ok(serde_json::to_value(child)?);
+        }
+        if !live.offers(crate::reflexes::TOOL) {
+            return Ok(not_started(format!(
+                "[run_reflex error] {} is unavailable in this loop",
+                crate::reflexes::TOOL
+            )));
+        }
+        let resolution = match crate::reflexes::resolution(&engine, &ctx.run_id, i, index, &call).await? {
+            crate::reflexes::Resolved::Reflex(resolution) => resolution,
+            crate::reflexes::Resolved::Refused(problem) => {
+                return Ok(not_started(format!("[run_reflex error] {problem}")));
+            }
+        };
+        // The verdict, spent by this invocation (`guard_child_verdict`): a
+        // redispatch after a crash replays it, and starts the reflex once.
+        let reviewed = resolution.summary.needs_guard();
+        let at = crate::agent::CallSite {
+            runs: &ctx,
+            run: &ctx.run_id,
+            task: &ctx.task_path,
+            invocation: &ctx.idempotency_key,
+        };
+        let mut reflexes = crate::guard::Reflexes::default();
+        reflexes.0.insert(crate::guard::key(&call), (resolution.summary, Value::Null));
+        let verdict = match reviewed {
+            false => None,
+            true => crate::agent::call_verdict(&engine, &live, &at, &args, &call, &reflexes).await?,
+        };
+        if let Some(verdict) = verdict.as_ref().filter(|v| !v.allowed()) {
+            let context = live.guard_snapshot().await?;
+            return Ok(json!({"id": null, "error": verdict.reply(&context), "verdict": verdict}));
+        }
+        anyhow::ensure!(!reviewed || verdict.is_some(), "a reviewed reflex starts only under a verdict");
+        let mut host = ctx.host().cloned().unwrap_or_default();
+        host["reflex"] = json!({
+            "name": resolution.name, "version": resolution.version, "call": crate::guard::key(&call),
+            "reviewed": reviewed, "verdict": verdict,
+        });
+        let input = Value::Object(resolution.input.clone());
+        let mut meta = live.observation_metadata();
+        meta.insert("tool".into(), call.name.clone().into());
+        meta.insert("tool_call_id".into(), call.id.clone().into());
+        meta.insert("reflex".into(), resolution.name.clone().into());
+        meta.insert("workflow_version".into(), resolution.version.into());
+        if let Some(verdict) = &verdict {
+            meta.insert("guard".into(), serde_json::to_value(verdict)?);
+        }
+        let outer = live.scope().span(
+            SpanStart::new(crate::reflexes::TOOL, SpanKind::Tool)
+                .input(json!({"name": resolution.name, "input": input}))
+                .metadata(meta),
+        );
+        let span = outer.span(SpanStart::new(resolution.name.clone(), SpanKind::Chain).input(input.clone()).metadata(
+            metadata(
+                json!({"activity": "reflex", "workflow": resolution.name, "workflow_version": resolution.version}),
+            ),
+        ));
+        anchor_child(&engine, &id, span, Some(outer), live.opts.session_id.clone()).await?;
+        let build = move || -> Build { Box::pin(async move { Ok((input, host)) }) };
+        let started = crate::runs::start_pinned_child(
+            &engine,
+            &ctx,
+            &key,
+            &resolution.name,
+            resolution.version,
+            Site::Reflex,
+            build,
+        )
+        .await;
+        if let Err(error) = &started {
+            unanchor(&engine, &ctx, &id, &error.to_string()).await;
+        }
+        match started? {
+            Named::Started(child, _) => {
+                // A dry run's reflex ran on input its declaration accepted (R5).
+                if let Some(sandbox) = &engine.sandbox {
+                    sandbox.validated(&child.id);
+                }
+                let mut started = serde_json::to_value(child)?;
+                started["verdict"] = json!(verdict);
+                Ok(started)
+            }
+            Named::SetAside(fallback) => {
+                unanchor(&engine, &ctx, &id, &fallback.line).await;
+                Ok(not_started(format!("[run_reflex error] {}", fallback.line)))
+            }
         }
     };
     start.await.map_err(failed)
@@ -825,8 +1039,10 @@ async fn prepare_inherited(
     let id = saved.admission.id.clone();
     // Its trace: a span under its parent's current one, opened once (a
     // re-dispatch finds the anchor), before anything can fault it. Tagged
-    // `loop`, not `primary_loop`: the journal's answer is the parent's.
+    // `loop`, not `primary_loop`: the journal's answer is the parent's. A
+    // parent no agent function served is anchored first (design 10, R7).
     if engine.deps.db.run_trace(&id)?.is_none() {
+        anchor_inherited(engine, runs, &parent.admission.id).await?;
         let preset = request["preset"].as_str().unwrap_or(&parent_host.preset);
         let span = engine.scope_for(&parent.admission.id, &parent.admission.name).span(
             SpanStart::new("agent_loop", SpanKind::Chain)
@@ -2007,10 +2223,10 @@ pub const HOST_FUNCTIONS: &[HostFunction] = &[
     f(
         "classify",
         Read,
-        &["call", "guard_run", "worker_run"],
+        &["call", "guard_run", "worker_run", "reflex_run", "i", "index"],
         &["call"],
         "agent-loop",
-        "Whether one of the model's calls runs at most once (tool_once: writes and confirmed open-world reads) or may be repeated (tool_repeat). Returns once.",
+        "Whether one of the model's calls runs at most once (tool_once: writes and confirmed open-world reads) or may be repeated (tool_repeat; always for run_reflex, whose start was its effect). Returns once, and for run_reflex (with i and index) the call's pinned resolution as reflex.",
     ),
     f(
         "tool_once",
@@ -2023,10 +2239,10 @@ pub const HOST_FUNCTIONS: &[HostFunction] = &[
     f(
         "tool_repeat",
         Read,
-        &["call", "guard_run", "worker_run", "i", "index", "memory"],
+        &["call", "guard_run", "worker_run", "reflex_run", "reflex_error", "i", "index", "memory"],
         &["call"],
         "agent-loop",
-        "Execute one of the model's reads (or join a worker) under the host-verified guard verdict; refuses a call that must run at most once. Returns presented, failed, result and working-memory updates for agent_settle.",
+        "Execute one of the model's reads (or join a worker, or a reflex: reflex_run, else the start's reflex_error) under the host-verified guard verdict; refuses a call that must run at most once. Returns presented, failed, result and working-memory updates for agent_settle.",
     ),
     f(
         "start_guard",
@@ -2043,6 +2259,14 @@ pub const HOST_FUNCTIONS: &[HostFunction] = &[
         &["call", "i", "index"],
         "agent-loop",
         "Start the model's invoke_sub_agent call as a worker child. loop names the loop it runs, before the call's own loop argument and its skills' preference (default agent-loop; one set aside runs agent-loop). Returns id, key, done and waiting (id null when it cannot start); join it with listen, then tool_repeat with worker_run.",
+    ),
+    f(
+        "start_reflex",
+        Write,
+        &["call", "guard_run", "i", "index"],
+        &["call", "i", "index"],
+        "agent-loop",
+        "Start the model's run_reflex call as a child: the reflex version its round resolved, with the call's input, under the call's verdict when it needs one (only a closed-world read needs none). Returns id, key, done and waiting, or id null with error (a bad call, a block, a refused start); join it with listen, then tool_repeat with reflex_run and reflex_error.",
     ),
     f(
         "signal_session",
@@ -2224,7 +2448,7 @@ pub const ENGINE_FUNCTIONS: &[HostFunction] = &[
         &["name", "input", "host"],
         &["name"],
         "workflow",
-        "The engine's own: start an owned child of a workflow. Without host it has no host data and cannot take agent turns. host: inherit gives it this run's host data unchanged, which is how a workflow starts a loop (agent-loop or one of yours): input { request: { input, skills, loaded, preset, system, exclude_tools, on_step, allow_skill_writes } }. The loop keeps this run's conversation, confirmation target, session and excluded tools; its instructions start with this run's, then system; exclude_tools takes more tools away from it and its workers; on_step {workflow, input} starts that workflow after each acting turn with input + {seq, step}. A bad request faults the loop; a paused or tripped loop is refused with an error you catch (urn:ouro:errors:definition.tripped): nothing runs in its place. Returns id, key, done and waiting: join with listen, then loop_outcome and loop_transcript.",
+        "The engine's own: start an owned child of a workflow. Without host it has no host data and cannot take agent turns. host: inherit gives it this run's host data unchanged, which is how a workflow starts a reflex (input: its parameters; join with listen on done, then child_outcome) or a loop (agent-loop or one of yours): input { request: { input, skills, loaded, preset, system, exclude_tools, on_step, allow_skill_writes } }. The loop keeps this run's conversation, confirmation target, session and excluded tools; its instructions start with this run's, then system; exclude_tools takes more tools away from it and its workers; on_step {workflow, input} starts that workflow after each acting turn with input + {seq, step}. A bad request faults the loop; a paused or tripped loop is refused with an error you catch (urn:ouro:errors:definition.tripped): nothing runs in its place. Returns id, key, done and waiting: join with listen, then loop_outcome and loop_transcript.",
     ),
     f("child_outcome", Read, &["id", "key"], &["id", "key"], "workflow", "The engine's own: an owned child's outcome."),
 ];

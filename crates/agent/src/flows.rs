@@ -515,7 +515,7 @@ pub fn check(mcp: &dyn Mcp, definition: &str) -> Result<Workflow, String> {
 
 // Every task of `wf` with its reference: the top level, reusable functions
 // and extensions, and every nested list.
-fn each_task(wf: &Workflow, visit: &mut dyn FnMut(&Task, &str)) {
+pub(crate) fn each_task(wf: &Workflow, visit: &mut dyn FnMut(&Task, &str)) {
     fn list(tasks: &TaskList, at: &str, visit: &mut dyn FnMut(&Task, &str)) {
         for (i, (name, t)) in tasks.iter().enumerate() {
             task(t, &format!("{at}/{i}/{name}"), visit);
@@ -638,6 +638,7 @@ pub fn gate(engine: &Engine, name: &str, definition: &str) -> anyhow::Result<Gat
         .collect();
     let local: Vec<String> = wf.uses.functions.iter().map(|(n, _)| n.clone()).collect();
     let mut problems = denied(&wf);
+    problems.extend(crate::reflexes::problems(&wf));
     problems.extend(argument_problems(&*engine.deps.mcp, &sites, &local));
     anyhow::ensure!(problems.is_empty(), "{}", invalid(&problems));
     require_guarded_turns(&wf)?;
@@ -650,7 +651,8 @@ pub fn gate(engine: &Engine, name: &str, definition: &str) -> anyhow::Result<Gat
 /// round wherever `agent_turn` is, and the metadata a launch reads. The
 /// authoring skill's examples are held to them (tests/flows.rs).
 pub fn agent_rules(wf: &Workflow) -> anyhow::Result<()> {
-    let problems = denied(wf);
+    let mut problems = denied(wf);
+    problems.extend(crate::reflexes::problems(wf));
     anyhow::ensure!(problems.is_empty(), "{}", invalid(&problems));
     require_guarded_turns(wf)?;
     require_metadata(wf)
@@ -1120,7 +1122,11 @@ pub async fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> any
                 })
                 .collect();
             let then = "before the user sees it, then describe in words what it will do, the at-most-once calls above all; activate this version only after they confirm it in the chat.";
-            let next = if is_runtime_workflow(&name, wf) {
+            let next = if crate::reflexes::declaration(wf).is_some() {
+                format!(
+                    "Dry-run it on input its declaration accepts (try_workflow with `input`, the parameters by name; `drafts` for reflexes it starts) {then}"
+                )
+            } else if is_runtime_workflow(&name, wf) {
                 format!(
                     "Dry-run it on a signal of the type it handles (try_workflow with `signal`, and `drafts` for the other drafts of the chain) {then}"
                 )
@@ -1209,6 +1215,14 @@ pub async fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> any
                 let Some((&latest, d)) = definitions.versions.iter().next_back() else { continue };
                 let meta = WorkflowMeta::get(db, &name, &d.digest)?;
                 let trip = definitions.tripped.as_ref();
+                // A reflex's declaration and what it does, the active
+                // version's apart from the latest's (design 10, R6).
+                let active = definitions.active.and_then(|v| definitions.versions.get(&v));
+                let active_reflex = match active {
+                    Some(a) => crate::reflexes::info(engine, &name, &a.yaml).await,
+                    None => None,
+                };
+                let latest_reflex = crate::reflexes::info(engine, &name, &d.yaml).await;
                 workflows.push(json!({
                     "name": name, "latest_version": latest, "status": status(&definitions, latest),
                     "active_version": definitions.active,
@@ -1218,6 +1232,7 @@ pub async fn tool(engine: &Engine, name: &str, args: &Map<String, Value>) -> any
                     "tripped": trip.is_some_and(|t| t.breaker), "paused": trip.is_some_and(|t| t.manual.is_some()),
                     "note": meta.as_ref().and_then(|m| m.note.clone()),
                     "created_at": meta.as_ref().and_then(|m| created_at(m.created_ms)),
+                    "active_reflex": active_reflex, "latest_reflex": latest_reflex,
                 }));
             }
             Ok(json!({"count": workflows.len(), "workflows": workflows}).to_string())

@@ -46,6 +46,13 @@ do:
                     call: start_worker
                     with: { call: '${ $entry.value }', i: '${ $context.i }', index: '${ $entry.key }', memory: '${ $context.memory }' }
                     export: { as: '${ $context + { worker: .id } }' }
+                - start_reflex:
+                    # A reflex (design 10) the round need not review: a
+                    # closed-world read, or a call that starts nothing.
+                    if: '${ $entry.value.name == "run_reflex" }'
+                    call: start_reflex
+                    with: { call: '${ $entry.value }', guard_run: null, i: '${ $context.i }', index: '${ $entry.key }' }
+                    export: { as: '${ $context + { reflex: .id, reflex_error: (.error // null) } }' }
                 - wait_worker:
                     if: '${ $context.worker != null }'
                     listen:
@@ -58,9 +65,21 @@ do:
                 - sleep_worker:
                     if: '${ $context.worker != null and .[0].type == ("waiting:" + $context.worker) }'
                     listen: { to: { one: { with: { type: '${ "done:" + $context.worker }' } } } }
+                - wait_reflex:
+                    if: '${ $context.reflex != null }'
+                    listen:
+                      read: envelope
+                      to:
+                        any:
+                          - with: { type: '${ "done:" + $context.reflex }' }
+                          - with: { type: '${ "waiting:" + $context.reflex }' }
+                    metadata: { ouro: { hold: PT15M } }
+                - sleep_reflex:
+                    if: '${ $context.reflex != null and .[0].type == ("waiting:" + $context.reflex) }'
+                    listen: { to: { one: { with: { type: '${ "done:" + $context.reflex }' } } } }
                 - classify:
                     call: classify
-                    with: { call: '${ $entry.value }', guard_run: null, worker_run: '${ $context.worker // null }' }
+                    with: { call: '${ $entry.value }', guard_run: null, worker_run: '${ $context.worker // null }', reflex_run: '${ $context.reflex // null }', i: '${ $context.i }', index: '${ $entry.key }' }
                     export: { as: '${ $context + { once: .once } }' }
                 - once:
                     if: '${ $context.once }'
@@ -80,6 +99,8 @@ do:
                       call: '${ $entry.value }'
                       guard_run: null
                       worker_run: '${ $context.worker // null }'
+                      reflex_run: '${ $context.reflex // null }'
+                      reflex_error: '${ $context.reflex_error // null }'
                       i: '${ $context.i }'
                       index: '${ $entry.key }'
                       memory: '${ if ($entry.value.name | startswith("working_memory_")) or $entry.value.name == "invoke_sub_agent" then $context.memory else null end }'
@@ -103,9 +124,29 @@ do:
                     for: { each: entry, in: '${ $context.calls | to_entries | map(select(.key as $k | ($context.guarded // [] | index($k)) != null)) }' }
                     metadata: { ouro: { concurrency: 16 } }
                     do:
+                      - start_reflex:
+                          # A reviewed reflex (design 10) starts under its
+                          # verdict, which this start spends; the join only
+                          # checks it.
+                          if: '${ $entry.value.name == "run_reflex" }'
+                          call: start_reflex
+                          with: { call: '${ $entry.value }', guard_run: '${ $context.guard_run // null }', i: '${ $context.i }', index: '${ $entry.key }' }
+                          export: { as: '${ $context + { reflex: .id, reflex_error: (.error // null) } }' }
+                      - wait_reflex:
+                          if: '${ $context.reflex != null }'
+                          listen:
+                            read: envelope
+                            to:
+                              any:
+                                - with: { type: '${ "done:" + $context.reflex }' }
+                                - with: { type: '${ "waiting:" + $context.reflex }' }
+                          metadata: { ouro: { hold: PT15M } }
+                      - sleep_reflex:
+                          if: '${ $context.reflex != null and .[0].type == ("waiting:" + $context.reflex) }'
+                          listen: { to: { one: { with: { type: '${ "done:" + $context.reflex }' } } } }
                       - classify:
                           call: classify
-                          with: { call: '${ $entry.value }', guard_run: '${ $context.guard_run // null }', worker_run: null }
+                          with: { call: '${ $entry.value }', guard_run: '${ $context.guard_run // null }', worker_run: null, reflex_run: '${ $context.reflex // null }', i: '${ $context.i }', index: '${ $entry.key }' }
                           export: { as: '${ $context + { once: .once } }' }
                       - once:
                           if: '${ $context.once }'
@@ -121,7 +162,7 @@ do:
                       - repeat:
                           if: '${ $context.once | not }'
                           call: tool_repeat
-                          with: { call: '${ $entry.value }', guard_run: '${ $context.guard_run // null }', i: '${ $context.i }', index: '${ $entry.key }' }
+                          with: { call: '${ $entry.value }', guard_run: '${ $context.guard_run // null }', reflex_run: '${ $context.reflex // null }', reflex_error: '${ $context.reflex_error // null }', i: '${ $context.i }', index: '${ $entry.key }' }
                       - indexed:
                           set: '${ { index: $entry.key, result: . } }'
       output: { as: '${ (.[0] + .[1]) | sort_by(.index) | map(.result) }' }

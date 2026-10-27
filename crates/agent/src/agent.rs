@@ -575,11 +575,18 @@ pub async fn prepare(engine: &Engine, opts: &LoopOptions) -> anyhow::Result<Prep
             Some(set) => set.intersection(whitelist).cloned().collect(),
         });
     }
+    // The reflexes it may run (design 10), as the catalog is now: part of
+    // the instructions the run is admitted with, so a restart keeps them.
+    let reflexes = match opts.exclude_tools.contains(crate::reflexes::TOOL) {
+        true => None,
+        false => crate::reflexes::catalog_block(engine).await?,
+    };
     let mut parts = Vec::new();
     if let Some(prompt) = opts.system_prompt.as_ref().filter(|s| !s.is_empty()) {
         parts.push(prompt.as_str());
     }
     parts.extend(bodies.iter().map(String::as_str));
+    parts.extend(reflexes.as_deref());
     parts.push(WORKING_MEMORY_INSTRUCTIONS);
     let system = parts.join(INSTRUCTION_SEPARATOR);
     Ok(Prepared { names, bodies, allowed, system })
@@ -977,6 +984,7 @@ impl AgentLoop {
         if let Some(sandbox) = &engine.sandbox
             && tool_effect(engine, name) == Effect::Write
             && name != "invoke_sub_agent"
+            && name != crate::reflexes::TOOL
         {
             span.update(ContextUpdate::metadata(json!({"mock": true}).as_object().cloned().unwrap_or_default()));
             let (run, task) = at.map(|at| (at.run, at.task)).unzip();
@@ -1135,6 +1143,12 @@ impl AgentLoop {
                 Ok(_) => Ok("[invoke_sub_agent error] failed to start: the worker was not started".into()),
                 Err(error) => Ok(format!("[invoke_sub_agent error] {error}")),
             },
+            // A reflex runs as its own run, started by the round
+            // (`start_reflex`); reaching here, none started for this call.
+            "run_reflex" => {
+                Ok("[run_reflex error] the reflex was not started: this loop's workflow has no start_reflex step"
+                    .into())
+            }
             name if crate::flows::TOOLS.contains(&name) => crate::flows::tool(engine, name, args).await,
             "workflow_functions" => crate::flows::functions(engine, args),
             "probe_function" => crate::flows::probe(engine, args, &self.cancel).await,
@@ -1378,6 +1392,8 @@ const SYNTHETIC_WRITES: &[&str] = &[
     "schedule_task",
     "cancel_scheduled_task",
     "invoke_sub_agent",
+    // What a reflex does is its resolution's (design 10); without one, a write.
+    "run_reflex",
 ];
 
 /// What a call does to the world: a write is sent at most once. Serialized
@@ -1816,11 +1832,17 @@ impl AgentLoop {
             .ok_or_else(|| anyhow::anyhow!("guard requires the host's admitted loop input"))
     }
 
-    async fn guard_calls(&self, engine: &Engine, calls: &[providers::ToolCall]) -> anyhow::Result<()> {
+    async fn guard_calls(
+        &self,
+        engine: &Engine,
+        calls: &[providers::ToolCall],
+        reflexes: &crate::guard::Reflexes,
+    ) -> anyhow::Result<()> {
         let context = self.guard_snapshot().await?;
         let (chain, call_count) = self.guard_history().await;
+        let (scope, cancel) = (self.scope(), &self.cancel);
         let verdicts =
-            crate::guard::judge(engine, &context, calls, &chain, call_count, &self.scope(), &self.cancel).await?;
+            crate::guard::judge_with(engine, &context, calls, &chain, call_count, reflexes, &scope, cancel).await?;
         self.guard.lock().await.verdicts.extend(verdicts);
         Ok(())
     }
@@ -1899,7 +1921,10 @@ pub async fn guard_review(
     )?;
     let (chain, call_count): (Vec<Value>, usize) =
         serde_json::from_value(input.get("history").cloned().unwrap_or(json!([[], 0])))?;
-    let verdicts = crate::guard::judge(engine, &context, &calls, &chain, call_count, scope, cancel).await?;
+    // The round's reflex calls as `start_guard` resolved them (design 10).
+    let reflexes = crate::reflexes::round_reflexes(&engine.deps.db, &input["reflexes"])?;
+    let verdicts =
+        crate::guard::judge_with(engine, &context, &calls, &chain, call_count, &reflexes, scope, cancel).await?;
     let items: Vec<_> = calls
         .into_iter()
         .filter_map(|call| {
@@ -1951,6 +1976,12 @@ pub fn runs_once(
     worker: bool,
 ) -> anyhow::Result<bool> {
     if call.name == "invoke_sub_agent" && worker {
+        return Ok(false);
+    }
+    // A reflex's start is its effect, made once by `start_reflex` (design
+    // 10, R3): its join (or the reply of a call that never started) only
+    // reads, so `tool_once` never runs for it.
+    if call.name == crate::reflexes::TOOL {
         return Ok(false);
     }
     if tool_effect(engine, &call.name) == Effect::Write {
@@ -2033,6 +2064,112 @@ pub struct CallSite<'a> {
     pub invocation: &'a str,
 }
 
+/// The verdict one of the loop's calls runs under: its round's guard child's
+/// (spent by this invocation, `at.invocation`), a confirmation still
+/// pending for it (unverified), or the inline review a round without a
+/// guard child still gets (R-L2); `None` for a call that needs none.
+/// `reflexes`: the round's `run_reflex` calls as resolved (design 10).
+pub(crate) async fn call_verdict(
+    engine: &Arc<Engine>,
+    loop_: &Arc<AgentLoop>,
+    at: &CallSite<'_>,
+    args: &Value,
+    call: &providers::ToolCall,
+    reflexes: &crate::guard::Reflexes,
+) -> anyhow::Result<Option<crate::guard::Verdict>> {
+    let key = crate::guard::key(call);
+    Ok(if let Some(verdict) = guard_child_verdict(engine, at, args, call).await? {
+        loop_.guard.lock().await.verdicts.remove(&key);
+        Some(verdict)
+    } else if crate::confirmation::Store::pending_loop_confirmation(&engine.deps.db, at.run, &key)? {
+        // Omitting a guard child cannot bypass its outstanding human decision.
+        Some(confirmation_verdict(call, "unverified"))
+    } else if crate::guard::needs_guard_in(engine, call, reflexes) {
+        // The inline review a round without a guard child still gets (R-L2).
+        let recorded = loop_.guard.lock().await.verdicts.remove(&key);
+        Some(match recorded {
+            Some(verdict) => verdict,
+            None => {
+                loop_.guard_calls(engine, std::slice::from_ref(call), reflexes).await?;
+                loop_
+                    .guard
+                    .lock()
+                    .await
+                    .verdicts
+                    .remove(&key)
+                    .ok_or_else(|| anyhow::anyhow!("guard did not record a verdict"))?
+            }
+        })
+    } else {
+        None
+    })
+}
+
+// What a `run_reflex` call answers (design 10, R3, R4): the outcome of the
+// reflex its round started (`reflex_run`), joined, or why nothing started
+// (`reflex_error`, the start's own reply; else the call's resolution). The
+// join spends no verdict: the start owned it. It checks the run is this
+// call's child and that its admission carries what authorized it.
+async fn reflex_reply(
+    engine: &Arc<Engine>,
+    loop_: &Arc<AgentLoop>,
+    args: &Value,
+    at: &CallSite<'_>,
+    call: &providers::ToolCall,
+) -> anyhow::Result<(Arc<dyn Span>, String)> {
+    let round = args["i"].as_u64().zip(args["index"].as_u64());
+    if let Some(id) = args.get("reflex_run").and_then(Value::as_str) {
+        let (i, index) = round.ok_or_else(|| anyhow::anyhow!("a reflex is joined at its call's place: i and index"))?;
+        let key = crate::reflexes::child_key(i, index);
+        let saved = at.runs.run(id).await?.ok_or_else(|| anyhow::anyhow!("unknown reflex run"))?;
+        anyhow::ensure!(
+            saved.child.as_ref().is_some_and(|link| link.parent == at.run && link.key.ends_with(&format!("/{key}"))),
+            "reflex run does not belong to this call"
+        );
+        let note = saved.admission.host().map(|h| h["reflex"].clone()).unwrap_or_default();
+        let authorized = note["call"] == crate::guard::key(call)
+            && (note["reviewed"] != true || note["verdict"]["label"] == "allow");
+        if let Some(outcome) = &saved.outcome {
+            engine.ended_child(id, outcome).await;
+        }
+        let name = saved.admission.name.clone();
+        let raw = match saved.outcome {
+            _ if !authorized => {
+                "[run_reflex error] this reflex run was not admitted for this call under an allowing verdict".into()
+            }
+            Some(ouro_runtime::ows::run::Status::Completed(Value::String(s))) => s,
+            Some(ouro_runtime::ows::run::Status::Completed(v)) => v.to_string(),
+            Some(ouro_runtime::ows::run::Status::Faulted(e)) => {
+                format!("[run_reflex error] `{name}` failed: {}", e.detail.clone().unwrap_or_else(|| e.to_string()))
+            }
+            Some(ouro_runtime::ows::run::Status::Cancelled) => format!("[run_reflex error] `{name}` was cancelled"),
+            _ => anyhow::bail!("the reflex has not ended"),
+        };
+        return Ok((loop_.scope().span(SpanStart::new("run_reflex:result", SpanKind::Tool)), raw));
+    }
+    let raw = match (args.get("reflex_error").and_then(Value::as_str), round) {
+        (Some(error), _) => error.to_owned(),
+        (None, Some((i, index))) => match crate::reflexes::resolution(engine, at.run, i, index, call).await? {
+            crate::reflexes::Resolved::Refused(problem) => format!("[run_reflex error] {problem}"),
+            crate::reflexes::Resolved::Reflex(_) => {
+                "[run_reflex error] the reflex was not started: this loop's workflow has no start_reflex step".into()
+            }
+        },
+        (None, None) => {
+            "[run_reflex error] the reflex was not started: this loop's workflow has no start_reflex step".into()
+        }
+    };
+    let mut metadata = loop_.observation_meta.clone();
+    metadata.insert("tool".into(), call.name.clone().into());
+    metadata.insert("tool_call_id".into(), call.id.clone().into());
+    let span = loop_.scope().span(
+        SpanStart::new(crate::reflexes::TOOL, SpanKind::Tool)
+            .input(json!({"raw_arguments": call.arguments}))
+            .metadata(metadata),
+    );
+    Ok((span, raw))
+}
+
 pub async fn loop_tool(
     engine: &Arc<Engine>,
     loop_: &Arc<AgentLoop>,
@@ -2052,66 +2189,47 @@ pub async fn loop_tool(
         }));
     }
     let _slot = loop_.slots.acquire().await?;
-    let verdict = if let Some(verdict) = guard_child_verdict(engine, at, args, &call).await? {
-        loop_.guard.lock().await.verdicts.remove(&crate::guard::key(&call));
-        Some(verdict)
-    } else if crate::confirmation::Store::pending_loop_confirmation(&engine.deps.db, run, &crate::guard::key(&call))? {
-        // Omitting a guard child cannot bypass its outstanding human decision.
-        Some(confirmation_verdict(&call, "unverified"))
-    } else if crate::guard::needs_guard(engine, &call) {
-        // The inline review a round without a guard child still gets (R-L2).
-        let key = crate::guard::key(&call);
-        let recorded = loop_.guard.lock().await.verdicts.remove(&key);
-        Some(match recorded {
-            Some(verdict) => verdict,
-            None => {
-                loop_.guard_calls(engine, std::slice::from_ref(&call)).await?;
-                loop_
-                    .guard
-                    .lock()
-                    .await
-                    .verdicts
-                    .remove(&key)
-                    .ok_or_else(|| anyhow::anyhow!("guard did not record a verdict"))?
-            }
-        })
+    let (verdict, guard_call, joined, (span, raw)) = if call.name == crate::reflexes::TOOL {
+        let (span, raw) = reflex_reply(engine, loop_, args, at, &call).await?;
+        let guard_call = loop_.guard.lock().await.record_call(&call, raw.starts_with("[guard] blocked:"));
+        (None, guard_call, None, (span, raw))
     } else {
-        None
-    };
-    let guard_call = loop_.guard.lock().await.record_call(&call, verdict.as_ref().is_some_and(|v| !v.allowed()));
-    let joined = match (worker_run, round) {
-        (Some(id), Some((i, index))) if call.name == "invoke_sub_agent" => {
-            Some((id, worker_handle(i, index), worker_key(i, index)))
-        }
-        _ => None,
-    };
-    let dispatched = if let Some((id, _, key)) = &joined {
-        let saved = at.runs.run(id).await?.ok_or_else(|| anyhow::anyhow!("unknown worker run"))?;
-        anyhow::ensure!(
-            saved.child.as_ref().is_some_and(|link| link.parent == run && link.key.ends_with(&format!("/{key}"))),
-            "worker run does not belong to this call"
-        );
-        if let Some(outcome) = &saved.outcome {
-            engine.ended_child(id, outcome).await;
-        }
-        let raw = match saved.outcome {
-            Some(ouro_runtime::ows::run::Status::Completed(Value::String(s))) => s,
-            Some(ouro_runtime::ows::run::Status::Completed(v)) => v.to_string(),
-            Some(ouro_runtime::ows::run::Status::Faulted(e)) => format!(
-                "[invoke_sub_agent error] sub-agent crashed: {}",
-                e.detail.clone().unwrap_or_else(|| e.to_string())
-            ),
-            // Cancelled explicitly: a failure of this call.
-            Some(ouro_runtime::ows::run::Status::Cancelled) => {
-                format!("[invoke_sub_agent error] sub-agent {id} was cancelled")
+        let verdict = call_verdict(engine, loop_, at, args, &call, &Default::default()).await?;
+        let guard_call = loop_.guard.lock().await.record_call(&call, verdict.as_ref().is_some_and(|v| !v.allowed()));
+        let joined = match (worker_run, round) {
+            (Some(id), Some((i, index))) if call.name == "invoke_sub_agent" => {
+                Some((id, worker_handle(i, index), worker_key(i, index)))
             }
-            _ => anyhow::bail!("worker has not ended"),
+            _ => None,
         };
-        Ok((loop_.scope().span(SpanStart::new("invoke_sub_agent:result", SpanKind::Tool)), raw))
-    } else {
-        loop_.start_call(engine, &call, Some(at), verdict.as_ref()).await
+        let dispatched = if let Some((id, _, key)) = &joined {
+            let saved = at.runs.run(id).await?.ok_or_else(|| anyhow::anyhow!("unknown worker run"))?;
+            anyhow::ensure!(
+                saved.child.as_ref().is_some_and(|link| link.parent == run && link.key.ends_with(&format!("/{key}"))),
+                "worker run does not belong to this call"
+            );
+            if let Some(outcome) = &saved.outcome {
+                engine.ended_child(id, outcome).await;
+            }
+            let raw = match saved.outcome {
+                Some(ouro_runtime::ows::run::Status::Completed(Value::String(s))) => s,
+                Some(ouro_runtime::ows::run::Status::Completed(v)) => v.to_string(),
+                Some(ouro_runtime::ows::run::Status::Faulted(e)) => format!(
+                    "[invoke_sub_agent error] sub-agent crashed: {}",
+                    e.detail.clone().unwrap_or_else(|| e.to_string())
+                ),
+                // Cancelled explicitly: a failure of this call.
+                Some(ouro_runtime::ows::run::Status::Cancelled) => {
+                    format!("[invoke_sub_agent error] sub-agent {id} was cancelled")
+                }
+                _ => anyhow::bail!("worker has not ended"),
+            };
+            (loop_.scope().span(SpanStart::new("invoke_sub_agent:result", SpanKind::Tool)), raw)
+        } else {
+            loop_.start_call(engine, &call, Some(at), verdict.as_ref()).await?
+        };
+        (verdict, guard_call, joined, dispatched)
     };
-    let (span, raw) = dispatched?;
     let failed = raw.starts_with("[guard] blocked:") || is_tool_error(&raw);
     if let Some(sandbox) = &engine.sandbox {
         sandbox.call(&loop_.opts.id, args["i"].as_u64(), &call, verdict.as_ref(), !failed, &raw);

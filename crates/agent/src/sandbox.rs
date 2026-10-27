@@ -156,6 +156,9 @@ struct Record {
     fallbacks: HashMap<String, Fallback>,
     set_aside: Vec<Fallback>,
     recovery: Option<Start>,
+    // The runs started on input their reflex declaration accepted (design
+    // 10, R5): a reflex draft is tried only by one of them.
+    validated: BTreeSet<String>,
 }
 
 #[derive(Default)]
@@ -255,6 +258,11 @@ impl Sandbox {
     }
 
     /// A version set aside at a start (whatever ran in its place).
+    /// Run `run` is a reflex started on input its declaration accepted.
+    pub fn validated(&self, run: &str) {
+        self.lock().validated.insert(run.to_owned());
+    }
+
     pub fn set_aside(&self, fallback: &Fallback) {
         self.lock().set_aside.push(fallback.clone());
     }
@@ -1175,17 +1183,38 @@ pub async fn try_draft(
         !crate::flows::takes_turns(&wf),
         "`{name}` takes agent turns, which run on the input the host admits a signal with: try it on a fire of its task (try_workflow with signal {{source: scheduler, content: the task's prompt, payload: {{workflow: \"{name}\"}}}})"
     );
-    let signal =
-        crate::flows::WorkflowSignal { id: 0, source: "scheduler".into(), content: String::new(), env_context: None };
-    let input = Value::Object(crate::flows::signal_input(&signal, &session.env));
+    // A reflex runs on its parameters (design 10, R5), checked against its
+    // declaration; any other draft on a scheduled fire's input.
+    let input = match crate::reflexes::declaration(&wf) {
+        Some(declaration) => Value::Object(
+            crate::reflexes::validate(name, &declaration, args.get("input"))
+                .map_err(|problem| anyhow::anyhow!("input: {problem}"))?,
+        ),
+        None => {
+            anyhow::ensure!(
+                args.get("input").is_none_or(Value::is_null),
+                "input: `{name}` is no reflex; it runs on a scheduled fire's input"
+            );
+            let signal = crate::flows::WorkflowSignal {
+                id: 0,
+                source: "scheduler".into(),
+                content: String::new(),
+                env_context: None,
+            };
+            Value::Object(crate::flows::signal_input(&signal, &session.env))
+        }
+    };
     let sandbox = Sandbox::new(Answer::Confirm, drafts, DRAFT_REPLY, false);
+    let id = format!("try:{name}");
+    if crate::reflexes::declaration(&wf).is_some() {
+        sandbox.validated(&id);
+    }
     let root = scope.span(
         SpanStart::new("dry-run", SpanKind::Chain)
             .input(input.clone())
             .metadata(metadata(json!({"workflow": name, "workflow_version": draft.version, "dry_run": true}))),
     );
     let dry = sandbox_engine(engine, &sandbox, root.clone(), env_of(session))?;
-    let id = format!("try:{name}");
     dry.scopes.borrow(&id, root.clone());
     let budget = tokio::time::Instant::now() + DRY_RUN_TIMEOUT;
     let outcome = dry_run(&dry, &sandbox, &draft.yaml, input, &id, name, None, budget, cancel).await;
@@ -1345,9 +1374,16 @@ async fn close(dry: &Arc<Engine>) {
 
 // Decision 10: a listed draft is tried when the dry run completed and every
 // run of its content completed. The only write a try makes outside it.
+// A reflex's draft, only when one of its runs ran on input its declaration
+// accepted (design 10, R5).
 fn mark_tried(engine: &Engine, sandbox: &Sandbox, runs: &[DryRunRun]) -> anyhow::Result<()> {
+    let validated = sandbox.lock().validated.clone();
     for (name, draft) in &sandbox.drafts {
         let of: Vec<&DryRunRun> = runs.iter().filter(|r| r.name == *name && r.digest == draft.digest).collect();
+        let reflex = crate::reflexes::declared(&draft.yaml).is_some();
+        if reflex && !of.iter().any(|r| validated.contains(&r.id)) {
+            continue;
+        }
         if !of.is_empty() && of.iter().all(|r| matches!(r.outcome, Some(Status::Completed(_)))) {
             WorkflowMeta::mark_tried(&engine.deps.db, name, &draft.digest)?;
         }

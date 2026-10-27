@@ -420,7 +420,14 @@ enum Live {
 #[derive(Default)]
 pub struct Scopes {
     live: Mutex<HashMap<String, Live>>,
+    // Runs nothing anchors on demand (`functions::anchor_inherited`): they
+    // inherit no host data from their parent, or they are loops their
+    // preparation anchors. A cache, bounded.
+    plain: Mutex<std::collections::HashSet<String>>,
 }
+
+// The most runs `Scopes::plain` remembers before it starts over.
+const PLAIN_RUNS: usize = 10_000;
 
 impl Scopes {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Live>> {
@@ -474,6 +481,19 @@ impl Scopes {
 
     pub fn current(&self, run: &str) -> Option<Scope> {
         current(&self.lock(), run)
+    }
+
+    /// Whether `run` was found to inherit no host data from its parent.
+    pub fn not_inherited(&self, run: &str) -> bool {
+        self.plain.lock().unwrap_or_else(|e| e.into_inner()).contains(run)
+    }
+
+    pub fn mark_not_inherited(&self, run: &str) {
+        let mut plain = self.plain.lock().unwrap_or_else(|e| e.into_inner());
+        if plain.len() >= PLAIN_RUNS {
+            plain.clear();
+        }
+        plain.insert(run.to_owned());
     }
 
     /// Whether the scope of `run` is one this registry ends (not borrowed).
@@ -747,6 +767,7 @@ impl AgentDb {
             tx.execute("DELETE FROM guard_verdict_uses WHERE child_run = ?1", [run])?;
             tx.execute("DELETE FROM run_evidence WHERE run_id = ?1", [run])?;
             tx.execute("DELETE FROM prepared_loops WHERE run_id = ?1", [run])?;
+            tx.execute("DELETE FROM reflex_calls WHERE run_id = ?1", [run])?;
         }
         tx.execute(
             "DELETE FROM evidence WHERE NOT EXISTS (SELECT 1 FROM run_evidence l WHERE l.digest = evidence.digest)",
@@ -1113,7 +1134,9 @@ pub async fn boot(engine: &std::sync::Arc<crate::agent::Engine>) -> anyhow::Resu
 /// Where a named start happens: the signal's own run; a loop (the primary,
 /// a worker, a recovery report, a loop the host runs itself), which only a
 /// loop may serve; a route the dispatcher starts; a scheduled task's saved
-/// workflow; a loop's step observer (design 08), which nothing replaces.
+/// workflow; a loop's step observer (design 08), which nothing replaces; a
+/// reflex the model's call resolved (design 10), started at its pinned
+/// version or not at all (`start_pinned_child`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Site {
     Signal,
@@ -1121,6 +1144,7 @@ pub enum Site {
     Route,
     Saved,
     Observer,
+    Reflex,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1130,6 +1154,7 @@ pub enum FallbackReason {
     Invalid,
     Missing,
     NotALoop,
+    NotAReflex,
     Paused,
 }
 
@@ -1142,6 +1167,7 @@ impl FallbackReason {
             FallbackReason::Invalid => "it no longer fits the tools".into(),
             FallbackReason::Missing => "it has no active version".into(),
             FallbackReason::NotALoop => "it is not a loop".into(),
+            FallbackReason::NotAReflex => "it is not a reflex".into(),
             FallbackReason::Paused => "an operator paused it".into(),
         }
     }
@@ -1188,6 +1214,7 @@ impl Fallback {
             (Some((ran, _)), _) => format!("the built-in `{ran}` runs this time"),
             (None, Site::Route) => "the default path handles this signal".into(),
             (None, Site::Observer) => "nothing observes this step".into(),
+            (None, Site::Reflex) => "nothing runs in its place".into(),
             (None, _) => "the agent loop takes this task".into(),
         };
         let line = format!(
@@ -1341,7 +1368,7 @@ async fn fallback_target(engine: &crate::agent::Engine, site: Site) -> anyhow::R
     let name = match site {
         Site::Signal => crate::supervisor::SIGNAL_NAME,
         Site::Loop => crate::agent::AGENT_LOOP_NAME,
-        Site::Route | Site::Saved | Site::Observer => return Ok(None),
+        Site::Route | Site::Saved | Site::Observer | Site::Reflex => return Ok(None),
     };
     let version = crate::flows::builtin_version(&engine.runtime, name)
         .await?
@@ -1531,6 +1558,79 @@ pub async fn start_named_child(
             anyhow::bail!("{}", fallback.error.clone().unwrap_or(fallback.line))
         }
     }
+}
+
+/// Starts the host child `key` of the calling run as version `version` of
+/// `name`, the version a call pinned (design 10, R1, R3: a reflex at
+/// `Site::Reflex`), its input and host data from `build`. A child the call
+/// started before is joined first, before anything about the version is
+/// read. Nothing ever runs in its place: a version paused, tripped, gone,
+/// no longer a reflex or refused by the engine is set aside for this start
+/// (`Named::SetAside`), and the caller answers with its line.
+pub async fn start_pinned_child(
+    engine: &crate::agent::Engine,
+    ctx: &dyn ChildStarts,
+    key: &str,
+    name: &str,
+    version: u64,
+    site: Site,
+    build: impl FnOnce() -> futures::future::BoxFuture<'static, anyhow::Result<(Value, Value)>>,
+) -> anyhow::Result<Named<ouro_runtime::ChildRef>> {
+    let start = async |version: Option<u64>, input: Value, host: Value| {
+        ctx.start_child(ouro_runtime::ChildStart { key: key.into(), name: name.into(), version, input, host }).await
+    };
+    if let Some(saved) = ctx.run(&ctx.child_id(key)).await? {
+        anyhow::ensure!(saved.admission.name == name, "the child {key} runs `{}`, not `{name}`", saved.admission.name);
+        let child = start(None, Value::Null, Value::Null).await?;
+        return Ok(Named::Started(child, ran_of(&saved)));
+    }
+    let definitions = engine.runtime.definitions(name).await?;
+    let pinned = definitions.versions.get(&version);
+    let aside = |reason, error: Option<String>, faults| Aside {
+        version: Some(version),
+        digest: pinned.map(|d| d.digest.clone()),
+        reason,
+        error,
+        faults,
+    };
+    let aside = match (pinned, &definitions.tripped) {
+        (None, _) => aside(FallbackReason::Missing, None, None),
+        (Some(_), Some(trip)) => {
+            let refusal = trip.refusal(name);
+            let reason = if refusal.paused { FallbackReason::Paused } else { FallbackReason::Tripped };
+            let error = match &trip.manual {
+                Some(manual) => format!("{refusal}: {}", manual.note),
+                None => refusal.to_string(),
+            };
+            aside(reason, Some(error), Some(trip.faults))
+        }
+        (Some(d), None) if site == Site::Reflex && crate::reflexes::declared(&d.yaml).is_none() => {
+            aside(FallbackReason::NotAReflex, None, None)
+        }
+        (Some(_), None) => {
+            let (input, host) = build().await?;
+            match start(Some(version), input, host).await {
+                Ok(child) => {
+                    let ran = Ran { name: name.into(), version, pinned: true, fallback: None };
+                    return Ok(Named::Started(child, ran));
+                }
+                // Any refusal admitted nothing (nesting too deep, a
+                // mismatch): the call's answer, never the loop's fault.
+                Err(e) => match (child_refusal(&e), &e) {
+                    (Some(why), _) => refused(version, why),
+                    (None, ouro_runtime::ChildError::Refused(_)) => {
+                        refused(version, (FallbackReason::Invalid, e.to_string(), None))
+                    }
+                    (None, _) => return Err(e.into()),
+                },
+            }
+        }
+    };
+    let fallback = Fallback::new(name, aside, site, None);
+    if let Some(sandbox) = &engine.sandbox {
+        sandbox.set_aside(&fallback);
+    }
+    Ok(Named::SetAside(fallback))
 }
 
 // ── 11. what a handler reads of its run tree ────────────────────────────────

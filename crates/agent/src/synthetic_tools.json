@@ -258,6 +258,31 @@
   {
     "type": "function",
     "function": {
+      "name": "run_reflex",
+      "description": "Run a reflex: a saved workflow that does one finished thing (the Reflexes block of your instructions lists them; list_workflows gives each one's declaration). Its output is this call's reply. One that changes something, or reads the internet, is reviewed like any such call.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The reflex."
+          },
+          "input": {
+            "type": "object",
+            "description": "Its parameters by name; give every required one (marked * in the block)."
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "save_workflow",
       "description": "Validate a workflow definition (Open Workflow Specification DSL 1.0, YAML) and store it as a new draft version of `name`; saving the same text again returns its existing version. Problems come back with the path of the task and property to fix; fix them all and save again. The reply lists every call the workflow makes with its delivery (at_least_once / at_most_once) — show the user the at-most-once calls (the writes) before asking them to confirm. A draft never runs; see activate_workflow.",
       "parameters": {
@@ -460,7 +485,7 @@
     "type": "function",
     "function": {
       "name": "try_workflow",
-      "description": "Dry-run a saved workflow once, now. Without `signal`: as a scheduled fire would run it. With `signal`: as if that signal had just arrived, through the whole chain (the signal dispatcher, the route it picks, the loop, the guard, workers), with this workflow and each of `drafts` at its latest saved version in place of the active one. Model turns, reads (the internet's and MCP's) and the guard run for real; every write is only recorded and answered with {\"mock\": true, \"note\": \"dry run: not executed\", \"delivered\": true} (without `signal`: {\"ok\": true, \"dryRun\": true}), a confirmation is answered automatically (`confirm`), and nothing is kept. Returns the trace: the path of every workflow with each switch's case, each model turn's reasoning, text and calls, each call's verdict and reply, the writes, how each loop ended and the output. A signal with an unknown or missing source runs nothing and lists the signal types, each with its latest real signal.",
+      "description": "Dry-run a saved workflow once, now. Without `signal`: as a scheduled fire would run it; a reflex on `input`, its parameters by name, checked against its declaration. With `signal`: as if that signal had just arrived, through the whole chain (the signal dispatcher, the route it picks, the loop, the guard, workers), with this workflow and each of `drafts` at its latest saved version in place of the active one. Model turns, reads (the internet's and MCP's) and the guard run for real; every write is only recorded and answered with {\"mock\": true, \"note\": \"dry run: not executed\", \"delivered\": true} (without `signal`: {\"ok\": true, \"dryRun\": true}), a confirmation is answered automatically (`confirm`), and nothing is kept. Returns the trace: the path of every workflow with each switch's case, each model turn's reasoning, text and calls, each call's verdict and reply, the writes, how each loop ended and the output. A signal with an unknown or missing source runs nothing and lists the signal types, each with its latest real signal.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -506,6 +531,10 @@
               "expire"
             ],
             "description": "How the user answers a confirmation the guard asks for; accept by default."
+          },
+          "input": {
+            "type": "object",
+            "description": "For a reflex (metadata.reflex): its parameters by name, as run_reflex passes them. A reflex is tried only on input its declaration accepts."
           }
         },
         "required": [

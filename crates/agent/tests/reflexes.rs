@@ -30,8 +30,10 @@ use tokio_util::sync::CancellationToken;
 // ── the world ───────────────────────────────────────────────────────────────
 
 // `news_list` reads the agent's own store (closed world); `fetch_url` reads
-// the internet (open world); `send` changes it. `stop_on(name)` makes the
-// next call of `name` stop the process: it is recorded, then never answers.
+// the internet (open world); `send` changes the agent's own store (a
+// closed-world write: only its effect asks for a review).
+// `stop_on(name)` makes the next call of `name` stop the process: it is
+// recorded, then never answers.
 #[derive(Default)]
 struct World {
     calls: Mutex<Vec<(String, Map<String, Value>)>>,
@@ -61,7 +63,7 @@ impl Mcp for World {
         matches!(name, "news_list" | "fetch_url")
     }
     fn open_world(&self, name: &str) -> bool {
-        name != "news_list"
+        name == "fetch_url"
     }
     async fn call_tool(&self, name: &str, args: Map<String, Value>, _: &CancellationToken) -> anyhow::Result<String> {
         self.calls.lock().unwrap().push((name.into(), args.clone()));
@@ -88,9 +90,13 @@ impl Mcp for World {
 // The engine's store, whose writes stop at a chosen row: from the first
 // write `trigger` matches, every write of the process fails, as if it died
 // there. `revive` is the next process, on the same rows.
+// Whether a write (its row's kind, its value as JSON text) is where the
+// process dies.
+type Trigger = Box<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
 #[derive(Default)]
 struct Crash {
-    trigger: Mutex<Option<(Box<dyn Fn(&str, &str) -> bool + Send + Sync>, CancellationToken)>>,
+    trigger: Mutex<Option<(Trigger, CancellationToken)>>,
     dead: AtomicBool,
 }
 
@@ -202,7 +208,13 @@ fn guard(label: &str) -> Arc<GuardApi> {
 }
 
 // A process on `s`, its clock `ahead_ms` ahead.
-fn engine_on(s: &Stores, model: Arc<dyn ChatProvider>, world: Arc<World>, api: &Arc<GuardApi>, ahead_ms: i64) -> Arc<Engine> {
+fn engine_on(
+    s: &Stores,
+    model: Arc<dyn ChatProvider>,
+    world: Arc<World>,
+    api: &Arc<GuardApi>,
+    ahead_ms: i64,
+) -> Arc<Engine> {
     let p = |model: &str| ModelPreset { model: model.into(), reasoning_effort: ReasoningEffort::Disabled };
     let backend = Arc::new(Crashing { inner: s.backend.clone(), crash: s.crash.clone() });
     let view: Arc<dyn AtomicBackend> = Arc::new(s.backend.read_only_view());
@@ -315,7 +327,9 @@ fn verdict_uses(db: &AgentDb) -> i64 {
 
 fn reflex(name: &str, description: &str, input: Value, required: &[&str], body: &str) -> String {
     let declaration = json!({"reflex": {"description": description, "input": input, "required": required}});
-    format!("document: {{ dsl: '1.0.4', namespace: agent, name: {name}, version: '1.0.0', metadata: {declaration} }}\n{body}")
+    format!(
+        "document: {{ dsl: '1.0.4', namespace: agent, name: {name}, version: '1.0.0', metadata: {declaration} }}\n{body}"
+    )
 }
 
 fn news_window() -> String {
@@ -382,9 +396,13 @@ fn news_brief() -> String {
 // Saves, marks tried and activates `definition` without starting the
 // engine's worker: a process that only changes the catalog.
 async fn activate_quietly(engine: &Arc<Engine>, name: &str, definition: &str) {
-    let saved = agent::flows::tool(engine, "save_workflow", json!({"name": name, "definition": definition}).as_object().unwrap())
-        .await
-        .unwrap_or_else(|e| panic!("saving {name}: {e:#}"));
+    let saved = agent::flows::tool(
+        engine,
+        "save_workflow",
+        json!({"name": name, "definition": definition}).as_object().unwrap(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("saving {name}: {e:#}"));
     let version = serde_json::from_str::<Value>(&saved).unwrap()["version"].as_u64().unwrap();
     support::mark_tried(engine, name, definition);
     agent::flows::tool(engine, "activate_workflow", json!({"name": name, "version": version}).as_object().unwrap())
@@ -393,9 +411,12 @@ async fn activate_quietly(engine: &Arc<Engine>, name: &str, definition: &str) {
 }
 
 async fn save(engine: &Arc<Engine>, name: &str, definition: &str) -> anyhow::Result<Value> {
-    let saved =
-        agent::flows::tool(engine, "save_workflow", json!({"name": name, "definition": definition}).as_object().unwrap())
-            .await?;
+    let saved = agent::flows::tool(
+        engine,
+        "save_workflow",
+        json!({"name": name, "definition": definition}).as_object().unwrap(),
+    )
+    .await?;
     Ok(serde_json::from_str(&saved)?)
 }
 
@@ -538,7 +559,11 @@ async fn a_crash_after_the_verdict_is_spent_and_before_the_admission_starts_the_
     )])]));
     let engine1 = engine_on(&s, first.clone(), world.clone(), &api, 0);
     support::activate_definition(&engine1, "news-send", &news_send()).await;
-    let crashed = s.crash.arm(|kind, value| kind == "run" && value.contains("\"name\":\"news-send\""));
+    // The reflex's own admission (the round's guard child, admitted
+    // before, names it in its input).
+    let crashed = s.crash.arm(|kind, value| {
+        kind == "run" && value.contains("\"name\":\"news-send\"") && !value.contains("\"name\":\"guard\"")
+    });
     let sent = tokio::spawn(start(&engine1, "w4").await.send("post hello".into()));
     fired(&crashed).await;
     engine1.shutdown().await;
@@ -701,10 +726,9 @@ async fn the_catalog_reads_the_active_version_not_a_newer_draft() {
     let api = guard("allow");
     let engine = engine_on(&s, model.clone(), world.clone(), &api, 0);
     support::activate_definition(&engine, "news-window", &news_window()).await;
-    let v2 = news_window().replace("\"since\":\"the window's start, ISO\"", "\"from\":\"the start\"").replace(
-        "required\":[\"since\"]",
-        "required\":[\"from\"]",
-    );
+    let v2 = news_window()
+        .replace("\"since\":\"the window's start, ISO\"", "\"from\":\"the start\"")
+        .replace("required\":[\"since\"]", "required\":[\"from\"]");
     assert_ne!(v2, news_window());
     save(&engine, "news-window", &v2).await.unwrap();
     assert_eq!(start(&engine, "k3").await.send("go".into()).await.unwrap(), "ok");
@@ -785,7 +809,8 @@ async fn a_paused_or_tripped_reflex_is_an_error_reply_and_nothing_runs_in_its_pl
     let engine = engine_on(&s, model.clone(), world.clone(), &api, 0);
     support::activate_definition(&engine, "news-window", &news_window()).await;
     support::activate_definition(&engine, "news-broken", &broken).await;
-    let request = ouro_runtime::control::Request { id: "pause".into(), actor: "operator".into(), reason: "test".into() };
+    let request =
+        ouro_runtime::control::Request { id: "pause".into(), actor: "operator".into(), reason: "test".into() };
     engine.control.pause(&request, "news-window", "maintenance").await.unwrap();
     assert_eq!(start(&engine, "p1").await.send("go".into()).await.unwrap(), "paused");
     let reply = seen(&model, 1);
@@ -853,7 +878,9 @@ async fn a_reflex_draft_is_tried_on_input_its_declaration_accepts() {
     save(&engine, "news-send", &news_send()).await.unwrap();
     let tried = || {
         let digest = ouro_runtime::durable::digest_of(&news_send());
-        agent::flows::WorkflowMeta::get(&engine.deps.db, "news-send", &digest).unwrap().is_some_and(|m| m.tried_ms.is_some())
+        agent::flows::WorkflowMeta::get(&engine.deps.db, "news-send", &digest)
+            .unwrap()
+            .is_some_and(|m| m.tried_ms.is_some())
     };
     let attempt = |args: Value| {
         let engine = engine.clone();

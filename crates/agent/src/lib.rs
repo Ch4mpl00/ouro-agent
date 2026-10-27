@@ -18,6 +18,7 @@ pub mod local_recorder;
 pub mod mcp;
 pub mod models;
 pub mod providers;
+pub mod reflexes;
 pub mod runs;
 pub mod schedule;
 pub mod session;
