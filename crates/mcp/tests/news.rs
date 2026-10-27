@@ -487,6 +487,9 @@ fn search_news_returns_the_closest_matching_rows_best_first_without_near_duplica
                     args.insert("queries".into(), json!(queries));
                 }
                 let flat = value(call(&env.client, "search_news", Value::Object(args.clone())).await, "search_news");
+                // Without sinceISO a search covers the day before untilISO (or now).
+                let f =
+                    Filters { since: f.since.or(Some(f.until.unwrap_or(Utc::now().timestamp_millis()) - DAY)), ..f };
                 let at = format!("{f:?} {queries:?} k={k}");
                 let qv: Vec<Vec<f64>> =
                     word_vectors(&queries).into_iter().map(|v| v.into_iter().map(f64::from).collect()).collect();
@@ -606,7 +609,10 @@ fn dedup_at_the_top_leaves_room_for_the_next_distinct_match() {
             embeds: true,
         };
         seed(env, &[item("1", "rust"), item("2", "rust rust"), item("3", "rust tax")]).await;
-        let reply = value(call(&env.client, "search_news", json!({ "query": "rust", "k": 2 })).await, "search_news");
+        let reply = value(
+            call(&env.client, "search_news", json!({ "query": "rust", "k": 2, "sinceISO": iso(t0() - DAY) })).await,
+            "search_news",
+        );
         assert_eq!(reply["results"].as_array().unwrap().len(), 2);
     });
 }
