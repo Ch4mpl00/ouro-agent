@@ -404,6 +404,9 @@ pub struct LoopOptions {
     pub tags: Option<Vec<String>>,
     pub metadata: Metadata,
     pub trace_scope: Option<Scope>,
+    /// The request the loop is admitted for, which chooses the reflexes its
+    /// instructions list (`reflexes::catalog_block`); `None` lists them all.
+    pub reflex_request: Option<String>,
 }
 
 impl LoopOptions {
@@ -436,6 +439,7 @@ impl LoopOptions {
             tags: None,
             metadata: Map::new(),
             trace_scope: None,
+            reflex_request: None,
         }
     }
 }
@@ -579,7 +583,10 @@ pub async fn prepare(engine: &Engine, opts: &LoopOptions) -> anyhow::Result<Prep
     // the instructions the run is admitted with, so a restart keeps them.
     let reflexes = match opts.exclude_tools.contains(crate::reflexes::TOOL) {
         true => None,
-        false => crate::reflexes::catalog_block(engine).await?,
+        false => {
+            let scope = opts.trace_scope.clone().unwrap_or_else(crate::tracing::null_scope);
+            crate::reflexes::catalog_block(engine, opts.reflex_request.as_deref(), &scope, &opts.cancel).await?
+        }
     };
     let mut parts = Vec::new();
     if let Some(prompt) = opts.system_prompt.as_ref().filter(|s| !s.is_empty()) {
@@ -898,6 +905,7 @@ impl AgentLoop {
         }
         match name {
             "invoke_sub_agent" => self.opts.parent_id.is_none(),
+            crate::reflexes::FIND_TOOL => !self.opts.exclude_tools.contains(crate::reflexes::TOOL),
             "write_skill" => {
                 self.opts.parent_id.is_none() || (self.opts.allow_skill_writes && self.runs_skill("dreaming"))
             }
@@ -1021,6 +1029,11 @@ impl AgentLoop {
                 Ok(crate::skills::find_skills(&*engine.deps.skill_store, &index, client, &params, &scope, &self.cancel)
                     .await?
                     .to_string())
+            }
+            crate::reflexes::FIND_TOOL => {
+                let query = args.get("query").and_then(Value::as_str).unwrap_or_default();
+                let scope: Scope = span;
+                Ok(crate::reflexes::find(engine, query, &scope, &self.cancel).await?.to_string())
             }
             // Only validates: ending the session is the round's decision
             // (agent_settle), taken once every call has answered.

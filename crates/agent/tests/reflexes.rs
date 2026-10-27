@@ -215,6 +215,17 @@ fn engine_on(
     api: &Arc<GuardApi>,
     ahead_ms: i64,
 ) -> Arc<Engine> {
+    engine_with(s, model, world, api.clone(), ahead_ms)
+}
+
+// The same, with `api` answering Jev's questions.
+fn engine_with(
+    s: &Stores,
+    model: Arc<dyn ChatProvider>,
+    world: Arc<World>,
+    api: Arc<dyn agent::providers::JsonApi>,
+    ahead_ms: i64,
+) -> Arc<Engine> {
     let p = |model: &str| ModelPreset { model: model.into(), reasoning_effort: ReasoningEffort::Disabled };
     let backend = Arc::new(Crashing { inner: s.backend.clone(), crash: s.crash.clone() });
     let view: Arc<dyn AtomicBackend> = Arc::new(s.backend.read_only_view());
@@ -234,7 +245,7 @@ fn engine_on(
         memory: s.db.clone(),
         tracer: Arc::new(tracer),
         codex: Arc::new(NoCodex),
-        decisions: Some(agent::decisions::decision_client("guard-test".into(), api.clone())),
+        decisions: Some(agent::decisions::decision_client("guard-test".into(), api)),
         env: Default::default(),
         db: (*s.db).clone(),
         store: Arc::new(TransactionalStore::new(backend)),
@@ -713,6 +724,75 @@ async fn the_catalog_lists_active_tried_reflexes_and_a_restart_keeps_the_admitte
     assert_eq!(start(&engine2, "k2").await.send("go".into()).await.unwrap(), "fresh");
     assert!(system(&second, 1).contains("news-late("), "a new loop sees it");
     engine2.shutdown().await;
+}
+
+// Jev, judging one reflex useful for every request and the others not; the
+// guard's questions answered as `GuardApi` answers them.
+#[derive(Default)]
+struct Chooser {
+    requests: Mutex<Vec<Value>>,
+}
+#[async_trait]
+impl agent::providers::JsonApi for Chooser {
+    async fn post(&self, url: &str, body: Value, cancel: &CancellationToken) -> anyhow::Result<Value> {
+        let Some(reflexes) = body["state"]["reflexes"].as_array().cloned() else {
+            return GuardApi::default().post(url, body, cancel).await;
+        };
+        self.requests.lock().unwrap().push(body["state"].clone());
+        let answers: Map<String, Value> = reflexes
+            .iter()
+            .enumerate()
+            .map(|(n, r)| {
+                (
+                    format!("reflex_{n}"),
+                    json!({"type": "noul", "noul": if r["name"] == "news-window" { 0.95 } else { 0.1 }}),
+                )
+            })
+            .collect();
+        Ok(json!({"model": "jev-test", "answers": answers}))
+    }
+}
+
+// Past a few reflexes, the loop's instructions list only those Jev chose for
+// its request, and find_reflexes searches them all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn past_a_few_reflexes_the_instructions_list_the_ones_chosen_for_the_request() {
+    let s = stores();
+    let jev = Arc::new(Chooser::default());
+    let model = Arc::new(Scripted::new(vec![
+        calls(&[("find_reflexes", json!({"query": "the news of today"}))]),
+        assistant("done"),
+    ]));
+    let engine = engine_with(&s, model.clone(), Arc::new(World::default()), jev.clone(), 0);
+    support::activate_definition(&engine, "news-window", &news_window()).await;
+    for n in ["a", "b", "c", "d", "e"] {
+        let name = format!("news-{n}");
+        support::activate_definition(&engine, &name, &news_window().replace("news-window", &name)).await;
+    }
+    let mut opts = options("k1");
+    opts.reflex_request = Some("what is in the news".into());
+    assert_eq!(engine.start_loop(opts).await.unwrap().send("go".into()).await.unwrap(), "done");
+
+    let admitted = system(&model, 0);
+    assert!(
+        admitted.contains("Chosen for this request, 1 of 6; find_reflexes(query) searches the others"),
+        "{admitted}"
+    );
+    assert!(admitted.contains("- news-window(since*, query) [reads]"), "{admitted}");
+    assert!(!admitted.contains("news-a("), "an unchosen reflex is not listed: {admitted}");
+    let asked = jev.requests.lock().unwrap().clone();
+    assert_eq!(asked.len(), 2, "the block, chosen once, and the search");
+    assert_eq!(asked[0]["current_request"], "what is in the news");
+    assert_eq!(asked[0]["reflexes"].as_array().unwrap().len(), 6);
+    assert_eq!(asked[1]["current_request"], "the news of today");
+
+    let reply = seen(&model, 1);
+    assert!(
+        reply.contains("news-window(since*, query)") && reply.contains("saved") && reply.contains(":6}"),
+        "{reply}"
+    );
+    assert!(!reply.contains("news-a("), "{reply}");
+    engine.shutdown().await;
 }
 
 // R6: the catalog and list_workflows read the active version: a newer
