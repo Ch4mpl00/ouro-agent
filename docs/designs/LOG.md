@@ -739,3 +739,102 @@ pinned ones. Before deploying, query the prod engine store for live runs
 of the old `telegram` version (records with a `start_loop` call, today only
 a Telegram signal sleeping on a confirmation) and cancel them or let them
 finish: `start_loop` is no longer registered.
+
+## 2026-10-27 (design 10: executor)
+
+Branch `feat/reflexes`, design 10 with R1–R7 and the round-2 fix. Test-first:
+`tests/reflexes.rs` (tests 1–7, R2's `fetch_url` reflex, R4's two crash
+windows, R5, R6, the three-level composition with a restart and its trace)
+failed before the implementation, all 13 (run kept in the session's
+scratchpad). The crash windows use a store whose writes stop at a chosen
+row (`Crashing`: from the first matching write on, every write of the
+process fails, as if it died there); the next process runs with its clock
+60 s ahead, since the dead one kept its leases.
+
+Deviations, each with its reason:
+
+- **The pinned resolution lives in agent.db `reflex_calls`** (migration
+  0019), insert-once, keyed by the loop run and the call's place in its
+  round (`i.index`), and `classify` also records it in its output (R1's
+  journal record). The round's `start_guard` is the first step that meets
+  the call and must already know what the reflex does to put it in the
+  ready or the held branch, and `classify` runs after `start_reflex`; one
+  table every step reads (start_guard, start_reflex, classify, the join)
+  is the one resolution. Keyed by place, not by call key: a test model's
+  `call-0` with the same arguments in two rounds is two calls.
+- **`classify` answers `once: false` for every `run_reflex`**, joined or
+  not: `start_reflex` owns the effect, `tool_once` must never start one,
+  and a call that never started is a recorded error `tool_repeat` presents
+  (R3). An override without `start_reflex` answers every call with "this
+  loop's workflow has no start_reflex step".
+- **`child_outcome` is a closed-world read** in the summary, beside R2's
+  four adapters: it reads an owned child's stored outcome, and without it
+  every composing reflex (decision 5's call pattern) would be a write.
+- **The reflex's host data is the loop's admitted host data plus a
+  `reflex` note** (name, version, call key, whether it is reviewed, the
+  verdict), which R4 asks for. Not byte-equal to its parent's, so design
+  09's recognition never takes a reflex for a loop child; reflexes it
+  starts with `host: inherit` inherit the note.
+- **The gate also refuses** the parameter names `env` and `request` (the
+  `$workflow.input.env` rule must mean something; `request` is how a
+  workflow asks for a loop) and a reflex that is also a loop or a route
+  (those run on a signal's input; `try_workflow` would refuse to try it on
+  its parameters).
+- **The catalog** leaves out a reflex its breaker or an operator set
+  aside; its lines are `- name(since*, query) [reads|writes]: description`
+  under one header line, 28 at most and then `more: list_workflows (N more
+  reflexes)`, 30 lines in all; it sits before the working-memory rules, and
+  a loop that excludes `run_reflex` gets none. `run_reflex` is offered to
+  every loop, workers too: a reflex is a tool, not delegation.
+- **`Site::Reflex` starts through a new `runs::start_pinned_child`**: it
+  joins first, then admits the pinned version or sets it aside (missing,
+  paused, tripped, `NotAReflex`, refused); any refusal of the child by the
+  engine (nesting too deep, too) is the call's error reply, never the
+  loop's fault.
+- **The guard's evidence** is a `reflex` field on the call in the review
+  state (`guard::judge_with`): a note, name, version, writes, open world
+  and the pinned YAML cut to 12 000 characters, stored as evidence of the
+  round's guard child only for calls the guard reviews. The guard's
+  instructions are unchanged. Without a decision service, a reflex that
+  writes fails closed and a read reflex open, as the same direct calls do.
+- **R7's anchoring is in the registry's wrapper** (`functions::add`): every
+  call of a run with host data that has no scope and no anchor asks
+  `anchor_inherited`, which walks up through the caller's `RunReads`;
+  runs that inherit nothing are remembered (bounded) so they cost one look.
+  A loop a workflow started keeps its own `agent_loop` span from its
+  preparation, which now anchors missing ancestors first.
+- **R5**: a reflex draft without accepted `input` is refused before
+  anything runs; a non-reflex given `input` too. A reflex draft is marked
+  tried only when one of its runs started on validated input (the try's
+  root, or a `run_reflex` start in a signal's try); one reached only by
+  another workflow's `start_child` stays untried.
+- **Test 7** is in `tests/reflexes.rs`, beside the others. World's `send`
+  is a closed-world write, so a write reflex's review comes from its effect
+  alone (with an open-world write, hand mutant 1 would have hidden behind
+  the open-world rule).
+
+Hand mutants (temporary edits, reverted, no second worktree):
+
+1. A write reflex classified as a read (the summary took every MCP tool as
+   a read): killed by test 2 (the block case saw no review request), and
+   by the restart, both crash-window and catalog (`[reads]`) tests.
+2. `start_reflex` ignoring a blocking verdict (the early `{id: null}`
+   removed): killed by test 2's block case only ("blocked: nothing sent").
+
+Rollout: migration 0019 applies on boot. The built-in `agent-loop` text
+changes, so boot installs a new built-in version; runs in flight keep their
+pinned one, whose model may now call `run_reflex` (the tool is code): the
+old round has no `start_reflex`, so such a call is an error reply, nothing
+starts. An agent override of `agent-loop` or a loop variant saved before
+this lacks the reflex paths in the same way; re-copy the round to use
+reflexes. No reflex exists until the agent saves, tries and the user
+activates one.
+
+Verification: `cargo fmt --all`, `cargo clippy --all-targets -- -D
+warnings`, one full `scripts/test.py`: 103 binaries passed (807 tests, 2
+ignored). One small change landed while that run was under way (the inline
+review of a round without a guard child also sees the reflex's YAML,
+`reflexes::call_reflexes`); `tests/reflexes.rs` and clippy were run again
+on it. Under that load `agent_loop`'s
+`close_cancels_active_round_joins_tools_and_closes_trace_once` once hit its
+10 s wait in an earlier crate-only run, and passed alone and in the full run.

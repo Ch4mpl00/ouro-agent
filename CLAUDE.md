@@ -167,7 +167,21 @@ deletion.
    the request's; `agent-loop`'s `begin` step takes its first transcript
    (`loop_begin`); `loop_outcome` / `loop_transcript` read it back by the
    ref `start_child` returned. A refused start (paused, tripped) is the
-   caller's to catch: nothing runs in its place. **Telegram signals route to
+   caller's to catch: nothing runs in its place. **Reflexes** (docs/designs/10,
+   `reflexes.rs`): a workflow declaring `metadata.reflex` (description,
+   input, required; never `$workflow.input.env`) does one finished thing.
+   Every loop's instructions list the active, tried ones (built when they
+   are prepared, so a restart keeps them); the model runs one with
+   `run_reflex(name, input)`, resolved once per call and pinned in agent.db
+   `reflex_calls` (version, validated input, and what its YAML does
+   transitively). A closed-world read runs unreviewed; an open-world read or
+   a write goes through the guard with the pinned YAML and the input.
+   `start_reflex` (ready and held branch) starts that version as a host
+   child keyed by the call (`Site::Reflex`: nothing in its place), spending
+   the verdict and noting it in the child's host data; `tool_repeat` joins
+   it. Workflows compose reflexes with `start_child { host: inherit }`; a
+   run started that way is anchored by the first agent function serving it,
+   ancestors first. **Telegram signals route to
    the built-in `telegram`** (`workflows/telegram.yaml`, priority -1, so an
    agent's route of the same specificity wins; docs/designs/08): it opens the
    👀 bubble, gathers the first turn's context, starts `agent-loop` as its
@@ -250,6 +264,8 @@ mcp-tools/
     │   │                                   trace scopes, quiescence, built-ins, reconciler, named
     │   │                                   starts and their fallbacks
     │   ├── src/functions.rs                the engine's registry: MCP tools, host functions, steps
+    │   ├── src/reflexes.rs                 reflexes: the declaration, what one does, a call's pinned
+    │   │                                   resolution, the catalog, the guard's evidence
     │   ├── src/sandbox.rs                  dry runs on the engine's dry run: a signal through the draft
     │   │                                   chain, real turns, reads and guard, writes mocked, nothing kept
     │   ├── src/schedule.rs                 scheduled tasks: `task-<id>` definitions on engine triggers,
@@ -316,7 +332,7 @@ data directory remains under `packages/`, gitignored.
   activity journal's progress, the schedule's fires and task ids
   (`scheduled_fires`, `task_ids`; the tasks are engine definitions), and what the agent keeps beside the engine's runs
   (`run_trace`, `evidence`, `tool_snapshot`, `confirmations`,
-  `workflow_meta`, `prepared_loops`). The engine's own store (every workflow run, every
+  `workflow_meta`, `prepared_loops`, `reflex_calls`). The engine's own store (every workflow run, every
   workflow version and its breaker) is `engine.db` beside it, `ouro_*`
   tables migrated by the engine (`runs.rs` §1); back the two files up
   together. Migrations live in `crates/agent/migrations`

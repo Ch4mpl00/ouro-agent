@@ -1,6 +1,6 @@
 # 10. Reflexes: a catalog the loop can run
 
-Status: reviewed (Codex Sol, two rounds) · Issue: #64 (epic)
+Status: reviewed (Codex Sol, two rounds); implemented, with the deviations in LOG "2026-10-27 (design 10: executor)" · Issue: #64 (epic)
 
 ## Problem
 
