@@ -54,7 +54,9 @@ Read the YAML to see what a reflex does, what it reads and what it returns;
 when one does what the task needs (or a part of it), run it with
 `run_reflex` instead of making its calls yourself: it costs one call, keeps
 its rules and makes none of the plumbing mistakes. When none is listed but
-the task looks routine, `find_reflexes` searches the others.
+the task looks routine, `find_reflexes` searches the others. A reflex's
+result is that step done: build on it. Repeat its calls by hand only when
+the result itself shows it could not do the job, and say why.
 
 When the user asks to save or change standing guidance (style, preferences or
 domain procedures), use `write_skill` to create or update a live skill,
