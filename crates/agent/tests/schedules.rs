@@ -850,7 +850,7 @@ async fn the_migration_continues_both_sequences_and_settles_the_old_fires() {
             r#"CREATE TABLE "__drizzle_migrations" (id SERIAL PRIMARY KEY, hash text NOT NULL, created_at numeric)"#,
         )
         .unwrap();
-        for m in agent::db::migrations().unwrap().into_iter().filter(|m| m.tag != "0017_engine_schedules") {
+        for m in agent::db::migrations().unwrap().into_iter().take_while(|m| m.tag != "0017_engine_schedules") {
             for statement in &m.statements {
                 conn.execute_batch(statement).unwrap();
             }

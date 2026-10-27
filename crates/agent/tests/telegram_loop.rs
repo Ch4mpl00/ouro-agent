@@ -658,8 +658,9 @@ async fn a_wrapper_starts_a_custom_loop_and_reads_its_outcome_and_transcript() {
     assert!(tools.contains(&"send_telegram_message".to_owned()), "the tools: * skill widened: {tools:?}");
     assert!(!tools.contains(&"edit_telegram_message".to_owned()), "the exclusion survived the setup: {tools:?}");
 
-    // A draft of the wrapper dry-runs: its child inherits in the dry run's store.
-    let draft = probe_route("probe-d", "probe-d", "research-loop", narrow);
+    // A draft of the wrapper (a route on a source the agent receives) dry-runs:
+    // its child inherits in the dry run's store.
+    let draft = probe_route("probe-d", "telegram", "research-loop", narrow);
     let args = json!({"name":"probe-d","definition":draft});
     agent::flows::tool(&s.f.engine, "save_workflow", args.as_object().unwrap()).await.unwrap();
     let trace = s.f.engine.deps.tracer.trace(agent::tracing::TraceStart {
@@ -668,11 +669,16 @@ async fn a_wrapper_starts_a_custom_loop_and_reads_its_outcome_and_transcript() {
         ..Default::default()
     });
     let scope: agent::tracing::Scope = trace.clone();
-    let args = json!({"name":"probe-d","signal":{"source":"probe-d","content":"probe the loop"}});
-    let report =
-        agent::sandbox::try_signal(&s.f.engine, args.as_object().unwrap(), &context(), &scope, &CancellationToken::new())
-            .await
-            .unwrap();
+    let args = json!({"name":"probe-d","signal":{"source":"telegram","content":MESSAGE}});
+    let report = agent::sandbox::try_signal(
+        &s.f.engine,
+        args.as_object().unwrap(),
+        &context(),
+        &scope,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     let report: Value = serde_json::from_str(&report).unwrap();
     assert_eq!(report["status"], "completed", "{report:#}");
     assert!(report["output"].as_str().unwrap().starts_with("completed|dry done|"), "{report:#}");
@@ -1143,11 +1149,14 @@ async fn the_childs_trace_nests_under_its_wrapper_once() {
     restarted.shutdown().await;
 
     let (_, observations) = s.f.db.get_trace("probe-t:81").unwrap().expect("the signal's trace");
-    let loops: Vec<_> = observations
-        .iter()
-        .filter(|o| o.name == "agent_loop" && o.meta("activity") == Some(&json!("loop")))
-        .collect();
-    assert_eq!(loops.len(), 1, "one span for the child: {:#?}", observations.iter().map(|o| &o.name).collect::<Vec<_>>());
+    let loops: Vec<_> =
+        observations.iter().filter(|o| o.name == "agent_loop" && o.meta("activity") == Some(&json!("loop"))).collect();
+    assert_eq!(
+        loops.len(),
+        1,
+        "one span for the child: {:#?}",
+        observations.iter().map(|o| &o.name).collect::<Vec<_>>()
+    );
     let by_id: std::collections::HashMap<&str, &agent::trace_model::Observation> =
         observations.iter().map(|o| (o.id.as_str(), o)).collect();
     let ancestors = |id: &str| {
@@ -1191,7 +1200,11 @@ async fn a_paused_loop_is_refused_and_the_wrapper_answers_the_user() {
     assert!(s.model.loop_seen.lock().unwrap().is_empty(), "no loop ran");
     let composes = s.model.composes.lock().unwrap().clone();
     assert_eq!(composes.len(), 1);
-    assert!(composes[0].contains("maintenance window"), "the refusal is in the work: {}", composes[0]);
+    assert!(
+        composes[0].contains("could not start") && composes[0].contains("agent-loop is paused by an operator"),
+        "the refusal is in the work: {}",
+        composes[0]
+    );
     assert_eq!(replies(&s.mcp).len(), 1);
     assert_eq!(statuses(&s.mcp).last().unwrap()["text"], "");
     s.supervisor.shutdown().await;

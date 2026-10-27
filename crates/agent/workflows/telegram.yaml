@@ -2,9 +2,10 @@ document: { dsl: '1.0.4', namespace: agent, name: telegram, version: '1.0.0', me
 # A Telegram signal's flow (docs/designs/08-telegram-loop.md): the route the
 # dispatcher starts as the signal's primary run, wrapped around a loop that
 # does not know it runs here. It opens a 👀 bubble at once, gathers the
-# first turn's context, starts the loop as its own child with the delivery
-# tools taken away and a status observer on every step, joins it, composes
-# the one reply from what the loop did, sends it through the guard as the
+# first turn's context, starts the loop as its own child (`start_child` with
+# `host: inherit`, design 09) with the delivery tools taken away and a status
+# observer on every step, joins it, composes the one reply from what the loop
+# did (or from why it could not start), sends it through the guard as the
 # loop would, and clears the bubble. Every bubble call is cosmetic: none of
 # them can fail the signal. Priority -1: an agent's route of the same
 # specificity wins without a tie.
@@ -54,69 +55,92 @@ do:
   - work:
       try:
         - start:
-            call: start_loop
-            with:
-              input: '${ $context.input }'
-              skills: [telegram]
-              loaded: '${ [ "telegram" ] + ($context.preselected.names // []) }'
-              preset: smart
-              exclude_tools: [send_telegram_message, telegram_send_status, start_typing, send_telegram_chat_action]
-              on_step: >-
-                ${ if $context.conversation != null
-                   then { workflow: "telegram-status", input: { id: $context.bubble, chatId: $context.conversation.chatId, messageThreadId: $context.conversation.messageThreadId } }
-                   else null end }
-              system: >-
-                ${ [
-                  $context.activity,
-                  $context.pending_confirmations,
-                  "Call find_skills only when the task needs something specific that the skills already in your instructions don't cover; the source is only a hint.",
-                  $context.preselected.block,
-                  "This conversation's reply is written and sent for you after you finish: do not send it yourself and do not assign its delivery to a worker. Do the work now, then finish with what you did, what failed, and what the user should hear."
-                ] | map(select(. != null and . != "")) }
-            export: { as: '${ $context + { loop: . } }' }
-        - wait:
-            # No hold: the wrapper suspends until its loop ends; a loop that
-            # sleeps on a confirmation lets it sleep too.
-            listen:
-              read: envelope
-              to:
-                any:
-                  - with: { type: '${ $context.loop.done }' }
-                  - with: { type: '${ $context.loop.waiting }' }
-        - sleeping:
-            if: '${ .[0].type == $context.loop.waiting }'
+            # The loop, as this run's child with this run's host data (design
+            # 09): its parameters are its request. A refused start (an
+            # operator paused agent-loop, or it tripped) starts nothing in its
+            # place: the user hears it through the same reply.
+            try:
+              - loop:
+                  call: start_child
+                  with:
+                    name: agent-loop
+                    host: inherit
+                    input:
+                      request:
+                        input: '${ $context.input }'
+                        skills: [telegram]
+                        loaded: '${ [ "telegram" ] + ($context.preselected.names // []) }'
+                        preset: smart
+                        exclude_tools: [send_telegram_message, telegram_send_status, start_typing, send_telegram_chat_action]
+                        on_step: >-
+                          ${ if $context.conversation != null
+                             then { workflow: "telegram-status", input: { id: $context.bubble, chatId: $context.conversation.chatId, messageThreadId: $context.conversation.messageThreadId } }
+                             else null end }
+                        system: >-
+                          ${ [
+                            $context.activity,
+                            $context.pending_confirmations,
+                            "Call find_skills only when the task needs something specific that the skills already in your instructions don't cover; the source is only a hint.",
+                            $context.preselected.block,
+                            "This conversation's reply is written and sent for you after you finish: do not send it yourself and do not assign its delivery to a worker. Do the work now, then finish with what you did, what failed, and what the user should hear."
+                          ] | map(select(. != null and . != "")) }
+            catch:
+              # Every error a start answers is a refusal, nothing admitted:
+              # a pause or a trip (urn:ouro:errors:definition.tripped), any
+              # other urn:ouro:errors:call.not_executed. An interruption is
+              # no answer: the start resumes.
+              as: refused
+              do:
+                - unavailable:
+                    set: '${ { refused: ($refused.detail // $refused.title // "the agent loop was refused") } }'
+            export: { as: '${ $context + (if .refused != null then { refused: .refused } else { loop: . } end) }' }
+        - joined:
+            if: '${ $context.loop != null }'
             do:
-              - hide:
-                  # A bubble would freeze above the card for hours; the
-                  # tombstone keeps later status lines away.
-                  if: '${ $context.conversation != null }'
-                  try:
-                    - quiet:
+              - wait:
+                  # No hold: the wrapper suspends until its loop ends; a loop that
+                  # sleeps on a confirmation lets it sleep too.
+                  listen:
+                    read: envelope
+                    to:
+                      any:
+                        - with: { type: '${ $context.loop.done }' }
+                        - with: { type: '${ $context.loop.waiting }' }
+              - sleeping:
+                  if: '${ .[0].type == $context.loop.waiting }'
+                  do:
+                    - hide:
+                        # A bubble would freeze above the card for hours; the
+                        # tombstone keeps later status lines away.
+                        if: '${ $context.conversation != null }'
                         try:
-                          - clear:
-                              call: telegram_send_status
-                              with:
-                                id: '${ $context.bubble }'
-                                text: ''
-                                chatId: '${ $context.conversation.chatId }'
-                                messageThreadId: '${ $context.conversation.messageThreadId }'
-                                seq: 1000000
+                          - quiet:
+                              try:
+                                - clear:
+                                    call: telegram_send_status
+                                    with:
+                                      id: '${ $context.bubble }'
+                                      text: ''
+                                      chatId: '${ $context.conversation.chatId }'
+                                      messageThreadId: '${ $context.conversation.messageThreadId }'
+                                      seq: 1000000
+                              catch:
+                                # An unknown outcome is caught only by name; nothing resends it.
+                                errors: { with: { type: urn:ouro:errors:call.unknown } }
+                                do:
+                                  - unanswered: { set: '${ . }' }
                         catch:
-                          # An unknown outcome is caught only by name; nothing resends it.
-                          errors: { with: { type: urn:ouro:errors:call.unknown } }
                           do:
-                            - unanswered: { set: '${ . }' }
-                  catch:
-                    do:
-                      - hidden: { set: '${ . }' }
-              - done:
-                  listen: { to: { one: { with: { type: '${ $context.loop.done }' } } } }
-        - outcome:
-            call: loop_outcome
-            with: { ref: '${ $context.loop }' }
-            export: { as: '${ $context + { outcome: . } }' }
+                            - hidden: { set: '${ . }' }
+                    - done:
+                        listen: { to: { one: { with: { type: '${ $context.loop.done }' } } } }
+              - outcome:
+                  call: loop_outcome
+                  with: { ref: '${ $context.loop }' }
+                  export: { as: '${ $context + { outcome: . } }' }
         - after_loop:
             switch:
+              - refused: { when: '${ $context.loop == null }', then: unavailable }
               - faulted: { when: '${ $context.outcome.status == "faulted" }', then: loop_failed }
               - completed: { when: '${ $context.outcome.status == "completed" }', then: transcript }
               - cancelled: { then: clear }
@@ -127,6 +151,11 @@ do:
                 status: 500
                 title: '${ $context.outcome.error.title // "Loop failed" }'
                 detail: '${ $context.outcome.error.detail // $context.outcome.error.title // "loop failed" }'
+        - unavailable:
+            # Nothing ran: the reply says so, from the refusal.
+            set: '${ . }'
+            export: { as: '${ $context + { work: ("The agent loop could not start, so nothing was done: " + $context.refused), outcome: { status: "refused", output: "" } } }' }
+            then: compose
         - transcript:
             call: loop_transcript
             with: { ref: '${ $context.loop }' }

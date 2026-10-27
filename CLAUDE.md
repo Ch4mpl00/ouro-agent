@@ -155,17 +155,29 @@ deletion.
    run (`route_signal`, most specific first), a scheduled task's saved
    workflow likewise (`run_saved_workflow`); a worker or the primary may run
    a loop variant (the YAML's `start_worker { loop }`, the call's `loop`,
-   a skill's `loop:`, else `agent-loop`). **Telegram signals route to the
-   built-in `telegram`** (`workflows/telegram.yaml`, priority -1, so an
+   a skill's `loop:`, else `agent-loop`). **A workflow starts a loop as its
+   child** with the engine's `start_child { name, host: inherit, input: {
+   request } }` (ouro 0.4, docs/designs/09): the child's host data is its
+   parent's, byte-equal; its parameters (input, skills, preset, system,
+   `exclude_tools`, `on_step`) are its request, checked for mistakes only
+   (a bad one faults the child). The first host function that serves it
+   prepares it through `loop_for` (`functions::inherited_loop`) and stores
+   the preparation insert-once in agent.db `prepared_loops`; restarts and
+   the guard read the first one stored; the deny set is the parent's plus
+   the request's; `agent-loop`'s `begin` step takes its first transcript
+   (`loop_begin`); `loop_outcome` / `loop_transcript` read it back by the
+   ref `start_child` returned. A refused start (paused, tripped) is the
+   caller's to catch: nothing runs in its place. **Telegram signals route to
+   the built-in `telegram`** (`workflows/telegram.yaml`, priority -1, so an
    agent's route of the same specificity wins; docs/designs/08): it opens the
-   👀 bubble, gathers the first turn's context, starts the loop as its own
-   child with `start_loop` (host data inherited from the route's, only
-   narrowed: `exclude_tools` takes the delivery tools away from it and its
-   workers, `on_step` starts the `telegram-status` observer after each acting
-   turn through `observe_step`), joins it, composes the reply with
-   `llm_compose` from `loop_transcript`, sends it through the guard
-   (`start_guard` + `tool_once`, as the loop would) and clears the bubble.
-   The loop does not know it runs inside a Telegram flow. **The breaker is the engine's**:
+   👀 bubble, gathers the first turn's context, starts `agent-loop` as its
+   child that way (`exclude_tools` takes the delivery tools away from it and
+   its workers, `on_step` starts the `telegram-status` observer after each
+   acting turn through `observe_step`), joins it, composes the reply with
+   `llm_compose` from `loop_transcript` (or from the refusal, when the loop
+   could not start), sends it through the guard (`start_guard` +
+   `tool_once`, as the loop would) and clears the bubble. The loop does not
+   know it runs inside a Telegram flow. **The breaker is the engine's**:
    three faults of a version's runs in a row trip it; built-ins declare
    `breaker: off`, agent versions declare none. Every start of a name the
    agent may have overridden goes through `runs::start_named_root/child`
@@ -304,7 +316,7 @@ data directory remains under `packages/`, gitignored.
   activity journal's progress, the schedule's fires and task ids
   (`scheduled_fires`, `task_ids`; the tasks are engine definitions), and what the agent keeps beside the engine's runs
   (`run_trace`, `evidence`, `tool_snapshot`, `confirmations`,
-  `workflow_meta`). The engine's own store (every workflow run, every
+  `workflow_meta`, `prepared_loops`). The engine's own store (every workflow run, every
   workflow version and its breaker) is `engine.db` beside it, `ouro_*`
   tables migrated by the engine (`runs.rs` §1); back the two files up
   together. Migrations live in `crates/agent/migrations`

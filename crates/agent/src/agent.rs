@@ -227,9 +227,16 @@ impl Engine {
         &self.lifecycle
     }
     pub async fn start_loop(self: &Arc<Self>, opts: LoopOptions) -> anyhow::Result<Arc<AgentLoop>> {
-        self.create_or_join_loop(opts, false).await
+        self.create_or_join_loop(opts, None, false).await
     }
-    async fn create_or_join_loop(self: &Arc<Self>, opts: LoopOptions, join: bool) -> anyhow::Result<Arc<AgentLoop>> {
+    // `prepared`: the skills a loop a workflow started was prepared with
+    // (design 09), never read again; otherwise read now.
+    async fn create_or_join_loop(
+        self: &Arc<Self>,
+        opts: LoopOptions,
+        prepared: Option<Prepared>,
+        join: bool,
+    ) -> anyhow::Result<Arc<AgentLoop>> {
         self.check_start(&opts)?;
         if let Some(live) = self.loops.lock().await.get(&opts.id).cloned().filter(|l| !l.is_closed()) {
             if join {
@@ -237,7 +244,10 @@ impl Engine {
             }
             anyhow::bail!("agent-loop id {} already exists", opts.id);
         }
-        let prepared = prepare(self, &opts).await?;
+        let prepared = match prepared {
+            Some(prepared) => prepared,
+            None => prepare(self, &opts).await?,
+        };
         // IO above may have overlapped shutdown or another start of this id.
         let mut registry = self.loops.lock().await;
         self.check_start(&opts)?;
@@ -449,7 +459,7 @@ pub struct AgentLoop {
     setup: std::sync::Mutex<Setup>,
     sends: AtomicUsize,
     // Built by the engine for a run's functions (`loop_for`), so ended with
-    // the run; a loop a caller started (`start_loop`) is the caller's.
+    // the run; a loop a caller started (`Engine::start_loop`) is the caller's.
     run_owned: AtomicBool,
     observation_meta: Metadata,
     // False for a loop rebuilt after a restart until a host function has
@@ -1384,14 +1394,24 @@ pub type Records = std::collections::BTreeMap<String, ouro_runtime::ows::durable
 
 /// A loop run's host data (`FunctionContext::host`), or a refusal: only runs
 /// the host started as loops (a signal's primary, a worker, a recovery, a
-/// loop the host runs itself) carry the model's parameters (invariant 3).
+/// loop the host runs itself) carry the model's parameters (invariant 3),
+/// and the children that inherit theirs (`start_child { host: inherit }`).
 pub fn loop_host_of(host: Option<&Value>, function: &str) -> anyhow::Result<crate::runs::LoopHost> {
     match crate::runs::host_kind(host) {
         Some(kind) if crate::runs::loop_kind(kind) => Ok(serde_json::from_value(host.cloned().unwrap_or_default())
             .map_err(|e| refuse(format!("{function}: {e}")))?),
         _ => Err(refuse(format!(
-            "{function} requires the host's admitted model input: a run the runtime started on a signal, or a worker; a child a workflow starts itself has none"
+            "{function} requires the host's admitted model input: a run the runtime started on a signal, a worker, or a child started with `host: inherit` from one of those; a child a workflow starts without it has none"
         ))),
+    }
+}
+
+/// A preset as host data names it: one the model can select, or the
+/// compiler's.
+pub(crate) fn preset_named(name: &str) -> anyhow::Result<PresetName> {
+    match name {
+        "compiler" => Ok(PresetName::Compiler),
+        name => PresetName::selectable(name).ok_or_else(|| anyhow::anyhow!("unknown preset {name}")),
     }
 }
 
@@ -1455,7 +1475,10 @@ impl Engine {
     }
 
     /// The live loop of `run`, or one rebuilt from its host data, tracing in
-    /// the run's current scope.
+    /// the run's current scope. A loop a workflow started (its host data
+    /// inherited, its parameters its request, design 09) is rebuilt from its
+    /// stored preparation, which the first call prepares
+    /// (`functions::inherited_loop`).
     pub async fn loop_for(
         self: &Arc<Self>,
         runs: &dyn crate::runs::RunReads,
@@ -1464,10 +1487,12 @@ impl Engine {
     ) -> anyhow::Result<Arc<AgentLoop>> {
         if let Some(live) = self.loops.lock().await.get(run).cloned().filter(|l| !l.is_closed()) {
             if self.scopes.current(run).is_some() || live.trace.is_none() {
-                live.rescope(self.scope_for(run, &host.workflow));
+                live.rescope(self.scope_for(run, &live.opts.workflow));
             }
             return Ok(live);
         }
+        let prepared = crate::functions::inherited_loop(self, runs, run, host).await?;
+        let host = prepared.as_ref().map_or(host, |p| &p.host);
         let env = crate::session::EnvData::from_json(&host.env)?;
         let mut opts = LoopOptions::new(run, self.session(&host.session, env));
         opts.workflow = host.workflow.clone();
@@ -1479,10 +1504,7 @@ impl Engine {
         opts.tool_whitelist = host.tool_whitelist.as_ref().map(|w| w.iter().cloned().collect());
         opts.exclude_tools = host.exclude_tools.iter().cloned().collect();
         opts.on_step = host.on_step.clone();
-        opts.preset = match host.preset.as_str() {
-            "compiler" => PresetName::Compiler,
-            name => PresetName::selectable(name).ok_or_else(|| anyhow::anyhow!("unknown preset {name}"))?,
-        };
+        opts.preset = preset_named(&host.preset)?;
         opts.max_iterations = host.max_iterations;
         opts.max_concurrent_tools = host.max_concurrent_tools;
         opts.parent_id = host.parent_id.clone();
@@ -1496,28 +1518,34 @@ impl Engine {
         opts.signal_id = host.signal_id;
         opts.session_id = host.session_id.clone();
         opts.trace_scope = Some(self.scope_for(run, &host.workflow));
-        let live = self.create_or_join_loop(opts, true).await?;
+        let skills = prepared.as_ref().map(|p| p.skills.clone());
+        let live = self.create_or_join_loop(opts, skills, true).await?;
         live.run_owned.store(true, Ordering::SeqCst);
         if live.guard.lock().await.context.is_none() {
-            let context = self.guard_context_of(runs, run, host).await?;
+            let first = prepared.as_ref().map(|p| &p.input);
+            let context = self.guard_context_of(runs, run, host, first).await?;
             live.admit_guard(context).await;
         }
         Ok(live)
     }
 
-    // The guard's evidence for a loop run, from its host data only.
+    // The guard's evidence for a loop run, from its host data only (a loop
+    // a workflow started: its preparation's, and its first transcript).
     async fn guard_context_of(
         &self,
         runs: &dyn crate::runs::RunReads,
         run: &str,
         host: &crate::runs::LoopHost,
+        first: Option<&Value>,
     ) -> anyhow::Result<crate::guard::Context> {
         let task = match self.evidence_of(host.guard_request.as_ref())? {
             Some(task) => task,
             None => {
-                let saved = runs.run(run).await?.ok_or_else(|| anyhow::anyhow!("unknown run {run}"))?;
-                let messages: Vec<Message> =
-                    serde_json::from_value(saved.admission.input["messages"].clone()).unwrap_or_default();
+                let admitted = match first {
+                    Some(first) => first.clone(),
+                    None => runs.run(run).await?.ok_or_else(|| anyhow::anyhow!("unknown run {run}"))?.admission.input,
+                };
+                let messages: Vec<Message> = serde_json::from_value(admitted["messages"].clone()).unwrap_or_default();
                 messages
                     .iter()
                     .find(|m| providers::role(m) == "user")
@@ -1772,7 +1800,12 @@ pub async fn loop_turn(engine: &Arc<Engine>, loop_: &Arc<AgentLoop>, args: &Valu
     if i >= max.saturating_add(usize::from(args["extra_turn"] == true)) {
         anyhow::bail!("session {} exceeded maxIterations={max}", loop_.opts.id);
     }
-    let mut messages: Vec<Message> = serde_json::from_value(args.get("messages").cloned().unwrap_or(Value::Null))?;
+    let messages = args.get("messages").filter(|m| !m.is_null()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "agent_turn: messages are required; a loop a workflow started with its request takes its first ones from loop_begin (copy agent-loop's begin step)"
+        )
+    })?;
+    let mut messages: Vec<Message> = serde_json::from_value(messages.clone())?;
     if i == 0
         && let Some(message) = messages.iter().find(|m| providers::role(m) == "user")
     {
