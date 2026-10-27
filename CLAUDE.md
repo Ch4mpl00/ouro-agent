@@ -54,6 +54,16 @@ design decision against it first.
   decision away from the agent is the wrong one: make the agent better
   informed instead.
 
+**An activated workflow is trusted code** (maintainer, 2026-10-27). A version
+of the agent's runs only after a dry run and the user's confirmation, and
+YAML's direct calls are already unguarded (#59), so the runtime does not
+defend against a workflow: no YAML-vs-runtime trust boundary. Host data
+says only which tree a run belongs to (signal, conversation, session) and is
+inherited as it is (`start_child { host: inherit }`); a loop's parameters
+(preset, skills, instructions, excluded tools) are ordinary input, checked
+for existence, not for authority. The one boundary is model ↔ world: every
+tool call a model makes goes through the guard.
+
 Example: Telegram's `start_typing` costs a model turn, yet the supervisor does
 not call it automatically. Whether and when to show typing is the agent's
 choice.

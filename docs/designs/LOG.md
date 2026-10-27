@@ -652,3 +652,22 @@ executor took alone, each reversible:
   tests. The scratch worktree shared the target directory, and one full
   run picked up the mutants' artifacts; the reported run is a clean one
   after a rebuild.
+
+## 2026-10-27 (maintainer: an activated workflow is trusted code)
+
+- The design 09 draft (loops as children via ouro 0.4 `host: inherit`) drew a
+  Codex Sol review with five high findings, all at the YAML-vs-runtime trust
+  boundary: a fabricated signal under an inherited dispatcher's host data, a
+  skippable preparation step, a grandchild restoring excluded tools, a
+  `builtin.*` fallback bypassing an operator's pause, rollout. Fixing them
+  needed an admission hook in the engine (`derive`).
+- The maintainer chose to simplify the model instead: an activated workflow
+  (the maintainer's, or the agent's after a dry run and the user's
+  confirmation) is trusted code, as #59 already treats YAML's direct calls.
+  Host data names the tree; a loop's parameters are input; the guard on the
+  model's tool calls is the boundary. The review's trust findings (1–3, and
+  9's narrowing) no longer apply; the fallback goes (4: a refusal is caught
+  by the wrapper, a pause holds); rollout (5), the freeze point (6), the
+  snapshot (7), fault semantics (8), tracing (10) are kept in design 09 v2.
+- #68 (rights narrow down the tree) is closed by this decision: YAML passes
+  what it means to, and model-started workers already inherit exclusions.
