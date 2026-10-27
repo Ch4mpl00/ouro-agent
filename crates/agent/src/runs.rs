@@ -254,6 +254,26 @@ impl AgentDb {
         let mut statement = conn.prepare("SELECT name, read_only FROM tool_snapshot ORDER BY name")?;
         Ok(statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
     }
+
+    /// The stored preparation of a loop a workflow started (design 09).
+    pub fn prepared_loop(&self, run: &str) -> anyhow::Result<Option<PreparedLoop>> {
+        let body: Option<String> = self
+            .read()
+            .query_row("SELECT body FROM prepared_loops WHERE run_id = ?1", [run], |r| r.get(0))
+            .optional()?;
+        Ok(body.map(|b| serde_json::from_str(&b)).transpose()?)
+    }
+
+    /// Stores `prepared` unless one is stored already, and returns the one
+    /// stored: the first preparation wins (a re-dispatch, a recovery or a
+    /// concurrent handler that prepared again keeps it).
+    pub fn insert_prepared_loop(&self, run: &str, prepared: &PreparedLoop) -> anyhow::Result<PreparedLoop> {
+        self.conn().execute(
+            "INSERT INTO prepared_loops (run_id, body, created_ms) VALUES (?1, ?2, ?3) ON CONFLICT(run_id) DO NOTHING",
+            params![run, serde_json::to_string(prepared)?, now_ms()],
+        )?;
+        self.prepared_loop(run)?.ok_or_else(|| anyhow::anyhow!("the preparation of {run} was not stored"))
+    }
 }
 
 fn run_trace_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RunTrace> {
@@ -340,6 +360,22 @@ pub struct LoopHost {
     /// place (§10): its record, and the line its instructions carry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<Fallback>,
+}
+
+/// A loop a workflow started itself (`start_child { host: inherit, input:
+/// { request } }`, design 09), as the first host function that served it
+/// prepared it from its parent's parameters and its request: what its host
+/// data would have said had the host started it (`host`), its first
+/// transcript and working memory (`input`, what `loop_begin` answers), its
+/// skills as read then (`skills`) and the skills its starter says it runs
+/// (`loaded`). Stored once (agent.db `prepared_loops`); nothing reads the
+/// request or the skill files again.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PreparedLoop {
+    pub host: LoopHost,
+    pub input: Value,
+    pub skills: crate::agent::Prepared,
+    pub loaded: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -710,6 +746,7 @@ impl AgentDb {
             tx.execute("DELETE FROM confirmations WHERE run_id = ?1", [run])?;
             tx.execute("DELETE FROM guard_verdict_uses WHERE child_run = ?1", [run])?;
             tx.execute("DELETE FROM run_evidence WHERE run_id = ?1", [run])?;
+            tx.execute("DELETE FROM prepared_loops WHERE run_id = ?1", [run])?;
         }
         tx.execute(
             "DELETE FROM evidence WHERE NOT EXISTS (SELECT 1 FROM run_evidence l WHERE l.digest = evidence.digest)",

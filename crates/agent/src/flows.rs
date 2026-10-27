@@ -560,9 +560,12 @@ fn each_task(wf: &Workflow, visit: &mut dyn FnMut(&Task, &str)) {
 /// (decision 3), `emit` (design 01, 17), `run: workflow` (its version
 /// resolution picks versions the agent never named), the reserved contexts'
 /// functions (the guard round's, `fire_scheduled`) and a `start_child` of a
-/// task's definition by a literal name. The engine's `call: start_child { name, input }`
-/// stays allowed: it starts the active version of a name the YAML names,
-/// with no host data, so only its own trusted steps run.
+/// task's definition by a literal name. The engine's `call: start_child {
+/// name, input, host? }` stays allowed: it starts the active version of a
+/// name the YAML names, with no host data, or with this run's unchanged
+/// (`host: inherit`): how a workflow starts a loop, its parameters its
+/// request (design 09). An activated workflow is trusted code; the guard on
+/// the model's calls is the boundary.
 fn denied(wf: &Workflow) -> Vec<String> {
     let mut problems = Vec::new();
     if wf.schedule.is_some() {
@@ -581,7 +584,7 @@ fn denied(wf: &Workflow) -> Vec<String> {
         match &task.kind {
         Kind::Emit(_) => problems.push(format!("{at}/emit: a version of yours cannot emit events")),
         Kind::Run(run) if matches!(run.process, ouro_runtime::ows::model::Process::Workflow { .. }) => problems.push(
-            format!("{at}/run: `run: workflow` is not available to your versions; start a child with `call: start_child` (name, input) and join it with listen and child_outcome"),
+            format!("{at}/run: `run: workflow` is not available to your versions; start a child with `call: start_child` (name, input; host: inherit for a loop) and join it with listen"),
         ),
         Kind::Call { function, .. } if crate::functions::host_function(function).is_some_and(|f| f.context == "guard") => {
             problems.push(format!("{at}/call: `{function}` belongs to the reserved guard round"))

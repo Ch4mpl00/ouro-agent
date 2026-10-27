@@ -671,3 +671,71 @@ executor took alone, each reversible:
   snapshot (7), fault semantics (8), tracing (10) are kept in design 09 v2.
 - #68 (rights narrow down the tree) is closed by this decision: YAML passes
   what it means to, and model-started workers already inherit exclusions.
+
+## 2026-10-27 (design 09: executor)
+
+Branch `feat/loop-children`. ouro v0.4.0 needed no API change. Test-first:
+the design's tests in `tests/telegram_loop.rs` (the Telegram cases and the
+custom-loop round trip ported from `start_loop`, plus restarts, a bad
+request, tracing, a paused loop and a nested loop) failed before the
+implementation on the gate (`start_child` takes no `host`), the inherited
+host data and the paused start failing the signal.
+
+Deviations, each with its reason:
+
+- **`agent-loop` gains a `begin` step.** The engine admits the child with the
+  input the YAML gives (`{request}`), so the first transcript cannot be in
+  the run's input. The preparation itself stays in `loop_for` (no step marks
+  or can skip it); `begin` (`if: $context.messages == null`, `call:
+  loop_begin`) only reads what was stored: messages, working memory, and the
+  conversation, confirmation target and observer the steps read. A
+  host-started loop skips it. An agent's override without it faults when a
+  workflow starts it (`agent_turn` says what to copy); a variant whose first
+  step is `loop_setup` works (it reads the preparation too).
+- **The request has no `loop`.** The loop is `start_child`'s `name`; the
+  request is parsed with unknown fields refused (a typo of a parameter must
+  not be silently ignored, the same rule as `exclude_tools` names), so a
+  `loop` field faults the child. `loaded` defaults to the request's skills.
+- **Recognition is by host data, not by id.** An inherited child is a child
+  run whose input has `request` and whose host data equals its parent's
+  (what "inherited byte-equal" means), not the engine's `child:` id format.
+- **A nested wrapper keeps its parent's narrowing.** "The parent's deny set"
+  is the parent's effective one: when the parent is itself a loop child a
+  workflow started, its own preparation (prepared on demand, recursively,
+  insert-once). Hand mutant 2 needed a new test for it,
+  `a_nested_loop_keeps_its_parents_exclusions`: test 1's exclusion cases
+  cannot see it, because the Telegram route's own deny set is empty.
+- **A refused start is any error of the start.** A pause or a trip of a
+  reserved `start_child` answers `urn:ouro:errors:definition.tripped`, not
+  `call.not_executed` (the other refusals); `telegram.yaml` catches every
+  error of its start (each is a refusal, nothing admitted; an interruption
+  is never caught). The engine's refusal text names the pause but not the
+  operator's note, so the reply says the loop is paused by an operator.
+- **Anchoring under a suspended parent.** When the parent's execution has
+  stopped (it suspended on its `listen`), `scope_for(parent)` opens a
+  continuation segment of the parent and the child's span nests there; the
+  tree still runs parent span → segment → child span (test 5).
+- **Tests' seams.** "A restart before preparation is stored" is a skill
+  store that dies in the preparation's skill read (`GatedSkills`). The
+  wrapper's start task is named `loop`, so the dry-run report's link key
+  stays `loop` (sandbox test unchanged). `schedules.rs`' migration test
+  applied "every migration but 0017"; with 0018 that skipped 0017, so it now
+  applies the ones before 0017, as it says.
+- `workflow-author.md` documents `start_child { host: inherit }` for loops,
+  `loop_outcome` / `loop_transcript`, the catchable refusal and the `begin`
+  step an override keeps.
+
+Hand mutants (temporary edits, reverted):
+
+1. The preparation recomputed on every `loop_for` (the stored one neither
+   read first nor returned): killed by `restarts_never_change_a_prepared_loop`
+   (the tools offered after the skill changed differ).
+2. The deny set taken from the request alone: killed by
+   `a_nested_loop_keeps_its_parents_exclusions` only (see above).
+
+Rollout: as the design says. The built-in `agent-loop` and `telegram` texts
+change, so boot installs new built-in versions; runs in flight keep their
+pinned ones. Before deploying, query the prod engine store for live runs
+of the old `telegram` version (records with a `start_loop` call, today only
+a Telegram signal sleeping on a confirmation) and cancel them or let them
+finish: `start_loop` is no longer registered.

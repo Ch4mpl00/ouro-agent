@@ -475,18 +475,36 @@ the hold or the task timeout ends, it suspends durably; recovery replays the
 listen and consumes the persisted event or handles the timeout. A crash during
 the hold is recovered through the ordinary lease and journal.
 
-`start_child { name, input? }` starts the active version of a workflow
-immediately as an owned durable child and returns `{ id, key, done, waiting }`.
-The invocation path identifies it across replay; its admitted definition and
-input stay immutable. It gets no host data, so it cannot take agent turns:
-only its own steps run. Listen on its `done` / `waiting` event types (use
-an in-memory hold for fast work). After `waiting`, listen on `done` without a
-hold to release the worker. `child_outcome { id, key }` reads the owned
-child's stored terminal outcome; event data alone is not authority. Ending a
-parent cancels unfinished children. The built-in `guard` workflow is
-reserved and readable, but cannot be saved or activated; its review and
-confirmation functions are private. An `agent-loop` override must call
-`start_guard` before its tool round.
+`start_child { name, input?, host? }` starts the active version of a
+workflow immediately as an owned durable child and returns `{ id, key, done,
+waiting }`. The invocation path identifies it across replay; its admitted
+definition and input stay immutable. Without `host` it gets no host data, so
+it cannot take agent turns: only its own steps run. Listen on its `done` /
+`waiting` event types (use an in-memory hold for fast work). After `waiting`,
+listen on `done` without a hold to release the worker. `child_outcome { id,
+key }` reads the owned child's stored terminal outcome; event data alone is
+not authority. Ending a parent cancels unfinished children.
+
+To run a loop (`agent-loop` or one of yours) from a workflow that has a
+signal's context (a route, a scheduled task's workflow), start it with
+`host: inherit` and its parameters in `input.request`:
+`start_child { name: agent-loop, host: inherit, input: { request: { input,
+skills, loaded, preset, system, exclude_tools, on_step, allow_skill_writes }
+} }`. Only `input` (the first user message) is required. The loop keeps
+your run's conversation, confirmation target, session and excluded tools;
+its instructions are your run's, then `system`; `exclude_tools` takes more
+tools from it and its workers. A bad request (an unknown preset, skill or
+tool name) faults the loop; join it with listen, then read `loop_outcome {
+ref }` (completed with output, faulted with error, cancelled) and
+`loop_transcript { ref }` (what it did), `ref` being what `start_child`
+returned. A paused or tripped loop refuses the start with an error you can
+catch; nothing runs in its place, so the catch decides what the user hears.
+
+The built-in `guard` workflow is reserved and readable, but cannot be saved
+or activated; its review and confirmation functions are private. An
+`agent-loop` override must call `start_guard` before its tool round, and keep
+the `begin` step (`loop_begin` when `$context.messages` is null) if a
+workflow may start it.
 
 
 A subset of the Open Workflow Specification 1.0, in YAML, with the

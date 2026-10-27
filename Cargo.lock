@@ -3217,8 +3217,8 @@ dependencies = [
 
 [[package]]
 name = "ouro-durable"
-version = "0.3.0"
-source = "git+https://github.com/Ch4mpl00/ouro?tag=v0.3.0#758bd0cf74958a8b76e404770742b7e1e1f51537"
+version = "0.4.0"
+source = "git+https://github.com/Ch4mpl00/ouro?tag=v0.4.0#4ff3b72b3f394bebe219f3d109c33a0a53f10a67"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3239,8 +3239,8 @@ dependencies = [
 
 [[package]]
 name = "ouro-runtime"
-version = "0.3.0"
-source = "git+https://github.com/Ch4mpl00/ouro?tag=v0.3.0#758bd0cf74958a8b76e404770742b7e1e1f51537"
+version = "0.4.0"
+source = "git+https://github.com/Ch4mpl00/ouro?tag=v0.4.0#4ff3b72b3f394bebe219f3d109c33a0a53f10a67"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3269,8 +3269,8 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
 name = "ows"
-version = "0.3.0"
-source = "git+https://github.com/Ch4mpl00/ouro?tag=v0.3.0#758bd0cf74958a8b76e404770742b7e1e1f51537"
+version = "0.4.0"
+source = "git+https://github.com/Ch4mpl00/ouro?tag=v0.4.0#4ff3b72b3f394bebe219f3d109c33a0a53f10a67"
 dependencies = [
  "anyhow",
  "async-trait",

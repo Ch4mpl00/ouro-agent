@@ -1,8 +1,9 @@
 // The functions the engine's runs call (docs/designs/03-runs-on-the-engine.md, A):
 // 1. the registry and typed outcomes; 2. MCP tools from the snapshot;
 // 3. loop functions; 4. context functions; 5. child starters and their
-// settlement; 6. guard functions; 7. dispatcher functions; 8. workflow steps;
-// 8b. scheduled tasks; 9. the catalog authors see.
+// settlement; 5b. loops a workflow starts; 6. guard functions; 7. dispatcher
+// functions; 8. workflow steps; 8b. scheduled tasks; 9. the catalog authors
+// see.
 //
 // A handler reads its run tree (its own run, its ancestors, its descendants
 // and their records) through the call's run access (`FunctionContext::run`,
@@ -14,8 +15,9 @@
 // its host data says it serves (`FunctionContext::host`): loop functions a
 // loop run, guard functions a guard run, dispatcher functions the signal's
 // run. YAML can neither read nor forge host data, and a run a workflow starts
-// itself has none (invariant 3), so a refusal is the answer to any other
-// caller, recorded as not executed.
+// itself has none (invariant 3) unless it inherits its parent's unchanged
+// (`start_child { host: inherit }`, design 09: a loop a workflow starts, §5b),
+// so a refusal is the answer to any other caller, recorded as not executed.
 use crate::{
     agent::{AGENT_LOOP_NAME, Effect, Engine, EngineDeps, LoopOptions, Refusal, refuse, tool_call},
     errors::is_aborted,
@@ -55,6 +57,7 @@ pub fn registry(engine: Weak<Engine>, deps: &EngineDeps) -> Registry {
     add(&mut registry, &engine, "agent_turn", repeat, agent_turn);
     add(&mut registry, &engine, "agent_settle", repeat, agent_settle);
     add(&mut registry, &engine, "loop_setup", repeat, loop_setup);
+    add(&mut registry, &engine, "loop_begin", repeat, loop_begin);
     add(&mut registry, &engine, "classify", repeat, classify);
     add(&mut registry, &engine, "tool_once", once, |e, a, c| tool(e, a, c, true));
     add(&mut registry, &engine, "tool_repeat", repeat, |e, a, c| tool(e, a, c, false));
@@ -64,7 +67,6 @@ pub fn registry(engine: Weak<Engine>, deps: &EngineDeps) -> Registry {
     add(&mut registry, &engine, "start_guard", repeat, start_guard);
     add(&mut registry, &engine, "start_worker", repeat, start_worker);
     add(&mut registry, &engine, "primary_loop", repeat, primary_loop);
-    add(&mut registry, &engine, "start_loop", repeat, start_loop);
     add(&mut registry, &engine, "loop_outcome", repeat, loop_outcome);
     add(&mut registry, &engine, "loop_transcript", repeat, loop_transcript);
     add(&mut registry, &engine, "observe_step", repeat, observe_step);
@@ -265,11 +267,35 @@ async fn agent_settle(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
 async fn loop_setup(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
     let setup = async {
         let live = live_loop(&engine, &ctx).await?;
-        let saved = RunReads::run(&ctx, &ctx.run_id).await?.ok_or_else(|| anyhow::anyhow!("unknown run"))?;
+        // A loop a workflow started begins with its preparation (design 09).
+        let admitted = match engine.deps.db.prepared_loop(&ctx.run_id)? {
+            Some(prepared) => prepared.input,
+            None => {
+                RunReads::run(&ctx, &ctx.run_id).await?.ok_or_else(|| anyhow::anyhow!("unknown run"))?.admission.input
+            }
+        };
         let records = RunReads::records(&ctx, &ctx.run_id).await?;
-        crate::agent::loop_setup(&engine, &live, &ctx.run_id, &saved.admission.input, &args, &records).await
+        crate::agent::loop_setup(&engine, &live, &ctx.run_id, &admitted, &args, &records).await
     };
     setup.await.map_err(failed)
+}
+
+/// `loop_begin`: the first transcript and working memory of a loop a
+/// workflow started with its request (`start_child { host: inherit }`,
+/// design 09), as its preparation stored them: `{messages, memory}`, and
+/// the conversation, confirmation target and observer its steps read, what
+/// the host admits a loop it starts itself with. The loop exports them into
+/// `$context` before its first `agent_turn`.
+async fn loop_begin(engine: Arc<Engine>, _args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
+    let begin = async {
+        live_loop(&engine, &ctx).await?;
+        engine.deps.db.prepared_loop(&ctx.run_id)?.map(|prepared| prepared.input).ok_or_else(|| {
+            anyhow::anyhow!(
+                "loop_begin: this loop was started with its transcript, not a request: skip the step with `if: '${{ $context.messages == null }}'`"
+            )
+        })
+    };
+    begin.await.map_err(failed)
 }
 
 async fn classify(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
@@ -711,95 +737,156 @@ fn narrow(engine: &Engine, args: &Value, opts: &mut LoopOptions) -> anyhow::Resu
     Ok(())
 }
 
-/// `start_loop { input, loop?, skills, loaded, preset, system,
-/// exclude_tools, on_step, allow_skill_writes }`: one loop as an owned child
-/// of the calling loop run (a route's, an agent's saved workflow's), any
-/// named loop (`loop`, default agent-loop; one set aside runs agent-loop).
-/// Its host data is the caller's, only narrowed (design 08, review G-H1):
-/// the conversation, the confirmation target, the session, the signal and
-/// the guard's evidence come from the caller's host data, never from YAML;
-/// its instructions start with the caller's own (the session context, the
-/// signal's source and env note, a handover or fallback line, a button
-/// press's note). The caller's `signal_input` and `preselect_skills` records
-/// give it the earlier messages and the preselected block, as
-/// `primary_loop`'s do. Returns the child ref: join it with listen, then
-/// `loop_outcome` and `loop_transcript`.
-///
-/// TODO(ouro#43): once `run: workflow`/`start_child` can inherit host data,
-/// replace `start_loop` (and `signal`'s `primary_loop`) with `run: workflow`
-/// and remove this function.
-async fn start_loop(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
-    let start = async {
-        let (live, host) = engine.loop_of(&ctx, &ctx.run_id, ctx.host(), "start_loop").await?;
-        let input = args["input"].as_str().ok_or_else(|| anyhow::anyhow!("input: Required"))?;
-        let records = RunReads::records(&ctx, &ctx.run_id).await?;
-        let recorded_input = crate::agent::recorded_output(&records, "signal_input");
-        if let Some(memory) = recorded_input.and_then(|o| o["memory"].as_str()) {
-            let snapshot = engine.evidence_of(Some(&memory.to_owned()))?.unwrap_or_default();
-            engine.memory_in(&live.opts.session.memory, &serde_json::from_str(&snapshot)?)?;
-        }
-        let key = "loop";
-        let id = ctx.child_id(key);
-        let mut opts = LoopOptions::new(&id, live.opts.session.clone());
-        opts.workflow = args["loop"].as_str().filter(|l| !l.is_empty()).unwrap_or(AGENT_LOOP_NAME).to_owned();
-        opts.conversation = host.conversation.clone();
-        opts.confirm = host.confirm.clone();
-        opts.signal_id = host.signal_id;
-        opts.session_id = host.session_id.clone();
-        opts.parent_id = host.parent_id.clone();
-        opts.root_request = live.opts.root_request.clone();
-        opts.guard_request = live.opts.guard_request.clone();
-        opts.tool_whitelist = live.opts.tool_whitelist.clone();
-        opts.exclude_tools = live.opts.exclude_tools.clone();
-        opts.include_engine_skills = host.include_engine_skills;
-        opts.max_iterations = host.max_iterations;
-        opts.allow_skill_writes = host.allow_skill_writes && args["allow_skill_writes"] == true;
-        opts.earlier_user_messages = match recorded_input.and_then(|o| o["earlier"].as_str()) {
-            Some(digest) => serde_json::from_str(&engine.evidence_of(Some(&digest.to_owned()))?.unwrap_or_default())?,
-            None => live.opts.earlier_user_messages.clone(),
-        };
-        opts.preset = match args["preset"].as_str() {
-            None => live.opts.preset,
-            Some(preset) => crate::models::PresetName::selectable(preset)
-                .ok_or_else(|| anyhow::anyhow!("preset: unknown preset {preset}"))?,
-        };
-        opts.skills = strings(&args, "skills");
-        let system = strings(&args, "system");
-        if let Some(block) =
-            crate::agent::recorded_output(&records, "preselect_skills").and_then(|o| o["block"].as_str())
-            && system.iter().any(|part| part.contains(block))
-        {
-            opts.loaded_skill_text = block.to_owned();
-        }
-        let inherited = engine.evidence_of(host.evidence.system.as_ref())?;
-        let parts = inherited.into_iter().chain(system).filter(|p| !p.is_empty()).collect::<Vec<_>>();
-        opts.system_prompt = Some(parts.join("\n\n"));
-        narrow(&engine, &args, &mut opts)?;
-        // Its skills must exist whichever loop runs it.
-        crate::agent::prepare(&engine, &opts).await?;
-        // Tagged `loop`, not `primary_loop`: the journal's answer is the
-        // caller's (what the user got), not this loop's closing note.
-        let span = live.scope().span(SpanStart::new("agent_loop", SpanKind::Chain).metadata(metadata(
-            json!({"activity": "loop", "workflow": opts.workflow, "preset": opts.preset.as_str()}),
-        )));
-        anchor_child(&engine, &id, span.clone(), None, opts.session_id.clone()).await?;
-        let memory = engine.memory_out(&ctx.run_id, &live.opts.session.memory).await?;
-        let build = loop_builder(&engine, &opts, PRIMARY, &id, input, memory);
-        let started = crate::runs::start_named_child(&engine, &ctx, key, &opts.workflow, Site::Loop, build).await;
-        if let Err(error) = &started {
-            unanchor(&engine, &ctx, &id, &error.to_string()).await;
-        }
-        match started? {
-            Named::Started(child, ran) => {
-                if let Some(fallback) = &ran.fallback {
-                    crate::runs::trace_fallback(span.clone(), fallback, true);
-                }
-                Ok(serde_json::to_value(child)?)
-            }
-            Named::SetAside(fallback) => Err(anyhow::anyhow!("{}", fallback.line)),
-        }
+// ── 5b. loops a workflow starts ─────────────────────────────────────────────
+// Design 09: a workflow starts a loop with the engine's `start_child { name,
+// host: inherit, input: { request } }` and joins it with `listen`. Its host
+// data is its parent's, byte-equal: the tree it belongs to (the signal, the
+// conversation, the confirmation target, the session). Its parameters are
+// its request, ordinary input: an activated workflow is trusted code, so the
+// request is checked for mistakes (a preset that cannot be selected, a skill
+// that does not exist, a name that is no tool, a field that is no
+// parameter), never for authority. A bad request faults the child; the
+// caller reads why with `loop_outcome`. The first host function that serves
+// such a run (any of them, through `Engine::loop_for`) prepares it and
+// stores the preparation insert-once (`prepared_loops`): every later call,
+// recovery and guard reads the first one stored, and nothing reads the
+// request or the skill files again. A refused start (the loop's version
+// paused or tripped) is the caller's to catch: nothing runs in its place.
+
+/// A loop's parameters as a workflow asks for them (`input.request`).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoopRequest {
+    // The first user message.
+    input: String,
+    #[serde(default)]
+    skills: Vec<String>,
+    // The skills it runs, as its starter says (the signal's trace shows
+    // them for a wrapper that took no turn); its `skills` when absent.
+    #[serde(default)]
+    loaded: Option<Vec<String>>,
+    #[serde(default)]
+    preset: Option<String>,
+    // Its instructions, after the parent's own.
+    #[serde(default)]
+    system: Vec<String>,
+    #[serde(default)]
+    exclude_tools: Value,
+    #[serde(default)]
+    on_step: Value,
+    #[serde(default)]
+    allow_skill_writes: bool,
+}
+
+/// The preparation of run `run` if a workflow started it as a loop (its
+/// input has `request` and its host data is its parent's): the stored one,
+/// or the one prepared now and stored (the first stored wins); `None` for a
+/// run the host started. `host` is the run's host data, its parent's.
+pub(crate) async fn inherited_loop(
+    engine: &Arc<Engine>,
+    runs: &dyn RunReads,
+    run: &str,
+    host: &crate::runs::LoopHost,
+) -> anyhow::Result<Option<crate::runs::PreparedLoop>> {
+    if let Some(stored) = engine.deps.db.prepared_loop(run)? {
+        return Ok(Some(stored));
+    }
+    let Some(saved) = runs.run(run).await? else { return Ok(None) };
+    let Some(request) = saved.admission.input.get("request").filter(|r| !r.is_null()) else { return Ok(None) };
+    let Some(link) = &saved.child else { return Ok(None) };
+    let Some(parent) = runs.run(&link.parent).await? else { return Ok(None) };
+    // A host child's host data is the host's own, not its parent's.
+    if parent.admission.host() != saved.admission.host() {
+        return Ok(None);
+    }
+    // The parent's parameters: its own preparation when a workflow started
+    // it too, so a narrowing holds down the tree.
+    let parent_host = match Box::pin(inherited_loop(engine, runs, &link.parent, host)).await? {
+        Some(prepared) => prepared.host,
+        None => host.clone(),
     };
-    start.await.map_err(failed)
+    let prepared = prepare_inherited(engine, runs, &saved, &parent, &parent_host, request).await?;
+    let id = run.to_owned();
+    Ok(Some(engine.deps.db.write(move |db| db.insert_prepared_loop(&id, &prepared)).await?))
+}
+
+// A loop a workflow started, prepared from its parent's parameters
+// (`parent_host`), the context its parent's run captured (`signal_input`'s
+// earlier messages and working memory, `preselect_skills`' block) and its
+// request, as the host would have admitted it had it started the loop.
+async fn prepare_inherited(
+    engine: &Arc<Engine>,
+    runs: &dyn RunReads,
+    saved: &ouro_runtime::durable::SavedRun,
+    parent: &ouro_runtime::durable::SavedRun,
+    parent_host: &crate::runs::LoopHost,
+    request: &Value,
+) -> anyhow::Result<crate::runs::PreparedLoop> {
+    let id = saved.admission.id.clone();
+    // Its trace: a span under its parent's current one, opened once (a
+    // re-dispatch finds the anchor), before anything can fault it. Tagged
+    // `loop`, not `primary_loop`: the journal's answer is the parent's.
+    if engine.deps.db.run_trace(&id)?.is_none() {
+        let preset = request["preset"].as_str().unwrap_or(&parent_host.preset);
+        let span = engine.scope_for(&parent.admission.id, &parent.admission.name).span(
+            SpanStart::new("agent_loop", SpanKind::Chain)
+                .metadata(metadata(json!({"activity": "loop", "workflow": saved.admission.name, "preset": preset}))),
+        );
+        anchor_child(engine, &id, span, None, parent_host.session_id.clone()).await?;
+    }
+    let request: LoopRequest = serde_json::from_value(request.clone()).map_err(|e| anyhow::anyhow!("request: {e}"))?;
+    let env = crate::session::EnvData::from_json(&parent_host.env)?;
+    let session = engine.session(&parent_host.session, env);
+    let records = runs.records(&parent.admission.id).await?;
+    let recorded_input = crate::agent::recorded_output(&records, "signal_input");
+    if let Some(memory) = recorded_input.and_then(|o| o["memory"].as_str()) {
+        let snapshot = engine.evidence_of(Some(&memory.to_owned()))?.unwrap_or_default();
+        engine.memory_in(&session.memory, &serde_json::from_str(&snapshot)?)?;
+    }
+    let mut opts = LoopOptions::new(&id, session.clone());
+    opts.workflow = saved.admission.name.clone();
+    opts.conversation = parent_host.conversation.clone();
+    opts.confirm = parent_host.confirm.clone();
+    opts.signal_id = parent_host.signal_id;
+    opts.session_id = parent_host.session_id.clone();
+    opts.parent_id = parent_host.parent_id.clone();
+    opts.root_request = engine.evidence_of(parent_host.root_request_digest.as_ref())?;
+    opts.guard_request = engine.evidence_of(parent_host.guard_request.as_ref())?;
+    opts.tool_whitelist = parent_host.tool_whitelist.as_ref().map(|w| w.iter().cloned().collect());
+    // The parent's exclusions, then the request's (`narrow`).
+    opts.exclude_tools = parent_host.exclude_tools.iter().cloned().collect();
+    opts.include_engine_skills = parent_host.include_engine_skills;
+    opts.max_iterations = parent_host.max_iterations;
+    opts.max_concurrent_tools = parent_host.max_concurrent_tools;
+    opts.allow_skill_writes = request.allow_skill_writes;
+    let earlier = match recorded_input.and_then(|o| o["earlier"].as_str()) {
+        Some(digest) => engine.evidence_of(Some(&digest.to_owned()))?,
+        None => engine.evidence_of(parent_host.evidence.earlier.as_ref())?,
+    };
+    opts.earlier_user_messages = earlier.map(|e| serde_json::from_str(&e)).transpose()?.unwrap_or_default();
+    opts.preset = match &request.preset {
+        None => crate::agent::preset_named(&parent_host.preset)?,
+        Some(preset) => crate::models::PresetName::selectable(preset)
+            .ok_or_else(|| anyhow::anyhow!("preset: unknown preset {preset}"))?,
+    };
+    if let Some(block) = crate::agent::recorded_output(&records, "preselect_skills").and_then(|o| o["block"].as_str())
+        && request.system.iter().any(|part| part.contains(block))
+    {
+        opts.loaded_skill_text = block.to_owned();
+    }
+    let inherited = engine.evidence_of(parent_host.evidence.system.as_ref())?;
+    let parts = inherited.into_iter().chain(request.system).filter(|p| !p.is_empty()).collect::<Vec<_>>();
+    opts.system_prompt = Some(parts.join("\n\n"));
+    narrow(engine, &json!({"exclude_tools": request.exclude_tools, "on_step": request.on_step}), &mut opts)?;
+    opts.skills = request.skills;
+    let skills = crate::agent::prepare(engine, &opts).await?;
+    let messages = json!([providers::system(&skills.system), providers::user(&request.input)]);
+    let memory = engine.memory_out(&id, &session.memory).await?;
+    let input = crate::agent::loop_input(messages, memory, &opts);
+    let skill_text = skills.skill_text(&opts.loaded_skill_text);
+    let host = crate::agent::loop_host(engine, &opts, PRIMARY, &id, &skill_text).await?;
+    let loaded = request.loaded.unwrap_or_else(|| opts.skills.clone());
+    Ok(crate::runs::PreparedLoop { host, input, skills, loaded })
 }
 
 // An owned child of the calling run, or a refusal.
@@ -815,8 +902,9 @@ async fn own_child(
         .ok_or_else(|| refuse(format!("{function}: {id} is not a child of this run")))
 }
 
-/// `loop_outcome { ref }`: how a loop this run started ended: `{status:
-/// completed, output}`, `{status: faulted, error}`, `{status: cancelled}`,
+/// `loop_outcome { ref }`: how a loop this run started (the ref
+/// `start_child` returned) ended: `{status: completed, output}`, `{status:
+/// faulted, error}` (a bad request too, design 09), `{status: cancelled}`,
 /// or `{status: running}` before it ended.
 async fn loop_outcome(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
     let read = async {
@@ -839,8 +927,9 @@ async fn loop_outcome(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
     read.await.map_err(failed)
 }
 
-/// `loop_transcript { ref }`: what a loop this run started did, without its
-/// instructions (`agent::compact_transcript`); "" before its first turn.
+/// `loop_transcript { ref }`: what a loop this run started (the ref
+/// `start_child` returned) did, without its instructions
+/// (`agent::compact_transcript`); "" before its first turn.
 async fn loop_transcript(_engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
     let read = async {
         crate::agent::loop_host_of(ctx.host(), "loop_transcript")?;
@@ -1250,12 +1339,18 @@ async fn settle_child(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
                         let records = RunReads::records(&ctx, id).await?;
                         let host = crate::agent::loop_host_of(child.admission.host(), "settle_child")?;
                         let mut names = crate::agent::loop_skill_names(&engine, &host, &records);
-                        // A route that took no turn: its loop's skills
-                        // (`start_loop`'s `loaded`) are the ones that ran.
+                        // A route that took no turn: its loops' skills (the
+                        // `loaded` of each one's stored preparation, design
+                        // 09) are the ones that ran.
                         if !crate::agent::turned(&records) {
-                            for name in recorded_loaded(&records, "start_loop") {
-                                if !names.contains(&name) {
-                                    names.push(name);
+                            for child in RunReads::children(&ctx, id).await? {
+                                let Some(prepared) = engine.deps.db.prepared_loop(&child.admission.id)? else {
+                                    continue;
+                                };
+                                for name in prepared.loaded {
+                                    if !names.contains(&name) {
+                                        names.push(name);
+                                    }
                                 }
                             }
                         }
@@ -1301,7 +1396,7 @@ async fn settle_child(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
     settle.await.map_err(failed)
 }
 
-// The skills a loop starter (`primary_loop`, `start_loop`) said its loop runs.
+// The skills the signal's loop starter (`primary_loop`) said its loop runs.
 fn recorded_loaded(records: &crate::agent::Records, starter: &str) -> Vec<String> {
     use ouro_runtime::ows::durable::Record;
     records
@@ -1609,8 +1704,8 @@ async fn signal_transcript(_engine: Arc<Engine>, args: Value, ctx: FunctionConte
             return Err(refuse(format!("signal_transcript: {id} is not a child of this run")));
         }
         let mut records = RunReads::records(&ctx, id).await.unwrap_or_default();
-        // A route that took no turn ran a loop of its own (`start_loop`):
-        // the report reads the last of its loops that did (design 08, G-M5).
+        // A route that took no turn ran a loop of its own (its child, design
+        // 09): the report reads the last of its loops that did (design 08, G-M5).
         if !crate::agent::turned(&records) {
             for child in RunReads::children(&ctx, id).await.unwrap_or_default() {
                 let child = RunReads::records(&ctx, &child.admission.id).await.unwrap_or_default();
@@ -1902,6 +1997,14 @@ pub const HOST_FUNCTIONS: &[HostFunction] = &[
         "Set up the loop's instructions, once and before its first agent_turn. system is an array of strings added to the system prompt; skills names skills loaded in full, with their tools; input replaces the first user message. Returns messages and memory to export into $context, and setup (what a restart restores).",
     ),
     f(
+        "loop_begin",
+        Read,
+        &[],
+        &[],
+        "agent-loop",
+        "The first messages and working memory of a loop a workflow started with start_child (host: inherit, input.request), as the host prepared them once from its request; also conversation, confirm and on_step. Call it first when $context.messages is null and export the result into $context, as agent-loop's begin step does.",
+    ),
+    f(
         "classify",
         Read,
         &["call", "guard_run", "worker_run"],
@@ -2017,20 +2120,12 @@ pub const HOST_FUNCTIONS: &[HostFunction] = &[
         "Start the signal's primary agent as a child after signal_session; loop names the loop it runs (default agent-loop; one set aside runs agent-loop). Returns id, key, done and waiting: join it with listen on done, child_outcome and settle_child.",
     ),
     f(
-        "start_loop",
-        Write,
-        &["input", "loop", "skills", "loaded", "preset", "allow_skill_writes", "system", "exclude_tools", "on_step"],
-        &["input"],
-        "agent-loop",
-        "Start one loop as this run's child (a run the runtime started on a signal: a route, a saved workflow): loop names it (default agent-loop; one set aside runs agent-loop). Its conversation, confirmation target, session and guard evidence are this run's; its instructions start with this run's, then system. exclude_tools takes tools away from it and its workers; on_step {workflow, input} starts that workflow after each acting turn with input + {seq, step}. Returns id, key, done and waiting: join it with listen, then loop_outcome and loop_transcript.",
-    ),
-    f(
         "loop_outcome",
         Read,
         &["ref"],
         &["ref"],
         "agent-loop",
-        "How a loop this run started ended: status completed (with output), faulted (with error), cancelled, or running.",
+        "How a loop this run started ended (ref: what start_child returned): status completed (with output), faulted (with error: a bad request faults it too), cancelled, or running.",
     ),
     f(
         "loop_transcript",
@@ -2038,7 +2133,7 @@ pub const HOST_FUNCTIONS: &[HostFunction] = &[
         &["ref"],
         &["ref"],
         "agent-loop",
-        "What a loop this run started did, as compact text without its instructions: the request, its calls with their results, its notes; long work keeps the end.",
+        "What a loop this run started did (ref: what start_child returned), as compact text without its instructions: the request, its calls with their results, its notes; long work keeps the end.",
     ),
     f(
         "observe_step",
@@ -2120,16 +2215,16 @@ pub const HOST_FUNCTIONS: &[HostFunction] = &[
     f("skill_catalog_snapshot", Read, &[], &[], "workflow", "A step of the workflow runtime; the skill describes it."),
 ];
 
-/// The engine's own workflow functions (`start_child { name, input }`,
+/// The engine's own workflow functions (`start_child { name, input, host }`,
 /// `child_outcome { id, key }`), for the author's catalog.
 pub const ENGINE_FUNCTIONS: &[HostFunction] = &[
     f(
         "start_child",
         Read,
-        &["name", "input"],
+        &["name", "input", "host"],
         &["name"],
         "workflow",
-        "The engine's own: start an owned child of a saved workflow (no host data: it cannot take agent turns). Returns id, key, done and waiting.",
+        "The engine's own: start an owned child of a workflow. Without host it has no host data and cannot take agent turns. host: inherit gives it this run's host data unchanged, which is how a workflow starts a loop (agent-loop or one of yours): input { request: { input, skills, loaded, preset, system, exclude_tools, on_step, allow_skill_writes } }. The loop keeps this run's conversation, confirmation target, session and excluded tools; its instructions start with this run's, then system; exclude_tools takes more tools away from it and its workers; on_step {workflow, input} starts that workflow after each acting turn with input + {seq, step}. A bad request faults the loop; a paused or tripped loop is refused with an error you catch (urn:ouro:errors:definition.tripped): nothing runs in its place. Returns id, key, done and waiting: join with listen, then loop_outcome and loop_transcript.",
     ),
     f("child_outcome", Read, &["id", "key"], &["id", "key"], "workflow", "The engine's own: an owned child's outcome."),
 ];

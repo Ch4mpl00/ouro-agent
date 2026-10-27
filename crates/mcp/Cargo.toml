@@ -42,7 +42,7 @@ url = "2.5.8"
 agent = { path = "../agent" }
 # The engine the agent's test support names (tests/skill_index_workflow.rs
 # includes crates/agent/tests/support), at the agent's tag.
-ouro-runtime = { git = "https://github.com/Ch4mpl00/ouro", tag = "v0.3.0" }
+ouro-runtime = { git = "https://github.com/Ch4mpl00/ouro", tag = "v0.4.0" }
 cucumber = "0.23"
 proptest = "1"
 tempfile = "3"

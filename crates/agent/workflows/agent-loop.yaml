@@ -2,11 +2,18 @@ document: { dsl: '1.0.4', namespace: agent, name: agent-loop, version: '1.0.0', 
 # The ReAct loop as a durable engine run. The host admits it with the model's
 # parameters as host data; its input carries the transcript (`messages`) and
 # the working memory, its context the turn count; every task record is a
-# checkpoint, so a restart resumes the loop where it was.
+# checkpoint, so a restart resumes the loop where it was. A workflow starts
+# it with `start_child { host: inherit, input: { request } }` (design 09):
+# then its input is its request, and `begin` takes the transcript and the
+# working memory the host prepared from it.
 # Built-ins never trip (design 01, decision 10): a provider outage must not stop the agent.
 input:
   from: '${ . + { i: 0 } }'
 do:
+  - begin:
+      if: '${ $context.messages == null }'
+      call: loop_begin
+      export: { as: '${ $context + . }' }
   - turn:
       call: agent_turn
       with: { messages: '${ $context.messages }', memory: '${ $context.memory }', i: '${ $context.i }' }
