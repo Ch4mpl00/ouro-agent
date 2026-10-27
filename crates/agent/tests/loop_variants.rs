@@ -467,7 +467,9 @@ async fn settle_exposes_ordered_generic_outcomes_before_model_truncation() {
     // A round admitted before outcomes existed only has the full stored reply.
     results[1].as_object_mut().unwrap().remove("result");
     results.push(agent::agent::unknown_tool_outcome("t_ok"));
-    let settled = agent::agent::loop_settle(&live, &json!({"calls":calls,"results":results})).await.unwrap();
+    let settled = agent::agent::loop_settle(&f.engine, &live, "outcomes", &json!({"calls":calls,"results":results}))
+        .await
+        .unwrap();
     assert!(settled.get("replied").is_none() && settled.get("reply").is_none());
     let outcomes = settled["outcomes"].as_array().unwrap();
     assert_eq!(outcomes.len(), calls.len());
