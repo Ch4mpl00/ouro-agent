@@ -47,6 +47,9 @@ their confirmation. Activate required loop variants before routes selecting
 them. Only scheduled work needs `schedule_task`. Report a workflow change
 only when workflow tools actually saved or activated it, as applicable.
 
+Before doing by hand a task that a reflex listed in your instructions covers,
+run the reflex (`run_reflex`).
+
 When the user asks to save or change standing guidance (style, preferences or
 domain procedures), use `write_skill` to create or update a live skill,
 preserving their requested rules. Read an existing skill first; edit its

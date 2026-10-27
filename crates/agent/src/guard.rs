@@ -175,8 +175,38 @@ pub fn key(call: &ToolCall) -> String {
     format!("{}:{}", call.id, hex::encode(hash))
 }
 pub fn needs_guard(engine: &Engine, call: &ToolCall) -> bool {
+    needs_guard_in(engine, call, &Reflexes::default())
+}
+
+/// The `run_reflex` calls of a round, by call key, as their resolutions say
+/// (design 10): what each does and the evidence its review shows.
+#[derive(Clone, Debug, Default)]
+pub struct Reflexes(pub HashMap<String, (crate::reflexes::Summary, Value)>);
+
+impl Reflexes {
+    fn summary(&self, call: &ToolCall) -> Option<crate::reflexes::Summary> {
+        self.0.get(&key(call)).map(|(summary, _)| *summary)
+    }
+}
+
+/// Whether `call` needs the guard: a write or an open-world read; a
+/// `run_reflex` call by what its resolution says the reflex does (R2: only a
+/// closed-world read runs unreviewed), and one that resolved to nothing
+/// starts nothing; one with no resolution here counts as a write.
+pub fn needs_guard_in(engine: &Engine, call: &ToolCall, reflexes: &Reflexes) -> bool {
+    if call.name == crate::reflexes::TOOL {
+        return reflexes.summary(call).is_none_or(|s| s.needs_guard());
+    }
     call.name != "invoke_sub_agent"
         && (tool_effect(engine, &call.name) == crate::agent::Effect::Write || tool_open_world(engine, &call.name))
+}
+
+// Whether a call only reads, for the review that could not be made.
+fn reads(engine: &Engine, call: &ToolCall, reflexes: &Reflexes) -> bool {
+    match reflexes.summary(call) {
+        Some(summary) if call.name == crate::reflexes::TOOL => !summary.writes,
+        _ => tool_effect(engine, &call.name) == crate::agent::Effect::Read,
+    }
 }
 
 // ── 2. deterministic rules ──────────────────────────────────────────────────
@@ -321,12 +351,29 @@ pub async fn judge(
     scope: &Scope,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Vec<(String, Verdict)>> {
+    judge_with(engine, context, calls, chain, call_count, &Reflexes::default(), scope, cancel).await
+}
+
+/// `judge`, with the round's `run_reflex` calls as their resolutions say:
+/// each one reviewed carries its reflex's evidence (the pinned YAML) beside
+/// its arguments (the input).
+#[allow(clippy::too_many_arguments)]
+pub async fn judge_with(
+    engine: &Engine,
+    context: &Context,
+    calls: &[ToolCall],
+    chain: &[Value],
+    call_count: usize,
+    reflexes: &Reflexes,
+    scope: &Scope,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Vec<(String, Verdict)>> {
     check(cancel)?;
     let span = scope.span(SpanStart::new("guard", SpanKind::Chain));
     let child: Scope = span.clone();
     let mut verdicts = Vec::new();
     let mut pending = Vec::new();
-    for call in calls.iter().filter(|c| needs_guard(engine, c)) {
+    for call in calls.iter().filter(|c| needs_guard_in(engine, c, reflexes)) {
         if let Some(verdict) = deterministic(context, call) {
             verdicts.push((key(call), verdict));
         } else {
@@ -335,11 +382,14 @@ pub async fn judge(
     }
     if !pending.is_empty() {
         let questions = (0..pending.len()).map(|i| review_question("state", i)).collect::<anyhow::Result<Vec<_>>>()?;
-        let mut request = DecisionRequest::new(
-            review_state(context, &pending.iter().map(|c| (*c).clone()).collect::<Vec<_>>(), chain, call_count),
-            child,
-            cancel.clone(),
-        );
+        let mut state =
+            review_state(context, &pending.iter().map(|c| (*c).clone()).collect::<Vec<_>>(), chain, call_count);
+        for (i, call) in pending.iter().enumerate() {
+            if let Some((_, evidence)) = reflexes.0.get(&key(call)).filter(|_| call.name == crate::reflexes::TOOL) {
+                state["calls"][i]["reflex"] = evidence.clone();
+            }
+        }
+        let mut request = DecisionRequest::new(state, child, cancel.clone());
         request.name = "guard:round".into();
         for (i, question) in questions.iter().enumerate() {
             request = request.question(&format!("call_{i}"), question);
@@ -356,21 +406,18 @@ pub async fn judge(
             let mut verdict = match &result {
                 Ok(decision) => Verdict::new(settle(&decision.answer(&format!("call_{i}"), &questions[i])?)),
                 Err(error) => {
-                    let mut verdict = Verdict::new(
-                        if tool_effect(engine, &call.name) == crate::agent::Effect::Read || current_reply(context, call)
-                        {
-                            "allow"
-                        } else {
-                            "guard_unavailable"
-                        },
-                    );
+                    let mut verdict = Verdict::new(if reads(engine, call, reflexes) || current_reply(context, call) {
+                        "allow"
+                    } else {
+                        "guard_unavailable"
+                    });
                     verdict.unavailable = Some(error.to_string());
                     verdict
                 }
             };
             // Preserve the unavailable evidence even on a permitted reply.
             if verdict.allowed() && verdict.unavailable.is_some() {
-                verdict.guidance = if tool_effect(engine, &call.name) == crate::agent::Effect::Read {
+                verdict.guidance = if reads(engine, call, reflexes) {
                     "Decision service unavailable; open-world read passed deterministic checks."
                 } else {
                     "Decision service unavailable; reply to the current conversation permitted."
