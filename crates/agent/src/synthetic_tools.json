@@ -614,5 +614,115 @@
         "additionalProperties": false
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "filter_relevant",
+      "description": "Keep the items that pass `prompt` (a cheap batched decision model, one verdict per item; `threshold` 0–1 raises the bar). The same step a saved workflow calls. Pass a large list through `refs` (`{\"items\": \"<memory key>#items\"}`) rather than copying it. Returns the kept items.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "threshold": {
+            "type": "number"
+          },
+          "refs": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Inputs too large to copy: argument path → working-memory key, e.g. {\"items\": \"tool.ab12#items\"} or {\"input.posts\": \"posts\"}. A key's JSON value is used as JSON; `#a.b` takes a field of it."
+          }
+        },
+        "required": [
+          "prompt"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "llm_compose",
+      "description": "Write text (or JSON with `json: true`) from `prompt` and `input` with the compose model, a stronger writer than you. The same step a saved workflow calls. Pass large inputs through `refs` (`{\"input.posts\": \"<memory key>\"}`).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "prompt": {
+            "type": "string"
+          },
+          "input": {
+            "type": "object"
+          },
+          "json": {
+            "type": "boolean"
+          },
+          "preset": {
+            "type": "string"
+          },
+          "skill": {
+            "type": "string"
+          },
+          "refs": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Inputs too large to copy: argument path → working-memory key, e.g. {\"items\": \"tool.ab12#items\"} or {\"input.posts\": \"posts\"}. A key's JSON value is used as JSON; `#a.b` takes a field of it."
+          }
+        },
+        "required": [
+          "prompt"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "choose",
+      "description": "Pick one of `options` (label: criterion) for `input` with the decision model; `min_confidence` with `default` falls back when unsure. The same step a saved workflow calls. Pass large inputs through `refs`.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string"
+          },
+          "options": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "input": {},
+          "min_confidence": {
+            "type": "number"
+          },
+          "default": {
+            "type": "string"
+          },
+          "refs": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Inputs too large to copy: argument path → working-memory key, e.g. {\"items\": \"tool.ab12#items\"} or {\"input.posts\": \"posts\"}. A key's JSON value is used as JSON; `#a.b` takes a field of it."
+          }
+        },
+        "required": [
+          "question",
+          "options"
+        ],
+        "additionalProperties": false
+      }
+    }
   }
 ]
