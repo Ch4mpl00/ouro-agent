@@ -39,7 +39,7 @@ async fn faithfulness_for(backend: &dyn JudgeBackend, node: &JudgeNodeInput) -> 
 // `skip_faithfulness` is the gate's cost knob (target-axis-only judging): the
 // faithfulness pass is a SEPARATE backend call over the node's (often large)
 // input, so when the improver gates a non-faithfulness axis it can drop it and
-// halve the codex cost per sample. The judge-worker never skips — the stored
+// halve the judge cost per sample. The judge-worker never skips — the stored
 // corpus keeps all axes.
 pub async fn judge_node(
     backend: &dyn JudgeBackend,

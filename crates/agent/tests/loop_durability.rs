@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
-use support::{AnySkill, NoCodex, PersistLog, task_context};
+use support::{AnySkill, PersistLog, task_context};
 use tokio_util::sync::CancellationToken;
 
 // Engine runs take the worker's ticks: fewer cases than a store-only
@@ -265,7 +265,6 @@ fn engine(p: &Parts) -> Arc<Engine> {
         skill_store: Arc::new(AnySkill),
         memory: Arc::new(PersistLog::default()),
         tracer: Arc::new(agent::tracing::NullTracer),
-        codex: Arc::new(NoCodex),
         decisions: Some(support::allow_guard()),
         env: Default::default(),
         db: p.db.clone(),

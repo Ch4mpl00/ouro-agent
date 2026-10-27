@@ -126,7 +126,6 @@ async fn activate_reference_loop(root: &std::path::Path) {
         skill_store: Arc::new(support::AnySkill),
         memory: Arc::new(db.clone()),
         tracer: Arc::new(agent::tracing::NullTracer),
-        codex: Arc::new(support::NoCodex),
         decisions: None,
         schedule: Arc::new(agent::schedule::Schedules::in_memory()),
         env: Default::default(),

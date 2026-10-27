@@ -18,7 +18,7 @@ use agent::{
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
-use support::{AnySkill, NoCodex, PersistLog, Scripted, ToolMcp, activate_definition, mark_tried, recording};
+use support::{AnySkill, PersistLog, Scripted, ToolMcp, activate_definition, mark_tried, recording};
 use tokio_util::sync::CancellationToken;
 
 // ── the store ───────────────────────────────────────────────────────────────
@@ -147,7 +147,6 @@ fn world_on(
         skill_store: Arc::new(AnySkill),
         memory: persist.clone(),
         tracer: tracer.clone(),
-        codex: Arc::new(NoCodex),
         decisions,
         env: Default::default(),
         db: agent::db::AgentDb::open(":memory:").unwrap(),

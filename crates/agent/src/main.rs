@@ -3,7 +3,6 @@
 use agent::{
     activity::{ActivityOptions, Notes, create_activity_worker},
     agent::{EngineDeps, Providers, create_engine},
-    codex::codex_client,
     db::{AgentDb, DEFAULT_DB_PATH},
     decisions::{DecisionClient, OPENROUTER_DECISIONS_URL},
     errors::{is_aborted, or_cancel},
@@ -211,7 +210,6 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
             store,
             dry_store,
             tracer,
-            codex: codex_client(&std::env::var("CODEX_URL").unwrap_or_else(|_| "http://localhost:3010".into())),
             decisions: Some(Arc::new(
                 DecisionClient::with_retry(
                     std::env::var("AGENT_DECISION_MODEL").unwrap_or_else(|_| DEFAULT_DECISION_MODEL.into()),

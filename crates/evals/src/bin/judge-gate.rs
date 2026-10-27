@@ -3,10 +3,10 @@
 // moved beyond σ_judge (the noise floor from judge-noise).
 //
 //   judge-gate <traceId> --skill <skill> --patch <file.md>
-//              [--node <labelSubstr>] [--axis <axis>] [--samples N] [--provider codex|openai] [--k 2]
+//              [--node <labelSubstr>] [--axis <axis>] [--samples N] [--provider openai] [--k 2]
 //
 // The generator is re-run under the RECORDED model (what prod uses); the judge
-// defaults to codex (prod judge, cheap). Δ is graded against the committed
+// uses the OpenAI judge. Δ is graded against the committed
 // noise baseline for (judge model | prompt version).
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -42,7 +42,7 @@ fn or(v: &str, fallback: f64) -> f64 {
 
 fn parse_args(argv: &[String]) -> anyhow::Result<Cli> {
     let (mut skill, mut patch_file, mut axis, mut node) = (None, None, None, None);
-    let (mut samples, mut provider, mut k) = (3usize, JudgeProvider::Codex, 2.0);
+    let (mut samples, mut provider, mut k) = (3usize, JudgeProvider::OpenAi, 2.0);
     let mut rest = Vec::new();
     let mut i = 0;
     while i < argv.len() {
@@ -74,7 +74,7 @@ fn parse_args(argv: &[String]) -> anyhow::Result<Cli> {
         }
         _ => {
             eprintln!(
-                "usage: judge-gate <traceId> --skill <skill> --patch <file.md> [--node <labelSubstr>] [--axis <axis>] [--samples N] [--provider codex|openai] [--k 2]"
+                "usage: judge-gate <traceId> --skill <skill> --patch <file.md> [--node <labelSubstr>] [--axis <axis>] [--samples N] [--provider openai] [--k 2]"
             );
             std::process::exit(1);
         }
@@ -123,7 +123,6 @@ async fn main() -> anyhow::Result<()> {
 
     let judge_model = match cli.provider {
         JudgeProvider::OpenAi => JUDGE_MODEL.to_owned(),
-        JudgeProvider::Codex => std::env::var("CODEX_JUDGE_MODEL").unwrap_or_else(|_| "codex".into()),
     };
     let (sigma, found) = load_sigma_baseline(&root, &judge_model, JUDGE_PROMPT_VERSION);
 

@@ -102,7 +102,6 @@ flowchart LR
 | [`crates/mcp`](crates/mcp) | MCP server: Gmail, Telegram, news, memory and other tools, plus the pollers that emit signals. Knows nothing about the agent. |
 | [`crates/agent`](crates/agent) | The supervisor: signals, loops, guard, schedule, durable runs. Reaches tools only over MCP. |
 | [`crates/evals`](crates/evals) | Judges, golden sets (news filter, guard), trace replay and the workflow optimizer. |
-| [`crates/codex`](crates/codex) | The sandbox for the agent's `code_agent` tool. |
 
 Workflows run on the [ouro engine](https://github.com/Ch4mpl00/ouro) (crates
 `ows`, `ouro-durable`, `ouro-runtime`), a git dependency pinned to a tag.

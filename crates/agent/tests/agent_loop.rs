@@ -1083,7 +1083,6 @@ fn engine_with(openrouter: Option<Arc<dyn ChatProvider>>) -> Arc<agent::agent::E
         skill_store: Arc::new(AnySkill),
         memory: Arc::new(PersistLog::default()),
         tracer: null(),
-        codex: Arc::new(NoCodex),
         decisions: None,
         env: Default::default(),
         db: agent::db::AgentDb::open(":memory:").unwrap(),

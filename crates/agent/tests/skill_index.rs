@@ -16,7 +16,7 @@ use agent::{
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use std::sync::{Arc, Mutex};
-use support::{NoCodex, Scripted, ToolMcp, recording, task_context};
+use support::{Scripted, ToolMcp, recording, task_context};
 use tokio_util::sync::CancellationToken;
 
 struct MarkedMemory(Arc<ToolMcp>);
@@ -118,7 +118,6 @@ async fn dry_run_generates_without_writing_memory() {
         skill_store: skills,
         memory: Arc::new(db.clone()),
         tracer,
-        codex: Arc::new(NoCodex),
         decisions: None,
         schedule: Arc::new(agent::schedule::Schedules::in_memory()),
         env: Default::default(),
@@ -278,7 +277,6 @@ impl Fired {
             skill_store: skills,
             memory: db.clone(),
             tracer,
-            codex: Arc::new(NoCodex),
             decisions: None,
             schedule: Arc::new(agent::schedule::Schedules::new(db.clone())),
             env: Default::default(),

@@ -29,7 +29,7 @@ class Selection(unittest.TestCase):
         self.assertEqual(result["services"], [])
         self.assertFalse(result["infrastructure"])
 
-    def test_agent_change_does_not_restart_mcp_or_build_codex(self):
+    def test_agent_change_does_not_restart_mcp(self):
         result = deploy.plan(["crates/agent/src/agent.rs"])
         self.assertEqual(result["binaries"], ["agent-supervisor"])
         self.assertEqual(result["services"], ["agent"])
@@ -68,7 +68,7 @@ class Selection(unittest.TestCase):
             if command[1:3] == ["diff", "--name-only"]:
                 return "README.md\ncrates/mcp/tests/http_transport.rs"
             self.fail(str(command))
-        args = argparse.Namespace(host="unused", repository="unused", services=[], runtime_image=False)
+        args = argparse.Namespace(host="unused", repository="unused", services=[])
         with patch.object(deploy, "output", side_effect=git_output), \
              patch.object(deploy, "remote_info", return_value={"revision": "old", "hashes": {}}), \
              patch.object(deploy, "run") as commands, patch.object(deploy, "ssh") as remote:

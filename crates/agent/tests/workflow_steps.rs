@@ -20,7 +20,7 @@ use serde_json::{Map, Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use support::{AnySkill, NoCodex, PersistLog, Scripted, ToolMcp, TraceLog, recording};
+use support::{AnySkill, PersistLog, Scripted, ToolMcp, TraceLog, recording};
 use tokio_util::sync::CancellationToken;
 
 // What outlives an engine: its stores, the world, the model and the trace.
@@ -121,7 +121,6 @@ impl World {
             skill_store: Arc::new(AnySkill),
             memory: self.persist.clone(),
             tracer: self.tracer.clone(),
-            codex: Arc::new(NoCodex),
             decisions: self.decisions.clone(),
             env: Default::default(),
             db: self.db.clone(),

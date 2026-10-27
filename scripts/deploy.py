@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Build off-host, deliver changed binaries, apply one native deployment.
 
-Normal deploys never send a Docker image. --runtime-image explicitly updates
-the Codex container's Node/Python/CLI runtime. No previous release is kept.
+Deploys never send a Docker image. No previous release is kept.
 """
 import argparse
 import fcntl
@@ -27,7 +26,7 @@ import uuid
 PREFIX = Path("/opt/ouro")
 STATE = Path("/var/lib/ouro")
 CONFIG = Path("/etc/ouro")
-BINARIES = {"mcp": "mcp-tools", "agent": "agent-supervisor", "codex": "codex-service"}
+BINARIES = {"mcp": "mcp-tools", "agent": "agent-supervisor"}
 NATIVE = {"mcp", "mcp-tunnel", "agent"}
 ASSETS = ["skills.default", "crates/mcp/gateway.config.json", "deploy", "docker-compose.yml", "scripts/deploy.py"]
 
@@ -54,15 +53,14 @@ def plan(paths, bootstrap=False, requested=()):
     infrastructure = bootstrap
     if bootstrap:
         binaries.update(BINARIES.values())
-        services.update(NATIVE | {"codex", "tunnel-client"})
+        services.update(NATIVE | {"tunnel-client"})
     for path in paths:
         if path in {"Cargo.toml", "Cargo.lock"}:
             binaries.update(BINARIES.values())
-            services.update(NATIVE | {"codex"})
+            services.update(NATIVE)
         for crate, binary, affected in [
             ("mcp", "mcp-tools", {"mcp", "mcp-tunnel", "agent"}),
             ("agent", "agent-supervisor", {"agent"}),
-            ("codex", "codex-service", {"codex"}),
         ]:
             root = f"crates/{crate}/"
             if path == root + "Cargo.toml" or path.startswith((root + "src/", root + "migrations/")):
@@ -74,7 +72,7 @@ def plan(paths, bootstrap=False, requested=()):
             services.update({"mcp", "agent"})
         if path == "docker-compose.yml" or path.startswith("deploy/systemd/"):
             infrastructure = True
-            services.update(NATIVE | {"codex", "tunnel-client"})
+            services.update(NATIVE | {"tunnel-client"})
         if path == "deploy/probe.py":
             services.update(NATIVE | {"tunnel-client"})
     for name in requested:
@@ -131,9 +129,6 @@ def local(args):
     bootstrap = info["revision"] is None
     paths = [] if bootstrap else output(["git", "diff", "--name-only", info["revision"], revision]).splitlines()
     selection = plan(paths, bootstrap, args.services)
-    if args.runtime_image:
-        selection["infrastructure"] = True
-        selection["services"] = sorted(set(selection["services"]) | {"codex", "agent"})
     print(f"[deploy] {revision[:12]}: {json.dumps(selection)}", flush=True)
     if not selection["services"] and not bootstrap:
         print("[deploy] no runtime changes; no build, upload or restart")
@@ -157,24 +152,8 @@ def local(args):
                 binary.unlink()
         if unchanged:
             print("[deploy] unchanged binaries omitted: " + ", ".join(sorted(unchanged)), flush=True)
-        if args.runtime_image:
-            run(["docker", "buildx", "build", "--platform", "linux/amd64", "--target", "runtime",
-                 "--tag", "ouro-codex-runtime:current", "--load", "."])
-            # The expensive full runtime transfer happens only on explicit request.
-            save = subprocess.Popen(["docker", "save", "ouro-codex-runtime:current"], stdout=subprocess.PIPE)
-            compress = subprocess.Popen(["gzip", "-1"], stdin=save.stdout, stdout=subprocess.PIPE)
-            save.stdout.close()
-            try:
-                ssh(args.host, ["sh", "-c", "gunzip | docker load"], stdin=compress.stdout)
-            finally:
-                compress.stdout.close()
-                compress.wait()
-                save.wait()
-            if save.returncode or compress.returncode:
-                raise RuntimeError("runtime image transfer failed")
         manifest = {
             **selection, "revision": revision, "base_revision": info["revision"], "bootstrap": bootstrap,
-            "runtime_image": args.runtime_image,
             "hashes": {str(p.relative_to(payload)): digest(p) for p in payload.rglob("*") if p.is_file()},
         }
         (payload / "deployment.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -241,12 +220,9 @@ def bootstrap_configuration(repository):
         **mcp_env, "MCP_PORT": "3001", "MCP_ALLOWED_HOSTS": "*", "MCP_MEMORY_ACTOR": "chatgpt",
         "MCP_NO_POLLERS": "1", "MCP_TOOLSETS": "news-read,telegram-send,skills,memory",
     })
-    # Tag before writing the final env file (the resumable setup marker).
-    image = container("codex")["Image"]
-    run(["docker", "tag", image, "ouro-codex-runtime:current"])
     write_env(CONFIG / "agent.env", {
         **credential_environment(repository, ".env.agent", agent), **common,
-        "MCP_TRANSPORT": "http", "MCP_URL": "http://127.0.0.1:3000/mcp", "CODEX_URL": "http://127.0.0.1:3010",
+        "MCP_TRANSPORT": "http", "MCP_URL": "http://127.0.0.1:3000/mcp",
         "AGENT_ROOT": str(PREFIX / "app"), "AGENT_DB_PATH": str(STATE / "agent/agent.db"),
     })
 
@@ -371,14 +347,12 @@ def apply(payload, repository):
             run(["systemctl", "restart", "ouro-containers.service"])
         else:
             run(["systemctl", "start", "ouro-containers.service"])
-            if "codex" in affected:
-                run(["docker", "compose", "up", "-d", "--no-build", "--force-recreate", "codex"], cwd=repository)
         if "mcp-tunnel" in affected:
             affected.add("tunnel-client")
         units = [f"ouro-{name}.service" for name in ["mcp", "mcp-tunnel", "agent", "tunnel-client"] if name in affected]
         run(["systemctl", "enable", "ouro-containers.service", *units])
         run(["systemctl", "start", *units])
-        for name in ["mcp", "mcp-tunnel", "codex"]:
+        for name in ["mcp", "mcp-tunnel"]:
             run(["python3", PREFIX / "app/probe.py", name])
         run(["systemctl", "is-active", "ouro-agent", "ouro-mcp", "ouro-mcp-tunnel", "ouro-tunnel-client"])
         if "agent" in affected:
@@ -393,10 +367,9 @@ def arguments(argv=None):
     parser.add_argument("services", nargs="*", metavar="SERVICE")
     parser.add_argument("--host", default=os.environ.get("DEPLOY_HOST", "ouro"))
     parser.add_argument("--repository", default=os.environ.get("DEPLOY_DIR", "/root/agent-helper"))
-    parser.add_argument("--runtime-image", action="store_true")
     parser.add_argument("--apply", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    unknown = set(args.services) - (NATIVE | {"codex", "tunnel-client"})
+    unknown = set(args.services) - (NATIVE | {"tunnel-client"})
     if unknown:
         parser.error("unknown services: " + ", ".join(sorted(unknown)))
     return args

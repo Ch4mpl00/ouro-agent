@@ -54,13 +54,12 @@ decision is weighed against this first.
 ## Architecture
 
 Ouro is one Cargo workspace. The Rust services run natively under systemd.
-Postgres, the Codex sandbox and the tunnel daemon run in Docker.
+Postgres and the tunnel daemon run in Docker.
 
 | Crate | Binary | Role |
 | --- | --- | --- |
 | **`crates/mcp`** | `mcp-tools` | A stateless MCP server. It wraps Gmail, Telegram (bot and read-only userbot), Monobank, news, PDF, files and unified memory as primitive tools. It also runs the pollers that turn external events into signals. It knows nothing about the agent. |
 | **`crates/agent`** | `agent-supervisor` | The supervisor and the agent. It takes signals, preselects skills, and runs the agent loop or a saved workflow. It owns the schedule, the activity journal and the trace mirror. It knows MCP only through the protocol. |
-| **`crates/codex`** | `codex-service` | The sandbox where the agent's `code_agent` tool and the codex judge run `codex exec`. It exposes `POST /run` and `GET /health`. |
 | **`crates/evals`** | `judge`, `judge-worker`, `improve`, … | The tooling that evaluates the agent: a per-node judge, judge-noise calibration, the improver gate and the closed-loop improver, trace replay, the news-filter and guard golden sets, and the workflow optimizer, whose workbench runs candidates in memory on the engine's interpreter. It reads the trace mirror and Langfuse, and is never in the signal path. |
 
 Workflows run on the **ouro engine** (`Ch4mpl00/ouro`, crates `ows`,
@@ -105,8 +104,8 @@ mcp-tools/
 ├── .mcp.json                Claude Code → prod's restricted MCP (via ssh -L 3001)
 ├── .env.mcp.example         MCP env: integration credentials, embeddings, tunnel
 ├── .env.agent.example       agent env: model keys, presets, Langfuse
-├── docker-compose.yml       postgres, codex, tunnel-client (the services are systemd)
-├── Dockerfile               cached cross-builder + the Codex runtime image
+├── docker-compose.yml       postgres, tunnel-client (the services are systemd)
+├── Dockerfile               cached cross-builder for the native binaries
 ├── scripts/                 deploy.sh / deploy.py, test_deploy.py, test.py
 ├── deploy/                  systemd units + readiness probe
 ├── skills.default/          shipped skills (git-tracked, read-only fallback)
@@ -118,7 +117,6 @@ mcp-tools/
     ├── agent/               supervisor, agent loop, schedule, flows, runs, sandbox,
     │                        skills, activity, tracing;
     │                        migrations/ (agent.db)
-    ├── codex/               codex-service
     └── evals/               judge, improver, replay, golden-set evals
 ```
 
@@ -207,8 +205,8 @@ process. The records of runs that ended more than 7 days ago are swept.
 The host guard (`guard.rs`, compiled policy in `crates/agent/guard/`) reviews
 all writes and open-world reads of a round in one Jev decisions request, after
 deterministic chat and secret checks. MCP `openWorldHint` defaults to true when
-absent; internal reads explicitly declare false. `code_agent`, `probe_function`
-and `try_workflow` can reach the network and are reviewed. Other synthetic
+absent; internal reads explicitly declare false. `probe_function` and
+`try_workflow` can reach the network and are reviewed. Other synthetic
 reads, working memory, `finish` and delegation skip review; workers guard
 their own calls. The request shares one bounded context and compiled policy
 across short per-call questions. A verdict belongs to the loop, call
@@ -291,7 +289,6 @@ provides (`crates/agent/src/synthetic_tools.json`):
 | `working_memory_put` / `get` / `list` / `delete` | The session's temporary KV. Every tool result is stored under a fresh key. Results up to 8,000 bytes come back whole; larger ones come back as a key plus a 512-byte preview. `input_refs` hands values to a worker without copying them through the parent. |
 | `set_memory` | Persistent agent-side KV in agent.db, used for watermarks such as `news_digest.last_read_at` |
 | `finish` | Ends the session in the same round as the final delivery, instead of spending another turn on a closing message. If any call in that round fails, the session continues with the errors. |
-| `code_agent` | Delegate a computation to the Codex sandbox (Python with pandas/openpyxl, or Node) |
 | `schedule_task`, `list_scheduled_tasks`, `cancel_scheduled_task` | The agent's own schedule |
 | `save_workflow`, `activate_workflow`, `list_workflows`, `read_workflow` | [Saved workflows](#saved-workflows). Saving is reserved for the `workflow-author` worker. |
 

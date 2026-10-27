@@ -24,7 +24,7 @@ use serde_json::{Map, Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use support::{AnySkill, GuardApi, NoCodex, Scripted, calls, task_context};
+use support::{AnySkill, GuardApi, Scripted, calls, task_context};
 use tokio_util::sync::CancellationToken;
 
 // ── the world ───────────────────────────────────────────────────────────────
@@ -244,7 +244,6 @@ fn engine_with(
         skill_store: Arc::new(AnySkill),
         memory: s.db.clone(),
         tracer: Arc::new(tracer),
-        codex: Arc::new(NoCodex),
         decisions: Some(agent::decisions::decision_client("guard-test".into(), api)),
         env: Default::default(),
         db: (*s.db).clone(),

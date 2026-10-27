@@ -2,7 +2,6 @@
 pub mod properties;
 use agent::{
     agent::{Engine, EngineDeps, Providers, create_engine},
-    codex::Codex,
     db::AgentDb,
     local_recorder::local_recorder_tracer,
     mcp::Mcp,
@@ -114,13 +113,6 @@ impl Mcp for FakeMcp {
         self.closed.fetch_add(1, Ordering::SeqCst);
     }
 }
-pub struct NoCodex;
-#[async_trait]
-impl Codex for NoCodex {
-    async fn run(&self, _: Value, _: &CancellationToken) -> anyhow::Result<String> {
-        anyhow::bail!("unexpected codex call")
-    }
-}
 pub struct Fixture {
     pub root: tempfile::TempDir,
     pub db: Arc<AgentDb>,
@@ -218,7 +210,6 @@ fn open_engine(
         skill_store: store.clone(),
         memory: db.clone(),
         tracer: Arc::new(local_recorder_tracer(db.clone())),
-        codex: Arc::new(NoCodex),
         decisions: Some(allow_guard()),
         schedule: Arc::new(agent::schedule::Schedules::new(db.clone())),
         env: Default::default(),
@@ -575,7 +566,6 @@ impl Harness {
             skill_store: Arc::new(AnySkill),
             memory: persist.clone(),
             tracer,
-            codex: Arc::new(NoCodex),
             decisions: Some(allow_guard()),
             schedule: std::sync::Arc::new(agent::schedule::Schedules::in_memory()),
             env: Default::default(),

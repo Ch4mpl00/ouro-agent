@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use support::{AnySkill, GuardApi, NoCodex, PersistLog, Scripted, calls, task_context};
+use support::{AnySkill, GuardApi, PersistLog, Scripted, calls, task_context};
 use tokio_util::sync::CancellationToken;
 
 // `search` is a local read; `remote_read` and `upstream_read` read the open
@@ -111,7 +111,6 @@ fn engine_on(
         skill_store: Arc::new(AnySkill),
         memory: Arc::new(PersistLog::default()),
         tracer: Arc::new(agent::tracing::NullTracer),
-        codex: Arc::new(NoCodex),
         decisions,
         env: Default::default(),
         db: stores.db.clone(),
@@ -877,7 +876,6 @@ async fn open_world_reads_and_writes_share_one_request_after_local_and_secret_ch
     assert_eq!(requests[0].to_string().matches("You guard an assistant's tool calls").count(), 1, "one shared policy");
     assert!(seen(&model, 2).contains("[guard] blocked: secret_pattern"));
     for (name, guarded) in [
-        ("code_agent", true),
         ("probe_function", true),
         ("try_workflow", true),
         ("working_memory_put", false),

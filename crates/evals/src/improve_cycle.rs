@@ -119,8 +119,8 @@ pub struct ImproveCycleOpts {
     // Per-skill patch lesson budget (block new ships when full).
     pub budget: usize,
     // Re-judge the faithfulness axis in the gate too (collateral-regression guard).
-    // Default OFF: faithfulness is a separate, input-heavy codex call — skipping it
-    // when it isn't the target halves the gate's codex cost (target-axis-only).
+    // Default OFF: faithfulness is a separate, input-heavy judge call — skipping it
+    // when it isn't the target halves the gate's judge cost (target-axis-only).
     pub guard_faithfulness: bool,
     // Now in ms since the epoch, injected for the recent window + testability.
     pub now_ms: i64,
@@ -270,7 +270,7 @@ pub async fn run_improve_cycle(deps: &ImproveDeps<'_>, opts: &ImproveCycleOpts) 
 
     let existing_patch = deps.skills_read_patch(skill).await?;
 
-    // Short-circuit before spending codex on author+gate: if we'd ship but the
+    // Short-circuit before spending judge calls on author+gate: if we'd ship but the
     // per-skill budget is full, there's nothing to do until lessons are pruned.
     // (In propose-only mode we still author, to surface the candidate.)
     if opts.apply && budget_exceeded(&existing_patch, opts.budget) {

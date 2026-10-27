@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use support::{AnySkill, GuardApi, NoCodex, Scripted, calls, properties::Witnesses};
+use support::{AnySkill, GuardApi, Scripted, calls, properties::Witnesses};
 use tokio_util::sync::CancellationToken;
 
 // ── the world ───────────────────────────────────────────────────────────────
@@ -148,7 +148,6 @@ fn engine(p: &Parts) -> Arc<Engine> {
             skill_store: Arc::new(AnySkill),
             memory: Arc::new(p.db.clone()),
             tracer: Arc::new(agent::tracing::NullTracer),
-            codex: Arc::new(NoCodex),
             decisions: Some(agent::decisions::decision_client("test".into(), p.api.clone())),
             schedule: Arc::new(agent::schedule::Schedules::in_memory()),
             env: agent::session::EnvConfig { user_email: None, telegram_chat_id: Some("42".into()) },

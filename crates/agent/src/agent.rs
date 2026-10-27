@@ -3,7 +3,6 @@
 // Sections: 1. engine / skill scoping; 2. loop lifecycle; 3. dispatch / workers;
 // 4. the loop as a workflow (and its own first-turn context); 5. run history.
 use crate::{
-    codex::{SharedCodex, code_agent},
     db::MemoryStore,
     errors::{aborted, check},
     generation::{Observation, describe_completion, generation},
@@ -40,7 +39,6 @@ pub struct EngineDeps {
     pub skill_store: Arc<dyn SkillStore>,
     pub memory: Arc<dyn MemoryStore>,
     pub tracer: Arc<dyn Tracer>,
-    pub codex: SharedCodex,
     pub decisions: Option<Arc<crate::decisions::DecisionClient>>,
     // The schedule's seam: the fire table, the task-write mutex, the
     // drain's wake-up (schedule.rs §1).
@@ -1092,15 +1090,6 @@ impl AgentLoop {
                 let key = string_arg(args, "key", true)?;
                 Ok(json!({"memory_key": key, "deleted": self.opts.session.memory.delete(key)}).to_string())
             }
-            "code_agent" => {
-                code_agent(
-                    &engine.deps.codex,
-                    string_arg(args, "task", true)?,
-                    optional_string(args, "data")?,
-                    &self.cancel,
-                )
-                .await
-            }
             "read_skill" => {
                 let name = string_arg(args, "name", true)?;
                 // A skill this loop already runs is in its instructions: a
@@ -1434,7 +1423,7 @@ pub fn tool_effect(engine: &Engine, name: &str) -> Effect {
 /// MCP tools use annotations, never tool-name lists.
 pub fn tool_open_world(engine: &Engine, name: &str) -> bool {
     if synthetic_definitions().iter().any(|t| t.name == name) {
-        return matches!(name, "code_agent" | "probe_function" | "try_workflow");
+        return matches!(name, "probe_function" | "try_workflow");
     }
     engine.deps.mcp.open_world(name)
 }

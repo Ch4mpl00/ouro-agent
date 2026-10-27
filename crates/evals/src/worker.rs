@@ -32,7 +32,7 @@ pub struct JudgeWorkerOpts {
 impl JudgeWorkerOpts {
     pub fn from_env() -> JudgeWorkerOpts {
         JudgeWorkerOpts {
-            provider: JudgeProvider::from_env(),
+            provider: JudgeProvider::OpenAi,
             poll_interval_ms: num_env("JUDGE_POLL_INTERVAL_MS", 60_000.0) as u64,
             recent_limit: num_env("JUDGE_RECENT_LIMIT", 20.0) as u32,
             dry_run: !bool_env("JUDGE_WRITE_SCORES", false),
@@ -53,9 +53,9 @@ async fn process_trace(trace_id: &str, deps: &JudgeWorkerDeps<'_>, opts: &JudgeW
     let backend = judge_backend(opts.provider)?;
     println!("[judge-worker] judging {trace_id} provider={} nodes={}", opts.provider.as_str(), nodes.len());
 
-    // Judge ALL nodes first. If any fails (e.g. codex usage limit), we persist
+    // Judge ALL nodes first. If any fails (e.g. a usage limit), we persist
     // NOTHING and the trace reappears next tick — whole-trace auto-retry,
-    // per node. Sequential keeps codex within the shared ChatGPT quota.
+    // per node. Sequential keeps the judge within its rate limit.
     let mut judged = Vec::new();
     for node in &nodes {
         judged.push((node, judge_node(&*backend, &node.judge_input(), false).await?));

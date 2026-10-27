@@ -117,7 +117,7 @@ fn json_value() -> impl Strategy<Value = Value> {
 fn trace_op() -> impl Strategy<Value = TraceOp> {
     let trace_id = prop::sample::select(vec!["telegram:1", "scheduler:2", "gmail:3", "t4", "t5"]);
     let json = || prop::option::of(json_value());
-    let provider = || prop::sample::select(vec!["codex", "openai"]);
+    let provider = || prop::sample::select(vec!["other", "openai"]);
     let version = || prop::sample::select(vec!["n1", "n2"]);
     let skill = || prop::sample::select(vec!["planner", "news-digest", "telegram"]);
     prop_oneof![
@@ -384,7 +384,7 @@ fn a_judgement_rewrite_replaces_scores_and_needs_an_existing_trace() {
     let mut judgement = JudgementInput {
         trace_id: "old".into(),
         observation_id: "g1".into(),
-        provider: "codex".into(),
+        provider: "other".into(),
         prompt_version: "v1".into(),
         node_kind: "compose".into(),
         skill: "digest".into(),
@@ -396,7 +396,7 @@ fn a_judgement_rewrite_replaces_scores_and_needs_an_existing_trace() {
     judgement.detail = json!({"note":"fixed"});
     db.write_judgement(&judgement).unwrap();
     let rows =
-        db.list_judgements(&JudgementFilter { skill: "digest", provider: "codex", prompt_version: "v1" }).unwrap();
+        db.list_judgements(&JudgementFilter { skill: "digest", provider: "other", prompt_version: "v1" }).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].scores.faithfulness, Some(5.0));
     assert_eq!(rows[0].detail, json!({"note":"fixed"}));

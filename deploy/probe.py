@@ -7,21 +7,20 @@ import urllib.request
 
 
 def ready(service):
-    port = {"mcp": 3000, "mcp-tunnel": 3001, "codex": 3010}[service]
-    path = "/health" if service == "codex" else "/mcp"
+    port = {"mcp": 3000, "mcp-tunnel": 3001}[service]
     request = urllib.request.Request(
-        f"http://127.0.0.1:{port}{path}",
-        method="GET" if service == "codex" else "POST",
-        data=None if service == "codex" else b'{"jsonrpc":"2.0","id":0,"method":"ping"}',
+        f"http://127.0.0.1:{port}/mcp",
+        method="POST",
+        data=b'{"jsonrpc":"2.0","id":0,"method":"ping"}',
         headers={"Accept": "application/json, text/event-stream", "Content-Type": "application/json"},
     )
     try:
         with urllib.request.urlopen(request, timeout=2) as response:
-            return service == "codex" and response.status == 200
+            return False
     except urllib.error.HTTPError as error:
         # A valid ping without a session gets "expect initialize request".
         # This proves the protocol is up without allocating/evicting a session.
-        return service != "codex" and error.code == 422
+        return error.code == 422
     except (OSError, TimeoutError):
         return False
 
