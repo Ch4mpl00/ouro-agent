@@ -206,7 +206,7 @@ fn allows_a_deleted_key_to_be_explicitly_reused() {
 // Rust-only below: the context block and gathering the env.
 
 #[test]
-fn context_rendering_has_timezone_watermarks_and_email() {
+fn context_rendering_has_timezone_and_email_but_no_news_watermarks() {
     let mut env = support::context().env.clone();
     env.user_email = Some("user@example.test".into());
     env.news_last_read_at = Some("yesterday".into());
@@ -215,9 +215,7 @@ fn context_rendering_has_timezone_watermarks_and_email() {
         text,
         "## Current context\n\
          - Local time: 2026-09-06 15:00 (Europe/Chisinau)\n\
-         - User email: user@example.test\n\
-         - News last read at: yesterday\n\
-         - Tech last read at: never (bootstrap with now - 24h)"
+         - User email: user@example.test"
     );
     assert_eq!(format_local_time("2026-10-14T00:05:00Z".parse().unwrap(), "UTC").unwrap(), "2026-10-14 00:05");
 }

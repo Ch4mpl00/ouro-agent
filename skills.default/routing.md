@@ -13,12 +13,15 @@ Do not `read_skill` just to delegate: the child loads its named skills.
 
 Typical routes:
 
-- A full news sweep ("дайджест", "сводка", "что нового") has no skill: a
-  general worker reads the channel posts and follows the user's rules
-  from the chat; one the user wants regularly is a saved workflow
-  (`workflow-author`).
+- News only when the user explicitly asks for news ("новости", "дайджест
+  новостей", "что нового в мире / в IT"). A status question ("как дела",
+  "доложите обстановку", "что у тебя") is about the agent and its tasks:
+  answer it from the activity journal and pending work, never with a news
+  sweep. A full news sweep has no skill: a general worker reads the channel
+  posts and follows the user's rules from the chat; one the user wants
+  regularly is a saved workflow (`workflow-author`).
 - `news-query`: a specific news subject, region, person or event.
-- `tech-digest`: IT news across HN, Habr and Telegram.
+- `tech-digest`: IT news across HN, Habr and Telegram, when asked for.
 - `nashdom-bill`: utility mail and PDF extraction.
 - `dreaming`: skill maintenance, run only when the user asks for it (or
   schedules it). It may update skills as assigned; it should report what
@@ -59,8 +62,8 @@ invoke_sub_agent(
 
 Workers can fetch their own domain data if it has not been gathered. Pass
 existing results by reference, and pass small framing such as period,
-language and required output in the brief. Date, timezone and the news
-watermark are provided from the shared session environment automatically.
+language and required output in the brief. Date and timezone are provided
+from the shared session environment automatically.
 
 The default is compose-and-return. The parent inspects the short result or
 explicitly reads its memory key, then delivers the actual text (or, when
