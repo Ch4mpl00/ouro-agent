@@ -446,6 +446,8 @@ Rules for every class:
 - Tests: targeted ones while working; `cargo fmt` and `cargo clippy
   --all-targets -- -D warnings` before finishing; the full suite once before
   a merge to main, not after every change.
+- Skill or prompt text and model/preset choices: no tests at all, merge and
+  deploy (only a change to a skill's `tools:` list runs `shipped_skills`).
 - Read the summary of a command, a log or a subagent's report; open the
   detailed output only for a failure, and then only its failing part.
 - Never weaken a test or an invariant check to save tokens. A test that is
