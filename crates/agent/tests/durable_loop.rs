@@ -252,7 +252,7 @@ async fn working_memory_values_stay_out_of_the_journal_and_survive_a_restart() {
     let stores = stores();
     let stop = CancellationToken::new();
     let first = Arc::new(Scripted::new(vec![
-        calls(&[("search", json!({"q": "big"}))]),
+        calls(&[("search", json!({"q": "big"})), ("working_memory_put", json!({"key": "note", "value": "kept note"}))]),
         calls(&[("search", json!({"q": "again"}))]),
         calls(&[("send", json!({"q": "b"}))]),
     ]));
@@ -272,7 +272,7 @@ async fn working_memory_values_stay_out_of_the_journal_and_survive_a_restart() {
         .unwrap_or_else(|| panic!("the reply names its memory key: {preview}"));
 
     let second = Arc::new(Scripted::new(vec![
-        calls(&[("working_memory_get", json!({"key": key}))]),
+        calls(&[("working_memory_get", json!({"key": key})), ("working_memory_get", json!({"key": "note"}))]),
         calls(&[("finish", json!({"result": "read"}))]),
     ]));
     let engine2 = engine_on(&stores, second.clone(), Arc::new(World::default()), Some(support::allow_guard()));
@@ -285,6 +285,8 @@ async fn working_memory_values_stay_out_of_the_journal_and_survive_a_restart() {
     assert_eq!(ended(&engine2, "peer:mem").await, Status::Completed(json!("read")));
     let read = seen(&second, 1);
     assert!(read.contains("TAIL-OF-BIG"), "the value survives the restart whole");
+    let notes = second.seen.lock().unwrap()[1].messages.iter().filter(|m| m["content"] == "kept note").count();
+    assert_eq!(notes, 1, "what the model put survives the restart");
     engine2.shutdown().await;
 }
 
