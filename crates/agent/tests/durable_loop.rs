@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 // `search` is a local read; `remote_read` and `upstream_read` read the open
 // world; `send` and `append_doc` change it. With `stop` armed, a `send`
 // stops the process and never answers. A `search` with a `reply` argument
-// answers with it.
+// answers with it; `search {q: "big"}` answers with BIG, too large to inline.
 #[derive(Default)]
 struct World {
     calls: Mutex<Vec<String>>,
@@ -55,8 +55,17 @@ impl Mcp for World {
             stop.cancel();
             std::future::pending::<()>().await;
         }
+        if args.get("q") == Some(&json!("big")) {
+            return Ok(big());
+        }
         Ok(args.get("reply").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| format!("{name} ok")))
     }
+}
+
+// A tool result the loop keeps in working memory; its tail never reaches the
+// model's preview.
+fn big() -> String {
+    format!("{}TAIL-OF-BIG", "x".repeat(2_000_000))
 }
 
 impl World {
@@ -231,6 +240,51 @@ async fn a_round_cut_by_a_restart_resumes_without_regenerating_or_resending() {
     assert_eq!(state["chain"].as_array().unwrap().len(), 2);
     assert!(!requests[0].to_string().contains("search ok"));
     assert!(!requests[0].to_string().contains("outcome unknown"));
+    engine2.shutdown().await;
+}
+
+// The working memory travels through a run by reference: a large tool result
+// the loop keeps there is evidence, never in the run's journal (a journal
+// that copied it into every step grew to hundreds of megabytes and its
+// recovery outlived the lease). After a restart the loop reads it back whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn working_memory_values_stay_out_of_the_journal_and_survive_a_restart() {
+    let stores = stores();
+    let stop = CancellationToken::new();
+    let first = Arc::new(Scripted::new(vec![
+        calls(&[("search", json!({"q": "big"}))]),
+        calls(&[("search", json!({"q": "again"}))]),
+        calls(&[("send", json!({"q": "b"}))]),
+    ]));
+    let engine1 = engine_on(&stores, first.clone(), World::stopping(&stop), Some(support::allow_guard()));
+    let live = engine1.start_loop(options("peer:mem")).await.unwrap();
+    let sent = tokio::spawn(live.send("go".into()));
+    stop.cancelled().await;
+    engine1.shutdown().await;
+    assert!(sent.await.unwrap().is_err());
+    let preview = seen(&first, 1);
+    let key = preview
+        .split("tool.")
+        .nth(1)
+        .map(|rest| {
+            format!("tool.{}", rest.chars().take_while(|c| c.is_ascii_hexdigit() || *c == '-').collect::<String>())
+        })
+        .unwrap_or_else(|| panic!("the reply names its memory key: {preview}"));
+
+    let second = Arc::new(Scripted::new(vec![
+        calls(&[("working_memory_get", json!({"key": key}))]),
+        calls(&[("finish", json!({"result": "read"}))]),
+    ]));
+    let engine2 = engine_on(&stores, second.clone(), Arc::new(World::default()), Some(support::allow_guard()));
+    // Before the model reads it (its reply then is the transcript's), the
+    // value is nowhere in the journal, though three steps carried the memory.
+    let journal = format!("{:?}", engine2.runtime.records("peer:mem").await.unwrap());
+    assert!(!journal.contains("TAIL-OF-BIG"), "the journal holds the value by reference only");
+    assert!(journal.len() < big().len(), "{} bytes of journal", journal.len());
+    engine2.ready().await.unwrap();
+    assert_eq!(ended(&engine2, "peer:mem").await, Status::Completed(json!("read")));
+    let read = seen(&second, 1);
+    assert!(read.contains("TAIL-OF-BIG"), "the value survives the restart whole");
     engine2.shutdown().await;
 }
 

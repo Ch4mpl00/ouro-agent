@@ -259,7 +259,7 @@ async fn agent_turn(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> R
 
 async fn agent_settle(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
     let live = live_loop(&engine, &ctx).await.map_err(failed)?;
-    crate::agent::loop_settle(&live, &args).await.map_err(failed)
+    crate::agent::loop_settle(&engine, &live, &ctx.run_id, &args).await.map_err(failed)
 }
 
 async fn loop_setup(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> Result<Value, FunctionError> {
@@ -267,7 +267,7 @@ async fn loop_setup(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> R
         let live = live_loop(&engine, &ctx).await?;
         let saved = RunReads::run(&ctx, &ctx.run_id).await?.ok_or_else(|| anyhow::anyhow!("unknown run"))?;
         let records = RunReads::records(&ctx, &ctx.run_id).await?;
-        crate::agent::loop_setup(&engine, &live, &saved.admission.input, &args, &records).await
+        crate::agent::loop_setup(&engine, &live, &ctx.run_id, &saved.admission.input, &args, &records).await
     };
     setup.await.map_err(failed)
 }
@@ -577,7 +577,7 @@ async fn start_worker(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
             return Ok(json!({"id": null}));
         }
         anchor_child(&engine, &id, span.clone(), None, live.opts.session_id.clone()).await?;
-        let memory = live.opts.session.memory.snapshot();
+        let memory = engine.memory_out(&ctx.run_id, &live.opts.session.memory).await?;
         let build = loop_builder(&engine, &opts, crate::runs::WORKER, &id, &prompt, memory);
         let started = crate::runs::start_named_child(&engine, &ctx, &key, &opts.workflow, Site::Loop, build).await;
         if let Err(error) = &started {
@@ -612,7 +612,7 @@ async fn primary_loop(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
         let recorded_input = crate::agent::recorded_output(&records, "signal_input");
         if let Some(memory) = recorded_input.and_then(|o| o["memory"].as_str()) {
             let snapshot = engine.evidence_of(Some(&memory.to_owned()))?.unwrap_or_default();
-            session.memory.merge(&serde_json::from_str(&snapshot)?)?;
+            engine.memory_in(&session.memory, &serde_json::from_str(&snapshot)?)?;
         }
         let earlier: Vec<String> = match recorded_input.and_then(|o| o["earlier"].as_str()) {
             Some(digest) => serde_json::from_str(&engine.evidence_of(Some(&digest.to_owned()))?.unwrap_or_default())?,
@@ -648,7 +648,8 @@ async fn primary_loop(engine: Arc<Engine>, args: Value, ctx: FunctionContext) ->
         let span = scope
             .span(SpanStart::new("agent_loop", SpanKind::Chain).metadata(metadata(json!({"activity":"primary_loop"}))));
         anchor_child(&engine, &id, span.clone(), None, Some(session.id.clone())).await?;
-        let build = loop_builder(&engine, &opts, PRIMARY, &id, input, session.memory.snapshot());
+        let memory = engine.memory_out(&ctx.run_id, &session.memory).await?;
+        let build = loop_builder(&engine, &opts, PRIMARY, &id, input, memory);
         let started = crate::runs::start_named_child(&engine, &ctx, key, &opts.workflow, Site::Loop, build).await;
         if let Err(error) = &started {
             unanchor(&engine, &ctx, &id, &error.to_string()).await;
@@ -735,7 +736,7 @@ async fn start_loop(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> R
         let recorded_input = crate::agent::recorded_output(&records, "signal_input");
         if let Some(memory) = recorded_input.and_then(|o| o["memory"].as_str()) {
             let snapshot = engine.evidence_of(Some(&memory.to_owned()))?.unwrap_or_default();
-            live.opts.session.memory.merge(&serde_json::from_str(&snapshot)?)?;
+            engine.memory_in(&live.opts.session.memory, &serde_json::from_str(&snapshot)?)?;
         }
         let key = "loop";
         let id = ctx.child_id(key);
@@ -782,7 +783,8 @@ async fn start_loop(engine: Arc<Engine>, args: Value, ctx: FunctionContext) -> R
             json!({"activity": "loop", "workflow": opts.workflow, "preset": opts.preset.as_str()}),
         )));
         anchor_child(&engine, &id, span.clone(), None, opts.session_id.clone()).await?;
-        let build = loop_builder(&engine, &opts, PRIMARY, &id, input, live.opts.session.memory.snapshot());
+        let memory = engine.memory_out(&ctx.run_id, &live.opts.session.memory).await?;
+        let build = loop_builder(&engine, &opts, PRIMARY, &id, input, memory);
         let started = crate::runs::start_named_child(&engine, &ctx, key, &opts.workflow, Site::Loop, build).await;
         if let Err(error) = &started {
             unanchor(&engine, &ctx, &id, &error.to_string()).await;
@@ -1061,9 +1063,11 @@ async fn launch(
     // the press changed nothing (design 08, review G-M7).
     let note = (launch == Launch::Route).then(|| context["button"]["note"].as_str().map(str::to_owned)).flatten();
     let build = {
-        let (engine, anchored, scope, id) = (engine.clone(), anchored.clone(), scope.clone(), id.clone());
+        let (engine, anchored, scope, id, parent) =
+            (engine.clone(), anchored.clone(), scope.clone(), id.clone(), ctx.run_id.clone());
         move |choice: Choice| -> Build {
-            let (engine, anchored, scope, id) = (engine.clone(), anchored.clone(), scope.clone(), id.clone());
+            let (engine, anchored, scope, id, parent) =
+                (engine.clone(), anchored.clone(), scope.clone(), id.clone(), parent.clone());
             let (session, signal, host) = (session.clone(), signal.clone(), host.clone());
             let (content, handover, fallback_line) = (content.clone(), handover.clone(), fallback_line.clone());
             let note = note.clone();
@@ -1100,7 +1104,7 @@ async fn launch(
                     Some(parts.into_iter().flatten().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("\n\n"));
                 opts.signal_id = Some(host.signal_id);
                 opts.session_id = Some(session.id.clone());
-                let memory = session.memory.snapshot();
+                let memory = engine.memory_out(&parent, &session.memory).await?;
                 let (mut input, loop_host) =
                     loop_admission(&engine, &opts, PRIMARY, &id, &signal.content, memory, None).await?;
                 let workflow_signal = crate::flows::WorkflowSignal {

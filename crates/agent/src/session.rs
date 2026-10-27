@@ -2,6 +2,7 @@
 // on one signal (the primary loop, its workers, the workflow's steps) shares
 // one session; rendering the context block is a separate, pure step.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -94,9 +95,33 @@ fn quoted(key: &str) -> String {
 
 // Temporary KV shared by the loops of one task: insert-only keys, exact
 // strings, insertion order kept.
+//
+// A durable run carries it by reference: `[key, {"ref": digest}, format]`,
+// each value the evidence named by its digest (`Engine::memory_out` stores
+// and links it to the run before the run records the reference). The values
+// are immutable under their digests, so a recovery reads back exactly what
+// the run saw, and the journal grows by keys, not payloads: carried by value
+// it copied every value into every step's record.
 #[derive(Default)]
 pub struct WorkingMemory {
-    entries: Mutex<Vec<(String, String, Format)>>,
+    entries: Mutex<Vec<Entry>>,
+    // Digests known stored as evidence, and the runs each is linked to.
+    stored: Mutex<HashSet<String>>,
+    linked: Mutex<HashSet<(String, String)>>,
+}
+
+struct Entry {
+    key: String,
+    value: String,
+    format: Format,
+    digest: String,
+}
+
+/// A value a run's reference needs stored as evidence, linked to the run:
+/// `body` is `None` when the evidence already exists (only the link is new).
+pub struct Unlinked {
+    pub digest: String,
+    pub body: Option<String>,
 }
 
 impl WorkingMemory {
@@ -105,45 +130,81 @@ impl WorkingMemory {
             return Err(MemoryError::Empty);
         }
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        if entries.iter().any(|(k, _, _)| k == key) {
+        if entries.iter().any(|e| e.key == key) {
             return Err(MemoryError::Exists(quoted(key)));
         }
-        entries.push((key.to_owned(), value.to_owned(), format));
+        let digest = crate::runs::digest(value);
+        entries.push(Entry { key: key.to_owned(), value: value.to_owned(), format, digest });
         Ok(())
     }
 
     pub fn get(&self, key: &str) -> Result<String, MemoryError> {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        entries
-            .iter()
-            .find(|(k, _, _)| k == key)
-            .map(|(_, v, _)| v.clone())
-            .ok_or_else(|| MemoryError::Missing(quoted(key)))
+        entries.iter().find(|e| e.key == key).map(|e| e.value.clone()).ok_or_else(|| MemoryError::Missing(quoted(key)))
     }
 
     // Metadata in insertion order; payloads stay out.
     pub fn list(&self) -> Vec<MemoryEntry> {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        entries.iter().map(|(k, v, f)| MemoryEntry { key: k.clone(), format: *f, size_bytes: v.len() }).collect()
+        entries
+            .iter()
+            .map(|e| MemoryEntry { key: e.key.clone(), format: e.format, size_bytes: e.value.len() })
+            .collect()
     }
 
     // True if removed; the key may then be reused.
     pub fn delete(&self, key: &str) -> bool {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let before = entries.len();
-        entries.retain(|(k, _, _)| k != key);
+        entries.retain(|e| e.key != key);
         entries.len() != before
     }
 
-    // Every entry, for a durable run to carry: `[key, value, format]`.
-    pub fn snapshot(&self) -> Value {
+    /// The reference `run` carries, and what must be stored and linked to
+    /// `run` before it records it (`mark_linked` once it is).
+    pub fn references(&self, run: &str) -> (Value, Vec<Unlinked>) {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        Value::Array(entries.iter().map(|(k, v, f)| serde_json::json!([k, v, f])).collect())
+        let stored = self.stored.lock().unwrap_or_else(|e| e.into_inner());
+        let linked = self.linked.lock().unwrap_or_else(|e| e.into_inner());
+        let mut unlinked: Vec<Unlinked> = Vec::new();
+        for e in entries.iter() {
+            if !linked.contains(&(run.to_owned(), e.digest.clone())) && !unlinked.iter().any(|u| u.digest == e.digest) {
+                let body = (!stored.contains(e.digest.as_str())).then(|| e.value.clone());
+                unlinked.push(Unlinked { digest: e.digest.clone(), body });
+            }
+        }
+        let refs = entries.iter().map(|e| serde_json::json!([e.key, {"ref": e.digest}, e.format])).collect();
+        (Value::Array(refs), unlinked)
     }
 
-    // Adds a snapshot's entries this memory lacks; the ones it has stay.
-    pub fn merge(&self, snapshot: &Value) -> anyhow::Result<()> {
-        for (key, value, format) in serde_json::from_value::<Vec<(String, String, Format)>>(snapshot.clone())? {
+    pub fn mark_linked(&self, run: &str, digests: impl IntoIterator<Item = String>) {
+        let mut stored = self.stored.lock().unwrap_or_else(|e| e.into_inner());
+        let mut linked = self.linked.lock().unwrap_or_else(|e| e.into_inner());
+        for digest in digests {
+            stored.insert(digest.clone());
+            linked.insert((run.to_owned(), digest));
+        }
+    }
+
+    /// Adds a carried memory's entries this memory lacks; the ones it has
+    /// stay. A value is inline (a string) or a reference `body` resolves; a
+    /// reference it can't resolve is an error, never an empty value.
+    pub fn merge(&self, carried: &Value, body: impl Fn(&str) -> anyhow::Result<String>) -> anyhow::Result<()> {
+        for (key, value, format) in serde_json::from_value::<Vec<(String, Value, Format)>>(carried.clone())? {
+            if self.get(&key).is_ok() {
+                continue;
+            }
+            let value = match value {
+                Value::String(value) => value,
+                reference => {
+                    let digest = reference["ref"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("working memory {key}: neither a value nor a reference"))?;
+                    let value = body(digest)?;
+                    self.stored.lock().unwrap_or_else(|e| e.into_inner()).insert(digest.to_owned());
+                    value
+                }
+            };
             let _ = self.put(&key, &value, format);
         }
         Ok(())

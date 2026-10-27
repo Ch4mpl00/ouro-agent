@@ -715,7 +715,7 @@ impl AgentLoop {
         engine.ready().await?;
         let n = self.sends.fetch_add(1, Ordering::SeqCst);
         let run = if n == 0 { self.opts.id.clone() } else { format!("{}#{}", self.opts.id, n + 1) };
-        let (input, task) = {
+        let (messages, task) = {
             let mut messages = self.messages.lock().await;
             if let Some(text) = text {
                 messages.push(providers::user(&text));
@@ -726,8 +726,9 @@ impl AgentLoop {
                 .and_then(providers::content)
                 .unwrap_or_default()
                 .to_owned();
-            (loop_input(json!(*messages), self.opts.session.memory.snapshot(), &self.opts), task)
+            (json!(*messages), task)
         };
+        let input = loop_input(messages, engine.memory_out(&run, &self.opts.session.memory).await?, &self.opts);
         self.admit_task(&task).await;
         if run != self.opts.id {
             engine.loops.lock().await.insert(run.clone(), self.clone());
@@ -1403,6 +1404,54 @@ impl Engine {
         }
     }
 
+    /// The working memory as `run` carries it, by reference (session.rs):
+    /// each value is stored as evidence and linked to `run` before the
+    /// reference is returned, so the run never records a reference it
+    /// can't resolve after a restart, and retention keeps the value while the
+    /// run is kept.
+    pub async fn memory_out(&self, run: &str, memory: &crate::session::WorkingMemory) -> anyhow::Result<Value> {
+        let (references, unlinked) = memory.references(run);
+        if !unlinked.is_empty() {
+            let (owner, digests) = (run.to_owned(), unlinked.iter().map(|u| u.digest.clone()).collect::<Vec<_>>());
+            self.deps
+                .db
+                .write(move |db| {
+                    for u in unlinked {
+                        match u.body {
+                            Some(body) => db.put_evidence(&owner, &body).map(drop)?,
+                            None => db.link_evidence(&owner, &u.digest)?,
+                        }
+                    }
+                    Ok(())
+                })
+                .await?;
+            memory.mark_linked(run, digests);
+        }
+        Ok(references)
+    }
+
+    /// A working memory value as a run carries it: inline (an older run's)
+    /// or a reference to its evidence.
+    pub fn carried_value(&self, value: &Value) -> anyhow::Result<String> {
+        match value {
+            Value::String(value) => Ok(value.clone()),
+            reference => {
+                let digest =
+                    reference["ref"].as_str().ok_or_else(|| anyhow::anyhow!("neither a value nor a reference"))?;
+                self.deps
+                    .db
+                    .evidence(digest)?
+                    .ok_or_else(|| anyhow::anyhow!("working memory value {digest} is missing from evidence"))
+            }
+        }
+    }
+
+    /// Puts a carried working memory (`memory_out`'s, or an older run's
+    /// values inline) back into `memory`.
+    pub fn memory_in(&self, memory: &crate::session::WorkingMemory, carried: &Value) -> anyhow::Result<()> {
+        memory.merge(carried, |digest| self.carried_value(&json!({"ref": digest})))
+    }
+
     /// The live loop of `run`, or one rebuilt from its host data, tracing in
     /// the run's current scope.
     pub async fn loop_for(
@@ -1706,7 +1755,7 @@ impl AgentLoop {
         if let Some(memory) = memory.filter(|m| !m.is_null())
             && !self.memory_restored.swap(true, Ordering::SeqCst)
         {
-            self.opts.session.memory.merge(memory)?;
+            self.engine.upgrade().ok_or_else(aborted)?.memory_in(&self.opts.session.memory, memory)?;
         }
         Ok(())
     }
@@ -1985,6 +2034,17 @@ pub async fn loop_tool(
         sandbox.call(&loop_.opts.id, args["i"].as_u64(), &call, verdict.as_ref(), !failed, &raw);
     }
     let (mut presented, stored) = loop_.present(&call.name, &raw, &span);
+    // The kept reply goes to settle by reference too (session.rs).
+    let stored = match stored {
+        Some(Value::Array(kept)) if kept.len() == 3 => {
+            let body = kept[1].as_str().unwrap_or_default().to_owned();
+            let owner = run.to_owned();
+            let digest = engine.deps.db.write(move |db| db.put_evidence(&owner, &body)).await?;
+            loop_.opts.session.memory.mark_linked(run, [digest.clone()]);
+            Some(json!([kept[0], {"ref": digest}, kept[2]]))
+        }
+        other => other,
+    };
     // A durable worker's handle, for read_run: beside its answer, not in it,
     // so the answer can still be passed on as it is.
     if let Some((_, handle, _)) = joined
@@ -2029,11 +2089,16 @@ pub fn unknown_tool_outcome(name: &str) -> Value {
 /// model sees them, the working memory after the round, and whether
 /// `finish` ended the session (with its `output`), plus ordered generic tool
 /// outcomes for workflow-defined exit rules.
-pub async fn loop_settle(loop_: &Arc<AgentLoop>, args: &Value) -> anyhow::Result<Value> {
+pub async fn loop_settle(
+    engine: &Arc<Engine>,
+    loop_: &Arc<AgentLoop>,
+    run: &str,
+    args: &Value,
+) -> anyhow::Result<Value> {
     // The memory before the round, then what its calls stored and changed,
     // applied again from their results: after a restart they are not rerun.
     let memory = &loop_.opts.session.memory;
-    memory.merge(args.get("memory").unwrap_or(&json!([])))?;
+    engine.memory_in(memory, args.get("memory").unwrap_or(&json!([])))?;
     loop_.memory_restored.store(true, Ordering::SeqCst);
     let calls = args.get("calls").and_then(Value::as_array).cloned().unwrap_or_default();
     let results = args.get("results").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -2054,7 +2119,7 @@ pub async fn loop_settle(loop_: &Arc<AgentLoop>, args: &Value) -> anyhow::Result
         }
         if let Some([key, value, format]) = result.get("stored").and_then(Value::as_array).map(Vec::as_slice) {
             let format = if format == "json" { Format::Json } else { Format::Text };
-            let _ = memory.put(key.as_str().unwrap_or_default(), value.as_str().unwrap_or_default(), format);
+            let _ = memory.put(key.as_str().unwrap_or_default(), &engine.carried_value(value)?, format);
         }
         let presented = result.get("presented").and_then(Value::as_str).unwrap_or_default().to_owned();
         let failed = result.get("failed").and_then(Value::as_bool).unwrap_or(true);
@@ -2062,10 +2127,13 @@ pub async fn loop_settle(loop_: &Arc<AgentLoop>, args: &Value) -> anyhow::Result
             "name": call.name,
             "arguments": serde_json::from_str::<Value>(&call.arguments).unwrap_or_else(|_| json!(call.arguments)),
             "ok": !failed,
-            "result": result.get("result").cloned().unwrap_or_else(|| {
-                let raw = result.get("stored").and_then(|stored| stored.get(1)).and_then(Value::as_str);
-                outcome_result(raw.unwrap_or(&presented))
-            }),
+            "result": match result.get("result") {
+                Some(result) => result.clone(),
+                None => {
+                    let raw = result.get("stored").and_then(|stored| stored.get(1)).map(|v| engine.carried_value(v));
+                    outcome_result(&raw.transpose()?.unwrap_or_else(|| presented.clone()))
+                }
+            },
         }));
         let finish = finish_result(&call);
         round.push((call, presented, failed, finish));
@@ -2080,9 +2148,10 @@ pub async fn loop_settle(loop_: &Arc<AgentLoop>, args: &Value) -> anyhow::Result
     if let Some(sandbox) = loop_.engine.upgrade().and_then(|engine| engine.sandbox.clone()) {
         sandbox.settled(&loop_.opts.id, finished.is_some());
     }
+    let memory = engine.memory_out(run, memory).await?;
     Ok(json!({
         "replies": replies,
-        "memory": memory.snapshot(),
+        "memory": memory,
         "outcomes": outcomes,
         "finished": finished.is_some(),
         "output": finished.unwrap_or_default(),
@@ -2124,7 +2193,7 @@ pub async fn loop_context(
                 )
             })?;
             let (input, earlier) = crate::supervisor::signal_input(signal, &at.session, mcp, scope, cancel).await?;
-            let snapshot = at.session.memory.snapshot();
+            let snapshot = engine.memory_out(&at.run, &at.session.memory).await?;
             let earlier = (!earlier.is_empty()).then(|| json!(earlier).to_string());
             let memory = (snapshot.as_array().is_some_and(|m| !m.is_empty())).then(|| snapshot.to_string());
             // A write may wait for the engine's lock on agent.db (runs.rs §2).
@@ -2186,6 +2255,7 @@ pub(crate) fn recorded_output<'a>(records: &'a Records, function: &str) -> Optio
 pub async fn loop_setup(
     engine: &Arc<Engine>,
     live: &Arc<AgentLoop>,
+    run: &str,
     admitted: &Value,
     args: &Value,
     records: &Records,
@@ -2294,7 +2364,7 @@ pub async fn loop_setup(
     ));
     Ok(json!({
         "messages": messages,
-        "memory": live.opts.session.memory.snapshot(),
+        "memory": engine.memory_out(run, &live.opts.session.memory).await?,
         "setup": {"skills": added, "preselected": preselected,
             "guard": {"skills": evidence, "earlier_user_messages": earlier}},
     }))
