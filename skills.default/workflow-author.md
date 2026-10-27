@@ -467,6 +467,25 @@ X since a time"): the loops list the active ones in their instructions and
 run one with `run_reflex(name, input)`, and workflows compose them. It is an
 ordinary workflow with a declaration:
 
+- **One step, not a scenario.** A reflex is one meaningful, reusable step
+  ("find the news on a topic since a time and keep the relevant ones"), not
+  a whole task ("the twice-daily digest"). A scenario is a workflow that
+  composes reflexes and adds its own constants and order. Before saving a
+  reflex, ask whether a different task could call it as it is; if it only
+  fits one task, split it or make it a plain workflow.
+  - **Everything specific is a parameter.** The filter's criteria, the
+    window, the source, the query, the chat: the caller passes them, so one
+    reflex serves the digest, a question in chat and a research task. Bake
+    in no stream name, memory key, chat id or task's rules; the scenario
+    that calls it supplies them from its own YAML.
+  - **It returns data and leaves the rest to its caller.** A reflex that
+    gathers or filters returns what it found and writes nothing. The loop
+    keeps a run_reflex result in working memory like any tool result, so a
+    large result reaches the model as a `memory_key` it can pass on by
+    reference. Writing, sending and bookkeeping (a journal entry, a
+    watermark) belong to the scenario, or to a separate write reflex that
+    does only that one thing.
+
 - **The declaration.** `metadata.reflex`: `description` (what it does and
   when to use it, one or two sentences: the catalog shows it), `input` (each
   parameter and what it means; the YAML reads it as
