@@ -504,7 +504,9 @@ const INSTRUCTION_SEPARATOR: &str = "\n\n---\n\n";
 /// What a loop's instructions are made of, read from the skill store: its
 /// skills (name and body, in order), the tools they allow (None: every tool)
 /// and the system prompt. A starter computes it for a child's admission
-/// without building the child's loop (design 03, R2-M1).
+/// without building the child's loop (design 03, R2-M1), and a loop a
+/// workflow started keeps it (`runs::PreparedLoop`, design 09).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Prepared {
     pub names: Vec<String>,
     pub bodies: Vec<String>,
