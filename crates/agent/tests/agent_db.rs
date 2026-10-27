@@ -338,7 +338,8 @@ fn migration_files_hash_like_drizzle_recorded_them() {
             "4279364f30eccda5",
             "50bde7d815712e91",
             "2bff852aa66ec4a5",
-            "dcce9cc39e04d9c7"
+            "dcce9cc39e04d9c7",
+            "bd807c24d316e439"
         ]
     );
     let rust = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
