@@ -282,14 +282,10 @@ pub fn render_context(env: &EnvData) -> anyhow::Result<String> {
     if let Some(email) = env.user_email.as_deref().filter(|e| !e.is_empty()) {
         lines.push(format!("- User email: {email}"));
     }
-    lines.push(format!(
-        "- News last read at: {}",
-        env.news_last_read_at.as_deref().unwrap_or("never (bootstrap with now - 24h)")
-    ));
-    lines.push(format!(
-        "- Tech last read at: {}",
-        env.tech_last_read_at.as_deref().unwrap_or("never (bootstrap with now - 24h)")
-    ));
+    // The news watermarks stay out: shown to every loop they read as a
+    // standing task to catch up on news ("доложите обстановку" became a
+    // digest). Saved workflows still get them as `env.newsLastReadAt` /
+    // `env.techLastReadAt`.
     Ok(lines.join("\n"))
 }
 

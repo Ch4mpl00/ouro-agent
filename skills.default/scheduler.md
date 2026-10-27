@@ -55,7 +55,7 @@ for the oldest slot it missed (the `Slot` line), not once per missed slot.
    )
    ```
 
-   The worker gets date, timezone and news watermark from the session.
+   The worker gets date and timezone from the session.
    It can fetch missing domain evidence itself. Use multiple workers when
    useful, passing result keys between them instead of copying payloads.
    Read `content`, or explicitly read its memory key if the result was
