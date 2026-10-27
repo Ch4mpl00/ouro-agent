@@ -423,6 +423,7 @@ pub struct Entry {
     pub version: u64,
     pub declaration: Declaration,
     pub summary: Summary,
+    pub yaml: String,
 }
 
 /// Every reflex the loop may be told of, by name: its active version is
@@ -443,26 +444,39 @@ pub async fn catalog(engine: &Engine) -> anyhow::Result<Vec<Entry>> {
             continue;
         }
         let summary = summarize(engine, &active.name, &d.yaml).await;
-        entries.push(Entry { name: active.name, version: active.version, declaration, summary });
+        entries.push(Entry { name: active.name, version: active.version, declaration, summary, yaml: d.yaml.clone() });
     }
     Ok(entries)
 }
 
-/// A loop is told of every reflex while there are at most this many; past
-/// that, Jev chooses the ones its request needs and `find_reflexes` finds
-/// the others, so the catalog costs a few lines however many there are.
-pub const LIST_ALL_UP_TO: usize = 5;
 /// The bar and the count of the reflexes chosen for a request: the stricter
-/// bar of skill preselection, since every line is on every turn.
+/// bar of skill preselection, since each one's YAML is on every turn.
 pub const CHOSEN_THRESHOLD: f64 = 0.7;
 pub const CHOSEN_LIMIT: usize = 5;
+/// The most YAML the chosen reflexes put into the instructions together;
+/// one past it is shown by its line, its YAML left to `read_workflow`.
+pub const CHOSEN_YAML_CHARS: usize = 24_000;
 /// `find_reflexes`, the model's search over the catalog, and its bar.
 pub const FIND_TOOL: &str = "find_reflexes";
 pub const FIND_THRESHOLD: f64 = 0.5;
-pub const FIND_LIMIT: usize = 10;
+pub const FIND_LIMIT: usize = 5;
 const REQUEST_CHARS: usize = 4000;
 
 const HEADER: &str = "Reflexes: saved workflows that each do one finished thing. Run one with run_reflex(name, input) instead of making its calls yourself; `*` marks a required parameter, [writes] one that changes something.";
+
+const CHOSEN_HEADER: &str = "Each reflex below is a saved workflow a dry run tried: its YAML shows what it does, the parameters it reads ($workflow.input.<name>) and what it returns. Run one with run_reflex(name, input); `*` marks a required parameter, [writes] one that changes something (the guard reviews it).";
+
+// A chosen reflex with its YAML, cut to `room` characters.
+fn section(entry: &Entry, room: usize) -> String {
+    let effect = if entry.summary.writes { "writes" } else { "reads" };
+    let description = entry.declaration.description.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!(
+        "### {}({}) [{effect}]\n{description}\n```yaml\n{}\n```",
+        entry.name,
+        entry.declaration.signature(),
+        crate::activity::clip(entry.yaml.trim_end(), room)
+    )
+}
 
 fn line(entry: &Entry) -> String {
     let effect = if entry.summary.writes { "writes" } else { "reads" };
@@ -501,10 +515,10 @@ fn ranked(entries: Vec<Entry>, scores: Vec<f64>, bar: f64, limit: usize) -> Vec<
 /// workflow-started loop's stored preparation), so a restart sees the same
 /// one. `None` with nothing to list.
 ///
-/// With more than [`LIST_ALL_UP_TO`] reflexes and the loop's `request`
-/// known, it lists only those Jev chose for it and points to
-/// `find_reflexes` for the rest; without a request (a preparation that only
-/// checks), or when Jev fails, the whole catalog up to its cap.
+/// With the loop's `request` known, it holds the reflexes Jev chose for it,
+/// each with its YAML (together at most [`CHOSEN_YAML_CHARS`]), and points
+/// to `find_reflexes` for the rest; without a request (a preparation that
+/// only checks), or when Jev fails, one line per reflex up to its cap.
 pub async fn catalog_block(
     engine: &Engine,
     request: Option<&str>,
@@ -516,32 +530,36 @@ pub async fn catalog_block(
         return Ok(None);
     }
     let total = entries.len();
-    if let Some(request) = request.filter(|r| !r.trim().is_empty() && total > LIST_ALL_UP_TO) {
-        match scores(engine, &entries, request, scope, cancel).await {
-            Ok(scores) => {
-                let chosen = ranked(entries, scores, CHOSEN_THRESHOLD, CHOSEN_LIMIT);
-                let mut lines = vec![HEADER.to_owned()];
-                if chosen.is_empty() {
-                    lines.push(format!(
-                        "{total} are saved and none was chosen for this request; {FIND_TOOL}(query) searches them."
-                    ));
-                } else {
-                    lines.push(format!(
-                        "Chosen for this request, {} of {total}; {FIND_TOOL}(query) searches the others:",
-                        chosen.len()
-                    ));
-                    lines.extend(chosen.iter().map(|(entry, _)| line(entry)));
-                }
-                return Ok(Some(lines.join("\n")));
-            }
-            Err(error) => {
-                crate::errors::check(cancel)?;
-                eprintln!("[reflexes] [warn] choosing reflexes failed, listing the catalog: {error:#}");
-                return Ok(Some(full(&entries)));
-            }
+    let Some(request) = request.filter(|r| !r.trim().is_empty()) else { return Ok(Some(full(&entries))) };
+    let scores = match scores(engine, &entries, request, scope, cancel).await {
+        Ok(scores) => scores,
+        Err(error) => {
+            crate::errors::check(cancel)?;
+            eprintln!("[reflexes] [warn] choosing reflexes failed, listing the catalog: {error:#}");
+            return Ok(Some(full(&entries)));
+        }
+    };
+    let chosen = ranked(entries, scores, CHOSEN_THRESHOLD, CHOSEN_LIMIT);
+    let mut parts = vec![HEADER.to_owned()];
+    if chosen.is_empty() {
+        parts
+            .push(format!("{total} are saved and none was chosen for this request; {FIND_TOOL}(query) searches them."));
+        return Ok(Some(parts.join("\n")));
+    }
+    parts
+        .push(format!("Chosen for this request, {} of {total}; {FIND_TOOL}(query) searches the others.", chosen.len()));
+    parts.push(CHOSEN_HEADER.to_owned());
+    let mut room = CHOSEN_YAML_CHARS;
+    for (entry, _) in &chosen {
+        let size = entry.yaml.chars().count().min(YAML_CHARS);
+        if size <= room {
+            room -= size;
+            parts.push(section(entry, YAML_CHARS));
+        } else {
+            parts.push(format!("{} (its YAML: read_workflow)", line(entry)));
         }
     }
-    Ok(Some(full(&entries)))
+    Ok(Some(parts.join("\n\n")))
 }
 
 // The whole catalog, up to its cap.
@@ -581,6 +599,7 @@ pub async fn find(
                 "description": e.declaration.description, "input": e.declaration.input,
                 "required": e.declaration.required, "writes": e.summary.writes,
                 "open_world": e.summary.open_world, "score": score,
+                "yaml": crate::activity::clip(&e.yaml, YAML_CHARS),
             })
         })
         .collect();

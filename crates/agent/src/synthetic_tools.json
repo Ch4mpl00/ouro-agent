@@ -284,7 +284,7 @@
     "type": "function",
     "function": {
       "name": "find_reflexes",
-      "description": "Search your reflexes (saved workflows that each do one finished thing) for ones useful for a task: each match with how to call it with run_reflex, its parameters, whether it writes, and a relevance score. Use it when the Reflexes block does not list one that fits.",
+      "description": "Search your reflexes (saved workflows that each do one finished thing) for ones useful for a task: each match with how to call it with run_reflex, its parameters, whether it writes, its YAML and a relevance score. Use it when the Reflexes block does not list one that fits.",
       "parameters": {
         "type": "object",
         "properties": {
