@@ -111,6 +111,7 @@ impl World {
             },
             mcp: Arc::new(Marked(self.mcp.clone())),
             presets: Presets {
+                instant: p("gpt-5.4-mini"),
                 base: p("gpt-5.4-mini"),
                 smart: p("gpt-5.4"),
                 smartest: p("gpt-5.4"),

@@ -113,7 +113,7 @@ async fn dry_run_generates_without_writing_memory() {
     let engine = create_engine(EngineDeps {
         providers: Providers { openai: llm.clone(), gemini: llm.clone(), deepseek: llm.clone(), openrouter: None },
         mcp: Arc::new(MarkedMemory(mcp)),
-        presets: Presets { base: p(), smart: p(), smartest: p(), compiler: p(), compose: p() },
+        presets: Presets { instant: p(), base: p(), smart: p(), smartest: p(), compiler: p(), compose: p() },
         skills: vec![],
         skill_store: skills,
         memory: Arc::new(db.clone()),
@@ -272,7 +272,7 @@ impl Fired {
         create_engine(EngineDeps {
             providers: Providers { openai: llm.clone(), gemini: llm.clone(), deepseek: llm, openrouter: None },
             mcp,
-            presets: Presets { base: p(), smart: p(), smartest: p(), compiler: p(), compose: p() },
+            presets: Presets { instant: p(), base: p(), smart: p(), smartest: p(), compiler: p(), compose: p() },
             skills: vec![],
             skill_store: skills,
             memory: db.clone(),

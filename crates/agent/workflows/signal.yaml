@@ -148,7 +148,7 @@ do:
               with:
                 error: '${ $failure }'
                 skills: [recovery]
-                preset: base
+                preset: instant
                 max_iterations: 5
                 system: '${ [ $context.context, $context.signal.env_context ] | map(select(. != null and . != "")) }'
                 prompt: >-

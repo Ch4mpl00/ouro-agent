@@ -39,6 +39,7 @@ const CHAT: i64 = 42;
 fn presets() -> Presets {
     let p = |model: &str, reasoning_effort| ModelPreset { model: model.into(), reasoning_effort };
     Presets {
+        instant: p("m-base", ReasoningEffort::Disabled),
         base: p("m-base", ReasoningEffort::Disabled),
         smart: p("m-smart", ReasoningEffort::Medium),
         smartest: p("m-smartest", ReasoningEffort::Max),
