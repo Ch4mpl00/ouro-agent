@@ -70,7 +70,7 @@ do:
                         input: '${ $context.input }'
                         skills: [telegram]
                         loaded: '${ [ "telegram" ] + ($context.preselected.names // []) }'
-                        preset: smart
+                        preset: base
                         exclude_tools: [send_telegram_message, telegram_send_status, start_typing, send_telegram_chat_action]
                         on_step: >-
                           ${ if $context.conversation != null

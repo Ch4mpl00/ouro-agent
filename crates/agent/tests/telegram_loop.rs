@@ -453,7 +453,7 @@ async fn a_telegram_signal_runs_the_wrapper_its_loop_and_sends_the_composed_repl
     assert_eq!(host["conversation"], conversation, "from the wrapper's host data");
     assert_eq!(host["confirm"], conversation);
     assert_eq!(host["signal_id"], 42);
-    assert_eq!(host["preset"], "smart");
+    assert_eq!(host["preset"], "base", "the request's preset");
     let mut excluded: Vec<&str> = EXCLUDED.to_vec();
     excluded.sort();
     assert_eq!(host["exclude_tools"], json!(excluded));

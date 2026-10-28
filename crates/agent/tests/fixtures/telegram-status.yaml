@@ -14,7 +14,7 @@ do:
             call: llm_compose
             timeout: { after: PT20S }
             with:
-              preset: base
+              preset: instant
               json: true
               prompt: >-
                 Write one line for a Telegram progress bubble: an emoji and at most 60 characters in Russian saying what
