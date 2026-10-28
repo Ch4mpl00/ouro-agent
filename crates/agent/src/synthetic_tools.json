@@ -649,6 +649,13 @@
       "parameters": {
         "type": "object",
         "properties": {
+          "refs": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Inputs too large to copy: argument path → working-memory key, e.g. {\"items\": \"tool.ab12#items\"} or {\"input.posts\": \"posts\"}. A key's JSON value is used as JSON; `#a.b` takes a field of it."
+          },
           "items": {
             "type": "array"
           },
@@ -657,13 +664,6 @@
           },
           "threshold": {
             "type": "number"
-          },
-          "refs": {
-            "type": "object",
-            "additionalProperties": {
-              "type": "string"
-            },
-            "description": "Inputs too large to copy: argument path → working-memory key, e.g. {\"items\": \"tool.ab12#items\"} or {\"input.posts\": \"posts\"}. A key's JSON value is used as JSON; `#a.b` takes a field of it."
           }
         },
         "required": [
@@ -681,6 +681,13 @@
       "parameters": {
         "type": "object",
         "properties": {
+          "refs": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Inputs too large to copy: argument path → working-memory key, e.g. {\"items\": \"tool.ab12#items\"} or {\"input.posts\": \"posts\"}. A key's JSON value is used as JSON; `#a.b` takes a field of it."
+          },
           "prompt": {
             "type": "string"
           },
@@ -695,13 +702,6 @@
           },
           "skill": {
             "type": "string"
-          },
-          "refs": {
-            "type": "object",
-            "additionalProperties": {
-              "type": "string"
-            },
-            "description": "Inputs too large to copy: argument path → working-memory key, e.g. {\"items\": \"tool.ab12#items\"} or {\"input.posts\": \"posts\"}. A key's JSON value is used as JSON; `#a.b` takes a field of it."
           }
         },
         "required": [
@@ -719,6 +719,13 @@
       "parameters": {
         "type": "object",
         "properties": {
+          "refs": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Inputs too large to copy: argument path → working-memory key, e.g. {\"items\": \"tool.ab12#items\"} or {\"input.posts\": \"posts\"}. A key's JSON value is used as JSON; `#a.b` takes a field of it."
+          },
           "question": {
             "type": "string"
           },
@@ -734,13 +741,6 @@
           },
           "default": {
             "type": "string"
-          },
-          "refs": {
-            "type": "object",
-            "additionalProperties": {
-              "type": "string"
-            },
-            "description": "Inputs too large to copy: argument path → working-memory key, e.g. {\"items\": \"tool.ab12#items\"} or {\"input.posts\": \"posts\"}. A key's JSON value is used as JSON; `#a.b` takes a field of it."
           }
         },
         "required": [
