@@ -202,7 +202,13 @@ impl Fixture {
         for name in ["OPENAI_API_KEY", "DEEPSEEK_API_KEY", "GEMINI_API_KEY", "OPEN_ROUTER_API_KEY"] {
             cmd.env(name, "fixture-key");
         }
-        for name in ["AGENT_BASE_MODEL", "AGENT_SMART_MODEL", "AGENT_SMARTEST_MODEL", "AGENT_COMPILER_MODEL"] {
+        for name in [
+            "AGENT_INSTANT_MODEL",
+            "AGENT_BASE_MODEL",
+            "AGENT_SMART_MODEL",
+            "AGENT_SMARTEST_MODEL",
+            "AGENT_COMPILER_MODEL",
+        ] {
             cmd.env(name, "gpt-fixture");
         }
         cmd.env("MCP_TRANSPORT", "http")

@@ -292,10 +292,10 @@ async fn routing_uses_source_payload_specificity_priority_and_active_overrides()
     let pick = async |source: &str, payload: &Value| {
         flows::signal_routes(&f.engine, source, payload).await.unwrap().into_iter().next().map(|r| r.0)
     };
-    // The built-in Telegram route (design 08) at priority -1: an agent's
-    // route of the same specificity wins without a tie.
-    assert_eq!(pick("telegram", &Value::Null).await.as_deref(), Some("telegram"));
-    assert_eq!(pick("telegram_button", &Value::Null).await.as_deref(), Some("telegram"));
+    // The runtime ships no Telegram route: a signal takes the default path
+    // until an agent version routes it.
+    assert_eq!(pick("telegram", &Value::Null).await, None);
+    assert_eq!(pick("telegram_button", &Value::Null).await, None);
     assert!(flows::built_in("telegram-loop").is_none());
     activate_telegram_loop(&f.engine).await;
     assert_eq!(pick("telegram", &Value::Null).await.as_deref(), Some("telegram-loop"));

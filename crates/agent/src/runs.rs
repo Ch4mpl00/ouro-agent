@@ -37,8 +37,8 @@ pub const FUNCTION_SLOTS: usize = 2 * DRIVES;
 /// The run tree's jump budget, a backstop: `max_iterations` is the binding
 /// limit of every loop. One round of agent-loop takes two jumps (`route` and
 /// `next`) plus one per guarded call in its guard round; the dispatcher takes
-/// at most three, and the Telegram route around its loop a handful (its
-/// switch and the reply's guard round; design 08). With the primary's 100 iterations and 16 workers of 50,
+/// at most three, and a wrapper flow around a loop a handful (its
+/// switch and the reply's guard round). With the primary's 100 iterations and 16 workers of 50,
 /// each with up to 16 guarded calls a round, that is
 /// 100 × 18 + 16 × 50 × 18 + 3 = 16 203; this leaves a margin over it
 /// (docs/operations.md, Jump budget). The recovery report runs outside the
@@ -697,8 +697,8 @@ pub async fn install_builtins(
     builtins: &[(&str, &str)],
 ) -> anyhow::Result<()> {
     for (name, yaml) in builtins {
-        // A built-in that calls tools this MCP does not offer (the Telegram
-        // route without Telegram) is not installed; the rest are, and its
+        // A built-in that calls tools this MCP does not offer (one that needs
+        // a tool group the MCP is scoped without) is not installed; the rest are, and its
         // signals take the default path.
         if let Err(error) = runtime.validate(yaml) {
             eprintln!("[engine] the built-in `{name}` does not fit this MCP and is not installed: {error:#}");

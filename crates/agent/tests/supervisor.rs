@@ -612,7 +612,7 @@ async fn recovery_failure_keeps_the_primary_error_and_transcript() {
         let (f, _, supervisor) = setup(model.clone());
         if invalid_preset {
             // An operator's (or an older rule's) signal version, past the gate.
-            store_definition(&f.engine, "signal", &SIGNAL.replace("preset: base", "preset: unknown")).await;
+            store_definition(&f.engine, "signal", &SIGNAL.replace("preset: instant", "preset: unknown")).await;
         }
         // After one tool round, both the primary and the recovery provider
         // fail. An invalid recovery preset also exercises setup failure.

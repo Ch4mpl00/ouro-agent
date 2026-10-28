@@ -1,4 +1,4 @@
-document: { dsl: '1.0.4', namespace: agent, name: telegram, version: '1.0.0', metadata: { route: { when: { source: [telegram, telegram_button] }, priority: -1 }, ouro: { breaker: 'off' } } }
+document: { dsl: '1.0.4', namespace: agent, name: telegram, version: '1.0.0', metadata: { route: { when: { source: [telegram, telegram_button] }, priority: -1 } } }
 # A Telegram signal's flow (docs/designs/08-telegram-loop.md): the route the
 # dispatcher starts as the signal's primary run, wrapped around a loop that
 # does not know it runs here. It opens a 👀 bubble at once, gathers the
@@ -22,7 +22,7 @@ do:
                   call: telegram_send_status
                   with:
                     id: '${ $context.bubble }'
-                    text: 👀
+                    text: смотрю 👀
                     chatId: '${ $context.conversation.chatId }'
                     messageThreadId: '${ $context.conversation.messageThreadId }'
                     seq: 0
@@ -70,7 +70,7 @@ do:
                         input: '${ $context.input }'
                         skills: [telegram]
                         loaded: '${ [ "telegram" ] + ($context.preselected.names // []) }'
-                        preset: smart
+                        preset: base
                         exclude_tools: [send_telegram_message, telegram_send_status, start_typing, send_telegram_chat_action]
                         on_step: >-
                           ${ if $context.conversation != null

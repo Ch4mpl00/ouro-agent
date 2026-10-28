@@ -1,4 +1,4 @@
-document: { dsl: '1.0.4', namespace: agent, name: telegram-status, version: '1.0.0', metadata: { ouro: { breaker: 'off' } } }
+document: { dsl: '1.0.4', namespace: agent, name: telegram-status, version: '1.0.0' }
 # One line for the Telegram wrapper's progress bubble (design 08): the
 # observer a loop starts after each acting turn, never joined. A cheap model
 # with no context but the step writes it; the line goes to the bubble with
@@ -14,7 +14,7 @@ do:
             call: llm_compose
             timeout: { after: PT20S }
             with:
-              preset: base
+              preset: instant
               json: true
               prompt: >-
                 Write one line for a Telegram progress bubble: an emoji and at most 60 characters in Russian saying what
