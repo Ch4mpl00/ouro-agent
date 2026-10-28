@@ -117,7 +117,9 @@ fn preset(model: &str, reasoning_effort: ReasoningEffort) -> ModelPreset {
 // Applied at startup when the AGENT_*_MODEL env overrides are absent.
 //   base     — non-thinking chat: recovery, simple workers, the
 //              workflow-path primary loop, the activity journal.
-//   smart    — the primary Telegram loop and editorial work.
+//   smart    — the primary Telegram loop and editorial work; low effort:
+//              the loop picks tools and passes data on, the writing is
+//              `compose`'s and the judging Jev's.
 //   smartest — a reserve high-end preset, selectable by sub-agents.
 //   compiler — the workflow compiler: one structured plan per signal.
 //   compose  — `llm_compose` steps by default: one generation, no tools.
@@ -128,7 +130,7 @@ const WORKHORSE: &str = "openrouter/deepseek/deepseek-v4.1-flash";
 pub fn default_presets() -> Presets {
     Presets {
         base: preset(WORKHORSE, ReasoningEffort::Disabled),
-        smart: preset(WORKHORSE, ReasoningEffort::High),
+        smart: preset(WORKHORSE, ReasoningEffort::Low),
         smartest: preset(WORKHORSE, ReasoningEffort::Max),
         compiler: preset(WORKHORSE, ReasoningEffort::High),
         compose: preset("gpt-6.1-sol", ReasoningEffort::Medium),
