@@ -277,8 +277,20 @@ impl BotApi {
         .await
     }
 
-    pub async fn answer_callback_query(&self, id: &str) -> Result<(), TelegramError> {
-        self.call::<Value>("answerCallbackQuery", json!({"callback_query_id":id})).await.map(drop)
+    // `text` shows as a notification at the top of the chat at once.
+    pub async fn answer_callback_query(&self, id: &str, text: Option<&str>) -> Result<(), TelegramError> {
+        let body = without_nulls(json!({"callback_query_id": id, "text": text}));
+        self.call::<Value>("answerCallbackQuery", body).await.map(drop)
+    }
+
+    // Takes a message's inline buttons away, its text left as it is.
+    pub async fn remove_buttons(&self, chat_id: &str, message_id: i64) -> Result<(), TelegramError> {
+        self.call::<Value>(
+            "editMessageReplyMarkup",
+            json!({ "chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []} }),
+        )
+        .await
+        .map(drop)
     }
 
     // A bot may only delete its own messages, within 48h.
@@ -980,9 +992,6 @@ pub async fn poll_once(
             && msg.chat.id == allowed_chat
             && let Some(data) = &callback.data
         {
-            if let Err(error) = bot.answer_callback_query(&callback.id).await {
-                tracing::warn!(%error, "could not answer button press");
-            }
             let text = msg
                 .reply_markup
                 .as_ref()
@@ -991,6 +1000,16 @@ pub async fn poll_once(
                 .flatten()
                 .find(|b| b.callback_data.as_ref() == Some(data))
                 .map(|b| b.text.as_str());
+            // The press is acknowledged at once, before the agent reads it:
+            // a notification naming the button, and the buttons taken away so
+            // nobody presses twice while the card waits for its outcome.
+            let ack = format!("⏳ {}", text.unwrap_or(data));
+            if let Err(error) = bot.answer_callback_query(&callback.id, Some(&ack)).await {
+                tracing::warn!(%error, "could not answer button press");
+            }
+            if let Err(error) = bot.remove_buttons(&msg.chat.id.to_string(), msg.message_id).await {
+                tracing::warn!(%error, "could not take the pressed message's buttons away");
+            }
             store
                 .record_message(
                     msg.chat.id,
