@@ -812,9 +812,14 @@ async fn every_acting_turn_starts_an_observer_before_its_calls_run() {
 async fn a_hanging_status_model_delays_nothing() {
     let s = setup(vec![calls(&[("t1", json!({"n":1}))]), assistant("done fast")], reply("fast reply"));
     s.model.hang_status.store(true, Ordering::SeqCst);
-    let started = std::time::Instant::now();
-    assert_eq!(s.supervisor.run_signal(&signal(42)).await.unwrap(), "fast reply");
-    assert!(started.elapsed() < std::time::Duration::from_secs(15), "{:?}", started.elapsed());
+    // The status model answers only when cancelled, so a reply that waited
+    // for it would never come: any bound tells the two apart, and a wide one
+    // stays true under load.
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(120), s.supervisor.run_signal(&signal(42)))
+        .await
+        .expect("the reply does not wait for the hanging status model");
+    assert_eq!(reply.unwrap(), "fast reply");
+    assert!(s.model.events.lock().unwrap().iter().any(|e| e == "model:status"), "the observer did ask");
     let runs = observers(&s.f.engine, 42).await;
     assert_eq!(runs.len(), 1);
     let ended = ended(&s.f.engine, &runs[0].admission.id).await;
