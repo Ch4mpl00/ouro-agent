@@ -801,5 +801,18 @@ async fn inline_buttons_split_edit_and_callback_signals() {
         )
     );
     assert_eq!(signals[1].1["text"], Value::Null);
-    assert_eq!(fake.lock().requests.iter().filter(|(m, _)| m == "answerCallbackQuery").count(), 2);
+    let requests = fake.lock().requests.clone();
+    let answers: Vec<_> =
+        requests.iter().filter(|(m, _)| m == "answerCallbackQuery").map(|(_, b)| &b["text"]).collect();
+    // Each press is answered at once, naming the button (the fake fails the
+    // first answer, which only warns).
+    assert_eq!(answers, [&json!("⏳ Confirm"), &json!("⏳ missing")]);
+    // The pressed messages lose their buttons; the other chat's press is not touched.
+    let removed: Vec<_> =
+        requests.iter().filter(|(m, _)| m == "editMessageReplyMarkup").map(|(_, b)| b.clone()).collect();
+    assert_eq!(removed.len(), 2, "{removed:?}");
+    assert_eq!(
+        removed[0],
+        json!({"chat_id": CHAT.to_string(), "message_id": 1001, "reply_markup": {"inline_keyboard": []}})
+    );
 }
