@@ -255,6 +255,7 @@ fn engine(p: &Parts) -> Arc<Engine> {
         },
         mcp: p.world.clone(),
         presets: Presets {
+            instant: preset("gpt-5.4-mini"),
             base: preset("gpt-5.4-mini"),
             smart: preset("gpt-5.4"),
             smartest: preset("gpt-5.4"),

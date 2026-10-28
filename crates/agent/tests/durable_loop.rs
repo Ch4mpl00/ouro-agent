@@ -101,6 +101,7 @@ fn engine_on(
         providers: Providers { openai: llm.clone(), gemini: llm.clone(), deepseek: llm, openrouter: None },
         mcp,
         presets: Presets {
+            instant: p("gpt-5.4-mini"),
             base: p("gpt-5.4-mini"),
             smart: p("gpt-5.4"),
             smartest: p("gpt-5.4"),

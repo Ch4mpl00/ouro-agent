@@ -80,6 +80,7 @@ fn configuration() -> anyhow::Result<Config> {
     let db = std::env::var_os("AGENT_DB_PATH").map(PathBuf::from).unwrap_or_else(|| root.join(DEFAULT_DB_PATH));
     let mut presets = default_presets();
     for (preset, name) in [
+        (&mut presets.instant, "AGENT_INSTANT_MODEL"),
         (&mut presets.base, "AGENT_BASE_MODEL"),
         (&mut presets.smart, "AGENT_SMART_MODEL"),
         (&mut presets.smartest, "AGENT_SMARTEST_MODEL"),
@@ -101,7 +102,7 @@ fn configuration() -> anyhow::Result<Config> {
         u32::try_from(positive("ACTIVITY_JOURNAL_MAX_ATTEMPTS", journal_options.max_generation_attempts.into())?)?;
     journal_options.budget.total_chars =
         usize::try_from(positive("ACTIVITY_JOURNAL_MAX_INPUT_CHARS", journal_options.budget.total_chars as u64)?)?;
-    let journal_model = std::env::var("ACTIVITY_JOURNAL_MODEL").unwrap_or_else(|_| presets.base.model.clone());
+    let journal_model = std::env::var("ACTIVITY_JOURNAL_MODEL").unwrap_or_else(|_| presets.instant.model.clone());
     // The same two variables MCP reads for the note on a queued signal.
     let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
     let default_chat_id = var("TELEGRAM_DEFAULT_CHAT_ID");
@@ -234,7 +235,7 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
                 let notes = Arc::new(Notes {
                     provider: engine.resolve_provider(&config.journal_model)?,
                     model: config.journal_model.clone(),
-                    reasoning_effort: config.presets.base.reasoning_effort,
+                    reasoning_effort: config.presets.instant.reasoning_effort,
                     timeout: Duration::from_secs(120),
                 });
                 let worker = create_activity_worker(db.clone(), notes, mcp.clone(), config.journal_options)?;

@@ -44,6 +44,7 @@ pub struct ModelPreset {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PresetName {
+    Instant,
     Base,
     Smart,
     Smartest,
@@ -54,6 +55,7 @@ pub enum PresetName {
 impl PresetName {
     pub fn as_str(self) -> &'static str {
         match self {
+            PresetName::Instant => "instant",
             PresetName::Base => "base",
             PresetName::Smart => "smart",
             PresetName::Smartest => "smartest",
@@ -65,6 +67,7 @@ impl PresetName {
     // A preset a workflow step or a sub-agent may pick; never `compiler`.
     pub fn selectable(name: &str) -> Option<PresetName> {
         match name {
+            "instant" => Some(PresetName::Instant),
             "base" => Some(PresetName::Base),
             "smart" => Some(PresetName::Smart),
             "smartest" => Some(PresetName::Smartest),
@@ -87,10 +90,11 @@ impl fmt::Display for PresetName {
 
 // Selectable inside a workflow (llm_compose / llm_agent `preset`) or by a
 // sub-agent. `compiler` is the compiler's own model, never chosen there.
-pub const PRESET_NAMES: [&str; 3] = ["base", "smart", "smartest"];
+pub const PRESET_NAMES: [&str; 4] = ["instant", "base", "smart", "smartest"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Presets {
+    pub instant: ModelPreset,
     pub base: ModelPreset,
     pub smart: ModelPreset,
     pub smartest: ModelPreset,
@@ -101,6 +105,7 @@ pub struct Presets {
 impl Presets {
     pub fn get(&self, name: PresetName) -> &ModelPreset {
         match name {
+            PresetName::Instant => &self.instant,
             PresetName::Base => &self.base,
             PresetName::Smart => &self.smart,
             PresetName::Smartest => &self.smartest,
@@ -115,11 +120,12 @@ fn preset(model: &str, reasoning_effort: ReasoningEffort) -> ModelPreset {
 }
 
 // Applied at startup when the AGENT_*_MODEL env overrides are absent.
-//   base     — non-thinking chat: recovery, simple workers, the
-//              workflow-path primary loop, the activity journal.
-//   smart    — the primary Telegram loop and editorial work; low effort:
-//              the loop picks tools and passes data on, the writing is
-//              `compose`'s and the judging Jev's.
+//   instant  — no thinking: one-line jobs that must be fast (a progress
+//              bubble's line, the activity journal, a recovery report).
+//   base     — low effort: the Telegram loop, simple workers, the
+//              workflow-path primary loop. It picks tools and passes data
+//              on; the writing is `compose`'s and the judging Jev's.
+//   smart    — high effort: editorial work, a route's default.
 //   smartest — a reserve high-end preset, selectable by sub-agents.
 //   compiler — the workflow compiler: one structured plan per signal.
 //   compose  — `llm_compose` steps by default: one generation, no tools.
@@ -129,8 +135,9 @@ fn preset(model: &str, reasoning_effort: ReasoningEffort) -> ModelPreset {
 const WORKHORSE: &str = "openrouter/deepseek/deepseek-v4.1-flash";
 pub fn default_presets() -> Presets {
     Presets {
-        base: preset(WORKHORSE, ReasoningEffort::Disabled),
-        smart: preset(WORKHORSE, ReasoningEffort::Low),
+        instant: preset(WORKHORSE, ReasoningEffort::Disabled),
+        base: preset(WORKHORSE, ReasoningEffort::Low),
+        smart: preset(WORKHORSE, ReasoningEffort::High),
         smartest: preset(WORKHORSE, ReasoningEffort::Max),
         compiler: preset(WORKHORSE, ReasoningEffort::High),
         compose: preset("gpt-6.1-sol", ReasoningEffort::Medium),

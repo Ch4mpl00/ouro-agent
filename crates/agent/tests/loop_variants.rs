@@ -492,7 +492,7 @@ async fn settle_exposes_ordered_generic_outcomes_before_model_truncation() {
 async fn workflow_authors_use_maximum_effort_for_every_requested_worker_preset() {
     // Every loop is an engine run: the parked suite's in-process and durable
     // paths are one.
-    for preset in ["base", "smart", "smartest"] {
+    for preset in ["instant", "base", "smart", "smartest"] {
         let model = Arc::new(Scripted::new(vec![
             calls(&[("invoke_sub_agent", json!({"skills":["workflow-author"],"preset":preset,"prompt":"draft"}))]),
             assistant("draft"),

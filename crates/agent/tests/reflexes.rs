@@ -234,6 +234,7 @@ fn engine_with(
         providers: Providers { openai: model.clone(), gemini: model.clone(), deepseek: model, openrouter: None },
         mcp: world,
         presets: Presets {
+            instant: p("gpt-5.4-mini"),
             base: p("gpt-5.4-mini"),
             smart: p("gpt-5.4"),
             smartest: p("gpt-5.4"),

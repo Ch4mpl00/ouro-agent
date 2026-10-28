@@ -85,6 +85,7 @@ impl agent::providers::ChatProvider for NoModel {
 fn configured_presets() -> agent::models::Presets {
     let mut presets = default_presets();
     for (key, preset) in [
+        ("INSTANT", &mut presets.instant),
         ("BASE", &mut presets.base),
         ("SMART", &mut presets.smart),
         ("SMARTEST", &mut presets.smartest),

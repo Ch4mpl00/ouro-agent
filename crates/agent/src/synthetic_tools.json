@@ -215,11 +215,12 @@
           "preset": {
             "type": "string",
             "enum": [
+              "instant",
               "base",
               "smart",
               "smartest"
             ],
-            "description": "Model preset for the sub-agent. `base` — cheap chat model, no thinking (default; use for simple one-offs and lookups). `smart` — DeepSeek with thinking on (use for real editorial / parsing work: digests, semantic dedup, PDF amount extraction). Default `base`."
+            "description": "Model preset for the sub-agent. `instant` — no thinking (mechanical one-offs). `base` — low thinking (default; simple tasks and lookups). `smart` — high thinking (real editorial or parsing work: digests, semantic dedup, PDF amount extraction). `smartest` — maximum. Default `base`."
           },
           "loop": {
             "type": "string",

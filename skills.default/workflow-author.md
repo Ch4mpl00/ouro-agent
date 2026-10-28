@@ -358,7 +358,7 @@ keys win; for overlapping routes with equally many keys, larger `priority`
 wins (default 0); activation refuses ties and names the conflicting
 workflow. A routed loop starts on the `smart` preset with the signal's
 conversation (else the default chat) as its confirmation target;
-`metadata.route.preset` (`base`, `smart`, `smartest`) and
+`metadata.route.preset` (`instant`, `base`, `smart`, `smartest`) and
 `metadata.route.confirm: none` (or the same under `metadata.agent`) change that. Its instructions start with the
 session context, the signal's source and its env addendum; its input carries
 `signal` (`id`, `source`, `content`, `env_context`, `payload`, `button`,
@@ -670,7 +670,7 @@ Functions besides the ones `workflow_functions` lists from the tools:
 - `llm_compose { skill?, prompt?, input?, preset?, json? }` — one generation
   (with `skill`'s instructions when one is named); `input` is an object
   shown to the model as tagged sections; `preset` is `compose` (default,
-  the writing model), `base`, `smart` or `smartest`. Returns the reply, parsed when it is JSON. With
+  the writing model), `instant`, `base`, `smart` or `smartest`. Returns the reply, parsed when it is JSON. With
   `json: true` the model must answer one JSON object (describe its fields
   in the prompt); any other reply faults the step instead of flowing on as
   text.
