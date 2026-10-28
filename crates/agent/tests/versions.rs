@@ -965,11 +965,7 @@ async fn routes_at_equal_specificity_need_distinct_priorities_and_the_most_speci
     activate_definition(&f.engine, "route-b", &prioritized).await;
     activate_definition(&f.engine, "route-c", &route("route-c", "source: telegram, topic: research")).await;
     let names = |routes: Vec<(String, u64)>| routes.into_iter().map(|(n, _)| n).collect::<Vec<_>>();
-    // The built-in Telegram route (design 08) comes last: priority -1.
-    assert_eq!(
-        names(flows::signal_routes(&f.engine, "telegram", &Value::Null).await.unwrap()),
-        ["route-b", "route-a", "telegram"]
-    );
+    assert_eq!(names(flows::signal_routes(&f.engine, "telegram", &Value::Null).await.unwrap()), ["route-b", "route-a"]);
     let research = json!({"topic":"research"});
     assert_eq!(names(flows::signal_routes(&f.engine, "telegram", &research).await.unwrap())[0], "route-c");
     let supervisor = create_supervisor(f.engine.clone());

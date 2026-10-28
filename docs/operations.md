@@ -139,7 +139,7 @@ worker's next tick (`poll_interval`, 50 ms).
 **Jump budget** (`limits.max_jumps`, per run tree): a backstop, not the
 binding limit, which is each loop's `max_iterations`. One agent-loop round
 takes two jumps plus one per guarded call; the dispatcher takes at most
-three, the Telegram route a handful more (design 08): Σ loops `max_iterations × (2 + guarded calls per round) + 3`. With
+three, a wrapper flow like the agent's Telegram one a handful more (design 08): Σ loops `max_iterations × (2 + guarded calls per round) + 3`. With
 the primary's 100 iterations and 16 workers of 50, each with up to 16
 guarded calls a round, that is 16 203; the ceiling is **20 000**. The
 recovery report runs as a root of its own (`recovery:<signal id>`), so an

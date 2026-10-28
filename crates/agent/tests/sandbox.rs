@@ -904,8 +904,8 @@ async fn a_route_draft_of_a_name_never_activated_runs_and_a_narrowed_route_does_
     assert_eq!(active_version(&s.f.engine, "tg-new").await, None, "nothing activated");
 
     // Narrowed: only presses route to the draft now, so a message takes the
-    // next route, the built-in `telegram` (design 08), although the active
-    // version's `when` matched it.
+    // default path (no other route matches), although the active version's
+    // `when` matched it.
     let (s, _) = sandbox(vec![assistant("default path"), assistant(r#"{"reply":"default path"}"#)], "allow").await;
     let narrowed = LOOP.replace("when: { source: [telegram, telegram_button] }", "when: { source: telegram_button }");
     assert_ne!(narrowed, LOOP);
@@ -914,8 +914,8 @@ async fn a_route_draft_of_a_name_never_activated_runs_and_a_narrowed_route_does_
     assert_eq!(report["status"], "completed", "{report:#}");
     assert_eq!(report["drafts"][0]["ran"], false, "{report:#}");
     assert!(runs_of(&report, "telegram-loop", None).is_empty(), "neither the draft nor the active one: {report:#}");
-    assert_eq!(run(&report, "telegram", Some("route"))["version"], "built-in");
-    assert_eq!(run(&report, "agent-loop", Some("loop"))["version"], "built-in");
+    assert!(runs_of(&report, "telegram", None).is_empty(), "no built-in Telegram route: {report:#}");
+    assert_eq!(run(&report, "agent-loop", Some("primary"))["version"], "built-in");
     assert!(!tried(&s.f.engine, "telegram-loop", &narrowed));
 }
 

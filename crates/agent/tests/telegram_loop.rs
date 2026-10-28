@@ -1,4 +1,5 @@
-// Design 08: the built-in `telegram` wrapper around a loop. A Telegram
+// Design 08: the `telegram` wrapper around a loop, an agent version (the
+// fixture) since the runtime ships none. A Telegram
 // signal routes to the wrapper, which opens the 👀 bubble, starts the loop
 // as its owned child (the delivery tools excluded, a status observer on
 // every step), joins it, composes the reply from what the loop did and sends
@@ -190,6 +191,10 @@ impl ChatProvider for Model {
 
 // ── the fixture ─────────────────────────────────────────────────────────────
 
+/// The Telegram flow as the agent keeps it: versions in the engine's store.
+const TELEGRAM: &str = include_str!("fixtures/telegram.yaml");
+const TELEGRAM_STATUS: &str = include_str!("fixtures/telegram-status.yaml");
+
 const SKILLS: &[(&str, &str)] = &[
     ("telegram", "---\ntools: [t1, edit_telegram_message]\n---\nTELEGRAM"),
     ("orchestrator", "---\ntools: *\n---\nORCHESTRATOR"),
@@ -294,15 +299,15 @@ struct Setup {
     supervisor: Arc<Supervisor>,
 }
 
-fn setup(turns: Vec<Message>, reply: Value) -> Setup {
-    setup_with(turns, reply, "allow", &["orchestrator", "routing"])
+async fn setup(turns: Vec<Message>, reply: Value) -> Setup {
+    setup_with(turns, reply, "allow", &["orchestrator", "routing"]).await
 }
 
-fn setup_with(turns: Vec<Message>, reply: Value, label: &str, engine_skills: &[&str]) -> Setup {
-    setup_gated(turns, reply, label, engine_skills, None)
+async fn setup_with(turns: Vec<Message>, reply: Value, label: &str, engine_skills: &[&str]) -> Setup {
+    setup_gated(turns, reply, label, engine_skills, None).await
 }
 
-fn setup_gated(
+async fn setup_gated(
     turns: Vec<Message>,
     reply: Value,
     label: &str,
@@ -318,6 +323,9 @@ fn setup_gated(
     if let Some(gate) = gate {
         *gate.engine.lock().unwrap() = Some(f.engine.clone());
     }
+    // The Telegram flow is the agent's own version, not a built-in: install it as one.
+    activate_definition(&f.engine, "telegram-status", TELEGRAM_STATUS).await;
+    activate_definition(&f.engine, "telegram", TELEGRAM).await;
     let supervisor = create_supervisor(f.engine.clone());
     Setup { f, mcp, api, model, supervisor }
 }
@@ -421,7 +429,8 @@ async fn a_telegram_signal_runs_the_wrapper_its_loop_and_sends_the_composed_repl
     let s = setup(
         vec![calls(&[("t1", json!({"n":1}))]), assistant("Did t1; tell the user it worked")],
         reply("Готово: t1"),
-    );
+    )
+    .await;
     s.mcp.history.lock().unwrap().push(
         json!({"id":100,"chat_id":-10042,"thread_id":7,"role":"user","text":"Earlier message","created_at":"2026-09-06 11:59:00"}),
     );
@@ -489,7 +498,7 @@ async fn a_telegram_signal_runs_the_wrapper_its_loop_and_sends_the_composed_repl
     assert_eq!(sent[0]["messageThreadId"], 7);
     assert_eq!(sent[0]["text"], "Готово: t1");
     let bubbles = statuses(&s.mcp);
-    assert_eq!(bubbles[0]["text"], "👀");
+    assert_eq!(bubbles[0]["text"], "смотрю 👀");
     assert_eq!(bubbles[0]["seq"], 0);
     assert_eq!(bubbles[0]["id"], "status:42");
     let last = bubbles.last().unwrap();
@@ -514,14 +523,14 @@ async fn a_telegram_signal_runs_the_wrapper_its_loop_and_sends_the_composed_repl
 // 2: the bubble opens before any model request and before the history read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_bubble_is_the_first_telegram_call_before_any_model_request() {
-    let s = setup(vec![assistant("nothing to do")], reply("ok"));
+    let s = setup(vec![assistant("nothing to do")], reply("ok")).await;
     s.supervisor.run_signal(&signal(42)).await.unwrap();
     let events = s.mcp.events.lock().unwrap().clone();
     let bubble = events.iter().position(|e| e == "mcp:telegram_send_status").expect("the bubble");
     let model = events.iter().position(|e| e.starts_with("model:")).expect("a model request");
     let history = events.iter().position(|e| e == "mcp:get_telegram_chat_history").expect("the history read");
     assert!(bubble < model && bubble < history, "{events:?}");
-    assert_eq!(statuses(&s.mcp)[0]["text"], "👀");
+    assert_eq!(statuses(&s.mcp)[0]["text"], "смотрю 👀");
     s.supervisor.shutdown().await;
 }
 
@@ -539,7 +548,8 @@ async fn an_excluded_tool_never_runs_and_workers_inherit_the_exclusion() {
             assistant("all done"),
         ],
         reply("the one reply"),
-    );
+    )
+    .await;
     assert_eq!(s.supervisor.run_signal(&signal(42)).await.unwrap(), "the one reply");
     let sent = replies(&s.mcp);
     assert_eq!(sent.len(), 1, "{sent:?}");
@@ -620,7 +630,8 @@ async fn a_wrapper_starts_a_custom_loop_and_reads_its_outcome_and_transcript() {
         reply("unused"),
         "allow",
         &[],
-    );
+    )
+    .await;
     activate_definition(&s.f.engine, "research-loop", &variant("research-loop")).await;
     let setup_loop = variant("setup-loop").replacen(
         "\ndo:\n",
@@ -691,7 +702,7 @@ async fn a_wrapper_starts_a_custom_loop_and_reads_its_outcome_and_transcript() {
 // it too: a typo must not leave the tool in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_bad_request_faults_the_child_and_the_wrapper_reads_why() {
-    let s = setup_with(vec![], reply("unused"), "allow", &[]);
+    let s = setup_with(vec![], reply("unused"), "allow", &[]).await;
     let cases = [
         ("probe-c", r#"{ input: x, exclude_tools: [send_telegram_mesage] }"#, "send_telegram_mesage"),
         ("probe-e", r#"{ input: x, preset: no-such-preset }"#, "no-such-preset"),
@@ -715,7 +726,7 @@ async fn a_bad_request_faults_the_child_and_the_wrapper_reads_why() {
 // loop the tool back by leaving it out of the request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_nested_loop_keeps_its_parents_exclusions() {
-    let s = setup_with(vec![assistant("nested done")], reply("unused"), "allow", &["orchestrator"]);
+    let s = setup_with(vec![assistant("nested done")], reply("unused"), "allow", &["orchestrator"]).await;
     let nest = r#"document: {dsl: '1.0.4', namespace: agent, name: nest, version: '1.0.0'}
 do:
   - loop:
@@ -747,7 +758,7 @@ output: { as: '${ .output }' }
 // The exclusion is host data: a loop rebuilt after a restart keeps it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_exclusion_survives_a_restart_mid_loop() {
-    let s = setup(vec![calls(&[("t1", json!({"n":1}))])], reply("after the restart"));
+    let s = setup(vec![calls(&[("t1", json!({"n":1}))])], reply("after the restart")).await;
     let stop = CancellationToken::new();
     *s.mcp.crash_on_t1.lock().unwrap() = Some(stop.clone());
     let supervisor = s.supervisor.clone();
@@ -783,7 +794,8 @@ async fn every_acting_turn_starts_an_observer_before_its_calls_run() {
     let s = setup(
         vec![calls(&[("t1", json!({"n":1}))]), calls(&[("t1", json!({"n":2}))]), assistant("two steps")],
         reply("done"),
-    );
+    )
+    .await;
     *s.mcp.probe.lock().unwrap() = Some(s.f.engine.clone());
     s.supervisor.run_signal(&signal(42)).await.unwrap();
     let observed = s.mcp.observed.lock().unwrap().clone();
@@ -810,7 +822,7 @@ async fn every_acting_turn_starts_an_observer_before_its_calls_run() {
 // the hanging observers are cancelled when the loop ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hanging_status_model_delays_nothing() {
-    let s = setup(vec![calls(&[("t1", json!({"n":1}))]), assistant("done fast")], reply("fast reply"));
+    let s = setup(vec![calls(&[("t1", json!({"n":1}))]), assistant("done fast")], reply("fast reply")).await;
     s.model.hang_status.store(true, Ordering::SeqCst);
     // The status model answers only when cancelled, so a reply that waited
     // for it would never come: any bound tells the two apart, and a wide one
@@ -831,7 +843,7 @@ async fn a_hanging_status_model_delays_nothing() {
 // does not exist or that an operator paused is ignored, and the loop ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn without_an_observer_or_with_a_broken_one_the_loop_completes() {
-    let s = setup(vec![calls(&[("t1", json!({"n":1}))]), assistant("scheduled done")], reply("unused"));
+    let s = setup(vec![calls(&[("t1", json!({"n":1}))]), assistant("scheduled done")], reply("unused")).await;
     let mut scheduled = signal(60);
     scheduled.source = "scheduler".into();
     scheduled.content = "do the task".into();
@@ -839,13 +851,12 @@ async fn without_an_observer_or_with_a_broken_one_the_loop_completes() {
     let primary = children(&s.f.engine, "signal:60").await.pop().unwrap();
     assert!(children(&s.f.engine, &primary.admission.id).await.iter().all(|c| c.admission.name != "telegram-status"));
 
-    let missing = agent::flows::built_in("telegram")
-        .unwrap()
+    let missing = TELEGRAM
         .replace("workflow: \"telegram-status\"", "workflow: \"no-such-observer\"")
         .replace("name: telegram,", "name: telegram-missing,")
         .replace("priority: -1", "priority: 1");
     assert!(missing.contains("no-such-observer"));
-    activate_definition(&s.f.engine, "telegram-missing", &without_breaker(&missing)).await;
+    activate_definition(&s.f.engine, "telegram-missing", &missing).await;
     s.model.turns.lock().unwrap().extend([calls(&[("t1", json!({"n":2}))]), assistant("loop done")]);
     *s.model.reply.lock().unwrap() = reply("despite the observer");
     assert_eq!(s.supervisor.run_signal(&signal(61)).await.unwrap(), "despite the observer");
@@ -863,7 +874,7 @@ async fn without_an_observer_or_with_a_broken_one_the_loop_completes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_null_reply_sends_nothing_and_clears_the_bubble() {
-    let s = setup(vec![assistant("nothing to say")], json!({"reply": null}));
+    let s = setup(vec![assistant("nothing to say")], json!({"reply": null})).await;
     assert_eq!(s.supervisor.run_signal(&signal(42)).await.unwrap(), "nothing to say");
     assert!(replies(&s.mcp).is_empty());
     assert_eq!(statuses(&s.mcp).last().unwrap()["text"], "");
@@ -874,7 +885,7 @@ async fn a_null_reply_sends_nothing_and_clears_the_bubble() {
 // sees the loop's work (the wrapper took no turn).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_loop_clears_the_bubble_and_the_report_sees_its_work() {
-    let s = setup(vec![calls(&[("t1", json!({"n":"loop transcript marker"}))])], reply("unused"));
+    let s = setup(vec![calls(&[("t1", json!({"n":"loop transcript marker"}))])], reply("unused")).await;
     let error = s.supervisor.run_signal(&signal(42)).await.unwrap_err();
     assert!(format!("{error:#}").contains("script exhausted"), "{error:#}");
     assert!(replies(&s.mcp).is_empty());
@@ -888,7 +899,7 @@ async fn a_failed_loop_clears_the_bubble_and_the_report_sees_its_work() {
 // A status tool that fails never fails the signal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failing_bubble_never_fails_the_signal() {
-    let s = setup(vec![calls(&[("t1", json!({"n":1}))]), assistant("done")], reply("sent anyway"));
+    let s = setup(vec![calls(&[("t1", json!({"n":1}))]), assistant("done")], reply("sent anyway")).await;
     s.mcp.status_fails.store(true, Ordering::SeqCst);
     assert_eq!(s.supervisor.run_signal(&signal(42)).await.unwrap(), "sent anyway");
     assert_eq!(replies(&s.mcp).len(), 1);
@@ -899,7 +910,7 @@ async fn a_failing_bubble_never_fails_the_signal() {
 // (its outcome is unknown, so it counts as sent) and clears the bubble.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crash_in_the_send_never_sends_twice_and_the_bubble_is_cleared_on_resume() {
-    let s = setup(vec![assistant("work done")], reply("the reply"));
+    let s = setup(vec![assistant("work done")], reply("the reply")).await;
     let stop = CancellationToken::new();
     *s.mcp.crash_on_reply.lock().unwrap() = Some(stop.clone());
     let supervisor = s.supervisor.clone();
@@ -935,7 +946,8 @@ async fn a_confirmation_in_the_loop_lets_the_wrapper_sleep_and_resume() {
         reply("after the press"),
         "needs_confirmation",
         &["orchestrator", "routing"],
-    );
+    )
+    .await;
     let output = s.supervisor.run_signal(&signal(42)).await.unwrap();
     assert!(output.contains("resumes"), "{output}");
     let card = s
@@ -970,7 +982,7 @@ async fn a_confirmation_in_the_loop_lets_the_wrapper_sleep_and_resume() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_composed_reply_goes_through_the_guard() {
     let secret = "the key is sk-abcdefghijklmnopqrstuvwxyz012345";
-    let s = setup(vec![assistant("found a key")], reply(secret));
+    let s = setup(vec![assistant("found a key")], reply(secret)).await;
     let output = s.supervisor.run_signal(&signal(42)).await.unwrap();
     assert!(output.contains("blocked"), "{output}");
     assert!(replies(&s.mcp).is_empty(), "a secret is never sent");
@@ -978,7 +990,7 @@ async fn the_composed_reply_goes_through_the_guard() {
     s.supervisor.shutdown().await;
 
     let link = "read https://example.com/post";
-    let s = setup(vec![assistant("found a post")], reply(link));
+    let s = setup(vec![assistant("found a post")], reply(link)).await;
     assert_eq!(s.supervisor.run_signal(&signal(42)).await.unwrap(), link);
     assert_eq!(replies(&s.mcp).len(), 1);
     let reviewed = s.api.requests.lock().unwrap().iter().any(|r| r.to_string().contains("example.com/post"));
@@ -990,7 +1002,7 @@ async fn the_composed_reply_goes_through_the_guard() {
 // the press changed nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_undelivered_press_tells_the_loop_it_changed_nothing() {
-    let s = setup(vec![assistant("noted")], json!({"reply": null}));
+    let s = setup(vec![assistant("noted")], json!({"reply": null})).await;
     let mut press = signal(45);
     press.source = "telegram_button".into();
     press.content =
@@ -1004,9 +1016,9 @@ async fn an_undelivered_press_tells_the_loop_it_changed_nothing() {
 // An agent's copy of the wrapper passes the gate and a dry run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_agent_copy_of_the_wrapper_passes_the_gate_and_a_dry_run() {
-    let s = setup(vec![calls(&[("t1", json!({"n":1}))]), assistant("dry done")], reply("dry reply"));
+    let s = setup(vec![calls(&[("t1", json!({"n":1}))]), assistant("dry done")], reply("dry reply")).await;
     s.f.engine.ready().await.unwrap();
-    let copy = without_breaker(agent::flows::built_in("telegram").unwrap());
+    let copy = TELEGRAM.to_owned();
     assert!(!copy.contains("breaker"));
     agent::flows::gate(&s.f.engine, "telegram", &copy).unwrap_or_else(|e| panic!("{e:#}"));
     let args = json!({"name":"telegram","definition":copy});
@@ -1063,7 +1075,8 @@ async fn restarts_never_change_a_prepared_loop() {
         "allow",
         &[],
         Some(gate.clone()),
-    );
+    )
+    .await;
     activate_definition(&s.f.engine, "probe-r", &probe_route("probe-r", "probe-r", "agent-loop", CHILD_REQUEST)).await;
     let supervisor = s.supervisor.clone();
     let first = tokio::spawn(async move { supervisor.run_signal(&probe_signal("probe-r", 80)).await });
@@ -1136,7 +1149,8 @@ async fn the_childs_trace_nests_under_its_wrapper_once() {
         "allow",
         &[],
         Some(gate.clone()),
-    );
+    )
+    .await;
     activate_definition(&s.f.engine, "probe-t", &probe_route("probe-t", "probe-t", "agent-loop", CHILD_REQUEST)).await;
     let supervisor = s.supervisor.clone();
     let first = tokio::spawn(async move { supervisor.run_signal(&probe_signal("probe-t", 81)).await });
@@ -1189,7 +1203,7 @@ async fn the_childs_trace_nests_under_its_wrapper_once() {
 // composes from), and nothing starts in its place.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_paused_loop_is_refused_and_the_wrapper_answers_the_user() {
-    let s = setup(vec![], reply("Сейчас не могу: агент приостановлен"));
+    let s = setup(vec![], reply("Сейчас не могу: агент приостановлен")).await;
     s.f.engine.ready().await.unwrap();
     let request =
         ouro_runtime::control::Request { id: "pause-loop".into(), actor: "operator".into(), reason: "test".into() };
